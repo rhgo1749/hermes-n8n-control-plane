@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 GITHUB_API = "https://api.github.com"
@@ -104,8 +104,6 @@ def discover_repositories(token: str, owner: str, topic: str) -> list[dict[str, 
     else:
         raise RegistryError(f"repository search exceeded {MAX_PAGES} pages")
 
-    # Search is the primary filter; still fail closed against malformed or
-    # obviously unrelated results when fixtures/mocks are used.
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for repo in found:
@@ -166,7 +164,7 @@ def build_entry(
     repo: dict[str, Any],
     checkout_root: Path,
     *,
-    origin_reader: Callable[[Path], str | None] = _git_origin,
+    origin_reader: Callable[[Path], str | None] | None = None,
 ) -> RegistryEntry:
     full_name = str(repo.get("full_name") or "").strip()
     if "/" not in full_name:
@@ -182,35 +180,35 @@ def build_entry(
     repo_name = full_name.split("/", 1)[1]
     slug = repo_name.casefold()
     checkout = checkout_root / slug
-    origin = origin_reader(checkout) if checkout.is_dir() else None
+    read_origin = origin_reader or _git_origin
+    origin = read_origin(checkout) if checkout.is_dir() else None
     contracts = _contracts(checkout) if checkout.is_dir() else ()
 
     if not checkout.exists():
         checkout_status = "missing"
-        ready = False
+        checkout_ok = False
         reason = "checkout_missing"
     elif not checkout.is_dir():
         checkout_status = "not_directory"
-        ready = False
+        checkout_ok = False
         reason = "checkout_not_directory"
     elif origin is None:
         checkout_status = "origin_unavailable"
-        ready = False
+        checkout_ok = False
         reason = "checkout_origin_unavailable"
     elif _normalise_remote(origin).casefold() != full_name.casefold():
         checkout_status = "remote_mismatch"
-        ready = False
+        checkout_ok = False
         reason = "checkout_remote_mismatch"
     else:
         checkout_status = "verified"
-        ready = True
-        reason = None
+        checkout_ok = True
+        reason = "board_unresolved_shadow_phase"
 
     # Board identity cannot safely be guessed from the repository slug because
-    # legacy boards may have non-canonical names (e.g. historical naming). A
-    # later phase will resolve association from Kanban evidence. Shadow mode
-    # therefore reports an explicit unresolved state instead of encoding an
-    # override table.
+    # legacy boards may have non-canonical names. A later phase will resolve
+    # association from Kanban evidence. Shadow mode therefore fails closed for
+    # cutover readiness instead of encoding an override table.
     return RegistryEntry(
         repository=full_name,
         repository_id=repository_id,
@@ -222,7 +220,7 @@ def build_entry(
         checkout_status=checkout_status,
         checkout_remote=origin,
         contract_paths=contracts,
-        ready=ready,
+        ready=False if checkout_ok else False,
         reason=reason,
     )
 
@@ -240,9 +238,14 @@ def _fixture_repositories(path: Path) -> list[dict[str, Any]]:
 
 
 def registry_snapshot(
-    repositories: Iterable[dict[str, Any]], checkout_root: Path
+    repositories: Iterable[dict[str, Any]],
+    checkout_root: Path,
+    *,
+    origin_reader: Callable[[Path], str | None] | None = None,
 ) -> dict[str, Any]:
-    entries = [build_entry(repo, checkout_root) for repo in repositories]
+    entries = [
+        build_entry(repo, checkout_root, origin_reader=origin_reader) for repo in repositories
+    ]
     entries.sort(key=lambda item: item.repository.casefold())
     return {
         "schema_version": 1,
