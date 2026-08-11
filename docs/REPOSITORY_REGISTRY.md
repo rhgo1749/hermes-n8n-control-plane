@@ -1,6 +1,6 @@
 # Repository registry — shadow phase
 
-This document defines Phase 1 of the repository auto-discovery work tracked in
+This document defines the shadow repository auto-discovery work tracked in
 issue #2.
 
 The goal is to eliminate the permanent five-repository inventory from the
@@ -10,13 +10,13 @@ of requiring a source-code edit.
 
 ## Safety boundary
 
-Phase 1 is **read only**. `repository_registry.py` does not create/delete
+The registry is **read only**. `repository_registry.py` does not create/delete
 webhooks, change n8n workflows, modify Hermes cron state, create Kanban boards,
 spawn workers, or write to GitHub.
 
 The existing production intake and its five-minute fallback remain unchanged.
 The registry is intentionally a shadow observation surface until its output is
-compared with the currently managed repositories.
+compared with the currently managed repositories and later cutover gates pass.
 
 ## Derived fields and authority
 
@@ -28,7 +28,7 @@ For every discovered repository the shadow snapshot records:
 - derived checkout path `/ws/projects/<slug>`
 - whether the checkout origin matches the GitHub repository
 - repository contract files present on the GitHub default branch
-- board association state
+- existing Kanban board association derived from task provenance
 - readiness/fail-closed reason
 
 The authority boundary is explicit:
@@ -39,6 +39,9 @@ GitHub default branch
 
 /ws/projects/<slug>
   └─ checkout-path/origin verification only
+
+live Kanban board DBs
+  └─ existing repo → board association from tasks.idempotency_key
 ```
 
 A stale or branch-diverged local checkout must not hide or invent repository
@@ -68,22 +71,46 @@ origins, and remote mismatches all fail closed. The registry does not scan and
 pick an arbitrary same-origin worktree because feature/validation worktrees may
 legitimately share the same remote.
 
-## Board identity is deliberately not guessed
+## Existing board association from durable task provenance
 
-Historical boards may not equal the canonical repository slug. The current
-production system already contains at least one historical naming exception,
-so the shadow registry reports:
+Board directory names are not treated as repository identity. Historical boards
+may not equal the canonical repository slug, so a permanent override such as
+`ctrl-hangul -> ctrlhangul` would only move the hard-coding problem.
+
+Instead, the registry scans only direct live board databases under:
 
 ```text
-board = null
-board_status = unresolved_shadow_phase
+/home/hermes/.hermes/kanban/boards/*/kanban.db
 ```
 
-until the next phase connects a resolver to existing Kanban evidence. This is
-preferable to adding another permanent override table.
+Directories beginning with `_` are ignored, which excludes `_archived` from the
+resolver. State snapshots and other profiles are outside this live-board root
+and therefore cannot become association evidence.
 
-The cutover gate is that the resolver must reproduce all existing effective
-repo → board associations before the legacy `REPOSITORIES` table is removed.
+Within each live board, the resolver reads `tasks.idempotency_key` and recognizes
+only the existing durable intake key format:
+
+```text
+github:<owner>/<repository>:issue:<number>
+```
+
+Resolution is fail-closed:
+
+- exactly one repository identity on a board, and that repository appears on
+  exactly one live board -> `resolved_task_provenance`
+- no matching task provenance -> `not_found_task_provenance`
+- one board contains provenance for multiple repositories ->
+  `ambiguous_task_provenance`
+- the same repository appears on multiple live boards ->
+  `ambiguous_multiple_boards`
+
+Only a verified checkout plus a uniquely resolved existing board makes a shadow
+entry `ready=true`. This still does **not** perform a live cutover or provision a
+new board.
+
+The first live evidence check found exactly one repository identity on each of
+the five current boards, including recovery of the historical
+`ctrl-hangul -> ctrlhangul` association without an exception table.
 
 ## Authentication requirement for zero-touch onboarding
 
@@ -107,9 +134,9 @@ The script reads `HERMES_GITHUB_TOKEN` first and falls back to `GITHUB_TOKEN`.
 
 ## Run in shadow mode
 
-Run the script where `/ws/projects` is the Hermes workspace. For the current
-host this is easiest inside the Hermes container while passing the token only in
-the child-process environment:
+Run the script where both `/ws/projects` and the live Kanban board root are
+available. For the current host this is easiest inside the Hermes container
+while passing the token only in the child-process environment:
 
 ```bash
 docker exec -i \
@@ -119,20 +146,16 @@ docker exec -i \
     --owner rhgo1749 \
     --topic hermes-agent \
     --checkout-root /ws/projects \
+    --kanban-root /home/hermes/.hermes/kanban/boards \
   < automation/n8n/scripts/repository_registry.py
 ```
 
 A fixture can be used without network access. Fixture repository objects may
-include `contract_paths` so tests can model the GitHub/default-branch result
-without reading a local working tree:
+include `contract_paths` so tests can model the GitHub/default-branch result.
+Tests that exercise board resolution create isolated temporary SQLite board DBs
+and pass their root through `--kanban-root` or the resolver helpers.
 
-```bash
-python3 automation/n8n/scripts/repository_registry.py \
-  --fixture-json /path/to/repositories.json \
-  --checkout-root /ws/projects
-```
-
-## Phase-1 canary
+## Shadow canary gates
 
 Before any live cutover:
 
@@ -140,21 +163,39 @@ Before any live cutover:
 2. Run the shadow registry and save the JSON output outside Git.
 3. Confirm the discovered repository set matches the current managed set.
 4. Confirm each existing checkout reports `verified` and its remote matches.
-5. Confirm contract detection matches the GitHub default branch, even if the local checkout is stale or on another branch.
-6. Keep board association unresolved until the Kanban-backed resolver lands.
-7. Do not remove the current five-repository inventory or polling fallback yet.
+5. Confirm contract detection matches the GitHub default branch, even if the
+   local checkout is stale or on another branch.
+6. Confirm each existing repository resolves to exactly one live Kanban board
+   from task idempotency provenance.
+7. Treat missing or ambiguous board provenance as not ready; do not guess by
+   board name.
+8. Do not remove the current five-repository inventory or polling fallback yet.
 
 The first production shadow canary found exactly the intended five repositories
 and verified all five `/ws/projects/<slug>` origins. It also exposed local
 checkout drift in contract-file detection, which is why contract authority now
 comes from the GitHub default branch rather than the local working tree.
 
+The Phase-2 evidence probe then found these unique live associations from
+`tasks.idempotency_key`:
+
+```text
+rhgo1749/ctrl-hangul                  -> ctrlhangul
+rhgo1749/H4V3-DJ                      -> h4v3-dj
+rhgo1749/h4v3-meowcore-avatar-lab     -> h4v3-meowcore-avatar-lab
+rhgo1749/h4v3-meowcore-voice-lab      -> h4v3-meowcore-voice-lab
+rhgo1749/re-bound                     -> re-bound
+```
+
+This is the evidence required to remove a future repository-name override table,
+but it does not yet remove the legacy intake inventory.
+
 ## Next phases
 
 Issue #2 tracks the remaining work:
 
-- resolve existing Kanban board association without a permanent override table
 - make the edge intake repository-scoped while preserving an explicit full scan
+- define provisioning behavior for opted-in repositories with no existing board
 - replace per-repository n8n workflow duplication with registry-driven webhook reconciliation
 - filter echo events without losing blocked-resume/rework/completion signals
 - add a persisted wake lease/generation guard so stale delayed pauses are no-ops
