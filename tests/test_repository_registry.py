@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -12,6 +13,7 @@ MODULE_PATH = ROOT / "automation" / "n8n" / "scripts" / "repository_registry.py"
 spec = importlib.util.spec_from_file_location("repository_registry", MODULE_PATH)
 assert spec and spec.loader
 registry = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = registry
 spec.loader.exec_module(registry)
 
 
@@ -37,7 +39,7 @@ def test_remote_normalization() -> None:
         assert registry._normalise_remote(value) == expected
 
 
-def test_verified_checkout_and_contract_detection() -> None:
+def test_verified_checkout_and_contract_detection_stays_shadow_unready() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         checkout = root / "ctrl-hangul"
@@ -55,8 +57,8 @@ def test_verified_checkout_and_contract_detection() -> None:
         )
         assert entry.repository_id == 42
         assert entry.checkout_status == "verified"
-        assert entry.ready is True
-        assert entry.reason is None
+        assert entry.ready is False
+        assert entry.reason == "board_unresolved_shadow_phase"
         assert entry.board is None
         assert entry.board_status == "unresolved_shadow_phase"
         assert entry.contract_paths == registry.CONTRACT_CANDIDATES
@@ -103,19 +105,16 @@ def test_snapshot_is_deterministic_and_has_no_repository_inventory() -> None:
         root = Path(td)
         for name in ("z-repo", "a-repo"):
             (root / name).mkdir()
-        original = registry._git_origin
-        try:
-            registry._git_origin = lambda p: f"https://github.com/rhgo1749/{p.name}.git"
-            snapshot = registry.registry_snapshot(
-                [_repo("rhgo1749/z-repo", 2), _repo("rhgo1749/a-repo", 1)],
-                root,
-            )
-        finally:
-            registry._git_origin = original
+        snapshot = registry.registry_snapshot(
+            [_repo("rhgo1749/z-repo", 2), _repo("rhgo1749/a-repo", 1)],
+            root,
+            origin_reader=lambda p: f"https://github.com/rhgo1749/{p.name}.git",
+        )
         names = [item["repository"] for item in snapshot["repositories"]]
         assert names == ["rhgo1749/a-repo", "rhgo1749/z-repo"]
         assert snapshot["mode"] == "shadow"
         assert snapshot["schema_version"] == 1
+        assert all(item["board"] is None for item in snapshot["repositories"])
 
 
 def test_fixture_shape() -> None:
