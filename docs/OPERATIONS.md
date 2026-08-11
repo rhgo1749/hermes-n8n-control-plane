@@ -48,9 +48,11 @@ A separate isolated-runtime canary verified both `trigger → tick → pause` an
 
 This repository cannot install n8n from the current agent container: it has no host Docker socket, sudo, systemd, or host SSH authority. On the Ubuntu host, install Docker Engine and Docker Compose v2 from [Docker's official Ubuntu guide](https://docs.docker.com/engine/install/ubuntu/) if they are absent.
 
-Do **not** use a Docker socket mount for n8n. The provided Compose file is deliberately private:
+Do **not** use a Docker socket mount for n8n. The provided Compose file uses
+host networking only so n8n can reach the host's Tailnet-only Hermes dashboard;
+n8n itself is deliberately private:
 
-- binds only `127.0.0.1:<host port>`;
+- listens only on `127.0.0.1:5678` (no Docker-published port);
 - uses a named `n8n_data` volume;
 - has `restart: unless-stopped`;
 - asks Docker/systemd to restore Docker on boot when `--enable-docker-service` is explicitly supplied;
@@ -65,7 +67,11 @@ From the repository root on the host:
 automation/n8n/scripts/host-install.sh --enable-docker-service
 ```
 
-The first boot creates a local owner account at `http://127.0.0.1:5678`. Pass `--port <private-port>` only when intentionally changing the host port; the script updates `N8N_HOST_PORT` and probes that effective value. The generated `automation/n8n/.env` and Docker volume are runtime state and are ignored by Git.
+The first boot creates a local owner account at `http://127.0.0.1:5678`. The
+listener is fixed at that port while Compose uses host networking, so
+`host-install.sh` rejects `--port` rather than silently creating a non-working
+mapped-port configuration. The generated `automation/n8n/.env` and Docker
+volume are runtime state and are ignored by Git.
 
 `N8N_ENCRYPTION_KEY` is generated once and must remain stable. Before changing n8n version or replacing data, export workflows and back up the n8n volume. This control plane intentionally uses the `2.32.7` tag rather than `latest`; record the pulled image digest in the host change record before an upgrade.
 
@@ -226,7 +232,7 @@ automation/n8n/scripts/export-workflows.sh
 For a live host, also retain:
 
 - `docker compose ps` with n8n healthy;
-- `curl -fsS http://127.0.0.1:<N8N_HOST_PORT-from-protected-.env>/healthz`;
+- `curl -fsS http://127.0.0.1:5678/healthz`;
 - n8n execution records for each canary;
 - Hermes job `last_run_at`/`last_status` evidence;
 - the cutover backup path and the exact rollback command.

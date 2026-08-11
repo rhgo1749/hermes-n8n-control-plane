@@ -54,7 +54,7 @@ def main() -> int:
         (home / "cron").mkdir(parents=True)
         binaries.mkdir()
         shutil.copy2(SOURCE_CUTOVER, scripts / "cutover.sh")
-        (root / "automation" / "n8n" / ".env").write_text("N8N_HOST_PORT=5678\n", encoding="utf-8")
+        (root / "automation" / "n8n" / ".env").write_text("N8N_PORT=5678\n", encoding="utf-8")
 
         jobs = {
             "jobs": [

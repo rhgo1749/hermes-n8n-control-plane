@@ -71,7 +71,7 @@ for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     if raw.lstrip().startswith("#") or "=" not in raw:
         continue
     key, value = raw.split("=", 1)
-    if key.strip() == "N8N_HOST_PORT":
+    if key.strip() == "N8N_PORT":
         print(value.strip())
         break
 else:

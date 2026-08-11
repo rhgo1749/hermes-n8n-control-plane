@@ -147,7 +147,9 @@ def main() -> int:
     compose = yaml.safe_load(compose_text)
     service = compose["services"]["n8n"]
     assert service["restart"] == "unless-stopped"
-    assert service["ports"] == ["127.0.0.1:${N8N_HOST_PORT:-5678}:5678"]
+    assert service["network_mode"] == "host"
+    assert "ports" not in service
+    assert service["environment"]["N8N_LISTEN_ADDRESS"] == "127.0.0.1"
     assert "/var/run/docker.sock" not in compose_text
     environment = service["environment"]
     assert environment["N8N_BLOCK_ENV_ACCESS_IN_NODE"] == "true"
@@ -158,6 +160,10 @@ def main() -> int:
     for job in ACTIVE_JOBS:
         assert job["id"] in plugin
     assert "create_job" not in plugin and "delete" not in plugin
+
+    env_example = (N8N / ".env.example").read_text(encoding="utf-8")
+    assert "N8N_PORT=5678" in env_example
+    assert "N8N_HOST_PORT" not in env_example
 
     print(json.dumps({"ok": True, "schedule_workflows": len(ACTIVE_JOBS), "github_workflows": len(GITHUB_REPOSITORIES)}))
     return 0
