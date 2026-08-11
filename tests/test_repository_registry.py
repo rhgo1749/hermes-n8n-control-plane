@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -37,6 +38,18 @@ def _repo(
     return result
 
 
+def _create_board_db(root: Path, board: str, keys: list[str]) -> None:
+    board_dir = root / board
+    board_dir.mkdir(parents=True)
+    con = sqlite3.connect(board_dir / "kanban.db")
+    try:
+        con.execute("CREATE TABLE tasks (idempotency_key TEXT)")
+        con.executemany("INSERT INTO tasks(idempotency_key) VALUES (?)", [(key,) for key in keys])
+        con.commit()
+    finally:
+        con.close()
+
+
 def test_remote_normalization() -> None:
     expected = "rhgo1749/ctrl-hangul"
     for value in (
@@ -48,26 +61,43 @@ def test_remote_normalization() -> None:
         assert registry._normalise_remote(value) == expected
 
 
-def test_verified_checkout_and_contract_detection_stays_shadow_unready() -> None:
+def test_verified_checkout_and_resolved_board_is_ready() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         checkout = root / "ctrl-hangul"
         checkout.mkdir(parents=True)
 
-        contracts = registry.CONTRACT_CANDIDATES
         entry = registry.build_entry(
             _repo("rhgo1749/ctrl-hangul", repo_id=42),
             root,
-            contract_paths=contracts,
+            contract_paths=registry.CONTRACT_CANDIDATES,
+            board="ctrlhangul",
+            board_status="resolved_task_provenance",
             origin_reader=lambda _: "git@github.com:rhgo1749/ctrl-hangul.git",
         )
         assert entry.repository_id == 42
         assert entry.checkout_status == "verified"
-        assert entry.ready is False
-        assert entry.reason == "board_unresolved_shadow_phase"
-        assert entry.board is None
-        assert entry.board_status == "unresolved_shadow_phase"
+        assert entry.ready is True
+        assert entry.reason is None
+        assert entry.board == "ctrlhangul"
+        assert entry.board_status == "resolved_task_provenance"
         assert entry.contract_paths == registry.CONTRACT_CANDIDATES
+
+
+def test_verified_checkout_without_board_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "ctrl-hangul").mkdir()
+        entry = registry.build_entry(
+            _repo("rhgo1749/ctrl-hangul"),
+            root,
+            origin_reader=lambda _: "https://github.com/rhgo1749/ctrl-hangul.git",
+        )
+        assert entry.checkout_status == "verified"
+        assert entry.ready is False
+        assert entry.board is None
+        assert entry.board_status == "not_found_task_provenance"
+        assert entry.reason == "board_not_found_task_provenance"
 
 
 def test_contract_detection_reads_default_branch_not_checkout() -> None:
@@ -98,8 +128,6 @@ def test_local_contract_drift_does_not_change_snapshot_contracts() -> None:
         root = Path(td)
         checkout = root / "ctrl-hangul"
         (checkout / "Docs").mkdir(parents=True)
-        # Deliberately create only a local Docs contract. The registry result
-        # must follow the supplied GitHub/default-branch reader instead.
         (checkout / "Docs" / "AGENTS.md").write_text("local-only", encoding="utf-8")
 
         snapshot = registry.registry_snapshot(
@@ -109,6 +137,7 @@ def test_local_contract_drift_does_not_change_snapshot_contracts() -> None:
                 "AGENTS.md",
                 ".agent/PR_REQUEST_TEMPLATE.md",
             ),
+            board_resolver=lambda repository: ("ctrlhangul", "resolved_task_provenance"),
             origin_reader=lambda _: "https://github.com/rhgo1749/ctrl-hangul.git",
         )
         entry = snapshot["repositories"][0]
@@ -116,11 +145,18 @@ def test_local_contract_drift_does_not_change_snapshot_contracts() -> None:
             "AGENTS.md",
             ".agent/PR_REQUEST_TEMPLATE.md",
         ]
+        assert entry["board"] == "ctrlhangul"
+        assert entry["ready"] is True
 
 
 def test_missing_checkout_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as td:
-        entry = registry.build_entry(_repo("rhgo1749/new-repo"), Path(td))
+        entry = registry.build_entry(
+            _repo("rhgo1749/new-repo"),
+            Path(td),
+            board="new-repo",
+            board_status="resolved_task_provenance",
+        )
         assert entry.checkout_status == "missing"
         assert entry.ready is False
         assert entry.reason == "checkout_missing"
@@ -134,6 +170,8 @@ def test_remote_mismatch_fails_closed() -> None:
         entry = registry.build_entry(
             _repo("rhgo1749/re-bound"),
             root,
+            board="re-bound",
+            board_status="resolved_task_provenance",
             origin_reader=lambda _: "https://github.com/rhgo1749/not-re-bound.git",
         )
         assert entry.checkout_status == "remote_mismatch"
@@ -148,6 +186,8 @@ def test_default_branch_is_repository_metadata() -> None:
         entry = registry.build_entry(
             _repo("rhgo1749/project-X", branch="develop"),
             root,
+            board="project-x",
+            board_status="resolved_task_provenance",
             origin_reader=lambda _: "https://github.com/rhgo1749/project-X.git",
         )
         assert entry.default_branch == "develop"
@@ -163,12 +203,14 @@ def test_snapshot_is_deterministic_and_has_no_repository_inventory() -> None:
             [_repo("rhgo1749/z-repo", 2), _repo("rhgo1749/a-repo", 1)],
             root,
             contract_reader=lambda repository, branch: (),
+            board_resolver=lambda repository: (None, "not_found_task_provenance"),
             origin_reader=lambda p: f"https://github.com/rhgo1749/{p.name}.git",
         )
         names = [item["repository"] for item in snapshot["repositories"]]
         assert names == ["rhgo1749/a-repo", "rhgo1749/z-repo"]
         assert snapshot["mode"] == "shadow"
-        assert snapshot["schema_version"] == 1
+        assert snapshot["schema_version"] == 2
+        assert snapshot["board_authority"] == "tasks.idempotency_key"
         assert all(item["board"] is None for item in snapshot["repositories"])
 
 
@@ -193,6 +235,65 @@ def test_fixture_shape_and_contracts() -> None:
         assert len(repos) == 1
         assert repos[0]["full_name"] == "rhgo1749/a-repo"
         assert reader("rhgo1749/a-repo", "main") == ("AGENTS.md",)
+
+
+def test_board_resolver_recovers_legacy_board_name_from_task_provenance() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _create_board_db(
+            root,
+            "ctrlhangul",
+            [
+                "github:rhgo1749/ctrl-hangul:issue:51",
+                "github:rhgo1749/ctrl-hangul:issue:52",
+                "not-a-github-key",
+            ],
+        )
+        evidence = registry._kanban_board_repository_evidence(root)
+        assert evidence == {"ctrlhangul": ("rhgo1749/ctrl-hangul",)}
+        assert registry._resolve_board("rhgo1749/ctrl-hangul", evidence) == (
+            "ctrlhangul",
+            "resolved_task_provenance",
+        )
+
+
+def test_board_resolver_fails_closed_when_one_board_contains_multiple_repositories() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _create_board_db(
+            root,
+            "mixed-board",
+            [
+                "github:rhgo1749/ctrl-hangul:issue:1",
+                "github:rhgo1749/re-bound:issue:2",
+            ],
+        )
+        evidence = registry._kanban_board_repository_evidence(root)
+        assert registry._resolve_board("rhgo1749/ctrl-hangul", evidence) == (
+            None,
+            "ambiguous_task_provenance",
+        )
+
+
+def test_board_resolver_fails_closed_when_repository_appears_on_multiple_boards() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _create_board_db(root, "board-a", ["github:rhgo1749/re-bound:issue:1"])
+        _create_board_db(root, "board-b", ["github:rhgo1749/re-bound:issue:2"])
+        evidence = registry._kanban_board_repository_evidence(root)
+        assert registry._resolve_board("rhgo1749/re-bound", evidence) == (
+            None,
+            "ambiguous_multiple_boards",
+        )
+
+
+def test_archived_board_directory_is_ignored() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _create_board_db(root, "_archived", ["github:rhgo1749/ctrl-hangul:issue:1"])
+        _create_board_db(root, "ctrlhangul", ["github:rhgo1749/ctrl-hangul:issue:2"])
+        evidence = registry._kanban_board_repository_evidence(root)
+        assert set(evidence) == {"ctrlhangul"}
 
 
 def main() -> int:
