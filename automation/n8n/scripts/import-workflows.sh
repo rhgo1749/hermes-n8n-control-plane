@@ -33,11 +33,10 @@ python3 "$N8N_DIR/scripts/render_workflows.py" \
   --output-dir "$RENDERED_DIR"
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps n8n
-for file in "$N8N_DIR"/state/rendered-workflows/*.json; do
-  base="$(basename "$file")"
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T n8n \
-    n8n import:workflow --input="/files/rendered-workflows/$base"
-done
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T n8n \
+  n8n import:workflow \
+    --separate \
+    --input=/files/rendered-workflows
 
 cat <<'EOF'
 Imported inactive workflows. Before activating any Schedule Trigger workflow:

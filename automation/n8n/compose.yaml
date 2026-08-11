@@ -7,13 +7,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      # Deliberately private. Add a reviewed HTTPS reverse proxy before exposing
-      # GitHub Trigger webhooks; do not publish this directly to the Internet.
-      - "127.0.0.1:${N8N_HOST_PORT:-5678}:5678"
+    # Host networking is required so n8n can reach the host's Tailscale-only
+    # Hermes dashboard. n8n itself remains loopback-only via N8N_LISTEN_ADDRESS.
+    network_mode: host
     environment:
       NODE_ENV: production
-      N8N_LISTEN_ADDRESS: 0.0.0.0
+      N8N_LISTEN_ADDRESS: 127.0.0.1
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       # Workflow expressions and Code nodes cannot read process env/secrets.
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
