@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Pause the legacy Hermes schedules only after n8n has been proven to call the
-# same existing Hermes cron path. `rollback` stops n8n before resuming Hermes.
+# Pause the legacy Hermes intake schedule only after n8n has been proven to
+# call the same existing Hermes cron path. `rollback` stops n8n before resuming
+# Hermes.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -16,14 +17,10 @@ ACTION="cutover"
 CONFIRMED=0
 N8N_WORKFLOWS_DEACTIVATED=0
 
-# Only jobs that were active in the audited inventory belong here. Existing
-# paused DJ jobs intentionally remain outside the migration and rollback set.
+# The GitHub agent-ready intake is the sole migration target. Every other
+# Hermes cron job remains outside the migration and rollback set.
 TARGETS=(
-  "default:168bd63461e7"
-  "default:e432a90c1361"
-  "default:df360bfa297d"
   "default:bf431b2a6ba6"
-  "dj-broadcast:27f6725028ff"
 )
 
 usage() {
@@ -32,15 +29,16 @@ Usage:
   cutover.sh --confirm-n8n-verified [--hermes-home PATH] [--hermes-bin PATH] [--n8n-port PORT]
   cutover.sh rollback --confirm-n8n-workflows-deactivated [--hermes-home PATH] [--hermes-bin PATH] [--n8n-port PORT]
 
-Cutover requires an explicit confirmation that every Schedule Trigger workflow
-has already been manually run at a non-scheduled time, the corresponding Hermes
-job reached last_status=ok, the workflow paused it again, and the test job was
-then resumed. This script does not activate n8n workflows for you: activate
-Schedule Trigger workflows only after this command has paused legacy schedules.
+Cutover requires an explicit confirmation that the sole Schedule Trigger
+workflow has already been manually run at a non-scheduled time, the GitHub
+agent-ready intake reached last_status=ok, the workflow paused it again, and
+the test job was then resumed. This script does not activate n8n workflows for
+you: activate the Schedule Trigger workflow only after this command has paused
+the legacy intake schedule.
 
-Before rollback, deactivate every migration workflow in the n8n UI and verify
-that state is persisted. Rollback then stops n8n (without removing data or
-volumes) and restores the captured pre-cutover states.
+Before rollback, deactivate every retained n8n intake workflow in the n8n UI
+and verify that state is persisted. Rollback then stops n8n (without removing
+data or volumes) and restores the captured pre-cutover states.
 EOF
 }
 
@@ -131,7 +129,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-home, destination = Path(sys.argv[1]), Path(sys.argv[2])
+home, destination = Path(sys.argv[1]).resolve(), Path(sys.argv[2])
 targets = [tuple(item.split(':', 1)) for item in sys.argv[3:]]
 rows = []
 for profile, job_id in targets:
@@ -141,7 +139,12 @@ for profile, job_id in targets:
     if job is None:
         raise SystemExit(f"cannot snapshot missing job: {profile}:{job_id}")
     rows.append({"profile": profile, "job": job})
-payload = {"created_at": datetime.now(timezone.utc).isoformat(), "hermes_home": str(home), "jobs": rows}
+payload = {
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "hermes_home": str(home),
+    "targets": [f"{profile}:{job_id}" for profile, job_id in targets],
+    "jobs": rows,
+}
 destination.parent.mkdir(parents=True, exist_ok=True)
 fd, temporary = tempfile.mkstemp(prefix=".cron-backup.", dir=destination.parent)
 try:
@@ -156,8 +159,44 @@ finally:
 PY
 }
 
+validate_snapshot_binding() {
+  local backup="$1"
+  python3 - "$HERMES_HOME" "$backup" "${TARGETS[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+home, backup = Path(sys.argv[1]).resolve(), Path(sys.argv[2])
+expected = list(sys.argv[3:])
+try:
+    payload = json.loads(backup.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"cannot read cutover snapshot: {exc}")
+raw_home = payload.get("hermes_home")
+if not isinstance(raw_home, str) or Path(raw_home).resolve() != home:
+    raise SystemExit("cutover snapshot belongs to a different Hermes home")
+if payload.get("targets") != expected:
+    raise SystemExit("cutover snapshot targets do not match the current migration target")
+rows = payload.get("jobs")
+if not isinstance(rows, list) or not rows:
+    raise SystemExit("snapshot does not contain jobs")
+actual = []
+for row in rows:
+    if not isinstance(row, dict):
+        raise SystemExit("snapshot contains an invalid row")
+    profile, job = row.get("profile"), row.get("job")
+    if not isinstance(profile, str) or not isinstance(job, dict) or not isinstance(job.get("id"), str):
+        raise SystemExit("snapshot row is missing profile or job id")
+    actual.append(f"{profile}:{job['id']}")
+if actual != expected:
+    raise SystemExit("cutover snapshot rows do not match the current migration target")
+print(f"validated {len(actual)} current migration snapshot target(s)")
+PY
+}
+
 snapshot_rows() {
   local backup="$1"
+  validate_snapshot_binding "$backup" >/dev/null
   python3 - "$backup" <<'PY'
 import json
 import sys
@@ -180,6 +219,9 @@ PY
 
 verify_snapshot() {
   local backup="$1"
+  if ! validate_snapshot_binding "$backup" >/dev/null; then
+    return 1
+  fi
   python3 - "$HERMES_HOME" "$backup" <<'PY'
 import json
 import sys
@@ -222,6 +264,10 @@ restore_snapshot() {
   local backup="$1"
   local profile job_id expected action
   local failures=()
+  if ! validate_snapshot_binding "$backup" >/dev/null; then
+    echo "Refusing to restore a snapshot outside the current migration target." >&2
+    return 1
+  fi
   snapshot_rows "$backup" >/dev/null
   while IFS=$'\t' read -r profile job_id expected; do
     if [[ "$expected" == "active" ]]; then
@@ -241,12 +287,14 @@ restore_snapshot() {
 }
 
 latest_backup() {
-  python3 - "$STATE_DIR/latest.json" "$STATE_DIR" <<'PY'
+  local backup
+  backup="$(python3 - "$STATE_DIR/latest.json" "$STATE_DIR" "${TARGETS[@]}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 latest, state_dir = Path(sys.argv[1]), Path(sys.argv[2]).resolve()
+expected = list(sys.argv[3:])
 try:
     payload = json.loads(latest.read_text(encoding="utf-8"))
     raw_backup = payload["backup"]
@@ -254,6 +302,8 @@ except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
     raise SystemExit(f"cannot read cutover snapshot metadata: {exc}")
 if not isinstance(raw_backup, str):
     raise SystemExit("cutover snapshot metadata has no backup path")
+if payload.get("targets") != expected:
+    raise SystemExit("cutover snapshot metadata targets do not match the current migration target")
 backup = Path(raw_backup).resolve()
 try:
     backup.relative_to(state_dir)
@@ -263,11 +313,16 @@ if not backup.is_file():
     raise SystemExit("cutover backup file is unavailable")
 print(backup)
 PY
+)" || return 1
+  if ! validate_snapshot_binding "$backup" >/dev/null; then
+    return 1
+  fi
+  printf '%s\n' "$backup"
 }
 
 if [[ "$ACTION" == "rollback" ]]; then
   [[ "$N8N_WORKFLOWS_DEACTIVATED" == 1 ]] || {
-    echo "Refusing rollback until all migration workflows are persistently deactivated in n8n." >&2
+    echo "Refusing rollback until all retained n8n intake workflows are persistently deactivated in n8n." >&2
     echo "After verifying that in the n8n UI, re-run with --confirm-n8n-workflows-deactivated." >&2
     exit 2
   }
@@ -314,6 +369,6 @@ printf '{"cutover_at":"%s","backup":"%s","targets":%s}\n' \
   > "$STATE_DIR/latest.json"
 chmod 600 "$STATE_DIR/latest.json"
 echo "Legacy schedules are paused, preserved, and recoverable."
-echo "Now activate the verified n8n Schedule Trigger workflows; do not activate them before this point."
-echo "Before rollback, deactivate all migration workflows in n8n and verify their persisted inactive state."
+echo "Now activate the verified n8n Schedule Trigger workflow; do not activate it before this point."
+echo "Before rollback, deactivate all retained n8n intake workflows and verify their persisted inactive state."
 echo "Rollback command: $0 rollback --confirm-n8n-workflows-deactivated --hermes-home '$HERMES_HOME' --n8n-port '$N8N_PORT'"

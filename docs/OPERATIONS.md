@@ -1,21 +1,24 @@
 # Operations runbook
 
-## Confirmed migration inventory
+## Confirmed migration scope and live Hermes cron inventory
 
-The following comes from the live Hermes cron stores audited on 2026-08-11. Only jobs that were active are part of the cutover; existing paused jobs remain untouched.
+The GitHub agent-ready intake is the sole n8n migration target. The following
+states were observed during the 2026-08-11 scope reduction. They are historical
+migration context, not a runtime state-restoration instruction. Before any host
+change, use the change owner's explicit canonical state for that maintenance
+window; never infer or mutate a non-intake job from this table. Do not create
+replacement jobs.
 
-| Profile | Hermes job ID | Existing script | Existing schedule | n8n workflow | Decision |
+| Profile | Hermes job ID | Existing script | Existing schedule | Observed state | Decision |
 |---|---|---|---|---|---|
-| `default` | `168bd63461e7` | `daily_session_cleanup.sh` | `0 9 * * *` | `schedule-daily-session-cleanup.json` | migrate |
-| `default` | `e432a90c1361` | `cleanup-stale-feature-repos.py` | `0 9 * * *` | `schedule-cleanup-stale-feature-repos.json` | migrate |
-| `default` | `df360bfa297d` | `repo-fetch-check.sh` | `0 9 * * *` | `schedule-repo-fetch-check.json` | migrate |
-| `default` | `bf431b2a6ba6` | `github-agent-ready-kanban-intake.py` | `*/5 * * * *` | `schedule-github-agent-ready-intake.json` | migrate |
-| `dj-broadcast` | `27f6725028ff` | `h4v3-broadcast-monitor.sh` | every 5 minutes | `schedule-h4v3-broadcast-health.json` | migrate |
-| `dj-broadcast` | `8b564532d38b` | `h4v3-music-generator.py` | hourly | — | keep paused |
-| `dj-broadcast` | `6c7e6c7a9fd1` | `hermes-dj-stream-supervisor.py` | every minute | — | keep paused |
+| `default` | `168bd63461e7` | `daily_session_cleanup.sh` | `0 9 * * *` | active | keep Hermes-owned |
+| `default` | `e432a90c1361` | `cleanup-stale-feature-repos.py` | `0 9 * * *` | active | keep Hermes-owned |
+| `default` | `df360bfa297d` | `repo-fetch-check.sh` | `0 9 * * *` | paused | keep Hermes-owned |
+| `default` | `bf431b2a6ba6` | `github-agent-ready-kanban-intake.py` | `*/5 * * * *` | active | migrate: `schedule-github-agent-ready-intake.json` |
+| `dj-broadcast` | `27f6725028ff` | `h4v3-broadcast-monitor.sh` | every 5 minutes | active | keep Hermes-owned; no n8n-native redesign |
+| `dj-broadcast` | `8b564532d38b` | `h4v3-music-generator.py` | hourly | paused | keep paused |
+| `dj-broadcast` | `6c7e6c7a9fd1` | `hermes-dj-stream-supervisor.py` | every minute | paused | keep paused; never modify for this migration |
 | `eval`, `kanban-main` | — | — | — | — | no jobs |
-
-The default gateway has `gateway.multiplex_profiles=true`. Direct evidence showed fresh ticker heartbeats and successful scheduled runs for the `dj-broadcast` profile, so the same existing ticker path owns the active DJ monitor.
 
 ## Why the adapter is a user plugin
 
@@ -24,13 +27,13 @@ The existing Hermes dashboard already exposes:
 - `POST /api/cron/jobs/{job_id}/trigger?profile=...`
 - `POST /api/cron/jobs/{job_id}/pause?profile=...`
 
-and routes calls into the existing profile-aware cron store. `trigger_job()` schedules the job for the next existing ticker cycle. The route normally requires an interactive dashboard session; it has no reusable long-lived machine token route. The `hermes-n8n-cron-auth` **user plugin** therefore registers exactly ten existing paths (trigger + pause for the five migrated jobs) with Hermes' pre-existing token-auth seam.
+and routes calls into the existing profile-aware cron store. `trigger_job()` schedules the job for the next existing ticker cycle. The route normally requires an interactive dashboard session; it has no reusable long-lived machine token route. The `hermes-n8n-cron-auth` **user plugin** therefore registers exactly two existing paths (trigger + pause for `bf431b2a6ba6`) with Hermes' pre-existing token-auth seam.
 
 It does not add an API endpoint or touch Hermes core. Its bearer token cannot list, create, edit, delete, or trigger any other cron job. It reads a root/plugin-owned mode-`0600` token file, rejects broad permissions or weak tokens, and compares with `hmac.compare_digest`. Because Hermes' generic token seam otherwise tries every service-token provider on an opted-in route, this plugin also refuses to register when another non-interactive dashboard token provider is already present. Do not enable a second service-token plugin alongside this migration without a separate security review.
 
 The upstream token seam matches a path and does not pass the `profile` query to the provider. Before installing the plugin, `configure-hermes-service-auth.sh` therefore fails closed unless every allowlisted job ID occurs exactly once in its intended profile. Re-run that installer/check after any manual profile or cron-inventory change. Formal per-request query scoping would require an upstream/core or new adapter interface and is intentionally out of scope.
 
-Each n8n workflow follows this intentionally small sequence:
+The retained n8n intake workflows follow this intentionally small sequence:
 
 1. n8n Schedule Trigger (or optional GitHub Trigger) calls the existing Hermes `trigger` route with a short timeout.
 2. The existing Hermes ticker claims and executes the existing no-agent script through the normal `run_one_job()` path.
@@ -118,7 +121,7 @@ Restart the existing Hermes dashboard through its existing supervisor. Then crea
 
 Attach this credential to both HTTP Request nodes in every imported workflow. Do not put the value in JSON, `.env.example`, Git, or chat.
 
-## 4. Render and import workflows
+## 4. Render and import intake workflows
 
 The tracked JSON templates are inactive and use a URL placeholder. Render/import them for the dashboard's current bind address:
 
@@ -129,33 +132,55 @@ automation/n8n/scripts/import-workflows.sh \
 
 `100.107.12.90:9119` is the observed current Tailnet dashboard bind. If it changes, pass the actual current dashboard address instead. The renderer permits plain `http` only for loopback, private, or Tailnet CGNAT IPs; use `https` for a hostname or public target. The n8n container communicates through that private Tailnet endpoint; it does not receive the Hermes home, Docker socket, or a shell capability.
 
+Only `Hermes schedule · GitHub agent-ready Issue intake` is a retained Schedule
+Trigger workflow. If n8n was previously imported from the broader template set,
+deactivate or delete these obsolete Schedule workflows in the n8n UI before any
+activation:
+
+- `Hermes schedule · 매일 저가치 세션 정리`;
+- `Hermes schedule · cleanup-stale-feature-repos`;
+- `Hermes schedule · Repo fetch check (CtrlHangul + Re-Bound)`;
+- `Hermes schedule · H4V3 Broadcast Health Monitor`.
+
+`import-workflows.sh` removes only stale ignored generated Schedule JSON before
+rendering the retained templates. It deliberately does not delete persisted n8n
+workflow records, so UI cleanup remains explicit and reviewable.
+
 ## 5. Canary and cutover gate
 
-For **each Schedule Trigger workflow**, run it manually at a time that is not its regular schedule. Wait for the 75-second pause node to finish. Any trigger or pause HTTP error means the outcome is not approved: leave the workflow inactive, restore the legacy job, resolve the error, and re-run the canary. Verify the corresponding Hermes job has all of:
+For the sole Schedule Trigger workflow, run it manually at a time that is not
+its regular schedule. Wait for the 75-second pause node to finish. Any trigger
+or pause HTTP error means the outcome is not approved: leave the workflow
+inactive, restore the legacy intake job, resolve the error, and re-run the
+canary. Verify `bf431b2a6ba6` has all of:
 
 - `last_status=ok`;
 - a fresh `last_run_at`;
 - `enabled=false` and `state=paused` after the workflow completes.
 
-Then restore it immediately before testing the next workflow:
+Then restore the intake immediately after the canary:
 
 ```bash
-HERMES_HOME="$HOME/.hermes" hermes -p default cron resume <job-id>
-# use -p dj-broadcast for 27f6725028ff
+HERMES_HOME="$HOME/.hermes" hermes -p default cron resume bf431b2a6ba6
 ```
 
-After all five canaries pass and source jobs are restored active, **leave the five Schedule Trigger workflows inactive** and first pause the legacy schedules:
+After the intake canary passes and the source job is restored active, **leave
+the Schedule Trigger workflow inactive** and first pause only the legacy intake
+schedule:
 
 ```bash
 automation/n8n/scripts/cutover.sh --confirm-n8n-verified \
   --hermes-home "$HOME/.hermes"
 ```
 
-The cutover script writes a mode-`0600` snapshot under ignored `state/cutover/`, pauses only the five listed legacy jobs, and restores the complete pre-cutover snapshot if a pause or post-pause verification fails. It does not delete jobs, source scripts, n8n data, or Kanban records. Only after it succeeds, activate the verified Schedule Trigger workflows in n8n. This order prevents a legacy scheduler and its corresponding n8n Schedule Trigger from firing the same job concurrently. If activation fails, leave n8n inactive and run the rollback procedure below.
+The cutover script writes a mode-`0600` snapshot under ignored `state/cutover/`, pauses only `bf431b2a6ba6`, and restores the complete pre-cutover snapshot if a pause or post-pause verification fails. It does not delete jobs, source scripts, n8n data, or Kanban records. Only after it succeeds, activate the verified Schedule Trigger workflow in n8n. This order prevents the legacy intake scheduler and its corresponding n8n Schedule Trigger from firing the same job concurrently. If activation fails, leave n8n inactive and run the rollback procedure below.
 
 ## 6. Rollback
 
-Rollback is intentionally gated to avoid dual scheduling. While n8n is still running, deactivate **every migration workflow** (the five Schedule workflows and any GitHub workflows later enabled) in the n8n UI and verify that their inactive state persists. Then run:
+Rollback is intentionally gated to avoid dual scheduling. While n8n is still
+running, deactivate every retained intake workflow (the one Schedule workflow
+and any GitHub Trigger workflows later enabled) in the n8n UI and verify that
+their inactive state persists. Then run:
 
 ```bash
 automation/n8n/scripts/cutover.sh rollback \
@@ -164,6 +189,12 @@ automation/n8n/scripts/cutover.sh rollback \
 ```
 
 It stops n8n without removing its volume or data, then restores the mode-`0600` pre-cutover snapshot and verifies the captured Hermes enabled states. It does not touch the two pre-existing paused DJ jobs. Do not run `docker compose up` after rollback unless the migration workflows remain persistently inactive.
+
+Snapshots from the former broader migration are deliberately rejected: rollback
+requires both `latest.json` and its backup rows to name exactly
+`default:bf431b2a6ba6` and the current Hermes home. Do not edit a legacy
+snapshot to bypass this boundary; complete a fresh one-job cutover after the
+intake canary instead.
 
 ## 7. GitHub event trigger (optional, requires ingress)
 

@@ -58,6 +58,10 @@ def main() -> int:
             assert provider.verify_token(token=token + "x") is None
             assert all(is_token_route(path) for path in plugin.TOKEN_ROUTE_PATHS)
             assert len(plugin.TOKEN_ROUTE_PATHS) == len(plugin.ALLOWED_JOBS) * 2
+            assert set(plugin.ALLOWED_JOBS) == {"bf431b2a6ba6"}
+            for excluded_job_id in ("168bd63461e7", "e432a90c1361", "df360bfa297d", "27f6725028ff"):
+                for action in ("trigger", "pause"):
+                    assert not is_token_route(f"/api/cron/jobs/{excluded_job_id}/{action}")
 
             clear_token_routes()
             original_providers = plugin.list_token_providers
@@ -99,7 +103,7 @@ def main() -> int:
             else:
                 os.environ["HERMES_N8N_CRON_TOKEN_FILE"] = previous
 
-    print(json.dumps({"ok": True, "route_count": 10}))
+    print(json.dumps({"ok": True, "route_count": 2}))
     return 0
 
 

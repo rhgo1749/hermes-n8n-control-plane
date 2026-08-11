@@ -2,7 +2,9 @@
 """Static regression checks for n8n templates, Compose hardening, and allowlists."""
 from __future__ import annotations
 
+import ast
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -105,12 +107,41 @@ def validate_dashboard_url_policy() -> None:
         raise AssertionError(f"accepted unsafe dashboard URL: {value}")
 
 
+def validate_single_intake_boundary() -> None:
+    expected_jobs = {"bf431b2a6ba6": "default"}
+    plugin_source = (ROOT / "hermes-plugin" / "n8n-cron-auth" / "__init__.py").read_text(encoding="utf-8")
+    plugin_tree = ast.parse(plugin_source)
+    allowed_jobs = None
+    for node in ast.walk(plugin_tree):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ALLOWED_JOBS":
+            assert node.value is not None
+            allowed_jobs = ast.literal_eval(node.value)
+            break
+    assert allowed_jobs == expected_jobs
+
+    installer_source = (N8N / "scripts" / "configure-hermes-service-auth.sh").read_text(encoding="utf-8")
+    installer_match = re.search(r"(?ms)^expected = (?P<mapping>\{.*?^\})", installer_source)
+    assert installer_match is not None
+    assert ast.literal_eval(installer_match.group("mapping")) == expected_jobs
+
+    cutover_source = (N8N / "scripts" / "cutover.sh").read_text(encoding="utf-8")
+    target_match = re.search(r"(?ms)^TARGETS=\(\n(?P<entries>.*?)^\)", cutover_source)
+    assert target_match is not None
+    targets = re.findall(r'^\s*"([^"]+)"\s*$', target_match.group("entries"), flags=re.MULTILINE)
+    assert targets == ["default:bf431b2a6ba6"]
+
+
 def main() -> int:
+    assert {job["id"] for job in ACTIVE_JOBS} == {"bf431b2a6ba6"}
+    expected_schedule_files = {f"schedule-{job['slug']}.json" for job in ACTIVE_JOBS}
+    actual_schedule_files = {path.name for path in (N8N / "workflows").glob("schedule-*.json")}
+    assert actual_schedule_files == expected_schedule_files
     for job in ACTIVE_JOBS:
         validate_schedule(job)
     for repo in GITHUB_REPOSITORIES:
         validate_github(repo)
     validate_dashboard_url_policy()
+    validate_single_intake_boundary()
 
     compose_text = (N8N / "compose.yaml").read_text(encoding="utf-8")
     compose = yaml.safe_load(compose_text)

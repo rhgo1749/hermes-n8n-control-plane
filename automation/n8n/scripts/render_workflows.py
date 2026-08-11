@@ -25,42 +25,14 @@ PAUSE_TIMEOUT_MS = 60_000
 _NAMESPACE = uuid.UUID("4d3669cd-39ce-4c84-a10d-762278d838c6")
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
-# Exact migration inventory, taken from the live Hermes cron stores on
-# 2026-08-11. Only active jobs are migrated. Existing paused jobs remain paused.
+# Exact migration inventory. The GitHub agent-ready intake is the sole Hermes
+# job controlled by n8n. All other Hermes cron jobs remain Hermes-owned.
 ACTIVE_JOBS: tuple[dict[str, str], ...] = (
-    {
-        "slug": "daily-session-cleanup",
-        "profile": "default",
-        "id": "168bd63461e7",
-        "name": "매일 저가치 세션 정리",
-        "schedule": "0 9 * * *",
-    },
-    {
-        "slug": "cleanup-stale-feature-repos",
-        "profile": "default",
-        "id": "e432a90c1361",
-        "name": "cleanup-stale-feature-repos",
-        "schedule": "0 9 * * *",
-    },
-    {
-        "slug": "repo-fetch-check",
-        "profile": "default",
-        "id": "df360bfa297d",
-        "name": "Repo fetch check (CtrlHangul + Re-Bound)",
-        "schedule": "0 9 * * *",
-    },
     {
         "slug": "github-agent-ready-intake",
         "profile": "default",
         "id": "bf431b2a6ba6",
         "name": "GitHub agent-ready Issue intake",
-        "schedule": "*/5 * * * *",
-    },
-    {
-        "slug": "h4v3-broadcast-health",
-        "profile": "dj-broadcast",
-        "id": "27f6725028ff",
-        "name": "H4V3 Broadcast Health Monitor",
         "schedule": "*/5 * * * *",
     },
 )

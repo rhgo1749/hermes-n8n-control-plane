@@ -1,6 +1,8 @@
 # Future improvements — intentionally not implemented in this migration
 
-The completed scope is limited to n8n installation/persistence, schedule migration, optional GitHub event wakeups, preserved Hermes execution, rollback, and operations evidence.
+The completed scope is limited to n8n installation/persistence, the GitHub
+agent-ready intake schedule and optional event wakeups, preserved Hermes
+execution, rollback, and operations evidence.
 
 Do not start these items as part of this migration:
 
@@ -13,3 +15,4 @@ Do not start these items as part of this migration:
 7. **Hermes core fork or extraction** — the only adapter is a user plugin that authorizes exact existing routes; no core files are modified.
 8. **Public ingress selection** — domain, reverse proxy, TLS, and public exposure require an explicit host/network decision. Until then, n8n stays loopback-only and GitHub Trigger workflows remain inactive.
 9. **Request-scoped profile authorization** — the existing generic token seam authorizes route paths but does not pass a `profile` query into providers. The installer currently fail-closes on non-unique job IDs; a formal profile-bound token interface would require a separately authorized core or adapter design.
+10. **H4V3 Broadcast Health Monitor n8n-native redesign** — `27f6725028ff` remains an existing Hermes-owned active cron job. Do not add an n8n workflow, scheduler, or health-policy replacement without a separately scoped design.

@@ -2,7 +2,8 @@
 
 This plugin does not create an endpoint, dispatch workers, change Kanban, or
 alter Hermes cron execution.  It only allows n8n to authenticate to the already
-existing dashboard ``trigger``/``pause`` routes for the five migrated jobs.
+existing dashboard ``trigger``/``pause`` routes for the sole migrated intake
+job.
 """
 from __future__ import annotations
 
@@ -33,11 +34,7 @@ SCOPE = "n8n-cron-trigger"
 # supplied. The route allowlist prevents the token from listing, editing,
 # creating, deleting, or triggering any job outside this migration.
 ALLOWED_JOBS: dict[str, str] = {
-    "168bd63461e7": "default",
-    "e432a90c1361": "default",
-    "df360bfa297d": "default",
     "bf431b2a6ba6": "default",
-    "27f6725028ff": "dj-broadcast",
 }
 TOKEN_ROUTE_PATHS: tuple[str, ...] = tuple(
     f"/api/cron/jobs/{job_id}/{action}"

@@ -15,8 +15,8 @@ Usage: configure-hermes-service-auth.sh [--hermes-home PATH] [--hermes-bin PATH]
                                         [--restart-command 'existing supervisor command']
 
 Installs a user plugin plus a newly generated 256-bit token file. The token is
-never printed. It authorizes only trigger/pause calls for the fixed five-job
-migration allowlist; it does not create a new API endpoint.
+never printed. It authorizes only trigger/pause calls for the fixed GitHub
+agent-ready intake job; it does not create a new API endpoint.
 
 A dashboard restart is required for route registration. Pass --restart-command
 only when you explicitly know the existing supervisor command; otherwise the
@@ -52,11 +52,7 @@ from pathlib import Path
 
 home = Path(sys.argv[1])
 expected = {
-    "168bd63461e7": "default",
-    "e432a90c1361": "default",
-    "df360bfa297d": "default",
     "bf431b2a6ba6": "default",
-    "27f6725028ff": "dj-broadcast",
 }
 stores = [("default", home / "cron/jobs.json")]
 stores.extend((path.parents[1].name, path) for path in sorted((home / "profiles").glob("*/cron/jobs.json")))

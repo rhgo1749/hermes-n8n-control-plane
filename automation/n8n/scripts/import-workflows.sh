@@ -21,9 +21,16 @@ done
 [[ -n "$DASHBOARD_URL" ]] || { usage; exit 2; }
 [[ -f "$ENV_FILE" ]] || { echo "Run host-install.sh first." >&2; exit 2; }
 
+RENDERED_DIR="$N8N_DIR/state/rendered-workflows"
+mkdir -p "$RENDERED_DIR"
+# Do not re-import stale Schedule templates after the scope reduction. This
+# affects only ignored generated copies; existing n8n workflow records must be
+# deactivated or deleted deliberately in the n8n UI.
+rm -f "$RENDERED_DIR"/schedule-*.json
+
 python3 "$N8N_DIR/scripts/render_workflows.py" \
   --dashboard-url "$DASHBOARD_URL" \
-  --output-dir "$N8N_DIR/state/rendered-workflows"
+  --output-dir "$RENDERED_DIR"
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps n8n
 for file in "$N8N_DIR"/state/rendered-workflows/*.json; do
@@ -36,12 +43,14 @@ cat <<'EOF'
 Imported inactive workflows. Before activating any Schedule Trigger workflow:
 1. Attach the protected `Hermes n8n cron` HTTP Header Auth credential to both
    HTTP Request nodes in every workflow.
-2. Manually run the repo-fetch-check workflow at a non-scheduled time.
-3. Verify the source Hermes job reports `last_status=ok` and is paused by the
-   workflow, then restore it with the documented canary restore command.
-4. Run the documented cutover command first. It pauses the legacy schedules
-   while the imported Schedule Trigger workflows remain inactive.
-5. Only after that command succeeds, activate the Schedule Trigger workflows.
+2. In the n8n UI, deactivate or delete any previously imported Schedule
+   workflows other than `Hermes schedule · GitHub agent-ready Issue intake`.
+3. Manually run that intake workflow at a non-scheduled time. Verify the source
+   Hermes intake reports `last_status=ok` and is paused by the workflow, then
+   restore it with the documented canary restore command.
+4. Run the documented cutover command first. It pauses the legacy intake
+   schedule while the imported Schedule Trigger workflow remains inactive.
+5. Only after that command succeeds, activate the Schedule Trigger workflow.
 
 GitHub Trigger workflows remain inactive until a reviewed public HTTPS ingress
 sets N8N_WEBHOOK_URL. Their activation creates signed GitHub webhooks.

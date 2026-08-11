@@ -1,6 +1,8 @@
-# Hermes → n8n schedule and GitHub automation migration
+# Hermes → n8n GitHub agent-ready intake control plane
 
-This repository contains the **scope-limited** migration from Hermes-owned cron glue to a self-hosted n8n Community Edition instance.
+This repository contains the **scope-limited** migration of one existing
+Hermes job—GitHub agent-ready Issue intake—to a self-hosted n8n Community
+Edition instance.
 
 ```text
 Schedule / GitHub event
@@ -19,14 +21,15 @@ Hermes cron trigger → existing ticker → existing script / Kanban / worker pa
 ## Scope
 
 - n8n Community Edition runs persistently on the Ubuntu host through Docker Compose.
-- Existing active Hermes script-only cron jobs are represented as inactive, tracked n8n Schedule Trigger exports.
-- n8n reuses the existing Hermes dashboard cron **trigger** and **pause** routes; it does not spawn processes or implement workers. The installer fail-closes if an allowlisted job ID is not unique to its intended profile.
+- Only `bf431b2a6ba6` (GitHub agent-ready Issue intake) is represented by an inactive, tracked n8n Schedule Trigger export. Optional GitHub Trigger exports only wake that same intake job.
+- n8n reuses the existing Hermes dashboard cron **trigger** and **pause** routes for that one job; it does not spawn processes or implement workers. The installer fail-closes if the allowlisted job ID is not unique to `default`.
 - The existing GitHub intake script remains authoritative for filtering, idempotency, Kanban projection, and reconciliation. Optional n8n GitHub Trigger workflows only wake that same script.
-- Legacy Hermes schedule entries are paused only after n8n canaries pass. They are preserved for rollback.
+- The intake's legacy Hermes schedule is paused only after its n8n canary passes. It is preserved for rollback.
+- `168bd63461e7`, `e432a90c1361`, `df360bfa297d`, and `27f6725028ff` remain Hermes-owned. In particular, H4V3 Broadcast Health Monitor has no n8n-native redesign in this scope.
 
 ## Explicit non-goals
 
-This change does **not** modify Hermes core, redesign Kanban state, create a new dispatch/completion API, add a separate idempotency database, move concurrency policy to n8n, or recreate worker/worktree/spawn behavior in n8n.
+This change does **not** modify Hermes core, redesign Kanban state, create a new dispatch/completion API, add a separate idempotency database, move concurrency policy or H4V3 Broadcast Health Monitor to n8n, or recreate worker/worktree/spawn behavior in n8n.
 
 See [operations](docs/OPERATIONS.md) for the controlled host rollout and [future improvements](docs/FUTURE_IMPROVEMENTS.md) for intentionally deferred ideas.
 
@@ -58,9 +61,9 @@ automation/n8n/scripts/import-workflows.sh \
   --dashboard-url http://100.107.12.90:9119
 
 # 4. Follow the manual credential + canary gates in docs/OPERATIONS.md.
-# 5. After every schedule workflow has passed its canary and been restored,
-#    pause the legacy schedules. Activate Schedule Trigger workflows only after
-#    this command succeeds (see docs/OPERATIONS.md).
+# 5. After the sole intake Schedule Trigger workflow has passed its canary and
+#    been restored, pause only the legacy intake schedule. Activate that
+#    workflow only after this command succeeds (see docs/OPERATIONS.md).
 automation/n8n/scripts/cutover.sh --confirm-n8n-verified \
   --hermes-home "$HOME/.hermes"
 ```
