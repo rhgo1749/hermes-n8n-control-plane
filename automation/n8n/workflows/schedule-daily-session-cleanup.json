@@ -1,0 +1,136 @@
+{
+  "name": "Hermes schedule · 매일 저가치 세션 정리",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "a5d04edc-8f04-5beb-9a12-43e09fc8aee9",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        180,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "__HERMES_DASHBOARD_URL__/api/cron/jobs/168bd63461e7/trigger?profile=default",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "e0fb23e7-0a9d-5227-8024-8cd4530da9d4",
+      "name": "Trigger existing Hermes cron job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 75,
+        "unit": "seconds"
+      },
+      "id": "eb7a97a8-54a0-5a41-a097-335d7d4d3708",
+      "name": "Wait for Hermes ticker",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "__HERMES_DASHBOARD_URL__/api/cron/jobs/168bd63461e7/pause?profile=default",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "neverError": false,
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "58449d36-d7f7-530b-9e09-c351f5fc45e3",
+      "name": "Pause legacy Hermes schedule",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        300
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Trigger existing Hermes cron job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger existing Hermes cron job": {
+      "main": [
+        [
+          {
+            "node": "Wait for Hermes ticker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Hermes ticker": {
+      "main": [
+        [
+          {
+            "node": "Pause legacy Hermes schedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

@@ -1,0 +1,13 @@
+# Host-specific n8n configuration and durable runtime data
+automation/n8n/.env
+automation/n8n/state/
+
+# Generated or local Python state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Never track bearer credentials or local copies of them
+*.token
+*.secret
+.n8n-cron-token
