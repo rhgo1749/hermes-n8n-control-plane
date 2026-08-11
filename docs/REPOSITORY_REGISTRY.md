@@ -18,7 +18,7 @@ The existing production intake and its five-minute fallback remain unchanged.
 The registry is intentionally a shadow observation surface until its output is
 compared with the currently managed repositories.
 
-## Derived fields
+## Derived fields and authority
 
 For every discovered repository the shadow snapshot records:
 
@@ -27,9 +27,24 @@ For every discovered repository the shadow snapshot records:
 - canonical slug (`repo-name.casefold()`)
 - derived checkout path `/ws/projects/<slug>`
 - whether the checkout origin matches the GitHub repository
-- repository contract files that actually exist locally
+- repository contract files present on the GitHub default branch
 - board association state
 - readiness/fail-closed reason
+
+The authority boundary is explicit:
+
+```text
+GitHub default branch
+  └─ contract-file presence
+
+/ws/projects/<slug>
+  └─ checkout-path/origin verification only
+```
+
+A stale or branch-diverged local checkout must not hide or invent repository
+contracts. Contract files are therefore detected through the GitHub Contents API
+at the repository's discovered `default_branch`, not by inspecting the local
+working tree.
 
 Contract files are detected from one shared candidate set:
 
@@ -41,6 +56,17 @@ Docs/AGENTS.md
 ```
 
 There is no per-repository contract list.
+
+## Checkout convention
+
+The current Hermes runtime uses `/ws/projects/<repo-name.casefold()>` for all
+managed repositories. The registry derives this path and verifies its `origin`
+normalizes to the discovered GitHub `owner/repository` identity.
+
+The path convention is not sufficient by itself: missing checkouts, unavailable
+origins, and remote mismatches all fail closed. The registry does not scan and
+pick an arbitrary same-origin worktree because feature/validation worktrees may
+legitimately share the same remote.
 
 ## Board identity is deliberately not guessed
 
@@ -62,7 +88,8 @@ repo → board associations before the legacy `REPOSITORIES` table is removed.
 ## Authentication requirement for zero-touch onboarding
 
 The topic is an **opt-in policy**, not an authorization grant. The GitHub
-credential used for discovery must be able to see future repositories.
+credential used for discovery must be able to see future repositories and read
+the candidate contract paths from their default branches.
 
 A fine-grained PAT limited to the current five selected repositories cannot
 provide the desired "add topic and done" behavior, because a newly created
@@ -80,19 +107,24 @@ The script reads `HERMES_GITHUB_TOKEN` first and falls back to `GITHUB_TOKEN`.
 
 ## Run in shadow mode
 
-From the Ubuntu host checkout:
+Run the script where `/ws/projects` is the Hermes workspace. For the current
+host this is easiest inside the Hermes container while passing the token only in
+the child-process environment:
 
 ```bash
-HERMES_GITHUB_TOKEN=... \
-python3 automation/n8n/scripts/repository_registry.py \
-  --owner rhgo1749 \
-  --topic hermes-agent
+docker exec -i \
+  -e HERMES_GITHUB_TOKEN="$(gh auth token)" \
+  hermes-cloudcli-agent \
+  python3 - \
+    --owner rhgo1749 \
+    --topic hermes-agent \
+    --checkout-root /ws/projects \
+  < automation/n8n/scripts/repository_registry.py
 ```
 
-Prefer setting the token through the existing protected host environment rather
-than typing it directly into shell history.
-
-A fixture can be used without network access:
+A fixture can be used without network access. Fixture repository objects may
+include `contract_paths` so tests can model the GitHub/default-branch result
+without reading a local working tree:
 
 ```bash
 python3 automation/n8n/scripts/repository_registry.py \
@@ -108,9 +140,14 @@ Before any live cutover:
 2. Run the shadow registry and save the JSON output outside Git.
 3. Confirm the discovered repository set matches the current managed set.
 4. Confirm each existing checkout reports `verified` and its remote matches.
-5. Confirm contract detection matches the files actually present in each repo.
+5. Confirm contract detection matches the GitHub default branch, even if the local checkout is stale or on another branch.
 6. Keep board association unresolved until the Kanban-backed resolver lands.
 7. Do not remove the current five-repository inventory or polling fallback yet.
+
+The first production shadow canary found exactly the intended five repositories
+and verified all five `/ws/projects/<slug>` origins. It also exposed local
+checkout drift in contract-file detection, which is why contract authority now
+comes from the GitHub default branch rather than the local working tree.
 
 ## Next phases
 
