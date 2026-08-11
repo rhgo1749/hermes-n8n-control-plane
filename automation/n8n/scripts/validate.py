@@ -152,6 +152,11 @@ def main() -> int:
     assert service["environment"]["N8N_LISTEN_ADDRESS"] == "127.0.0.1"
     assert "/var/run/docker.sock" not in compose_text
     environment = service["environment"]
+    # Every production workflow in this dedicated n8n instance can wake/pause
+    # the same intake job. A single FIFO execution slot is the concurrency
+    # contract that prevents an older delayed pause from overtaking a newer
+    # trigger from another repository or from the temporary polling fallback.
+    assert environment["N8N_CONCURRENCY_PRODUCTION_LIMIT"] == "1"
     assert environment["N8N_BLOCK_ENV_ACCESS_IN_NODE"] == "true"
     assert environment["N8N_DIAGNOSTICS_ENABLED"] == "false"
     assert environment["N8N_PUBLIC_API_DISABLED"] == "true"

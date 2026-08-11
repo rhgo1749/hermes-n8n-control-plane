@@ -24,14 +24,15 @@ Hermes cron trigger → existing ticker → existing script / Kanban / worker pa
 - Only `bf431b2a6ba6` (GitHub agent-ready Issue intake) is represented by an inactive, tracked n8n Schedule Trigger export. Optional GitHub Trigger exports only wake that same intake job.
 - n8n reuses the existing Hermes dashboard cron **trigger** and **pause** routes for that one job; it does not spawn processes or implement workers. The installer fail-closes if the allowlisted job ID is not unique to `default`.
 - The existing GitHub intake script remains authoritative for filtering, idempotency, Kanban projection, and reconciliation. Optional n8n GitHub Trigger workflows only wake that same script.
+- The five GitHub event workflows and the temporary polling fallback are production-serialized with `N8N_CONCURRENCY_PRODUCTION_LIMIT=1`. This prevents an older delayed pause from overtaking a newer trigger for the same Hermes intake job. See [GitHub event concurrency](docs/GITHUB_EVENT_CONCURRENCY.md).
 - The intake's legacy Hermes schedule is paused only after its n8n canary passes. It is preserved for rollback.
 - `168bd63461e7`, `e432a90c1361`, `df360bfa297d`, and `27f6725028ff` remain Hermes-owned. In particular, H4V3 Broadcast Health Monitor has no n8n-native redesign in this scope.
 
 ## Explicit non-goals
 
-This change does **not** modify Hermes core, redesign Kanban state, create a new dispatch/completion API, add a separate idempotency database, move concurrency policy or H4V3 Broadcast Health Monitor to n8n, or recreate worker/worktree/spawn behavior in n8n.
+This change does **not** modify Hermes core, redesign Kanban state, create a new dispatch/completion API, add a separate idempotency database, move H4V3 Broadcast Health Monitor to n8n, or recreate worker/worktree/spawn behavior in n8n. The single production slot is an n8n edge-safety guard for the shared intake job, not a new Hermes concurrency system.
 
-See [operations](docs/OPERATIONS.md) for the controlled host rollout and [future improvements](docs/FUTURE_IMPROVEMENTS.md) for intentionally deferred ideas.
+See [operations](docs/OPERATIONS.md) for the controlled host rollout, [GitHub event concurrency](docs/GITHUB_EVENT_CONCURRENCY.md) for the event activation gate, and [future improvements](docs/FUTURE_IMPROVEMENTS.md) for intentionally deferred ideas.
 
 ## Repository layout
 
@@ -42,6 +43,7 @@ See [operations](docs/OPERATIONS.md) for the controlled host rollout and [future
 | `automation/n8n/scripts/` | Host install, service-auth deployment, render/import/export, cutover/rollback, static validation |
 | `hermes-plugin/n8n-cron-auth/` | User plugin that token-authenticates only exact existing cron trigger/pause routes |
 | `tests/test_n8n_cron_auth_plugin.py` | Runtime test for the route allowlist and secret-file fail-closed behavior |
+| `tests/test_github_event_concurrency_contract.py` | Regression contract for the five GitHub event workflows and their single production execution slot |
 
 ## Fast host path
 
@@ -76,6 +78,7 @@ The 75-second pause is intentionally a bounded compensating cleanup, not a compl
 
 ```bash
 python3 automation/n8n/scripts/validate.py
+python3 tests/test_github_event_concurrency_contract.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
 ```
 
