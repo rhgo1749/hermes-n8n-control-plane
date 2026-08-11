@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 GITHUB_API = "https://api.github.com"
@@ -59,7 +59,13 @@ def _github_token() -> str:
     return token
 
 
-def _github_json(token: str, path: str, params: dict[str, Any] | None = None) -> Any:
+def _github_json(
+    token: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    *,
+    allow_not_found: bool = False,
+) -> Any:
     query = f"?{urlencode(params)}" if params else ""
     req = Request(
         f"{GITHUB_API}{path}{query}",
@@ -74,6 +80,8 @@ def _github_json(token: str, path: str, params: dict[str, Any] | None = None) ->
         with urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
             return json.load(response)
     except HTTPError as exc:
+        if allow_not_found and exc.code == 404:
+            return None
         body = exc.read().decode("utf-8", errors="replace")[:1000]
         raise RegistryError(f"GitHub API HTTP {exc.code}: {body}") from exc
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
@@ -121,6 +129,35 @@ def discover_repositories(token: str, owner: str, topic: str) -> list[dict[str, 
     return sorted(result, key=lambda item: str(item.get("full_name") or "").casefold())
 
 
+def _github_contracts(
+    token: str,
+    repository: str,
+    default_branch: str,
+    *,
+    fetch_json: Callable[..., Any] | None = None,
+) -> tuple[str, ...]:
+    """Detect contract files from the repository's authoritative default branch."""
+    fetch = fetch_json or _github_json
+    repository_path = quote(repository, safe="/")
+    found: list[str] = []
+    for candidate in CONTRACT_CANDIDATES:
+        candidate_path = quote(candidate, safe="/")
+        payload = fetch(
+            token,
+            f"/repos/{repository_path}/contents/{candidate_path}",
+            {"ref": default_branch},
+            allow_not_found=True,
+        )
+        if payload is None:
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "file":
+            raise RegistryError(
+                f"contract candidate is not a file on {repository}@{default_branch}: {candidate}"
+            )
+        found.append(candidate)
+    return tuple(found)
+
+
 def _normalise_remote(value: str) -> str:
     """Normalize common GitHub HTTPS/SSH/git remotes to ``owner/repo``."""
     raw = value.strip().rstrip("/")
@@ -156,14 +193,11 @@ def _git_origin(checkout: Path) -> str | None:
     return value or None
 
 
-def _contracts(checkout: Path) -> tuple[str, ...]:
-    return tuple(path for path in CONTRACT_CANDIDATES if (checkout / path).is_file())
-
-
 def build_entry(
     repo: dict[str, Any],
     checkout_root: Path,
     *,
+    contract_paths: Iterable[str] = (),
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> RegistryEntry:
     full_name = str(repo.get("full_name") or "").strip()
@@ -177,32 +211,34 @@ def build_entry(
     if not default_branch:
         raise RegistryError(f"repository default_branch is missing for {full_name}")
 
+    unknown_contracts = set(contract_paths) - set(CONTRACT_CANDIDATES)
+    if unknown_contracts:
+        raise RegistryError(
+            f"unknown contract paths for {full_name}: {', '.join(sorted(unknown_contracts))}"
+        )
+    contract_set = set(contract_paths)
+    contracts = tuple(path for path in CONTRACT_CANDIDATES if path in contract_set)
+
     repo_name = full_name.split("/", 1)[1]
     slug = repo_name.casefold()
     checkout = checkout_root / slug
     read_origin = origin_reader or _git_origin
     origin = read_origin(checkout) if checkout.is_dir() else None
-    contracts = _contracts(checkout) if checkout.is_dir() else ()
 
     if not checkout.exists():
         checkout_status = "missing"
-        checkout_ok = False
         reason = "checkout_missing"
     elif not checkout.is_dir():
         checkout_status = "not_directory"
-        checkout_ok = False
         reason = "checkout_not_directory"
     elif origin is None:
         checkout_status = "origin_unavailable"
-        checkout_ok = False
         reason = "checkout_origin_unavailable"
     elif _normalise_remote(origin).casefold() != full_name.casefold():
         checkout_status = "remote_mismatch"
-        checkout_ok = False
         reason = "checkout_remote_mismatch"
     else:
         checkout_status = "verified"
-        checkout_ok = True
         reason = "board_unresolved_shadow_phase"
 
     # Board identity cannot safely be guessed from the repository slug because
@@ -220,7 +256,7 @@ def build_entry(
         checkout_status=checkout_status,
         checkout_remote=origin,
         contract_paths=contracts,
-        ready=False if checkout_ok else False,
+        ready=False,
         reason=reason,
     )
 
@@ -237,15 +273,50 @@ def _fixture_repositories(path: Path) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _fixture_contract_reader(
+    repositories: Iterable[dict[str, Any]],
+) -> Callable[[str, str], tuple[str, ...]]:
+    by_name: dict[str, tuple[str, ...]] = {}
+    for repo in repositories:
+        full_name = str(repo.get("full_name") or "").strip()
+        raw = repo.get("contract_paths", [])
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            raise RegistryError(f"fixture contract_paths must be a string list for {full_name}")
+        unknown = set(raw) - set(CONTRACT_CANDIDATES)
+        if unknown:
+            raise RegistryError(
+                f"fixture contains unknown contract paths for {full_name}: "
+                f"{', '.join(sorted(unknown))}"
+            )
+        by_name[full_name.casefold()] = tuple(path for path in CONTRACT_CANDIDATES if path in raw)
+
+    def _read(repository: str, default_branch: str) -> tuple[str, ...]:
+        del default_branch
+        return by_name.get(repository.casefold(), ())
+
+    return _read
+
+
 def registry_snapshot(
     repositories: Iterable[dict[str, Any]],
     checkout_root: Path,
     *,
+    contract_reader: Callable[[str, str], tuple[str, ...]],
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> dict[str, Any]:
-    entries = [
-        build_entry(repo, checkout_root, origin_reader=origin_reader) for repo in repositories
-    ]
+    entries: list[RegistryEntry] = []
+    for repo in repositories:
+        full_name = str(repo.get("full_name") or "").strip()
+        default_branch = str(repo.get("default_branch") or "").strip()
+        contracts = contract_reader(full_name, default_branch)
+        entries.append(
+            build_entry(
+                repo,
+                checkout_root,
+                contract_paths=contracts,
+                origin_reader=origin_reader,
+            )
+        )
     entries.sort(key=lambda item: item.repository.casefold())
     return {
         "schema_version": 1,
@@ -269,9 +340,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.fixture_json:
             repositories = _fixture_repositories(args.fixture_json)
+            contract_reader = _fixture_contract_reader(repositories)
         else:
-            repositories = discover_repositories(_github_token(), args.owner, args.topic)
-        snapshot = registry_snapshot(repositories, args.checkout_root)
+            token = _github_token()
+            repositories = discover_repositories(token, args.owner, args.topic)
+            contract_reader = lambda repository, branch: _github_contracts(
+                token, repository, branch
+            )
+        snapshot = registry_snapshot(
+            repositories,
+            args.checkout_root,
+            contract_reader=contract_reader,
+        )
         text = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
