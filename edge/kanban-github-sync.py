@@ -2440,6 +2440,33 @@ def _latest_delivery_head(
     return str(head).casefold() if head else None
 
 
+def _last_delivery_event_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[int]:
+    """Epoch time of the newest recorded rework delivery event, if any."""
+    row = conn.execute(
+        "SELECT MAX(created_at) FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework_delivery'",
+        (task_id,),
+    ).fetchone()
+    value = row[0] if row else None
+    return int(value) if value is not None else None
+
+
+def _latest_rework_label_at(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+) -> Optional[int]:
+    """Epoch time of the newest agent-rework label addition, if any."""
+    events = _labeled_events(client, ref, pr_number)
+    if not events:
+        return None
+    added_at, _ = max(events, key=lambda item: item[0])
+    return added_at
+
+
 def _delivery_review_transition(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2484,6 +2511,62 @@ def _delivery_review_transition(
     }
 
 
+def _normalize_stale_review_ready(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    task_id: str,
+    status: str,
+    labels: set[str],
+    *,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    """Remove a stale ``agent-review-ready`` superseded by a newer rework.
+
+    A new trusted ``agent-rework`` request that postdates the previous
+    delivery makes the delivered round's ``agent-review-ready`` stale.
+    Only that single label is removed (``agent-rework`` is kept so the
+    classic REVIEW -> READY intake path or the dispatch lane owns the new
+    round on a later tick).  Returns ``None`` — keeping the fail-closed
+    lifecycle conflict guard — unless the newest ``agent-rework`` label
+    addition provably postdates the last ``github_pr_rework_delivery``
+    event.
+    """
+    delivery_at = _last_delivery_event_at(conn, task_id)
+    request_at = _latest_rework_label_at(client, ref, pr_number)
+    if delivery_at is None or request_at is None or request_at <= delivery_at:
+        return None
+    if dry_run:
+        return {
+            "task_id": task_id,
+            "status": status,
+            "changed": False,
+            "reason": "stale_review_ready_normalized_predicted",
+            "lifecycle": {"labels": sorted(labels)},
+        }
+    _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+        client,
+        ref,
+        pr_number,
+        add=(REWORK_LABEL,),
+        remove=(REVIEW_READY_LABEL,),
+    )
+    print(
+        f"kanban-github-sync: stale agent-review-ready removed for "
+        f"{ref.repository}#{pr_number} task={task_id} ({label_reason})",
+        file=sys.stderr,
+    )
+    return {
+        "task_id": task_id,
+        "status": status,
+        "changed": False,
+        "reason": "stale_review_ready_normalized",
+        "label_action": label_reason,
+        "lifecycle": label_evidence,
+    }
+
+
 def _reconcile_rework_lifecycle(
     conn: sqlite3.Connection,
     kanban_db: Any,
@@ -2503,6 +2586,40 @@ def _reconcile_rework_lifecycle(
     status = str(row["status"])
     labels = set(context["labels"])
     lifecycle = {REWORK_LABEL, WORKING_LABEL, REVIEW_READY_LABEL}
+
+    # A re-applied agent-rework after a spent delivery makes the previous
+    # round's agent-review-ready stale: normalize only that unambiguous
+    # pair (agent-rework + agent-review-ready, no agent-working) so the
+    # classic REVIEW -> READY intake path can own the new round.  Every
+    # other multi-label combination keeps the fail-closed guard below.
+    if (
+        REWORK_LABEL in labels
+        and REVIEW_READY_LABEL in labels
+        and WORKING_LABEL not in labels
+        and status in {"review", "ready"}
+    ):
+        try:
+            normalized = _normalize_stale_review_ready(
+                conn,
+                client,
+                ref,
+                int(context["pr_number"]),
+                task_id,
+                status,
+                labels,
+                dry_run=dry_run,
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id,
+                "status": status,
+                "changed": False,
+                "reason": "stale_review_ready_normalize_failed",
+                "error": str(exc),
+            }
+        if normalized is not None:
+            return normalized
+
     if len(labels & lifecycle) > 1:
         print(
             f"kanban-github-sync: lifecycle label conflict for {ref.repository}#{context['pr_number']} task={task_id}",

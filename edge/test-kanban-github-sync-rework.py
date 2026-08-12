@@ -1757,6 +1757,144 @@ def test_70_dry_run_predicts_repair():
     check("no label mutation", len(fake.patch_calls) == patches_before)
 
 
+def test_71_stale_review_ready_normalized_then_rework_round():
+    print("71. newer agent-rework after delivery -> stale agent-review-ready removed, "
+          "REVIEW -> READY round 2, claim -> agent-working, no duplicate spawn")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000071"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    results = run_sync(fake)  # delivery: card -> review, agent-review-ready
+    check("delivery -> review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    check("agent-review-ready projected",
+          "agent-review-ready" in fake.pr_labels.get(PR_N, [])
+          and "agent-working" not in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+    delivery_events = [e for e in task_events(tid)
+                       if e["kind"] == "github_pr_rework_delivery"]
+    check("one delivery event", len(delivery_events) == 1, str(delivery_events))
+    # Maintainer re-applies agent-rework AFTER the delivery.
+    future_label_ts = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60)
+    )
+    fake.pr_timeline[PR_N] = labeled_timeline(future_label_ts)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    results2 = run_sync(fake)  # tick: stale agent-review-ready normalized
+    normalized = [r for r in results2
+                  if r.get("reason") == "stale_review_ready_normalized"]
+    check("stale review-ready normalized", len(normalized) == 1, str(results2))
+    check("card stays review during normalization",
+          task_row(tid)["status"] == "review", str(task_row(tid)))
+    check("agent-rework kept, review-ready removed",
+          fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+    # Next tick: classic REVIEW -> READY intake of the new round.
+    results3 = run_sync(fake)
+    ready = [r for r in results3
+             if r.get("reason") == "agent_rework" and r.get("changed")]
+    check("review -> ready round 2", len(ready) == 1, str(results3))
+    check("card ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
+    rework_events = [e for e in task_events(tid)
+                     if e["kind"] == "github_pr_rework"]
+    check("two rework events", len(rework_events) == 2, str(rework_events))
+    check("agent-rework retained at intake",
+          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    # Dispatch: claim -> agent-working + exactly one spawn.
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws71-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    results4 = _run_sync_with_dispatch(fake, stub)
+    spawned = [r for r in results4 if r.get("reason") == "rework_worker_spawned"]
+    check("spawned once", len(spawned) == 1, str(results4))
+    check("card running", task_row(tid)["status"] == "running", str(task_row(tid)))
+    check("agent-working projected on claim",
+          "agent-working" in fake.pr_labels.get(PR_N, [])
+          and "agent-rework" not in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+    check("one spawn call", len(stub.calls) == 1, str(stub.calls))
+    with connect_closing() as conn:
+        results5 = mod._dispatch_pending_rework(
+            conn, kanban_db, "default", spawn_fn=stub,
+            cfg={"max_in_progress": 1, "default_assignee": "kanban-main"})
+    check("no duplicate spawn",
+          not [r for r in results5
+               if r.get("reason") == "rework_worker_spawned"], str(results5))
+    check("stub still one call", len(stub.calls) == 1, str(stub.calls))
+
+
+def test_72_stale_review_ready_dry_run_predicts_without_mutation():
+    print("72. dry-run on stale agent-review-ready -> predicted, no mutation")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000072"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivery
+    future_label_ts = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60)
+    )
+    fake.pr_timeline[PR_N] = labeled_timeline(future_label_ts)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    events_before = len(task_events(tid))
+    labels_before = list(fake.pr_labels.get(PR_N, []))
+    patches_before = len(fake.patch_calls)
+    results = mod.sync_board("default", dry_run=True, client=fake)
+    predicted = [r for r in results
+                 if r.get("reason") == "stale_review_ready_normalized_predicted"]
+    check("normalization predicted", len(predicted) == 1, str(results))
+    check("no label mutation", fake.pr_labels.get(PR_N) == labels_before,
+          str(fake.pr_labels))
+    check("no patch calls", len(fake.patch_calls) == patches_before)
+    check("no events written", len(task_events(tid)) == events_before)
+    check("status untouched", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+
+
+def test_73_older_rework_label_keeps_conflict_guard():
+    print("73. agent-rework older than delivery -> no normalization, conflict guard kept")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000073"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivery; timeline stays LABEL_ADDED_OLD (older than now)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    results = run_sync(fake)
+    conflict = [r for r in results if r.get("reason") == "lifecycle_label_conflict"]
+    normalized = [r for r in results
+                  if str(r.get("reason", "")).startswith("stale_review_ready_normalized")]
+    check("conflict guard kept", len(conflict) == 1, str(results))
+    check("no normalization", not normalized, str(results))
+    check("labels untouched",
+          sorted(fake.pr_labels.get(PR_N, [])) == sorted(["agent-rework", "agent-review-ready"]),
+          str(fake.pr_labels))
+    check("card stays review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+
+
+def test_74_working_review_ready_conflict_kept():
+    print("74. agent-working + agent-review-ready -> conflict guard kept (no auto-repair)")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    fake.pr_labels[PR_N] = ["agent-working", "agent-review-ready"]
+    results = run_sync(fake)
+    conflict = [r for r in results if r.get("reason") == "lifecycle_label_conflict"]
+    normalized = [r for r in results
+                  if str(r.get("reason", "")).startswith("stale_review_ready_normalized")]
+    check("conflict guard kept", len(conflict) == 1, str(results))
+    check("no normalization", not normalized, str(results))
+    check("labels untouched",
+          sorted(fake.pr_labels.get(PR_N, [])) == ["agent-review-ready", "agent-working"],
+          str(fake.pr_labels))
+
+
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2382,6 +2520,10 @@ def main() -> int:
         test_68_ready_open_pr_no_rework_respawn_guard,
         test_69_repeated_ticks_idempotent,
         test_70_dry_run_predicts_repair,
+        test_71_stale_review_ready_normalized_then_rework_round,
+        test_72_stale_review_ready_dry_run_predicts_without_mutation,
+        test_73_older_rework_label_keeps_conflict_guard,
+        test_74_working_review_ready_conflict_kept,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
