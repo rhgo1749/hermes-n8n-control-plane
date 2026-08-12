@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Read-only discovery of GitHub repositories opted into Hermes management.
 
-Phase-1 shadow registry: discovers repositories by GitHub topic and emits a
-normalized snapshot. It does not mutate GitHub, n8n, Hermes, Kanban, webhooks,
-or cron state.
+Shadow registry: discovers repositories by GitHub topic, derives repository
+metadata, and resolves existing Kanban board association from durable task
+provenance. It does not mutate GitHub, n8n, Hermes, Kanban, webhooks, or cron
+state.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -22,8 +25,10 @@ from urllib.request import Request, urlopen
 GITHUB_API = "https://api.github.com"
 DEFAULT_TOPIC = "hermes-agent"
 DEFAULT_CHECKOUT_ROOT = Path("/ws/projects")
+DEFAULT_KANBAN_BOARDS_ROOT = Path("/home/hermes/.hermes/kanban/boards")
 HTTP_TIMEOUT_SECONDS = 30
 MAX_PAGES = 20
+GITHUB_ISSUE_KEY = re.compile(r"^github:([^:]+/[^:]+):issue:\d+$", re.IGNORECASE)
 CONTRACT_CANDIDATES: tuple[str, ...] = (
     "AGENTS.md",
     "AGENTS_PROJECT.md",
@@ -193,11 +198,72 @@ def _git_origin(checkout: Path) -> str | None:
     return value or None
 
 
+def _kanban_board_repository_evidence(boards_root: Path) -> dict[str, tuple[str, ...]]:
+    """Read GitHub repository identities recorded in each live board's task keys."""
+    if not boards_root.exists():
+        return {}
+    if not boards_root.is_dir():
+        raise RegistryError(f"Kanban boards root is not a directory: {boards_root}")
+
+    evidence: dict[str, tuple[str, ...]] = {}
+    for db in sorted(boards_root.glob("*/kanban.db")):
+        board = db.parent.name
+        if board.startswith("_"):
+            continue
+
+        repositories: set[str] = set()
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = con.execute(
+                    "SELECT idempotency_key FROM tasks WHERE idempotency_key IS NOT NULL"
+                ).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            raise RegistryError(f"could not read Kanban provenance for board {board}: {exc}") from exc
+
+        for (raw_key,) in rows:
+            match = GITHUB_ISSUE_KEY.match(str(raw_key or ""))
+            if match:
+                repositories.add(match.group(1).casefold())
+        evidence[board] = tuple(sorted(repositories))
+    return evidence
+
+
+def _resolve_board(
+    repository: str,
+    evidence: dict[str, tuple[str, ...]],
+) -> tuple[str | None, str]:
+    """Resolve one existing board from durable GitHub issue task provenance."""
+    repository_key = repository.casefold()
+    exact: list[str] = []
+    conflicted: list[str] = []
+
+    for board, repositories in evidence.items():
+        if repository_key not in repositories:
+            continue
+        if len(repositories) == 1:
+            exact.append(board)
+        else:
+            conflicted.append(board)
+
+    if conflicted:
+        return None, "ambiguous_task_provenance"
+    if len(exact) == 1:
+        return exact[0], "resolved_task_provenance"
+    if not exact:
+        return None, "not_found_task_provenance"
+    return None, "ambiguous_multiple_boards"
+
+
 def build_entry(
     repo: dict[str, Any],
     checkout_root: Path,
     *,
     contract_paths: Iterable[str] = (),
+    board: str | None = None,
+    board_status: str = "not_found_task_provenance",
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> RegistryEntry:
     full_name = str(repo.get("full_name") or "").strip()
@@ -227,36 +293,41 @@ def build_entry(
 
     if not checkout.exists():
         checkout_status = "missing"
+        ready = False
         reason = "checkout_missing"
     elif not checkout.is_dir():
         checkout_status = "not_directory"
+        ready = False
         reason = "checkout_not_directory"
     elif origin is None:
         checkout_status = "origin_unavailable"
+        ready = False
         reason = "checkout_origin_unavailable"
     elif _normalise_remote(origin).casefold() != full_name.casefold():
         checkout_status = "remote_mismatch"
+        ready = False
         reason = "checkout_remote_mismatch"
     else:
         checkout_status = "verified"
-        reason = "board_unresolved_shadow_phase"
+        if board is None:
+            ready = False
+            reason = f"board_{board_status}"
+        else:
+            ready = True
+            reason = None
 
-    # Board identity cannot safely be guessed from the repository slug because
-    # legacy boards may have non-canonical names. A later phase will resolve
-    # association from Kanban evidence. Shadow mode therefore fails closed for
-    # cutover readiness instead of encoding an override table.
     return RegistryEntry(
         repository=full_name,
         repository_id=repository_id,
         default_branch=default_branch,
         canonical_slug=slug,
-        board=None,
-        board_status="unresolved_shadow_phase",
+        board=board,
+        board_status=board_status,
         checkout=str(checkout),
         checkout_status=checkout_status,
         checkout_remote=origin,
         contract_paths=contracts,
-        ready=False,
+        ready=ready,
         reason=reason,
     )
 
@@ -302,6 +373,7 @@ def registry_snapshot(
     checkout_root: Path,
     *,
     contract_reader: Callable[[str, str], tuple[str, ...]],
+    board_resolver: Callable[[str], tuple[str | None, str]],
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> dict[str, Any]:
     entries: list[RegistryEntry] = []
@@ -309,18 +381,22 @@ def registry_snapshot(
         full_name = str(repo.get("full_name") or "").strip()
         default_branch = str(repo.get("default_branch") or "").strip()
         contracts = contract_reader(full_name, default_branch)
+        board, board_status = board_resolver(full_name)
         entries.append(
             build_entry(
                 repo,
                 checkout_root,
                 contract_paths=contracts,
+                board=board,
+                board_status=board_status,
                 origin_reader=origin_reader,
             )
         )
     entries.sort(key=lambda item: item.repository.casefold())
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "shadow",
+        "board_authority": "tasks.idempotency_key",
         "contract_candidates": list(CONTRACT_CANDIDATES),
         "repositories": [
             {**asdict(entry), "contract_paths": list(entry.contract_paths)} for entry in entries
@@ -333,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner", default=os.environ.get("HERMES_GITHUB_OWNER", "rhgo1749"))
     parser.add_argument("--topic", default=os.environ.get("HERMES_GITHUB_TOPIC", DEFAULT_TOPIC))
     parser.add_argument("--checkout-root", type=Path, default=DEFAULT_CHECKOUT_ROOT)
+    parser.add_argument("--kanban-root", type=Path, default=DEFAULT_KANBAN_BOARDS_ROOT)
     parser.add_argument("--fixture-json", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -347,10 +424,14 @@ def main(argv: list[str] | None = None) -> int:
             contract_reader = lambda repository, branch: _github_contracts(
                 token, repository, branch
             )
+
+        board_evidence = _kanban_board_repository_evidence(args.kanban_root)
+        board_resolver = lambda repository: _resolve_board(repository, board_evidence)
         snapshot = registry_snapshot(
             repositories,
             args.checkout_root,
             contract_reader=contract_reader,
+            board_resolver=board_resolver,
         )
         text = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         if args.output:
