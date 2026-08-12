@@ -1,6 +1,6 @@
-# Repository registry — shadow phase
+# Repository registry — intake authority
 
-This document defines the shadow repository auto-discovery work tracked in
+This document defines the repository auto-discovery authority tracked in
 issue #2.
 
 The goal is to eliminate the permanent five-repository inventory from the
@@ -14,13 +14,13 @@ The registry is **read only**. `repository_registry.py` does not create/delete
 webhooks, change n8n workflows, modify Hermes cron state, create Kanban boards,
 spawn workers, or write to GitHub.
 
-The existing production intake and its five-minute fallback remain unchanged.
-The registry is intentionally a shadow observation surface until its output is
-compared with the currently managed repositories and later cutover gates pass.
+The registry remains read-only, but the edge intake now consumes its `ready=true`
+entries as the repository inventory. The five-minute polling fallback remains
+available and performs the same registry-driven full sweep.
 
 ## Derived fields and authority
 
-For every discovered repository the shadow snapshot records:
+For every discovered repository the registry snapshot records:
 
 - GitHub full name and immutable repository ID
 - GitHub `default_branch`
@@ -104,9 +104,9 @@ Resolution is fail-closed:
 - the same repository appears on multiple live boards ->
   `ambiguous_multiple_boards`
 
-Only a verified checkout plus a uniquely resolved existing board makes a shadow
-entry `ready=true`. This still does **not** perform a live cutover or provision a
-new board.
+Only a verified checkout plus a uniquely resolved existing board makes an
+entry `ready=true`. The live intake consumes only ready entries. The registry
+still does **not** automatically provision or delete Kanban boards.
 
 The first live evidence check found exactly one repository identity on each of
 the five current boards, including recovery of the historical
@@ -132,7 +132,7 @@ carry the `hermes-agent` topic.
 Do not put this credential in Git, workflow exports, command history, or chat.
 The script reads `HERMES_GITHUB_TOKEN` first and falls back to `GITHUB_TOKEN`.
 
-## Run in shadow mode
+## Run or inspect the registry
 
 Run the script where both `/ws/projects` and the live Kanban board root are
 available. For the current host this is easiest inside the Hermes container
@@ -155,7 +155,27 @@ include `contract_paths` so tests can model the GitHub/default-branch result.
 Tests that exercise board resolution create isolated temporary SQLite board DBs
 and pass their root through `--kanban-root` or the resolver helpers.
 
-## Shadow canary gates
+
+## Runtime pairing
+
+The production intake and registry are separate scripts but one runtime unit.
+`github-agent-ready-kanban-intake.py` locates the registry in this order:
+
+1. `HERMES_REPOSITORY_REGISTRY_SCRIPT`
+2. `repository_registry.py` beside the deployed intake script
+3. the source-tree `automation/n8n/scripts/repository_registry.py`
+
+A production deployment should therefore copy `repository_registry.py` beside
+the intake script, or set the explicit environment path. The GitHub token is
+passed to the registry only through the child-process environment and is never
+placed in command-line arguments.
+
+A scoped `--repository owner/repo` wake fails closed when the repository is not
+discovered or is not ready. The no-argument fallback processes every ready
+entry and reports unready entries in `registry_unready` without guessing a
+board or checkout association.
+
+## Cutover and canary gates
 
 Before any live cutover:
 
@@ -169,7 +189,7 @@ Before any live cutover:
    from task idempotency provenance.
 7. Treat missing or ambiguous board provenance as not ready; do not guess by
    board name.
-8. Do not remove the current five-repository inventory or polling fallback yet.
+8. Keep the polling fallback available until registry-driven event routing has sufficient production evidence.
 
 The first production shadow canary found exactly the intended five repositories
 and verified all five `/ws/projects/<slug>` origins. It also exposed local
@@ -187,8 +207,8 @@ rhgo1749/h4v3-meowcore-voice-lab      -> h4v3-meowcore-voice-lab
 rhgo1749/re-bound                     -> re-bound
 ```
 
-This is the evidence required to remove a future repository-name override table,
-but it does not yet remove the legacy intake inventory.
+This is the evidence used by the registry-driven intake, so the legacy
+repository-name override table is no longer required.
 
 ## Next phases
 

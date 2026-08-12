@@ -296,6 +296,60 @@ def test_archived_board_directory_is_ignored() -> None:
         assert set(evidence) == {"ctrlhangul"}
 
 
+
+def test_live_registry_snapshot_composes_existing_authorities() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        checkout_root = root / "projects"
+        kanban_root = root / "boards"
+        (checkout_root / "ctrl-hangul").mkdir(parents=True)
+        kanban_root.mkdir()
+
+        originals = {
+            "discover_repositories": registry.discover_repositories,
+            "_kanban_board_repository_evidence": registry._kanban_board_repository_evidence,
+            "_github_contracts": registry._github_contracts,
+            "_git_origin": registry._git_origin,
+        }
+
+        try:
+            registry.discover_repositories = (
+                lambda token, owner, topic: [
+                    _repo("rhgo1749/ctrl-hangul", 42)
+                ]
+            )
+            registry._kanban_board_repository_evidence = (
+                lambda root: {
+                    "ctrlhangul": ("rhgo1749/ctrl-hangul",)
+                }
+            )
+            registry._github_contracts = (
+                lambda token, repository, branch: ("AGENTS.md",)
+            )
+            registry._git_origin = (
+                lambda path: "https://github.com/rhgo1749/ctrl-hangul.git"
+            )
+
+            snapshot = registry.live_registry_snapshot(
+                "token",
+                "rhgo1749",
+                "hermes-agent",
+                checkout_root,
+                kanban_root,
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(registry, name, value)
+
+        assert snapshot["schema_version"] == 2
+        assert len(snapshot["repositories"]) == 1
+        entry = snapshot["repositories"][0]
+        assert entry["repository"] == "rhgo1749/ctrl-hangul"
+        assert entry["board"] == "ctrlhangul"
+        assert entry["default_branch"] == "main"
+        assert entry["contract_paths"] == ["AGENTS.md"]
+        assert entry["ready"] is True
+
 def main() -> int:
     tests = [
         value
