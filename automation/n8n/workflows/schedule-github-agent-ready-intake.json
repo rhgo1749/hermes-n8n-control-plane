@@ -24,7 +24,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "__HERMES_DASHBOARD_URL__/api/cron/jobs/bf431b2a6ba6/trigger?profile=default",
+        "url": "http://127.0.0.1:5680/trigger",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
@@ -65,7 +65,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "__HERMES_DASHBOARD_URL__/api/cron/jobs/bf431b2a6ba6/pause?profile=default",
+        "url": "={{ 'http://127.0.0.1:5680/pause?lease=' + $('Trigger existing Hermes cron job').item.json.body.lease }}",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
