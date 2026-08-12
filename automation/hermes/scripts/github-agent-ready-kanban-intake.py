@@ -104,6 +104,21 @@ class IntakeError(RuntimeError):
     """A deterministic intake prerequisite or command failure."""
 
 
+def _select_repositories(repository: str | None) -> tuple[RepositoryConfig, ...]:
+    """Return the requested repository scope, or the full fallback scope."""
+    if not repository:
+        return REPOSITORIES
+
+    matches = tuple(
+        config
+        for config in REPOSITORIES
+        if config.name.casefold() == repository.casefold()
+    )
+    if len(matches) != 1:
+        raise IntakeError(f"repository is not configured: {repository}")
+    return matches
+
+
 @dataclass(frozen=True)
 class RepoSnapshot:
     origin_main_sha: str
@@ -516,10 +531,15 @@ def _cleanup_one_closed_issue(
     return entry
 
 
-def _run_closed_issue_cleanup(token: str, *, dry_run: bool) -> list[dict[str, Any]]:
+def _run_closed_issue_cleanup(
+    token: str,
+    configs: tuple[RepositoryConfig, ...],
+    *,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
     """Closed-Issue label cleanup — the FIRST GitHub step of the cron tick.
 
-    Every configured repository is queried for closed Issues (PR payloads
+    Every selected repository is queried for closed Issues (PR payloads
     excluded); closed Issues carrying at least one label have ALL labels
     atomically replaced with an empty list.  A lookup or write failure
     raises IntakeError so the tick never proceeds to the open-issue
@@ -527,7 +547,7 @@ def _run_closed_issue_cleanup(token: str, *, dry_run: bool) -> list[dict[str, An
     GETs happen and every entry carries the predicted action.
     """
     results: list[dict[str, Any]] = []
-    for config in REPOSITORIES:
+    for config in configs:
         for issue in _iter_closed_issues(token, config.name):
             results.append(
                 _cleanup_one_closed_issue(token, config, issue, dry_run=dry_run)
@@ -727,14 +747,18 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str, str]) -> bool:
         return False
 
 
-def _issue_candidates(token: str | None, fixture_path: Path | None) -> list[tuple[RepositoryConfig, dict[str, Any]]]:
-    by_name = {config.name.lower(): config for config in REPOSITORIES}
+def _issue_candidates(
+    token: str | None,
+    fixture_path: Path | None,
+    configs: tuple[RepositoryConfig, ...],
+) -> list[tuple[RepositoryConfig, dict[str, Any]]]:
+    by_name = {config.name.casefold(): config for config in configs}
     candidates: list[tuple[RepositoryConfig, dict[str, Any]]] = []
     if fixture_path:
         raw_items = _fixture_issues(fixture_path)
         for issue in raw_items:
             repo_name = _issue_repository(issue)
-            config = by_name.get(repo_name.lower())
+            config = by_name.get(repo_name.casefold())
             if not config:
                 raise IntakeError(f"fixture repository is not configured: {repo_name}")
             _validate_issue(issue, config)
@@ -742,7 +766,7 @@ def _issue_candidates(token: str | None, fixture_path: Path | None) -> list[tupl
         return candidates
     if not token:
         raise IntakeError("GitHub token is required without --fixture-json")
-    for config in REPOSITORIES:
+    for config in configs:
         for issue in _iter_agent_ready_issues(token, config.name):
             candidates.append((config, issue))
     return candidates
@@ -823,6 +847,7 @@ def _sync_board(
 
 
 def _run(args: argparse.Namespace) -> int:
+    selected_configs = _select_repositories(args.repository)
     fixture_path = Path(args.fixture_json).resolve() if args.fixture_json else None
     token = None if fixture_path else _github_token()
     tick_started = int(time.time())
@@ -835,16 +860,20 @@ def _run(args: argparse.Namespace) -> int:
     # mode has no token and never mutates GitHub.
     cleanup_results: list[dict[str, Any]] = []
     if token:
-        cleanup_results = _run_closed_issue_cleanup(token, dry_run=bool(args.dry_run))
-    candidates = _issue_candidates(token, fixture_path)
+        cleanup_results = _run_closed_issue_cleanup(
+            token,
+            selected_configs,
+            dry_run=bool(args.dry_run),
+        )
+    candidates = _issue_candidates(token, fixture_path, selected_configs)
     snapshots: dict[str, RepoSnapshot] = {}
-    for config in REPOSITORIES:
+    for config in selected_configs:
         if any(candidate_config.name == config.name for candidate_config, _ in candidates):
             snapshots[config.name] = _repo_snapshot(config)
     sync_results: list[dict[str, Any]] = []
     if not args.dry_run:
         board_slugs = _board_slugs()
-        missing_boards = sorted({config.board for config in REPOSITORIES} - board_slugs)
+        missing_boards = sorted({config.board for config in selected_configs} - board_slugs)
         if missing_boards:
             raise IntakeError(f"configured Kanban boards are missing: {', '.join(missing_boards)}")
     imported_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -874,7 +903,7 @@ def _run(args: argparse.Namespace) -> int:
     # In dry-run the sync runs read-only so predicted notifications can be
     # reported without ever sending.
     if token:
-        for config in REPOSITORIES:
+        for config in selected_configs:
             sync_results.extend(_sync_board(config, token, dry_run=bool(args.dry_run)))
     predicted: list[str] = []
     telegram_sent = False
@@ -924,7 +953,7 @@ def _run(args: argparse.Namespace) -> int:
         "filter": {"state": "open", "label": GITHUB_LABEL},
         "closed_issue_cleanup": cleanup_results,
         "closed_issue_cleanup_count": len(cleanup_results),
-        "repositories": [config.name for config in REPOSITORIES],
+        "repositories": [config.name for config in selected_configs],
         "dry_run": bool(args.dry_run),
         "fixture": bool(fixture_path),
         "candidate_count": len(candidates),
@@ -945,6 +974,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Fetch/filter only; never mutate Kanban")
     parser.add_argument("--fixture-json", help="Test-only issue fixture; bypasses GitHub API")
+    parser.add_argument(
+        "--repository",
+        help="Limit this tick to one configured owner/repo; omit for the full fallback sweep",
+    )
     args = parser.parse_args()
     try:
         return _run(args)
