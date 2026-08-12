@@ -471,6 +471,7 @@ def test_full_fallback_uses_ready_registry_and_reports_unready() -> None:
     names = (
         "_github_token",
         "_load_registry_snapshot",
+        "_claim_wake_scope",
         "_telegram_config",
         "_run_closed_issue_cleanup",
         "_issue_candidates",
@@ -481,6 +482,7 @@ def test_full_fallback_uses_ready_registry_and_reports_unready() -> None:
     try:
         intake._github_token = lambda: "token"
         intake._load_registry_snapshot = lambda token: snapshot
+        intake._claim_wake_scope = lambda: None
         intake._telegram_config = lambda: None
 
         def fake_cleanup(token, configs, *, dry_run):
@@ -532,6 +534,76 @@ def test_registry_script_source_tree_fallback_exists() -> None:
     path = intake._registry_script_path()
     assert path.name == "repository_registry.py"
     assert path.is_file()
+
+
+
+def test_event_router_claim_limits_live_run() -> None:
+    calls: dict[str, list[str]] = {
+        "cleanup": [],
+        "sync": [],
+    }
+    snapshot = _snapshot(
+        [
+            _entry(
+                "rhgo1749/ctrl-hangul",
+                board="ctrlhangul",
+            ),
+            _entry("rhgo1749/re-bound"),
+        ]
+    )
+    names = (
+        "_github_token",
+        "_load_registry_snapshot",
+        "_claim_wake_scope",
+        "_telegram_config",
+        "_run_closed_issue_cleanup",
+        "_issue_candidates",
+        "_sync_board",
+    )
+    originals = {name: getattr(intake, name) for name in names}
+    try:
+        intake._github_token = lambda: "token"
+        intake._load_registry_snapshot = lambda token: snapshot
+        intake._claim_wake_scope = lambda: intake.WakeScope(
+            mode="event",
+            repositories=("rhgo1749/ctrl-hangul",),
+            expires_at=9999999999,
+        )
+        intake._telegram_config = lambda: None
+
+        def fake_cleanup(token, configs, *, dry_run):
+            calls["cleanup"] = [config.name for config in configs]
+            return []
+
+        intake._run_closed_issue_cleanup = fake_cleanup
+        intake._issue_candidates = lambda token, fixture_path, configs: []
+
+        def fake_sync(config, token, *, dry_run=False):
+            calls["sync"].append(config.name)
+            return []
+
+        intake._sync_board = fake_sync
+        args = argparse.Namespace(
+            dry_run=True,
+            fixture_json=None,
+            repository=None,
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert intake._run(args) == 0
+        output = json.loads(stdout.getvalue())
+        expected = ["rhgo1749/ctrl-hangul"]
+        assert calls["cleanup"] == expected
+        assert calls["sync"] == expected
+        assert output["repositories"] == expected
+        assert output["wake_scope"] == {
+            "mode": "event",
+            "repositories": expected,
+        }
+        assert output["scope_skipped"] == []
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
 
 
 def main() -> int:

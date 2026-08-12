@@ -220,3 +220,10 @@ Issue #2 tracks the remaining work:
 - filter echo events without losing blocked-resume/rework/completion signals
 - add a persisted wake lease/generation guard so stale delayed pauses are no-ops
 - canary the event-driven path before retiring polling
+
+
+## Registry-driven GitHub webhook router
+
+The event path contains no tracked repository inventory and no per-repository n8n GitHub Trigger workflow. The loopback `github-router` discovers `hermes-agent` repositories, reconciles one HMAC-signed repository webhook, verifies `X-Hub-Signature-256`, enqueues a durable repository/full wake scope, and wakes the existing intake through the lease controller. The intake claims one queued scope per invocation.
+
+The five-minute n8n schedule calls `/fallback`. Webhook reconciliation failure is surfaced but does not suppress the full-registry fallback. Repository readiness remains authoritative in the registry; an event for an unready repository is safely reported/skipped until normal checkout/board provisioning makes it ready.

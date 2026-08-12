@@ -24,52 +24,11 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://127.0.0.1:5680/trigger",
+        "url": "http://127.0.0.1:5681/fallback",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
-          "timeout": 10000,
-          "response": {
-            "response": {
-              "neverError": true,
-              "responseFormat": "json",
-              "fullResponse": true
-            }
-          }
-        }
-      },
-      "id": "6af11fef-460d-5736-b1a1-e9426e590830",
-      "name": "Trigger existing Hermes cron job",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        400,
-        300
-      ]
-    },
-    {
-      "parameters": {
-        "resume": "timeInterval",
-        "amount": 75,
-        "unit": "seconds"
-      },
-      "id": "c80aafd8-ee96-5ef7-8e79-7a038dd125cf",
-      "name": "Wait for Hermes ticker",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1.1,
-      "position": [
-        640,
-        300
-      ]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ 'http://127.0.0.1:5680/pause?lease=' + $('Trigger existing Hermes cron job').item.json.body.lease }}",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "options": {
-          "timeout": 60000,
+          "timeout": 120000,
           "response": {
             "response": {
               "neverError": false,
@@ -79,12 +38,12 @@
           }
         }
       },
-      "id": "1a40e3dd-33ca-5182-9c80-8dda5b34ba3a",
-      "name": "Pause legacy Hermes schedule",
+      "id": "cf6d7184-8b02-5a80-b188-7d7f64e67814",
+      "name": "Run registry fallback",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        880,
+        440,
         300
       ]
     }
@@ -95,29 +54,7 @@
       "main": [
         [
           {
-            "node": "Trigger existing Hermes cron job",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Trigger existing Hermes cron job": {
-      "main": [
-        [
-          {
-            "node": "Wait for Hermes ticker",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Wait for Hermes ticker": {
-      "main": [
-        [
-          {
-            "node": "Pause legacy Hermes schedule",
+            "node": "Run registry fallback",
             "type": "main",
             "index": 0
           }

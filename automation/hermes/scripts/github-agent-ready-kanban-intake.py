@@ -78,6 +78,74 @@ class RepoSnapshot:
     contract_paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class WakeScope:
+    mode: str
+    repositories: tuple[str, ...]
+    expires_at: int
+
+
+def _claim_wake_scope() -> WakeScope | None:
+    """Claim one durable router wake scope for this intake invocation.
+
+    Failure to reach the loopback router deliberately falls back to the
+    existing full-registry behavior so the legacy/manual reconciliation path
+    remains available during rollout and recovery.
+    """
+    url = os.environ.get(
+        "HERMES_INTAKE_SCOPE_CLAIM_URL",
+        "http://127.0.0.1:5681/scope/claim",
+    ).strip()
+    if not url:
+        return None
+    request = Request(url, method="POST", data=b"")
+    try:
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+    ):
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    mode = str(payload.get("mode") or "none")
+    if mode == "none":
+        return None
+    if mode not in {"event", "full"}:
+        return None
+    raw_repositories = payload.get("repositories") or []
+    if not isinstance(raw_repositories, list):
+        return None
+    repositories = tuple(
+        sorted(
+            {
+                str(repository).strip()
+                for repository in raw_repositories
+                if isinstance(repository, str)
+                and str(repository).count("/") == 1
+            },
+            key=str.casefold,
+        )
+    )
+    if mode == "event" and not repositories:
+        return None
+    try:
+        expires_at = int(payload.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    if expires_at <= int(time.time()):
+        return None
+    return WakeScope(
+        mode=mode,
+        repositories=repositories,
+        expires_at=expires_at,
+    )
+
+
 
 def _registry_script_path() -> Path:
     configured = os.environ.get("HERMES_REPOSITORY_REGISTRY_SCRIPT", "").strip()
@@ -1015,21 +1083,83 @@ def _run(args: argparse.Namespace) -> int:
     fixture_path = Path(args.fixture_json).resolve() if args.fixture_json else None
     token = None if fixture_path else _github_token()
 
+    wake_scope_mode = "fixture" if fixture_path else "legacy-full"
+    wake_scope_repositories: tuple[str, ...] = ()
+    scope_skipped: list[dict[str, str]] = []
+
     if fixture_path:
         available_configs = _fixture_repository_configs(fixture_path)
         registry_unready: list[dict[str, str]] = []
+        selected_configs = _select_repositories(
+            available_configs,
+            args.repository,
+        )
     else:
         assert token is not None
         registry_snapshot = _load_registry_snapshot(token)
-        available_configs, registry_unready = _repository_configs_from_registry(
-            registry_snapshot,
-            args.repository,
-        )
 
-    selected_configs = _select_repositories(
-        available_configs,
-        args.repository,
-    )
+        if args.repository:
+            available_configs, registry_unready = _repository_configs_from_registry(
+                registry_snapshot,
+                args.repository,
+            )
+            selected_configs = _select_repositories(
+                available_configs,
+                args.repository,
+            )
+            wake_scope_mode = "manual"
+            wake_scope_repositories = (args.repository,)
+        else:
+            available_configs, registry_unready = _repository_configs_from_registry(
+                registry_snapshot,
+                None,
+            )
+            wake_scope = _claim_wake_scope()
+            if wake_scope is not None and wake_scope.mode == "event":
+                wake_scope_mode = "event"
+                wake_scope_repositories = wake_scope.repositories
+                ready_by_name = {
+                    config.name.casefold(): config
+                    for config in available_configs
+                }
+                registry_entries = {
+                    str(entry.get("repository") or "").casefold(): entry
+                    for entry in registry_snapshot.get("repositories", [])
+                    if isinstance(entry, dict)
+                }
+                selected: list[RepositoryConfig] = []
+                seen: set[str] = set()
+                for repository in wake_scope.repositories:
+                    key = repository.casefold()
+                    config = ready_by_name.get(key)
+                    if config is not None:
+                        if key not in seen:
+                            selected.append(config)
+                            seen.add(key)
+                        continue
+                    entry = registry_entries.get(key)
+                    reason = (
+                        str(entry.get("reason") or "not_ready")
+                        if entry is not None
+                        else "not_managed"
+                    )
+                    scope_skipped.append(
+                        {
+                            "repository": repository,
+                            "reason": reason,
+                        }
+                    )
+                selected_configs = tuple(
+                    sorted(
+                        selected,
+                        key=lambda config: config.name.casefold(),
+                    )
+                )
+            else:
+                selected_configs = available_configs
+                if wake_scope is not None and wake_scope.mode == "full":
+                    wake_scope_mode = "fallback-full"
+
     tick_started = int(time.time())
     # Fixture mode is the test harness path: GitHub is bypassed and the
     # Telegram observer is disabled so verification runs never notify.
@@ -1135,6 +1265,11 @@ def _run(args: argparse.Namespace) -> int:
         "closed_issue_cleanup_count": len(cleanup_results),
         "repositories": [config.name for config in selected_configs],
         "registry_unready": registry_unready,
+        "wake_scope": {
+            "mode": wake_scope_mode,
+            "repositories": list(wake_scope_repositories),
+        },
+        "scope_skipped": scope_skipped,
         "dry_run": bool(args.dry_run),
         "fixture": bool(fixture_path),
         "candidate_count": len(candidates),
