@@ -47,6 +47,44 @@ services:
       retries: 8
       start_period: 30s
 
+
+  lease-controller:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      LEASE_LISTEN_PORT: "5680"
+      LEASE_HERMES_BASE_URL: ${LEASE_HERMES_BASE_URL:?set LEASE_HERMES_BASE_URL in .env}
+      LEASE_HERMES_JOB_ID: "bf431b2a6ba6"
+      LEASE_HERMES_PROFILE: "default"
+      LEASE_STATE_PATH: /state/hermes-intake-lease.json
+    command:
+      - python3
+      - /app/controller.py
+    volumes:
+      - ./lease-controller/controller.py:/app/controller.py:ro
+      - ./state:/state
+    tmpfs:
+      - /tmp:size=8m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:5680/healthz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
 volumes:
   n8n_data:
     name: hermes-n8n-control-plane-data

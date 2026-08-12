@@ -1,77 +1,59 @@
-# GitHub event intake concurrency gate
+# GitHub event intake concurrency guard
 
 ## Problem
 
-All five GitHub Trigger workflows and the temporary five-minute polling fallback
-control the same Hermes cron job, `default:bf431b2a6ba6`, using the same sequence:
+The five GitHub Trigger workflows and the five-minute polling fallback all
+control the same Hermes intake job:
 
 ```text
-trigger Hermes intake -> wait 75 seconds -> pause Hermes intake
-```
-
-Without serialization, two overlapping executions can interleave like this:
-
-```text
+default:bf431b2a6ba6
+Each execution follows:
+trigger -> wait 75 seconds -> pause
+Overlapping executions can therefore produce:
 A trigger -> B trigger -> A pause -> B pause
-```
-
-`A pause` is stale: it can disable the intake after `B` has just woken it.
-
-## Fix
-
-This n8n instance is intentionally dedicated to the GitHub intake bridge while
-this migration is active. `automation/n8n/compose.yaml` therefore sets:
-
-```yaml
+The delayed A pause is stale and must never disable intake after B has
+already issued a newer wake.
+n8n concurrency limit is not the correctness guard
+The n8n instance keeps:
 N8N_CONCURRENCY_PRODUCTION_LIMIT: "1"
-```
-
-n8n production executions are queued when the production concurrency limit is
-full. With a single production slot, each GitHub/Schedule execution completes
-its full trigger -> wait -> pause sequence before the next production trigger
-execution begins. The five repository workflows can therefore share the same
-Hermes intake without a stale-pause race.
-
-This is deliberately an edge-only fix. It does not change Hermes core, the
-intake script, Kanban, dispatcher, worker spawning, or callback behavior.
-
-## Rollout order
-
-1. Keep the current five-minute Schedule workflow active as the fallback.
-2. Pull this branch/commit on the Ubuntu host.
-3. Recreate only the n8n container so the production concurrency limit is
-   loaded. Do not restart Hermes for this change.
-4. Verify n8n is healthy and its effective container environment contains
-   `N8N_CONCURRENCY_PRODUCTION_LIMIT=1`.
-5. Import the five GitHub event workflow templates, attach their GitHub and
-   Hermes credentials, but keep them unpublished/inactive.
-6. Run the repository/static regression tests.
-7. Perform a live concurrency canary on the exact deployed n8n version: cause
-   two production GitHub-trigger executions close together and verify the
-   second execution stays queued until the first completes its 75-second wait
-   and pause. Do not use two manual executions for this proof because the
-   production concurrency contract applies to production-triggered executions.
-8. Verify Hermes intake executed successfully for the event(s), ends paused,
-   and no stale pause interrupts the newer execution.
-9. Publish the five GitHub event workflows.
-10. Leave the five-minute Schedule fallback enabled for an observation window.
-11. Only after event delivery and serialization are proven stable, unpublish
-    the five-minute Schedule fallback. The Hermes intake job itself remains
-    paused between n8n-driven wakes.
-
-## Failure rule
-
-If the second production execution starts before the first production execution
-has completed, or if Hermes ends in an unexpected enabled/paused state, do not
-publish the five GitHub event workflows and do not remove the five-minute
-fallback. Restore the known-good polling-only state and investigate the exact
-n8n runtime behavior first.
-
-## Trade-off
-
-The single production slot favors correctness over burst throughput. A burst of
-GitHub events is processed FIFO rather than concurrently. That is acceptable
-for this bridge because the existing Hermes intake scan remains the policy and
-reconciliation authority across all five repositories. If event volume later
-makes the queue delay material, replace the single-slot guard with a reviewed
-lease/coalescing coordinator before increasing production concurrency.
+as a burst/load limiter.
+Live testing on n8n 2.32.7 demonstrated that executions containing a Wait node
+can overlap: later production executions started while earlier executions were
+still inside their 75-second Wait. The concurrency limit therefore cannot be
+used as the stale-pause correctness boundary.
+Lease controller
+All schedule and GitHub event wake/pause paths instead call the loopback-only
+lease controller:
+n8n
+  -> 127.0.0.1:5680
+       -> Hermes dashboard
+POST /trigger creates and durably persists a new lease before forwarding the
+wake to Hermes. Creating a newer lease permanently supersedes all older leases.
+POST /pause?lease=<token> compares the supplied lease with the latest
+persisted lease:
+stale lease: HTTP 200, paused=false, reason=superseded; Hermes is not called
+latest active lease: forward the pause to Hermes, then persist paused
+latest pending lease: reject the pause rather than risk an ambiguous shutdown
+A transport failure after a trigger attempt never resurrects an older lease.
+The next polling or event wake supersedes the pending lease and restores a
+known active state.
+The persisted state survives controller restarts.
+Live canary
+The deployed controller was tested with multiple production GitHub event
+executions overlapping inside their 75-second Wait windows.
+Four wake executions produced four distinct leases. Their delayed pause calls
+arrived in order after newer leases had already been created. Older pauses were
+handled through the lease guard and the final/latest lease completed the real
+Hermes pause. The controller ended in:
+{"ok":true,"lease_status":"paused"}
+This is the required stale-pause race canary.
+Operational boundary
+GitHub remains source/code/PR truth.
+Kanban remains task state and history.
+n8n remains cross-system event/cadence glue.
+Hermes remains the execution authority.
+The five-minute polling workflow remains the reconciliation fallback.
+The lease controller is loopback-only and does not store the Hermes bearer
+token; n8n forwards the existing Authorization header to Hermes.
+Hermes core, dispatcher, workers, callbacks, and Kanban state-machine logic
+are unchanged.

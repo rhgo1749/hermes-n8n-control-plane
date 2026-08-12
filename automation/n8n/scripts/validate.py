@@ -65,8 +65,11 @@ def validate_schedule(job: dict[str, str]) -> None:
         "Pause legacy Hermes schedule",
     )
     expected = {
-        f"{PLACEHOLDER_URL}/api/cron/jobs/{job['id']}/trigger?profile={job['profile']}",
-        f"{PLACEHOLDER_URL}/api/cron/jobs/{job['id']}/pause?profile={job['profile']}",
+        "http://127.0.0.1:5680/trigger",
+        (
+            "={{ 'http://127.0.0.1:5680/pause?lease=' + "
+            "$('Trigger existing Hermes cron job').item.json.body.lease }}"
+        ),
     }
     assert set(http_urls(data)) == expected
     assert "credentials" not in json.dumps(data).lower()
@@ -89,8 +92,11 @@ def validate_github(repo: dict[str, str]) -> None:
         "Pause legacy Hermes intake schedule",
     )
     expected = {
-        f"{PLACEHOLDER_URL}/api/cron/jobs/{INTAKE_JOB['id']}/trigger?profile=default",
-        f"{PLACEHOLDER_URL}/api/cron/jobs/{INTAKE_JOB['id']}/pause?profile=default",
+        "http://127.0.0.1:5680/trigger",
+        (
+            "={{ 'http://127.0.0.1:5680/pause?lease=' + "
+            "$('Trigger existing Hermes intake').item.json.body.lease }}"
+        ),
     }
     assert set(http_urls(data)) == expected
     assert "credentials" not in json.dumps(data).lower()
@@ -152,11 +158,20 @@ def main() -> int:
     assert service["environment"]["N8N_LISTEN_ADDRESS"] == "127.0.0.1"
     assert "/var/run/docker.sock" not in compose_text
     environment = service["environment"]
-    # Every production workflow in this dedicated n8n instance can wake/pause
-    # the same intake job. A single FIFO execution slot is the concurrency
-    # contract that prevents an older delayed pause from overtaking a newer
-    # trigger from another repository or from the temporary polling fallback.
+    # Keep the single production slot as a burst/load limiter only.
+    # n8n Wait nodes can yield the production slot, so this setting is not the
+    # stale-pause correctness boundary. The lease-controller is.
     assert environment["N8N_CONCURRENCY_PRODUCTION_LIMIT"] == "1"
+
+    lease = compose["services"]["lease-controller"]
+    assert lease["restart"] == "unless-stopped"
+    assert lease["network_mode"] == "host"
+    assert lease["read_only"] is True
+    assert lease["user"] == "1000:1000"
+    assert lease["environment"]["LEASE_LISTEN_PORT"] == "5680"
+    assert lease["environment"]["LEASE_HERMES_JOB_ID"] == "bf431b2a6ba6"
+    assert lease["environment"]["LEASE_HERMES_PROFILE"] == "default"
+    assert lease["environment"]["LEASE_STATE_PATH"] == "/state/hermes-intake-lease.json"
     assert environment["N8N_BLOCK_ENV_ACCESS_IN_NODE"] == "true"
     assert environment["N8N_DIAGNOSTICS_ENABLED"] == "false"
     assert environment["N8N_PUBLIC_API_DISABLED"] == "true"
@@ -169,6 +184,7 @@ def main() -> int:
     env_example = (N8N / ".env.example").read_text(encoding="utf-8")
     assert "N8N_PORT=5678" in env_example
     assert "N8N_HOST_PORT" not in env_example
+    assert "LEASE_HERMES_BASE_URL=" in env_example
 
     print(json.dumps({"ok": True, "schedule_workflows": len(ACTIVE_JOBS), "github_workflows": len(GITHUB_REPOSITORIES)}))
     return 0

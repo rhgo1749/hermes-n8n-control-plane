@@ -65,17 +65,28 @@ def main() -> int:
         assert not calls.exists() or not calls.read_text(encoding="utf-8").strip()
         assert not (n8n / ".env").exists()
 
-        installed = run_installer(scripts / "host-install.sh", root, environment, "--timezone", "UTC")
+        installed = run_installer(
+            scripts / "host-install.sh",
+            root,
+            environment,
+            "--timezone",
+            "UTC",
+            "--hermes-base-url",
+            "http://100.107.12.90:9119",
+        )
         assert installed.returncode == 0, installed.stdout + installed.stderr
         values = read_fixture_env(n8n / ".env")
         assert values["N8N_PORT"] == "5678"
         assert values["N8N_EDITOR_BASE_URL"] == "http://127.0.0.1:5678"
+        assert values["LEASE_HERMES_BASE_URL"] == "http://100.107.12.90:9119"
         assert "N8N_HOST_PORT" not in values
         assert calls.exists() and "docker compose" in calls.read_text(encoding="utf-8")
 
         calls.unlink()
         (n8n / ".env").write_text(
-            "N8N_PORT=9119\nN8N_ENCRYPTION_KEY=test-fixture-value\n",
+            "N8N_PORT=9119\n"
+            "N8N_ENCRYPTION_KEY=test-fixture-value\n"
+            "LEASE_HERMES_BASE_URL=http://100.107.12.90:9119\n",
             encoding="utf-8",
         )
         invalid_runtime_port = run_installer(scripts / "host-install.sh", root, environment)

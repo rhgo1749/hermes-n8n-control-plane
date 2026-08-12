@@ -10,10 +10,11 @@ ENV_FILE="$N8N_DIR/.env"
 TIMEZONE="Asia/Seoul"
 ENABLE_DOCKER_SERVICE=0
 TIMEZONE_EXPLICIT=0
+HERMES_BASE_URL=""
 
 usage() {
   cat <<'EOF'
-Usage: host-install.sh [--timezone Asia/Seoul] [--enable-docker-service]
+Usage: host-install.sh [--timezone Asia/Seoul] [--hermes-base-url URL] [--enable-docker-service]
 
 Compose uses host networking so n8n can reach the host's Tailnet-only Hermes
 dashboard, while n8n itself listens only on 127.0.0.1:5678. `--port` is
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
       exit 2
       ;;
     --timezone) TIMEZONE="$2"; TIMEZONE_EXPLICIT=1; shift 2 ;;
+    --hermes-base-url) HERMES_BASE_URL="$2"; shift 2 ;;
     --enable-docker-service) ENABLE_DOCKER_SERVICE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -59,16 +61,17 @@ chmod 600 "$ENV_FILE"
 # actual n8n listener at 127.0.0.1:5678, so a former mapped host-port setting
 # must not survive into the runtime file.
 EFFECTIVE_PORT=5678
-python3 - "$ENV_FILE" "$TIMEZONE" "$TIMEZONE_EXPLICIT" <<'PY'
+python3 - "$ENV_FILE" "$TIMEZONE" "$TIMEZONE_EXPLICIT" "$HERMES_BASE_URL" <<'PY'
 import os
 import secrets
 import stat
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 path = Path(sys.argv[1])
-timezone, timezone_explicit = sys.argv[2:]
+timezone, timezone_explicit, hermes_base_url = sys.argv[2:]
 lines = path.read_text(encoding="utf-8").splitlines()
 values: dict[str, str] = {}
 order: list[str] = []
@@ -91,6 +94,7 @@ defaults = {
     "N8N_SECURE_COOKIE": "false",
     "GENERIC_TIMEZONE": timezone,
     "TZ": timezone,
+    "LEASE_HERMES_BASE_URL": "",
 }
 for key, value in defaults.items():
     if not values.get(key, "").strip():
@@ -100,6 +104,26 @@ order = [key for key in order if key != "N8N_HOST_PORT"]
 if timezone_explicit == "1":
     values["GENERIC_TIMEZONE"] = timezone
     values["TZ"] = timezone
+
+if hermes_base_url.strip():
+    values["LEASE_HERMES_BASE_URL"] = hermes_base_url.strip()
+
+lease_url = values.get("LEASE_HERMES_BASE_URL", "").strip()
+if not lease_url:
+    raise SystemExit(
+        "LEASE_HERMES_BASE_URL is required; pass --hermes-base-url URL "
+        "or set it in automation/n8n/.env"
+    )
+
+parsed_lease_url = urlparse(lease_url)
+if (
+    parsed_lease_url.scheme not in {"http", "https"}
+    or not parsed_lease_url.hostname
+    or parsed_lease_url.username
+    or parsed_lease_url.password
+):
+    raise SystemExit("LEASE_HERMES_BASE_URL must be an http(s) URL without credentials")
+
 if values["N8N_PORT"].strip() != "5678":
     raise SystemExit("N8N_PORT must be 5678 while Compose uses host networking")
 if not values.get("N8N_ENCRYPTION_KEY", "").strip():
