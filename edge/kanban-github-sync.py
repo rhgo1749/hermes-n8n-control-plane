@@ -2440,6 +2440,63 @@ def _latest_delivery_head(
     return str(head).casefold() if head else None
 
 
+def _current_round_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event: tuple[dict[str, Any], int, str],
+) -> Optional[dict[str, Any]]:
+    """Newest delivery event bound to the CURRENT rework round.
+
+    A delivery is current-round evidence only when ALL of:
+    - it was recorded at/after the round's governing ``github_pr_rework``
+      event (inclusive, so same-second ticks cannot lose the round);
+    - when both the round event and the delivery carry a request-comment
+      identity, the identities match;
+    - its head differs from the head the current round started from (a
+      current-round delivery can never equal the requested head — the
+      delivery validator rejects ``rework_head_unchanged`` — so a
+      recorded head equal to the round's requested head is a PAST round's
+      delivery).
+
+    Past-round deliveries (e.g. the round N-1 head still equal to the
+    live PR head while the round-N worker has not yet pushed) never
+    qualify, so an active current-round worker keeps ``agent-working``
+    and a past delivery can never justify ``agent-review-ready``.
+    """
+    payload, event_at, _ = event
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework_delivery' "
+        "AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, int(event_at)),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        delivery_payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(delivery_payload, dict):
+        return None
+    round_request_id = payload.get("request_comment_id")
+    delivery_request_id = delivery_payload.get("request_comment_id")
+    if (
+        round_request_id is not None
+        and delivery_request_id is not None
+        and int(round_request_id) != int(delivery_request_id)
+    ):
+        # Identity mismatch: the recorded delivery belongs to another round.
+        return None
+    round_requested_head = str(payload.get("head_sha") or "").casefold()
+    delivery_head = str(delivery_payload.get("head") or "").casefold()
+    if round_requested_head and delivery_head == round_requested_head:
+        # The recorded delivery head equals the head this round started
+        # from: it is the previous round's delivery, not current-round
+        # evidence.
+        return None
+    return delivery_payload
+
+
 def _last_delivery_event_at(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2668,13 +2725,18 @@ def _reconcile_rework_lifecycle(
 
     active = _task_has_active_rework_claim(conn, row)
     if active:
-        # A running claim whose round is ALREADY delivered is the core
-        # review lane (review -> running claim), never a rework owner:
-        # keep agent-review-ready and never downgrade to agent-working.
-        delivered_head = _latest_delivery_head(conn, task_id)
-        if delivered_head and str(
-            context["pr"].head_sha or ""
-        ).casefold() == delivered_head:
+        # The active claim belongs to the CURRENT rework round (the
+        # governing github_pr_rework event).  Only a delivery bound to
+        # that same round (recorded after its governing event,
+        # identity-matched when available) can make this claim the core
+        # review lane.  A past-round delivery whose head still equals the
+        # live PR head (round-N worker not yet pushed) is never
+        # current-round evidence: the active round-N worker keeps
+        # agent-working, which takes precedence over any past delivery.
+        current_delivery = _current_round_delivery(
+            conn, task_id, context["event"],
+        )
+        if current_delivery is not None:
             if dry_run:
                 return {
                     "task_id": task_id, "status": "running", "changed": False,

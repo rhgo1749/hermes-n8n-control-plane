@@ -1895,6 +1895,185 @@ def test_74_working_review_ready_conflict_kept():
           str(fake.pr_labels))
 
 
+def _round1_delivery_ready(fake: FakeGitHub, head: str) -> str:
+    """Deliver round 1 (head) -> review + agent-review-ready; return task id."""
+    tid = _rework_ready_task(fake)
+    fake.prs[PR_N]["head"]["sha"] = head
+    _close_rework_run(tid, head=head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, head)
+    run_sync(fake)
+    assert task_row(tid)["status"] == "review", "round-1 delivery did not apply"
+    assert "agent-review-ready" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels)
+    return tid
+
+
+def _round2_running_worker(fake: FakeGitHub, tid: str) -> int | None:
+    """Intake round 2 (review -> ready) and claim it as the running worker.
+
+    Returns the round-2 governing event's request_comment_id (the marker
+    for this round must carry it to pass the identity check), or None.
+    """
+    future_label_ts = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60)
+    )
+    fake.pr_timeline[PR_N] = labeled_timeline(future_label_ts)
+    fake.pr_labels[PR_N] = ["agent-rework"]
+    run_sync(fake)
+    assert task_row(tid)["status"] == "ready", "round-2 intake did not apply"
+    request_comment_id: int | None = None
+    events = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    if events:
+        value = events[-1]["payload"].get("request_comment_id")
+        if value is not None:
+            request_comment_id = int(value)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "round-2 claim failed"
+        conn.commit()
+    assert task_row(tid)["status"] == "running", "round-2 worker not running"
+    # The edge dispatcher swaps agent-rework -> agent-working on claim.
+    fake.pr_labels[PR_N] = ["agent-working"]
+    return request_comment_id
+
+
+def test_75_active_round2_prepush_keeps_agent_working():
+    print("75. round-2 worker pre-push (PR head == round-1 delivery head) -> "
+          "agent-working stable across ticks, no review-ready flip")
+    fake = fresh_env()
+    h1 = "0123456789abcdef0123456789abcdef00000075"
+    tid = _round1_delivery_ready(fake, h1)
+    check("round1 delivery review + review-ready",
+          task_row(tid)["status"] == "review"
+          and "agent-review-ready" in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+    _round2_running_worker(fake, tid)
+    check("round2 worker running", task_row(tid)["status"] == "running")
+    # Live PR head is still H1 == round-1 delivery head (worker not pushed).
+    check("PR head unchanged (== H1)", fake.prs[PR_N]["head"]["sha"] == h1)
+    for i in range(3):
+        results = run_sync(fake)
+        entries = [r for r in results if r.get("task_id") == tid]
+        working = [r for r in entries if r.get("reason") == "agent_working"]
+        review_ready = [r for r in entries
+                        if r.get("reason") == "agent_review_ready"]
+        check(f"tick {i + 1} agent-working", len(working) == 1, str(entries))
+        check(f"tick {i + 1} no review-ready flip", not review_ready, str(entries))
+        labels = fake.pr_labels.get(PR_N, [])
+        check(f"tick {i + 1} label agent-working only",
+              "agent-working" in labels
+              and "agent-review-ready" not in labels, str(labels))
+        check(f"tick {i + 1} card still running",
+              task_row(tid)["status"] == "running", str(task_row(tid)))
+
+
+def test_76_round2_pushed_new_head_no_marker_stays_working():
+    print("76. round-2 worker pushed H2 without marker -> agent-working (no delivery)")
+    fake = fresh_env()
+    h1 = "0123456789abcdef0123456789abcdef00000761"
+    tid = _round1_delivery_ready(fake, h1)
+    _round2_running_worker(fake, tid)
+    h2 = "0123456789abcdef0123456789abcdef00000762"
+    fake.prs[PR_N]["head"]["sha"] = h2  # pushed, no completion marker yet
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("agent-working maintained", any(
+        r.get("reason") == "agent_working" for r in entries), str(entries))
+    check("no review-ready", not any(
+        r.get("reason") == "agent_review_ready" for r in entries), str(entries))
+    labels = fake.pr_labels.get(PR_N, [])
+    check("label agent-working",
+          "agent-working" in labels
+          and "agent-review-ready" not in labels, str(labels))
+    check("card still running", task_row(tid)["status"] == "running")
+
+
+def test_77_stale_round1_marker_not_current_round_delivery():
+    print("77. stale round-1 completion marker -> never current-round delivery")
+    fake = fresh_env()
+    h1 = "0123456789abcdef0123456789abcdef00000771"
+    tid = _round1_delivery_ready(fake, h1)
+    # Model staleness: the round-1 marker predates the round-2 request.
+    for item in fake.issue_comments.get(PR_N, []):
+        if mod.REWORK_COMPLETE_MARKER in str(item.get("body") or ""):
+            item["created_at"] = "2026-08-10T00:00:30Z"
+    _round2_running_worker(fake, tid)
+    # The round-2 worker's run ends without any current-round marker.
+    with connect_closing() as conn:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        run_id = int(row["current_run_id"])
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET ended_at=?, outcome='completed', "
+            "status='done', summary='round2 ended without push' "
+            "WHERE id=? AND ended_at IS NULL",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?", (tid,)
+        )
+        conn.commit()
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("no review-ready from stale marker", not any(
+        r.get("reason") == "agent_review_ready" for r in entries), str(entries))
+    check("human attention (marker missing for current round)", any(
+        r.get("reason") == "rework_human_attention"
+        and r.get("diagnostic") == "completion_handoff_missing"
+        for r in entries), str(entries))
+    check("labels restored to agent-rework",
+          "agent-rework" in fake.pr_labels.get(PR_N, [])
+          and "agent-review-ready" not in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+
+
+def test_78_round2_delivery_transitions_to_review_ready():
+    print("78. round-2 current-round delivery (H2 + marker + run done) -> "
+          "review + agent-review-ready; review-lane claim keeps it")
+    fake = fresh_env()
+    h1 = "0123456789abcdef0123456789abcdef00000781"
+    tid = _round1_delivery_ready(fake, h1)
+    rcid = _round2_running_worker(fake, tid)
+    h2 = "0123456789abcdef0123456789abcdef00000782"
+    fake.prs[PR_N]["head"]["sha"] = h2
+    _close_rework_run(tid, head=h2, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, h2, request_comment=rcid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    ready = [r for r in entries if r.get("reason") == "agent_review_ready"]
+    check("round-2 delivery -> agent-review-ready", len(ready) == 1, str(entries))
+    check("card -> review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    labels = fake.pr_labels.get(PR_N, [])
+    check("label agent-review-ready",
+          "agent-review-ready" in labels
+          and "agent-working" not in labels, str(labels))
+    delivery_events = [e for e in task_events(tid)
+                       if e["kind"] == "github_pr_rework_delivery"]
+    check("two delivery events (one per round)", len(delivery_events) == 2,
+          str(delivery_events))
+    # Core review lane claims the delivered card; active claim + current
+    # round delivery -> agent-review-ready must be maintained.
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None, "review claim failed"
+        conn.commit()
+    check("review lane running", task_row(tid)["status"] == "running")
+    for i in range(2):
+        results2 = run_sync(fake)
+        entries2 = [r for r in results2 if r.get("task_id") == tid]
+        check(f"review tick {i + 1} keeps review-ready", any(
+            r.get("reason") == "agent_review_ready" for r in entries2),
+            str(entries2))
+        check(f"review tick {i + 1} no downgrade to working", not any(
+            r.get("reason") == "agent_working" for r in entries2),
+            str(entries2))
+
+
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2524,6 +2703,10 @@ def main() -> int:
         test_72_stale_review_ready_dry_run_predicts_without_mutation,
         test_73_older_rework_label_keeps_conflict_guard,
         test_74_working_review_ready_conflict_kept,
+        test_75_active_round2_prepush_keeps_agent_working,
+        test_76_round2_pushed_new_head_no_marker_stays_working,
+        test_77_stale_round1_marker_not_current_round_delivery,
+        test_78_round2_delivery_transitions_to_review_ready,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
