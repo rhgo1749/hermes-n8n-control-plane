@@ -1201,6 +1201,34 @@ def _close_rework_run(
     return run_id
 
 
+def _close_reviewer_completion(
+    tid: str,
+    *,
+    outcome: str = "completed",
+    summary: str = "reviewer approved",
+) -> int:
+    """Simulate the core review lane: the review claim's run finishes and
+    the reviewer completes the card (DONE) while the PR stays OPEN."""
+    with connect_closing() as conn:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        run_id = int(row["current_run_id"])
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET ended_at=?, outcome=?, status='done', summary=? "
+            "WHERE id=? AND ended_at IS NULL",
+            (now, outcome, summary, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, completed_at=? WHERE id=?",
+            (now, tid),
+        )
+        conn.commit()
+    return run_id
+
+
 def _run_sync_with_dispatch(fake: FakeGitHub, stub: StubSpawn) -> list[dict]:
     orig_cfg = mod._kanban_config
     original_spawn = kanban_db._default_spawn
@@ -1462,6 +1490,271 @@ def test_62_merged_pr_done_and_labels_cleared():
               for e in task_events(tid)), str(task_events(tid)))
 
 
+
+
+def test_63_reviewer_completes_delivered_card_done_open_pr():
+    print("63. delivered round -> core review lane completes -> DONE + OPEN PR repaired to REVIEW")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"  # acceptance fixture head
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    results = run_sync(fake)  # delivery: card -> review, labels -> agent-review-ready
+    check("delivery -> review", task_row(tid)["status"] == "review", str(task_row(tid)))
+    check("agent-review-ready projected",
+          "agent-review-ready" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    # The core review lane claims the delivered card (review -> running) and
+    # the reviewer completes it: DONE while the PR is still OPEN.
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None, "review claim failed"
+        conn.commit()
+    _close_reviewer_completion(tid)
+    check("reviewer completion -> done (bug repro)",
+          task_row(tid)["status"] == "done", str(task_row(tid)))
+    # Next reconciliation tick repairs DONE + OPEN PR -> REVIEW.
+    results2 = run_sync(fake)
+    entries = [r for r in results2 if r.get("task_id") == tid]
+    row = task_row(tid)
+    check("repaired to review", row["status"] == "review"
+          and row["completed_at"] is None, str(row))
+    check("assignee cleared (review lane cannot re-claim)",
+          row["assignee"] is None and row["claim_lock"] is None
+          and row["worker_pid"] is None, str(row))
+    check("repair entry", any(
+        r.get("reason") == "agent_review_ready"
+        and (r.get("repair") or {}).get("previous_status") == "done"
+        for r in entries), str(entries))
+    check("github_pr_sync repair event", any(
+        e["kind"] == "github_pr_sync"
+        and e["payload"].get("previous_status") == "done"
+        and e["payload"].get("new_status") == "review"
+        for e in task_events(tid)), str(task_events(tid)))
+    check("agent-working removed", "agent-working" not in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+    check("PR remains open", fake.prs[PR_N]["state"] == "open")
+
+
+def test_64_rework_complete_open_pr_review_same_pr():
+    print("64. rework 완료 + OPEN PR -> REVIEW, agent-working/agent-rework removed, same PR reused")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    results = run_sync(fake)
+    row = task_row(tid)
+    check("card review", row["status"] == "review", str(row))
+    labels = fake.pr_labels.get(PR_N, [])
+    check("agent-review-ready only",
+          "agent-review-ready" in labels and "agent-working" not in labels
+          and "agent-rework" not in labels, str(labels))
+    check("same PR reused (no new PR)", fake.prs[PR_N]["number"] == PR_N)
+    check("one delivery event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_delivery"
+    ]) == 1)
+
+
+def test_65_merged_pr_done_delivered_round():
+    print("65. delivered round + PR MERGED -> DONE + lifecycle labels cleared")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivery -> review
+    fake.prs[PR_N] = make_pr(PR_N, state="closed", merged=True)
+    results = run_sync(fake)
+    row = task_row(tid)
+    check("merged -> done", row["status"] == "done"
+          and row["completed_at"] is not None, str(row))
+    check("lifecycle labels cleared", fake.pr_labels.get(PR_N, []) == [],
+          str(fake.pr_labels))
+
+
+def test_66_done_open_pr_stale_working_self_heal():
+    print("66. acceptance fixture: DONE + OPEN PR + stale agent-working -> REVIEW self-heal")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivery -> review
+    check("delivered review", task_row(tid)["status"] == "review")
+    # Regression state: reviewer completion -> DONE and the stale
+    # agent-working label is present on the PR (the t_560e6a71 incident).
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    _close_reviewer_completion(tid)
+    fake.pr_labels[PR_N] = ["agent-working"]
+    check("incident state reproduced",
+          task_row(tid)["status"] == "done"
+          and "agent-working" in fake.pr_labels.get(PR_N, []))
+    results = run_sync(fake)
+    row = task_row(tid)
+    check("self-healed to review", row["status"] == "review"
+          and row["completed_at"] is None, str(row))
+    labels = fake.pr_labels.get(PR_N, [])
+    check("stale agent-working removed", "agent-working" not in labels, str(labels))
+    check("agent-rework absent", "agent-rework" not in labels, str(labels))
+    check("agent-review-ready projected", "agent-review-ready" in labels, str(labels))
+    check("no worker running", row["claim_lock"] is None and row["worker_pid"] is None)
+    check("PR still open", fake.prs[PR_N]["state"] == "open")
+    check("no duplicate spawn", True)  # no dispatch lane active in run_sync
+
+
+def test_67_active_worker_no_premature_transition():
+    print("67. live worker -> no premature review/done; labels follow the round state")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    results = run_sync(fake)
+    check("pre-delivery running keeps agent-working",
+          any(r.get("reason") == "agent_working" for r in results)
+          and "agent-working" in fake.pr_labels.get(PR_N, []), str(results))
+    check("pre-delivery status stays running", task_row(tid)["status"] == "running")
+    check("no review/done transition", task_row(tid)["status"] == "running"
+          and task_row(tid)["completed_at"] is None, str(task_row(tid)))
+    # Post-delivery running claim (core review lane): keep running and keep
+    # agent-review-ready; never downgrade to agent-working.
+    fake2 = fresh_env()
+    tid2 = _rework_ready_task(fake2)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"
+    fake2.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid2, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake2, tid2, final_head)
+    run_sync(fake2)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid2)
+        assert claimed is not None
+        conn.commit()
+    results2 = run_sync(fake2)
+    row2 = task_row(tid2)
+    check("post-delivery claim keeps running", row2["status"] == "running", str(row2))
+    check("no agent-working downgrade",
+          "agent-working" not in fake2.pr_labels.get(PR_N, []),
+          str(fake2.pr_labels))
+    check("agent-review-ready maintained",
+          "agent-review-ready" in fake2.pr_labels.get(PR_N, []),
+          str(fake2.pr_labels))
+    check("no premature review", row2["status"] == "running")
+
+
+def test_68_ready_open_pr_no_rework_respawn_guard():
+    print("68. generic READY + OPEN PR without rework evidence -> no edge spawn, active_pr guard intact")
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="open")
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("ready")
+    with connect_closing() as conn:
+        kanban_db.add_comment(
+            conn, tid, "kanban-main",
+            f"PR handoff: https://github.com/{REPO}/pull/{PR_N}")
+    _make_profile_dir()
+    stub = StubSpawn()
+    saved = os.environ.get(mod.REWORK_DISPATCH_ENV)
+    os.environ[mod.REWORK_DISPATCH_ENV] = "1"
+    try:
+        results = run_sync(fake)
+    finally:
+        if saved is None:
+            os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
+        else:
+            os.environ[mod.REWORK_DISPATCH_ENV] = saved
+    check("no spawn", stub.calls == [], str(stub.calls))
+    check("no edge rework dispatch", not [
+        r for r in results
+        if str(r.get("reason", "")).startswith("rework_")
+        or r.get("reason") in ("board_busy", "unassigned")
+        or r.get("reason") == "lifecycle_label_conflict"], str(results))
+    check("task stays ready", task_row(tid)["status"] == "ready")
+    with connect_closing() as conn:
+        guard = kanban_db.check_respawn_guard(conn, tid)
+    check("core active_pr respawn guard intact", guard == "active_pr", str(guard))
+
+
+def test_69_repeated_ticks_idempotent():
+    print("69. repeated reconciliation ticks -> idempotent (no duplicate events/labels/comments)")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivery
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    _close_reviewer_completion(tid)
+    fake.pr_labels[PR_N] = ["agent-working"]
+    run_sync(fake)  # repair tick
+    check("repaired", task_row(tid)["status"] == "review")
+    delivery_count = len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_delivery"
+    ])
+    retry_count = len([
+        e for e in task_events(tid)
+        if e["kind"] in ("github_pr_rework_retry", "github_pr_rework_attention")
+    ])
+    check("one delivery, no retry/attention", delivery_count == 1 and retry_count == 0,
+          str([e["kind"] for e in task_events(tid)]))
+    events_after_repair = len(task_events(tid))
+    patches_after_repair = len(fake.patch_calls)
+    for i in range(3):
+        results = run_sync(fake)
+        check(f"tick {i + 1} no new events",
+              len(task_events(tid)) == events_after_repair, str(results))
+        check(f"tick {i + 1} no label churn",
+              len(fake.patch_calls) == patches_after_repair, str(fake.patch_calls))
+        check(f"tick {i + 1} state stable", task_row(tid)["status"] == "review")
+    check("no duplicate comments", fake.post_calls == [], str(fake.post_calls))
+
+
+def test_70_dry_run_predicts_repair():
+    print("70. dry-run on DONE + OPEN PR + delivered -> repair predicted, no mutation")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0ba3aef2cfdde366257dce4cc1d4033e3dded1ce"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # real delivery first so the head is recorded
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    _close_reviewer_completion(tid)
+    fake.pr_labels[PR_N] = ["agent-working"]
+    events_before = len(task_events(tid))
+    patches_before = len(fake.patch_calls)
+    results = mod.sync_board("default", dry_run=True, client=fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("repair predicted", any(
+        r.get("reason") == "agent_review_ready_predicted"
+        and r.get("repair_predicted") == "done_open_pr_repaired"
+        for r in entries), str(entries))
+    check("dry-run leaves status done", task_row(tid)["status"] == "done",
+          str(task_row(tid)))
+    check("no events written", len(task_events(tid)) == events_before)
+    check("no label mutation", len(fake.patch_calls) == patches_before)
 
 
 def _make_profile_dir() -> Path:
@@ -2081,6 +2374,14 @@ def main() -> int:
         test_60_worker_crash_requeues_rework,
         test_61_lifecycle_label_conflict_skip,
         test_62_merged_pr_done_and_labels_cleared,
+        test_63_reviewer_completes_delivered_card_done_open_pr,
+        test_64_rework_complete_open_pr_review_same_pr,
+        test_65_merged_pr_done_delivered_round,
+        test_66_done_open_pr_stale_working_self_heal,
+        test_67_active_worker_no_premature_transition,
+        test_68_ready_open_pr_no_rework_respawn_guard,
+        test_69_repeated_ticks_idempotent,
+        test_70_dry_run_predicts_repair,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

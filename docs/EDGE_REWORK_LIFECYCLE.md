@@ -43,6 +43,14 @@ Rules:
   and the marker head is not the pre-rework requested head.
 - `agent-review-ready` is **not** Kanban DONE.  DONE only follows a fresh
   GitHub read proving the PR merged into the target branch.
+- Worker completion is never a DONE ground for an OPEN PR.  The core review
+  lane may claim a delivered card (`review -> running`) and a reviewer may
+  complete it (`done`) while the PR is still OPEN; the edge reconciliation
+  repairs `DONE + OPEN PR` back to REVIEW on the next tick (see below).
+- A running claim whose round is ALREADY delivered is the core review lane,
+  never a rework owner: the label projection keeps `agent-review-ready` and
+  never downgrades to `agent-working` (the pre-fix projection re-added
+  `agent-working` on the review claim, regressing the delivered label).
 
 ## Transitions implemented
 
@@ -51,6 +59,8 @@ Rules:
 | `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; claim released + request label kept if the patch fails |
 | `agent-working` maintained | running task with live claim/run | per-tick label projection (idempotent) |
 | `agent-working` → `agent-review-ready` | delivery evidence complete (marker + head + validation) | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
+| `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
+| `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `agent-working` → `agent-rework` (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | task requeued `→ ready`, `github_pr_rework_retry` event, failure counted against `kanban.failure_limit` (circuit breaker preserved) |
 | `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / no run, or worker text asks for human input | labels restored, `HERMES_KANBAN_REWORK_ATTENTION` comment + `github_pr_rework_attention` event (idempotent per round) |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same tick |
@@ -99,11 +109,18 @@ does **not** auto-deploy and does **not** merge itself.
 ## Verification
 
 `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py`
-covers the lifecycle matrix (298 checks): claim transition, claim failure,
+covers the lifecycle matrix (349 checks): claim transition, claim failure,
 duplicate-spawn guards (label + same-PR owner), working-label maintenance,
 local-commit-only, head mismatch, validation incomplete, handoff failure,
-full delivery, worker crash requeue, label conflict skip, merged cleanup, and
-the pre-existing rework/blocked/annotation regressions.
+full delivery, worker crash requeue, label conflict skip, merged cleanup,
+and the pre-existing rework/blocked/annotation regressions.  Tests 63–70
+pin the DONE + OPEN PR invariants: reviewer completion repair (63), rework
+completion → REVIEW on the same PR (64), delivered + merged → DONE (65),
+DONE + OPEN PR + stale `agent-working` self-heal (66, acceptance fixture
+t_560e6a71 / PR #9), live-worker non-transition + post-delivery label
+stability (67), generic READY + OPEN PR keeps the core `active_pr` guard
+(68), repeated-tick idempotency (69), and dry-run repair prediction without
+mutation (70).
 
 Hermes core (`kanban_db.py`, tools, CLI) is untouched; all mutations are edge
 direct-DB writes inside the operator-approved reconciliation scope.
