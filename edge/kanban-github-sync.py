@@ -2551,6 +2551,36 @@ def _reconcile_rework_lifecycle(
 
     active = _task_has_active_rework_claim(conn, row)
     if active:
+        # A running claim whose round is ALREADY delivered is the core
+        # review lane (review -> running claim), never a rework owner:
+        # keep agent-review-ready and never downgrade to agent-working.
+        delivered_head = _latest_delivery_head(conn, task_id)
+        if delivered_head and str(
+            context["pr"].head_sha or ""
+        ).casefold() == delivered_head:
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": "running", "changed": False,
+                    "reason": "agent_review_ready_predicted",
+                    "lifecycle": {"labels": sorted(labels)},
+                }
+            try:
+                _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                    client, ref, int(context["pr_number"]),
+                    add=(REVIEW_READY_LABEL,),
+                    remove=(REWORK_LABEL, WORKING_LABEL),
+                )
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id, "status": "running", "changed": False,
+                    "reason": "review_ready_label_projection_failed",
+                    "error": str(exc),
+                }
+            return {
+                "task_id": task_id, "status": "running", "changed": False,
+                "reason": "agent_review_ready", "label_action": label_reason,
+                "lifecycle": label_evidence,
+            }
         if dry_run:
             return {
                 "task_id": task_id, "status": "running", "changed": False,
@@ -2605,17 +2635,75 @@ def _reconcile_rework_lifecycle(
             }
         if delivered:
             if dry_run:
-                return {
-                    "task_id": task_id, "status": "review", "changed": False,
+                entry: dict[str, Any] = {
+                    "task_id": task_id, "status": status, "changed": False,
                     "reason": "agent_review_ready_predicted", "evidence": evidence,
                 }
+                if status == "done" and decision.desired_status == "review":
+                    # Predict the DONE + OPEN PR repair without mutating.
+                    entry["repair_predicted"] = "done_open_pr_repaired"
+                    entry["status"] = "review"
+                return entry
             existing_head = _latest_delivery_head(conn, task_id)
             if existing_head == str(evidence.get("head") or "").casefold():
-                return {
-                    "task_id": task_id, "status": "review", "changed": False,
-                    "reason": "agent_review_ready",
+                # Worker completion is never a DONE ground for an OPEN PR:
+                # a delivered round whose card was re-completed by the core
+                # review lane is repaired back to REVIEW via the classic
+                # path (assignee/claim/completed_at cleared so the review
+                # lane cannot auto-claim it again).
+                repair: Optional[dict[str, Any]] = None
+                if status == "done" and decision.desired_status == "review":
+                    context_block: Optional[str] = None
+                    try:
+                        context_block = _build_context_block(
+                            client, ref, decision.pull_requests
+                        )
+                    except GithubCompletionError:
+                        context_block = None
+                    with conn:
+                        db_result = apply_decision(
+                            conn, task_id, decision, context_block=context_block,
+                        )
+                    repair = {
+                        "previous_status": "done",
+                        "new_status": str(db_result.get("status") or "review"),
+                        "changed": bool(db_result.get("changed")),
+                        "reason": str(db_result.get("reason") or "linked_pr_open"),
+                    }
+                    entry_status = str(db_result.get("status") or "review")
+                    entry_changed = bool(db_result.get("changed"))
+                else:
+                    entry_status = status
+                    entry_changed = False
+                # Delivered rounds expose agent-review-ready only; a stale
+                # agent-working (post-delivery label regression) is cleaned
+                # here, idempotently.
+                entry = {
+                    "task_id": task_id, "status": entry_status,
+                    "changed": entry_changed, "reason": "agent_review_ready",
                     "evidence": evidence,
                 }
+                if repair is not None:
+                    entry["repair"] = repair
+                if status in {"running", "review", "done"}:
+                    try:
+                        _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                            client, ref, int(context["pr_number"]),
+                            add=(REVIEW_READY_LABEL,),
+                            remove=(REWORK_LABEL, WORKING_LABEL),
+                        )
+                    except GithubCompletionError as exc:
+                        return {
+                            "task_id": task_id,
+                            "status": entry_status,
+                            "changed": entry_changed,
+                            "reason": "review_ready_label_projection_failed",
+                            "error": str(exc),
+                            "evidence": evidence,
+                        }
+                    entry["label_action"] = label_reason
+                    entry["lifecycle"] = label_evidence
+                return entry
             db_result: Optional[dict[str, Any]] = None
             if status in {"ready", "running"}:
                 db_result = _delivery_review_transition(
