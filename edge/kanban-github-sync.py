@@ -1,0 +1,3659 @@
+#!/usr/bin/env python3
+"""GitHub-backed Kanban reconciliation — edge integration (non-core).
+
+Reconciles GitHub Issue intake cards against the authoritative GitHub PR
+state, outside the Hermes core.  The core ``complete_task`` keeps its
+upstream semantics (worker completion == DONE); this script is the only
+writer that may move GitHub-backed cards between ``review`` and ``done``
+based on a fresh GitHub re-query.
+
+State contract (per operator decision):
+  * DONE  + any required PR OPEN (or closed-not-merged)  -> REVIEW
+  * REVIEW + every required PR MERGED into target branch  -> DONE
+  * REVIEW + one-shot agent-rework request (single open PR carrying a
+    trusted ``agent-rework`` label, source Issue open + ``agent-ready``)
+    -> READY: the sync context block is refreshed into the task body and
+    one ``github_pr_rework`` event is recorded.  The rework label remains
+    until the edge dispatcher successfully claims the Kanban task; only
+    then is it atomically replaced by ``agent-working``.  A claim or label
+    mutation failure therefore leaves the request intake-visible.
+  * GitHub lookup failure / ambiguous decision            -> keep state
+  * blocked/triage/todo/scheduled/running/archived/ready  -> never
+    overwritten (REVIEW->READY is the only sync write into ``ready``;
+    an existing ``ready`` is preserved — only stale label removal is
+    retried)
+  * BLOCKED reconciliation (no invisible blocked work — GitHub must
+    stay the durable review surface):
+    - BLOCKED + every required PR merged into target      -> DONE
+    - BLOCKED + exactly one open PR with trusted
+      ``agent-rework`` (Issue open + ``agent-ready``)     -> READY
+      (direct, single tick; rework event; label removed last)
+    - BLOCKED + open non-draft PR (no rework request)     -> REVIEW
+    - BLOCKED + only Draft / closed-unmerged / no PR      -> stays
+      BLOCKED; durable GitHub evidence is enforced: Issue gets the
+      ``agent-blocked`` label and ONE sync-owned marker comment
+      (``<!-- HERMES KANBAN BLOCKER task_id=... -->``), created once
+      and patched in place when the reason changes (never appended)
+    - BLOCKED + no PR + ``agent-blocked`` absent + trusted
+      maintainer reply after the projection               -> READY
+      (``github_blocked_resolved`` exactly once)
+    - BLOCKED + Issue closed                          -> stays BLOCKED
+      with NO projection: a closed Issue never gets the ``agent-blocked``
+      label, a blocker marker comment, or a blocked-resume
+      (``closed_issue_no_projection``); the merged-PR completion
+      precedence still applies
+
+Safety:
+  * Schema compatibility is verified before any write; on mismatch the
+    script fails without touching the DB (survives Hermes updates).
+  * Every transition uses an optimistic ``UPDATE ... WHERE status=?`` and
+    aborts if another actor changed the row first.
+  * No ``complete_task``/hooks are invoked, so no duplicate completion
+    side effects are re-fired.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
+GITHUB_API = "https://api.github.com"
+DEFAULT_TIMEOUT_SECONDS = 30
+_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_PR_URL_RE_TEMPLATE = r"https?://github\.com/{repository}/pull/(\d+)"
+_PROVENANCE_END = "## Canonical Issue body"
+
+# Columns the sync may write. Verified against PRAGMA table_info before use.
+_REQUIRED_TASK_COLUMNS = (
+    "id", "body", "status", "assignee", "completed_at",
+    "claim_lock", "claim_expires", "worker_pid", "block_kind", "block_recurrences",
+    "workspace_path", "branch_name", "skills",
+)
+_EVENT_COLUMNS = ("task_id", "run_id", "kind", "payload", "created_at")
+
+# States reconciliation never overwrites, whatever GitHub says.
+_PRESERVED_STATES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "running", "blocked", "archived"}
+)
+
+# ---------------------------------------------------------------------------
+# agent-rework loop (one-shot rework requests driven by PR labels)
+# ---------------------------------------------------------------------------
+# Trusted GitHub operators whose review/comment text is treated as work
+# instructions (everything else is reference-only, never an instruction).
+TRUSTED_GITHUB_ACTORS = {"rhgo1749"}
+AGENT_READY_LABEL = "agent-ready"
+REWORK_LABEL = "agent-rework"
+WORKING_LABEL = "agent-working"
+REVIEW_READY_LABEL = "agent-review-ready"
+REWORK_COMPLETE_MARKER = "AGENT_REWORK_COMPLETE"
+REWORK_ATTENTION_MARKER = "HERMES_KANBAN_REWORK_ATTENTION"
+
+# Sync-owned body region.  Between these markers the whole block is
+# REPLACED on every refresh — never appended — so the body cannot grow.
+SYNC_CONTEXT_BEGIN = "<!-- BEGIN GITHUB SYNC CONTEXT -->"
+SYNC_CONTEXT_END = "<!-- END GITHUB SYNC CONTEXT -->"
+
+# Bounded context collection: truncated PR body, capped feedback items.
+MAX_PR_BODY_CHARS = 4000
+MAX_ITEM_CHARS = 1500
+MAX_TRUSTED_ITEMS = 10
+MAX_UNTRUSTED_ITEMS = 5
+
+# ---------------------------------------------------------------------------
+# BLOCKED visibility (no invisible blocked work)
+# ---------------------------------------------------------------------------
+BLOCKED_LABEL = "agent-blocked"
+BLOCKER_MARKER_PREFIX = "<!-- HERMES KANBAN BLOCKER task_id="
+BLOCKER_MARKER_SUFFIX = " -->"
+MAX_BLOCKER_REASON_CHARS = 1500
+MAX_ISSUE_RESPONSE_ITEMS = 3
+
+_NEEDS_FROM_MAINTAINER: dict[Optional[str], str] = {
+    None: "A maintainer decision is required.",
+    "needs_input": "A decision or input from the maintainer (reply on this Issue).",
+    "capability": "The required capability or environment access must be provided by the maintainer.",
+    "transient": "Confirm whether the blocking condition has cleared, then unblock.",
+}
+
+
+class SyncError(RuntimeError):
+    """A safe failure: nothing was written, or a transition was refused."""
+
+
+class GithubCompletionError(RuntimeError):
+    """A source-of-truth lookup could not be completed safely."""
+
+
+@dataclass(frozen=True)
+class GithubTaskRef:
+    repository: str
+    issue_number: int
+    target_branch: str = "main"
+    issue_title: str = ""
+
+
+@dataclass(frozen=True)
+class GithubPullRequest:
+    number: int
+    state: str
+    merged: bool
+    base_branch: str
+    html_url: str = ""
+    title: str = ""
+    head_sha: str = ""
+    head_ref: str = ""
+    author: str = ""
+    body: str = ""
+    draft: bool = False
+
+    @property
+    def is_merged_into_target(self) -> bool:
+        return self.merged and self.state == "closed"
+
+
+@dataclass(frozen=True)
+class GithubCompletionDecision:
+    desired_status: Optional[str]
+    reason: str
+    linked_pr_numbers: tuple[int, ...] = ()
+    pull_requests: tuple[GithubPullRequest, ...] = ()
+    error: Optional[str] = None
+
+    @property
+    def authoritative(self) -> bool:
+        return self.error is None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "desired_status": self.desired_status,
+            "reason": self.reason,
+            "linked_pr_numbers": list(self.linked_pr_numbers),
+            "pull_requests": [
+                {
+                    "number": pr.number,
+                    "state": pr.state,
+                    "merged": pr.merged,
+                    "base_branch": pr.base_branch,
+                    "html_url": pr.html_url,
+                    "title": pr.title,
+                }
+                for pr in self.pull_requests
+            ],
+            "error": self.error,
+            "authoritative": self.authoritative,
+        }
+
+
+class GithubApiClient:
+    """Small read-only GitHub REST client (token from environment)."""
+
+    def __init__(self, token: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> None:
+        token = str(token or "").strip()
+        if not token:
+            raise GithubCompletionError("GITHUB_TOKEN/GH_TOKEN is unavailable")
+        self._token = token
+        self._timeout = int(timeout)
+
+    @classmethod
+    def from_environment(cls) -> "GithubApiClient":
+        return cls(os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "")
+
+    def get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> tuple[Any, dict[str, str]]:
+        query = urlencode(dict(params or {}))
+        url = f"{GITHUB_API}{path}"
+        if query:
+            url += f"?{query}"
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-kanban-github-edge-sync",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                headers = {str(k).lower(): str(v) for k, v in response.headers.items()}
+                return payload, headers
+        except HTTPError as exc:
+            raise GithubCompletionError(f"GitHub API {exc.code} for {path}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise GithubCompletionError(
+                f"GitHub API request failed for {path}: {type(exc).__name__}"
+            ) from exc
+
+    def get_paginated(
+        self,
+        path: str,
+        params: Optional[Mapping[str, Any]] = None,
+        *,
+        max_pages: int = 10,
+    ) -> list[Any]:
+        base_params = dict(params or {})
+        page = 1
+        items: list[Any] = []
+        while page <= max_pages:
+            page_params = dict(base_params)
+            page_params["page"] = page
+            payload, headers = self.get(path, page_params)
+            if not isinstance(payload, list):
+                raise GithubCompletionError(f"GitHub returned a non-list response for {path}")
+            items.extend(payload)
+            link = headers.get("link", "")
+            if 'rel="next"' not in link:
+                return items
+            page += 1
+        raise GithubCompletionError(f"GitHub pagination exceeded {max_pages} pages for {path}")
+
+    def delete(self, path: str) -> int:
+        """DELETE with 404 treated as success (resource already gone)."""
+        request = Request(
+            f"{GITHUB_API}{path}",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-kanban-github-edge-sync",
+            },
+            method="DELETE",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                return int(response.status)
+        except HTTPError as exc:
+            if exc.code == 404:
+                return 404
+            raise GithubCompletionError(f"GitHub API {exc.code} for DELETE {path}") from exc
+        except (URLError, TimeoutError) as exc:
+            raise GithubCompletionError(
+                f"GitHub API request failed for DELETE {path}: {type(exc).__name__}"
+            ) from exc
+
+    def _write_json(self, method: str, path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
+        """POST/PATCH returning ``(status, body)``; network errors raise."""
+        request = Request(
+            f"{GITHUB_API}{path}",
+            data=json.dumps(dict(payload)).encode("utf-8"),
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "hermes-kanban-github-edge-sync",
+                "Content-Type": "application/json",
+            },
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                raw = response.read().decode("utf-8")
+                try:
+                    return int(response.status), json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    return int(response.status), None
+        except HTTPError as exc:
+            return int(exc.code), None
+        except (URLError, TimeoutError) as exc:
+            raise GithubCompletionError(
+                f"GitHub API request failed for {method} {path}: {type(exc).__name__}"
+            ) from exc
+
+    def post(self, path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
+        return self._write_json("POST", path, payload)
+
+    def patch(self, path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
+        return self._write_json("PATCH", path, payload)
+
+
+def parse_task_ref(body: Optional[str]) -> Optional[GithubTaskRef]:
+    """Parse only the importer-owned provenance header from a task body.
+
+    The canonical Issue body is untrusted input and can contain text that
+    looks like provenance; it is excluded before parsing.  Legacy intake
+    cards without ``completion contract: github-pr`` are accepted when their
+    provenance contains ``source: github-issue``.
+    """
+    text = str(body or "")
+    provenance = text.split(_PROVENANCE_END, 1)[0]
+    values: dict[str, str] = {}
+    for line in provenance.splitlines():
+        match = re.match(
+            r"^\s*-\s*(source|repository|issue number|issue title|target branch|target_branch|completion contract)\s*:\s*(.*?)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            values[match.group(1).casefold().replace("_", " ")] = match.group(2).strip()
+
+    source = values.get("source", "").casefold()
+    contract = values.get("completion contract", "").casefold()
+    if source != "github-issue" and contract != "github-pr":
+        return None
+    repository = values.get("repository", "").strip()
+    if not _REPOSITORY_RE.fullmatch(repository):
+        return None
+    try:
+        issue_number = int(values.get("issue number", ""))
+    except (TypeError, ValueError):
+        return None
+    if issue_number < 1:
+        return None
+    target_branch = values.get("target branch", "main").strip() or "main"
+    if any(ch.isspace() for ch in target_branch):
+        return None
+    issue_title = values.get("issue title", "").strip()
+    return GithubTaskRef(repository, issue_number, target_branch, issue_title)
+
+
+def is_github_backed_body(body: Optional[str]) -> bool:
+    return parse_task_ref(body) is not None
+
+
+def _pull_url_pattern(repository: str) -> re.Pattern[str]:
+    return re.compile(
+        _PR_URL_RE_TEMPLATE.format(repository=re.escape(repository)),
+        flags=re.IGNORECASE,
+    )
+
+
+def _timeline_pr_numbers(items: Iterable[Any], repository: str) -> set[int]:
+    numbers: set[int] = set()
+    pattern = _pull_url_pattern(repository)
+    for item in items:
+        if not isinstance(item, dict) or item.get("event") != "cross-referenced":
+            continue
+        source = item.get("source")
+        issue = source.get("issue") if isinstance(source, dict) else None
+        if not isinstance(issue, dict) or not issue.get("pull_request"):
+            continue
+        repo_data = issue.get("repository")
+        full_name = repo_data.get("full_name") if isinstance(repo_data, dict) else None
+        if full_name and str(full_name).casefold() != repository.casefold():
+            continue
+        number = issue.get("number")
+        if isinstance(number, int) and number > 0:
+            numbers.add(number)
+            continue
+        match = pattern.search(str(issue.get("html_url", "")))
+        if match:
+            numbers.add(int(match.group(1)))
+    return numbers
+
+
+def discover_linked_pr_numbers(
+    client: Any,
+    ref: GithubTaskRef,
+    text_sources: Iterable[str] = (),
+) -> tuple[int, ...]:
+    """Discover PR identifiers (Issue timeline + handoff text), let GitHub
+    verify every identifier."""
+    timeline = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{ref.issue_number}/timeline",
+        {"per_page": 100},
+    )
+    numbers = _timeline_pr_numbers(timeline, ref.repository)
+    pattern = _pull_url_pattern(ref.repository)
+    for source in text_sources:
+        for match in pattern.finditer(str(source or "")):
+            numbers.add(int(match.group(1)))
+    return tuple(sorted(numbers))
+
+
+def _parse_pull_request(number: int, payload: Any, ref: GithubTaskRef) -> GithubPullRequest:
+    if not isinstance(payload, dict):
+        raise GithubCompletionError(f"GitHub returned an invalid PR response for #{number}")
+    state = str(payload.get("state", "")).casefold()
+    base = payload.get("base")
+    base_branch = str(base.get("ref", "")) if isinstance(base, dict) else ""
+    merged_raw = payload.get("merged")
+    head = payload.get("head")
+    head_sha = str(head.get("sha", "")) if isinstance(head, dict) else ""
+    draft_raw = payload.get("draft")
+    if (
+        state not in {"open", "closed"}
+        or not isinstance(merged_raw, bool)
+        or not isinstance(draft_raw, bool)
+        or not base_branch
+        or not head_sha
+    ):
+        raise GithubCompletionError(f"GitHub returned incomplete PR data for #{number}")
+    merged = bool(merged_raw and base_branch == ref.target_branch)
+    user = payload.get("user")
+    return GithubPullRequest(
+        number=number,
+        state=state,
+        merged=merged,
+        base_branch=base_branch,
+        html_url=str(payload.get("html_url", "")),
+        title=str(payload.get("title", "")),
+        head_sha=head_sha,
+        head_ref=str(head.get("ref", "")) if isinstance(head, dict) else "",
+        author=str(user.get("login", "")) if isinstance(user, dict) else "",
+        body=str(payload.get("body") or ""),
+        draft=bool(draft_raw),
+    )
+
+
+def evaluate_completion(
+    ref: GithubTaskRef,
+    pull_requests: Iterable[GithubPullRequest],
+    *,
+    linked_pr_numbers: Optional[Iterable[int]] = None,
+) -> GithubCompletionDecision:
+    prs = tuple(sorted(pull_requests, key=lambda item: item.number))
+    numbers = tuple(
+        sorted(
+            set(int(number) for number in (linked_pr_numbers or ()))
+            | {pr.number for pr in prs}
+        )
+    )
+    if not prs:
+        return GithubCompletionDecision(
+            desired_status="review",
+            reason="no_linked_pr",
+            linked_pr_numbers=numbers,
+            pull_requests=prs,
+        )
+    if all(
+        pr.is_merged_into_target and pr.base_branch == ref.target_branch
+        for pr in prs
+    ):
+        return GithubCompletionDecision(
+            desired_status="done",
+            reason="all_linked_prs_merged",
+            linked_pr_numbers=numbers,
+            pull_requests=prs,
+        )
+    if any(pr.state == "open" for pr in prs):
+        reason = "linked_pr_open"
+    elif any(
+        pr.state == "closed"
+        and (not pr.merged or pr.base_branch != ref.target_branch)
+        for pr in prs
+    ):
+        reason = "linked_pr_closed_not_merged"
+    else:
+        reason = "linked_pr_not_merged"
+    return GithubCompletionDecision(
+        desired_status="review",
+        reason=reason,
+        linked_pr_numbers=numbers,
+        pull_requests=prs,
+    )
+
+
+def verify_completion(
+    client: Any,
+    ref: GithubTaskRef,
+    text_sources: Iterable[str] = (),
+) -> GithubCompletionDecision:
+    """Re-query the Issue links and each linked PR; fail closed on errors."""
+    try:
+        numbers = discover_linked_pr_numbers(client, ref, text_sources)
+        pull_requests = tuple(
+            _parse_pull_request(
+                number,
+                client.get(f"/repos/{ref.repository}/pulls/{number}")[0],
+                ref,
+            )
+            for number in numbers
+        )
+        return evaluate_completion(ref, pull_requests, linked_pr_numbers=numbers)
+    except GithubCompletionError as exc:
+        return GithubCompletionDecision(
+            desired_status=None,
+            reason="github_query_failed",
+            error=str(exc),
+        )
+
+
+# ---------------------------------------------------------------------------
+# agent-rework evaluation (label trust + one-shot semantics + context)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReworkDecision:
+    reason: str
+    pr_number: Optional[int] = None
+    head_sha: str = ""
+    request_comment_id: Optional[int] = None
+    context_block: str = ""
+    label_present: bool = False
+    label_added_at: Optional[int] = None
+    label_actor: str = ""
+    authoritative: bool = True
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "pr_number": self.pr_number,
+            "head_sha": self.head_sha,
+            "request_comment_id": self.request_comment_id,
+            "label_present": self.label_present,
+            "label_added_at": self.label_added_at,
+            "label_actor": self.label_actor,
+            "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
+            "authoritative": self.authoritative,
+            "error": self.error,
+        }
+
+
+def _parse_iso_ts(value: Any) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp())
+
+
+def _labeled_events(client: Any, ref: GithubTaskRef, pr_number: int) -> list[tuple[int, str]]:
+    """Return [(added_at_epoch, actor)] for ``agent-rework`` label additions."""
+    items = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr_number}/timeline",
+        {"per_page": 100},
+    )
+    events: list[tuple[int, str]] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("event") != "labeled":
+            continue
+        label = item.get("label")
+        if not isinstance(label, dict) or str(label.get("name")) != REWORK_LABEL:
+            continue
+        ts = _parse_iso_ts(item.get("created_at"))
+        actor = str((item.get("actor") or {}).get("login") or "")
+        if ts is not None:
+            events.append((ts, actor))
+    return events
+
+
+def _rework_request_comment_id(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    label_added_at: int,
+) -> Optional[int]:
+    """Return the newest trusted PR comment before the rework label."""
+    comments = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr_number}/comments",
+        {"per_page": 100},
+    )
+    candidates: list[tuple[str, int]] = []
+    for item in comments:
+        if not isinstance(item, dict):
+            continue
+        author = str((item.get("user") or {}).get("login") or "")
+        comment_id = item.get("id")
+        if author not in TRUSTED_GITHUB_ACTORS or not isinstance(comment_id, int):
+            continue
+        created_at = _parse_iso_ts(item.get("created_at"))
+        if created_at is None or created_at > label_added_at:
+            continue
+        candidates.append((str(item.get("created_at") or ""), comment_id))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def evaluate_rework(
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    *,
+    current_status: str,
+    last_rework_at: Optional[int],
+) -> Optional[ReworkDecision]:
+    """Evaluate the one-shot agent-rework request.
+
+    Returns ``None`` when no open linked PR carries ``agent-rework``.
+    A ``ReworkDecision`` with ``reason == "agent_rework"`` means the
+    REVIEW -> READY transition is authorised.  Raises
+    ``GithubCompletionError`` on any GitHub lookup failure (fail-closed).
+    """
+    if current_status not in {"review", "ready", "blocked"}:
+        return None
+    open_prs = [pr for pr in decision.pull_requests if pr.state == "open"]
+    if not open_prs:
+        return None
+    rework_prs: list[GithubPullRequest] = []
+    for pr in open_prs:
+        labels, _ = client.get(f"/repos/{ref.repository}/issues/{pr.number}/labels")
+        names = {str(item.get("name")) for item in labels if isinstance(item, dict)}
+        if REWORK_LABEL in names:
+            rework_prs.append(pr)
+    if not rework_prs:
+        return None
+    if len(rework_prs) > 1:
+        return ReworkDecision(reason="multiple_rework_prs", label_present=True)
+    pr = rework_prs[0]
+    events = _labeled_events(client, ref, pr.number)
+    if not events:
+        # Label present without any labeled event: data anomaly — do nothing.
+        return ReworkDecision(reason="rework_label_event_missing", pr_number=pr.number, label_present=True)
+    label_added_at, label_actor = max(events, key=lambda item: item[0])
+    request_comment_id = _rework_request_comment_id(
+        client, ref, pr.number, label_added_at
+    )
+    if label_actor not in TRUSTED_GITHUB_ACTORS:
+        return ReworkDecision(
+            reason="untrusted_rework_label_actor",
+            pr_number=pr.number,
+            head_sha=pr.head_sha,
+            request_comment_id=request_comment_id,
+            label_present=True,
+            label_added_at=label_added_at,
+            label_actor=label_actor,
+        )
+    if last_rework_at is not None and label_added_at <= last_rework_at:
+        # The request remains visible until the dispatcher has claimed the
+        # Kanban task.  Do not remove it merely because the DB event exists.
+        return ReworkDecision(
+            reason="rework_claim_pending",
+            pr_number=pr.number,
+            head_sha=pr.head_sha,
+            request_comment_id=request_comment_id,
+            label_present=True,
+            label_added_at=label_added_at,
+            label_actor=label_actor,
+        )
+    issue_payload, _ = client.get(f"/repos/{ref.repository}/issues/{ref.issue_number}")
+    if not isinstance(issue_payload, dict):
+        raise GithubCompletionError(f"GitHub returned an invalid issue response for #{ref.issue_number}")
+    issue_state = str(issue_payload.get("state", "")).casefold()
+    issue_labels = {str(item.get("name")) for item in issue_payload.get("labels", []) if isinstance(item, dict)}
+    if issue_state != "open" or AGENT_READY_LABEL not in issue_labels:
+        return ReworkDecision(
+            reason="issue_not_agent_ready",
+            pr_number=pr.number,
+            head_sha=pr.head_sha,
+            request_comment_id=request_comment_id,
+            label_present=True,
+            label_added_at=label_added_at,
+            label_actor=label_actor,
+        )
+    context_block = _build_context_block(client, ref, decision.pull_requests, rework_pr_number=pr.number)
+    return ReworkDecision(
+        reason="agent_rework",
+        pr_number=pr.number,
+        head_sha=pr.head_sha,
+        request_comment_id=request_comment_id,
+        context_block=context_block,
+        label_present=True,
+        label_added_at=label_added_at,
+        label_actor=label_actor,
+    )
+
+
+def _collect_pr_context(client: Any, ref: GithubTaskRef, pr: GithubPullRequest) -> dict[str, Any]:
+    return {
+        "reviews": client.get_paginated(
+            f"/repos/{ref.repository}/pulls/{pr.number}/reviews", {"per_page": 100}
+        ),
+        "review_comments": client.get_paginated(
+            f"/repos/{ref.repository}/pulls/{pr.number}/comments", {"per_page": 100}
+        ),
+        "issue_comments": client.get_paginated(
+            f"/repos/{ref.repository}/issues/{pr.number}/comments", {"per_page": 100}
+        ),
+    }
+
+
+def _build_context_block(
+    client: Any,
+    ref: GithubTaskRef,
+    pull_requests: Iterable[GithubPullRequest],
+    *,
+    rework_pr_number: Optional[int] = None,
+) -> str:
+    prs = tuple(pull_requests)
+    contexts = {pr.number: _collect_pr_context(client, ref, pr) for pr in prs}
+    return _render_sync_context(ref, prs, contexts, rework_pr_number=rework_pr_number)
+
+
+def _truncate(text: Any, limit: int) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "\n…[truncated]"
+
+
+def _feedback_items(
+    context: Mapping[str, Any],
+    *,
+    trusted: bool,
+) -> list[tuple[str, str, str, str]]:
+    """Return (when, author, kind, body) items, newest-last sorting later."""
+    items: list[tuple[str, str, str, str]] = []
+    for review in context.get("reviews", []):
+        if not isinstance(review, dict):
+            continue
+        state = str(review.get("state") or "").upper()
+        if state in {"PENDING", "DISMISSED"}:
+            continue
+        author = str((review.get("user") or {}).get("login") or "unknown")
+        if (author in TRUSTED_GITHUB_ACTORS) != trusted:
+            continue
+        body = str(review.get("body") or "").strip() or f"(review {state}, no body)"
+        items.append((str(review.get("submitted_at") or ""), author, f"review {state}", body))
+    for comment in context.get("review_comments", []):
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "unknown")
+        if (author in TRUSTED_GITHUB_ACTORS) != trusted:
+            continue
+        body = str(comment.get("body") or "").strip()
+        if not body:
+            continue
+        path = str(comment.get("path") or "")
+        line = comment.get("line") or comment.get("original_line") or ""
+        loc = f"{path}:{line}" if path else ""
+        kind = f"comment {loc}".strip()
+        items.append((str(comment.get("created_at") or ""), author, kind, body))
+    for comment in context.get("issue_comments", []):
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "unknown")
+        if (author in TRUSTED_GITHUB_ACTORS) != trusted:
+            continue
+        body = str(comment.get("body") or "").strip()
+        if not body:
+            continue
+        items.append((str(comment.get("created_at") or ""), author, "PR comment", body))
+    return items
+
+
+def _render_feedback_section(
+    items: list[tuple[str, str, str, str]], limit: int
+) -> list[str]:
+    ordered = sorted(items, key=lambda item: item[0], reverse=True)
+    lines: list[str] = []
+    for when, author, kind, body in ordered[:limit]:
+        lines.append(f"- {author} ({kind}, {when}): {_truncate(body, MAX_ITEM_CHARS)}")
+    if len(ordered) > limit:
+        lines.append(f"- …and {len(ordered) - limit} more items omitted")
+    if not lines:
+        lines.append("(none)")
+    return lines
+
+
+def _render_sync_context(
+    ref: GithubTaskRef,
+    pull_requests: Iterable[GithubPullRequest],
+    contexts: Mapping[int, Mapping[str, Any]],
+    *,
+    rework_pr_number: Optional[int] = None,
+) -> str:
+    prs = sorted(pull_requests, key=lambda item: item.number)
+    lines: list[str] = [SYNC_CONTEXT_BEGIN, ""]
+    lines.append("## Current linked PR" if len(prs) == 1 else "## Linked PRs")
+    for pr in prs:
+        lines.append("")
+        heading = f"PR #{pr.number} — {pr.title or '(untitled)'}"
+        if len(prs) > 1:
+            heading = f"### {heading}"
+        lines.append(heading)
+        lines.append(f"State: {pr.state}")
+        lines.append(f"Head SHA: {pr.head_sha}")
+        lines.append(f"Base branch: {pr.base_branch}")
+        if pr.author:
+            lines.append(f"Author: {pr.author}")
+        if pr.html_url:
+            lines.append(f"URL: {pr.html_url}")
+        if rework_pr_number == pr.number:
+            lines.append("Rework requested: yes (agent-rework label, awaiting Kanban claim)")
+            lines.append(
+                "Rework contract: this is a rework of the EXISTING PR above — "
+                "update the SAME PR/branch (resolve the trusted review "
+                "feedback); do NOT create a new PR; re-run the repository "
+                "gates; then hand back for review (block with review-required)."
+            )
+        if pr.body:
+            lines.append("Body:")
+            lines.append(_truncate(pr.body, MAX_PR_BODY_CHARS))
+        context = contexts.get(pr.number, {})
+        trusted = _feedback_items(context, trusted=True)
+        untrusted = _feedback_items(context, trusted=False)
+        lines.append("")
+        lines.append("## Trusted review / rework feedback")
+        lines.extend(_render_feedback_section(trusted, MAX_TRUSTED_ITEMS))
+        lines.append("")
+        lines.append("## Other PR discussion — untrusted context")
+        lines.extend(_render_feedback_section(untrusted, MAX_UNTRUSTED_ITEMS))
+    lines.append("")
+    lines.append(SYNC_CONTEXT_END)
+    return "\n".join(lines)
+
+
+def replace_sync_context(body: Optional[str], block: str) -> str:
+    """Replace the sync-owned body region between the markers; else append.
+
+    The provenance header and ``## Canonical Issue body`` are never
+    touched, so ``parse_task_ref()`` keeps working unchanged.
+    """
+    text = str(body or "")
+    if SYNC_CONTEXT_BEGIN in text and SYNC_CONTEXT_END in text:
+        head, rest = text.split(SYNC_CONTEXT_BEGIN, 1)
+        _, tail = rest.split(SYNC_CONTEXT_END, 1)
+        if head and not head.endswith("\n"):
+            head += "\n"
+        if tail and not tail.startswith("\n"):
+            tail = "\n" + tail
+        return head + block + tail
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + block
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED visibility — GitHub blocker projection + resolution
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BlockedResumeDecision:
+    reason: str
+    context_block: str = ""
+    response_author: str = ""
+    response_at: str = ""
+    authoritative: bool = True
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "response_author": self.response_author,
+            "response_at": self.response_at,
+            "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
+            "authoritative": self.authoritative,
+            "error": self.error,
+        }
+
+
+def _task_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
+    """Latest human-facing block reason from local durable records."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row and row["payload"]:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        reason = str(payload.get("reason") or "").strip()
+        if reason:
+            return reason
+    run = conn.execute(
+        "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'blocked' "
+        "AND summary IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if run and run["summary"]:
+        return str(run["summary"]).strip()
+    return "The task is blocked pending maintainer input (no reason recorded)."
+
+
+def _blocker_comment_body(task_id: str, reason: str, needs: str, *, no_pr: bool) -> str:
+    lines = [
+        f"{BLOCKER_MARKER_PREFIX}{task_id}{BLOCKER_MARKER_SUFFIX}",
+        "",
+        "🤖 Hermes blocked",
+        "",
+        f"Kanban task: `{task_id}`",
+        "",
+        "Reason:",
+        _truncate(reason, MAX_BLOCKER_REASON_CHARS),
+        "",
+        "Needs from maintainer:",
+        needs,
+    ]
+    if no_pr:
+        lines += ["", "No reviewable pull request is currently available."]
+    lines += ["", "This comment is maintained by the Hermes GitHub reconciliation layer."]
+    return "\n".join(lines)
+
+
+def _resume_consumed_comment_body(
+    task_id: str, response_at: str, response_author: str
+) -> str:
+    """Marker body for a one-shot-consumed resume (worker crash after unblock).
+
+    Keeps the GitHub Issue surface visible: the maintainer can see the
+    task WAS unblocked, that the worker crashed, and that a NEW comment
+    is required to resume.  Reuses the marker prefix so the projection
+    finder still recognises the comment.
+    """
+    lines = [
+        f"{BLOCKER_MARKER_PREFIX}{task_id}{BLOCKER_MARKER_SUFFIX}",
+        "",
+        "🤖 Hermes blocked (resume consumed)",
+        "",
+        f"Kanban task: `{task_id}`",
+        "",
+        f"Maintainer response ({response_author}, {response_at}) already unblocked "
+        "this task once, but the worker crashed before completing the work. "
+        "The same response is consumed and will not re-fire automatically.",
+        "",
+        "Needs from maintainer: post a NEW comment on the Issue to resume this "
+        "task once.",
+        "",
+        "No reviewable pull request is currently available.",
+        "",
+        "This comment is maintained by the Hermes GitHub reconciliation layer.",
+    ]
+    return "\n".join(lines)
+
+
+def _find_blocker_marker(comments: Iterable[Any], task_id: str) -> Optional[dict[str, Any]]:
+    marker = f"{BLOCKER_MARKER_PREFIX}{task_id}{BLOCKER_MARKER_SUFFIX}"
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        if marker in str(comment.get("body") or ""):
+            return comment
+    return None
+
+
+def _trusted_response_after(
+    comments: Iterable[Any], baseline_iso: str
+) -> Optional[dict[str, Any]]:
+    """Newest trusted-actor Issue comment created after the projection baseline."""
+    best: Optional[dict[str, Any]] = None
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "")
+        created = str(comment.get("created_at") or "")
+        body = str(comment.get("body") or "").strip()
+        if author not in TRUSTED_GITHUB_ACTORS or not body:
+            continue
+        if baseline_iso and created <= baseline_iso:
+            continue
+        if best is None or created > str(best.get("created_at") or ""):
+            best = comment
+    return best
+
+
+def _render_issue_resolve_context(
+    comments: Iterable[Any], baseline_iso: str
+) -> str:
+    """Sync-owned context for an Issue-only blocker resolution (bounded)."""
+    trusted: list[dict[str, Any]] = []
+    untrusted: list[dict[str, Any]] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "")
+        created = str(comment.get("created_at") or "")
+        body = str(comment.get("body") or "").strip()
+        if not body or (baseline_iso and created <= baseline_iso):
+            continue
+        (trusted if author in TRUSTED_GITHUB_ACTORS else untrusted).append(comment)
+    trusted.sort(key=lambda c: str(c.get("created_at") or ""), reverse=True)
+    untrusted.sort(key=lambda c: str(c.get("created_at") or ""), reverse=True)
+    lines = [SYNC_CONTEXT_BEGIN, "", "## Issue blocker resolution", ""]
+    for comment in trusted[:MAX_ISSUE_RESPONSE_ITEMS]:
+        author = str((comment.get("user") or {}).get("login") or "unknown")
+        created = str(comment.get("created_at") or "")
+        lines.append(
+            f"- {author} ({created}): {_truncate(comment.get('body'), MAX_ITEM_CHARS)}"
+        )
+    if not trusted:
+        lines.append("(none)")
+    lines += ["", "## Issue discussion — untrusted context (reference only)"]
+    for comment in untrusted[:MAX_ISSUE_RESPONSE_ITEMS]:
+        author = str((comment.get("user") or {}).get("login") or "unknown")
+        created = str(comment.get("created_at") or "")
+        lines.append(
+            f"- {author} ({created}): {_truncate(comment.get('body'), MAX_ITEM_CHARS)}"
+        )
+    if not untrusted:
+        lines.append("(none)")
+    lines += ["", SYNC_CONTEXT_END]
+    return "\n".join(lines)
+
+
+def evaluate_blocked_resume(
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    *,
+    marker_comment: Optional[dict[str, Any]],
+    issue_payload: Mapping[str, Any],
+    issue_comments: Iterable[Any],
+    last_resume_response_at: str = "",
+) -> BlockedResumeDecision:
+    """Authorise the no-PR BLOCKED -> READY resume (#7 conditions).
+
+    Resume requires: no linked PR, Issue open + ``agent-ready``,
+    ``agent-blocked`` absent, and a trusted maintainer Issue comment
+    created after the blocker projection baseline.  Anything else fails
+    closed (stays BLOCKED).
+
+    One-shot guard: a trusted response whose ``created_at`` equals the
+    last consumed ``github_blocked_resolved`` event's ``response_at``
+    must NOT re-authorise a resume (worker crash -> give_up -> BLOCKED
+    would otherwise re-fire the same transition every tick).  Only a NEW
+    trusted response re-enables the resume.
+    """
+    if decision.pull_requests:
+        return BlockedResumeDecision(reason="linked_pr_present")
+    if marker_comment is None:
+        return BlockedResumeDecision(reason="no_projection_baseline")
+    issue_state = str(issue_payload.get("state", "")).casefold()
+    issue_labels = {
+        str(item.get("name"))
+        for item in issue_payload.get("labels", [])
+        if isinstance(item, dict)
+    }
+    if issue_state != "open" or AGENT_READY_LABEL not in issue_labels:
+        return BlockedResumeDecision(reason="issue_not_ready")
+    if BLOCKED_LABEL in issue_labels:
+        return BlockedResumeDecision(reason="agent_blocked_label_present")
+    baseline = str(marker_comment.get("updated_at") or marker_comment.get("created_at") or "")
+    response = _trusted_response_after(issue_comments, baseline)
+    if response is None:
+        return BlockedResumeDecision(reason="no_trusted_response")
+    response_at = str(response.get("created_at") or "")
+    if last_resume_response_at and response_at == last_resume_response_at:
+        return BlockedResumeDecision(
+            reason="resume_consumed",
+            response_author=str((response.get("user") or {}).get("login") or ""),
+            response_at=response_at,
+        )
+    context_block = _render_issue_resolve_context(issue_comments, baseline)
+    return BlockedResumeDecision(
+        reason="agent_blocked_resolved",
+        context_block=context_block,
+        response_author=str((response.get("user") or {}).get("login") or ""),
+        response_at=response_at,
+    )
+
+
+def _add_label(
+    client: Any,
+    repository: str,
+    number: int,
+    label_name: str,
+) -> None:
+    """Add a label to an Issue/PR, creating the repo label if required.
+
+    Fail-closed and idempotent under the 422 label-create race: a failed
+    create is re-checked against the repo label list (another actor may
+    have won the race between our GET and POST) before raising; any
+    residual failure raises and is retried on the next tick.
+    """
+
+    def _repo_has_label() -> bool:
+        labels, _ = client.get(f"/repos/{repository}/labels", {"per_page": 100})
+        if not isinstance(labels, list):
+            raise GithubCompletionError("invalid repo labels payload")
+        return any(
+            str(item.get("name")) == label_name
+            for item in labels
+            if isinstance(item, dict)
+        )
+
+    def _add_to_issue() -> tuple[int, Any]:
+        return client.post(
+            f"/repos/{repository}/issues/{number}/labels",
+            {"labels": [label_name]},
+        )
+
+    status, _ = _add_to_issue()
+    if 200 <= status < 300:
+        return
+    if status not in (404, 422):
+        raise GithubCompletionError(
+            f"could not add label {label_name} to issue (HTTP {status})"
+        )
+    if not _repo_has_label():
+        create_status, _ = client.post(
+            f"/repos/{repository}/labels",
+            {
+                "name": label_name,
+                "color": "b60205",
+                "description": "Hermes Kanban task is blocked; resolution is tracked in the linked issue comment.",
+            },
+        )
+        if not (200 <= create_status < 300):
+            # Race: someone else created the label between our GET and
+            # POST.  Re-check once; if it now exists, proceed to the
+            # issue-label add, otherwise fail closed for the next tick.
+            if create_status in (404, 422) and _repo_has_label():
+                pass
+            else:
+                raise GithubCompletionError(
+                    f"could not create label {label_name} (HTTP {create_status})"
+                )
+    status, _ = _add_to_issue()
+    if not (200 <= status < 300):
+        raise GithubCompletionError(
+            f"could not add label {label_name} to issue (HTTP {status})"
+        )
+
+
+def _add_issue_label(client: Any, ref: GithubTaskRef, label_name: str) -> None:
+    _add_label(client, ref.repository, ref.issue_number, label_name)
+
+
+def _remove_label(
+    client: Any,
+    repository: str,
+    number: int,
+    label_name: str,
+) -> int:
+    """Remove a label from an Issue/PR; a missing label is already success."""
+    return client.delete(
+        f"/repos/{repository}/issues/{number}/labels/{label_name}"
+    )
+
+
+def _pr_labels(client: Any, repository: str, pr_number: int) -> set[str]:
+    labels, _ = client.get(f"/repos/{repository}/issues/{pr_number}/labels")
+    if not isinstance(labels, list):
+        raise GithubCompletionError(
+            f"GitHub returned invalid labels for {repository}#{pr_number}"
+        )
+    return {
+        str(item.get("name"))
+        for item in labels
+        if isinstance(item, dict) and item.get("name")
+    }
+
+
+def _remove_pr_label(client: Any, ref: GithubTaskRef, pr_number: int, label: str) -> int:
+    return _remove_label(client, ref.repository, pr_number, label)
+
+
+def _upsert_blocker_comment(
+    client: Any, ref: GithubTaskRef, task_id: str, body: str
+) -> tuple[str, Optional[int]]:
+    """Create the marker comment or patch it in place; never append a second."""
+    comments, _ = client.get(
+        f"/repos/{ref.repository}/issues/{ref.issue_number}/comments"
+    )
+    marker = _find_blocker_marker(comments, task_id)
+    if marker is None:
+        status, payload = client.post(
+            f"/repos/{ref.repository}/issues/{ref.issue_number}/comments",
+            {"body": body},
+        )
+        if not (200 <= status < 300):
+            raise GithubCompletionError(
+                f"could not create blocker comment (HTTP {status})"
+            )
+        comment_id = payload.get("id") if isinstance(payload, dict) else None
+        return "created", int(comment_id) if comment_id is not None else None
+    if str(marker.get("body") or "") == body:
+        return "unchanged", int(marker["id"]) if marker.get("id") is not None else None
+    status, payload = client.patch(
+        f"/repos/{ref.repository}/issues/comments/{marker['id']}",
+        {"body": body},
+    )
+    if not (200 <= status < 300):
+        raise GithubCompletionError(
+            f"could not update blocker comment (HTTP {status})"
+        )
+    return "updated", int(marker["id"]) if marker.get("id") is not None else None
+
+
+def _linked_pr_evidence(client: Any, ref: GithubTaskRef, pull_requests: Iterable[GithubPullRequest]) -> bool:
+    """GitHub-visible blocker evidence on linked PRs: agent-rework label or
+    trusted-actor content on an open/draft PR (a blocker handoff)."""
+    for pr in pull_requests:
+        labels, _ = client.get(f"/repos/{ref.repository}/issues/{pr.number}/labels")
+        names = {str(item.get("name")) for item in labels if isinstance(item, dict)}
+        if REWORK_LABEL in names:
+            return True
+        if pr.state != "open" and not pr.draft:
+            continue
+        context = _collect_pr_context(client, ref, pr)
+        if _feedback_items(context, trusted=True):
+            return True
+    return False
+
+
+def _append_blocked_projection_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    ref: GithubTaskRef,
+    block_kind: Optional[str],
+    action: str,
+    comment_id: Optional[int],
+) -> None:
+    payload = {
+        "previous_status": "blocked",
+        "new_status": "blocked",
+        "repository": ref.repository,
+        "issue_number": ref.issue_number,
+        "task_id": task_id,
+        "reason": "blocker_projection",
+        "action": action,
+        "comment_id": comment_id,
+        "block_kind": block_kind,
+        "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
+        "merge_authority": "human",
+        "auto_merge": False,
+        "source": "github",
+    }
+    _append_sync_event(conn, task_id, payload, kind="github_blocked_projection")
+
+
+def apply_blocked_resume(
+    conn: sqlite3.Connection,
+    task_id: str,
+    resume: BlockedResumeDecision,
+    ref: GithubTaskRef,
+) -> dict[str, Any]:
+    """BLOCKED -> READY with the hydrated Issue response; one event.
+
+    Optimistic (``WHERE status = 'blocked'``); body update and the
+    ``github_blocked_resolved`` event share the transaction.
+    """
+    row = conn.execute(
+        "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "changed": False, "reason": "task_missing"}
+    current_status = str(row["status"])
+    if current_status != "blocked":
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+    new_body = replace_sync_context(row["body"], resume.context_block)
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'ready',
+               completed_at = NULL,
+               assignee = NULL,
+               claim_lock = NULL,
+               claim_expires = NULL,
+               worker_pid = NULL,
+               block_kind = NULL,
+               block_recurrences = 0,
+               body = ?
+         WHERE id = ? AND status = 'blocked'
+        """,
+        (new_body, task_id),
+    )
+    if cur.rowcount != 1:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+    payload = {
+        "previous_status": "blocked",
+        "new_status": "ready",
+        "repository": ref.repository,
+        "issue_number": ref.issue_number,
+        "task_id": task_id,
+        "reason": "agent_blocked_resolved",
+        "response_author": resume.response_author,
+        "response_at": resume.response_at,
+        "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
+        "merge_authority": "human",
+        "auto_merge": False,
+        "source": "github",
+    }
+    _append_sync_event(conn, task_id, payload, kind="github_blocked_resolved")
+    return {
+        "task_id": task_id,
+        "status": "ready",
+        "changed": True,
+        "reason": "agent_blocked_resolved",
+        "resume": resume.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Kanban DB layer (edge only — direct transactional writes, approved scope)
+# ---------------------------------------------------------------------------
+
+def _hermes_home() -> Path:
+    return Path(
+        os.environ.get("HERMES_KANBAN_INTAKE_HOME")
+        or os.environ.get("HERMES_HOME")
+        or DEFAULT_HERMES_HOME
+    )
+
+
+def _import_kanban_db():
+    """Import the kanban core DB module.  A Hermes update that breaks the
+    import must fail loudly before any write, never silently."""
+    try:
+        from hermes_cli import kanban_db  # type: ignore
+        return kanban_db
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise SyncError(
+            "hermes_cli.kanban_db is not importable from this interpreter "
+            f"({sys.executable}): {exc}. Run with the Hermes venv python "
+            "(e.g. /ws/hermes-agent/venv/bin/python3) or fix the environment."
+        ) from exc
+
+
+def verify_schema(conn: sqlite3.Connection, kanban_db: Any) -> None:
+    """Fail-closed schema compatibility check.  No write may happen after a
+    mismatch — callers must abort the whole run."""
+    problems: list[str] = []
+
+    valid_statuses = getattr(kanban_db, "VALID_STATUSES", None)
+    if valid_statuses is None or "review" not in set(valid_statuses):
+        problems.append(
+            "kanban_db.VALID_STATUSES is missing or does not contain 'review' "
+            "(Hermes status model changed?)"
+        )
+
+    task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    for column in _REQUIRED_TASK_COLUMNS:
+        if column not in task_cols:
+            problems.append(f"tasks.{column} column missing (schema changed?)")
+
+    event_cols = {row[1] for row in conn.execute("PRAGMA table_info(task_events)")}
+    for column in _EVENT_COLUMNS:
+        if column not in event_cols:
+            problems.append(f"task_events.{column} column missing (schema changed?)")
+
+    if problems:
+        raise SyncError("schema compatibility check failed: " + "; ".join(problems))
+
+
+def _append_sync_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict[str, Any],
+    *,
+    kind: str = "github_pr_sync",
+    event_table: str = "task_events",
+    created_at: Optional[int] = None,
+) -> None:
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    conn.execute(
+        f"INSERT INTO {event_table} (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, NULL, ?, ?, ?)",
+        (task_id, kind, json.dumps(payload, ensure_ascii=False, sort_keys=True), timestamp),
+    )
+
+
+def _last_resume_response_at(conn: sqlite3.Connection, task_id: str) -> str:
+    """``response_at`` of the newest consumed ``github_blocked_resolved`` event.
+
+    One-shot resume guard: a trusted Issue response whose ``created_at``
+    matches this value has already been consumed and must not re-authorise
+    a BLOCKED -> READY transition after a worker crash.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'github_blocked_resolved' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return ""
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return ""
+    return str(payload.get("response_at") or "")
+
+
+def apply_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    decision: GithubCompletionDecision,
+    *,
+    context_block: Optional[str] = None,
+    allow_blocked_source: bool = False,
+) -> dict[str, Any]:
+    """One optimistic transition for one card.  Raises SyncError on refusal;
+    returns the result dict otherwise.  The caller owns the transaction.
+
+    ``context_block`` (only meaningful for DONE -> REVIEW) refreshes the
+    sync-owned body region in the same transaction; the transition is
+    never blocked by a missing context block.
+
+    ``allow_blocked_source`` lets the BLOCKED reconciliation reuse this
+    canonical transition path (BLOCKED -> REVIEW / BLOCKED -> DONE) with
+    the same stale blocker/claim/run cleanup; the preserved-state guard
+    is skipped only for ``blocked``.
+    """
+    row = conn.execute(
+        "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "changed": False, "reason": "task_missing"}
+    current_status = str(row["status"])
+    if not is_github_backed_body(row["body"]):
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "not_github_backed",
+        }
+    if not decision.authoritative:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": decision.reason,
+            "error": decision.error,
+        }
+    desired = decision.desired_status
+    if desired not in {"review", "done"}:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "invalid_sync_decision",
+        }
+
+    evidence = decision.to_dict()
+    if current_status == desired:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": decision.reason,
+            "sync_action": "idempotent",
+            "evidence": evidence,
+        }
+    if current_status in _PRESERVED_STATES and not (
+        allow_blocked_source and current_status == "blocked"
+    ):
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "state_preserved",
+            "evidence": evidence,
+        }
+
+    now = int(time.time())
+    if desired == "review":
+        # DONE -> REVIEW (required PR open / closed-not-merged).
+        new_body = row["body"]
+        if context_block is not None:
+            new_body = replace_sync_context(row["body"], context_block)
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'review',
+                   completed_at = NULL,
+                   assignee = NULL,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = NULL,
+                   block_recurrences = 0,
+                   body = ?
+             WHERE id = ? AND status = ?
+            """,
+            (new_body, task_id, current_status),
+        )
+    else:
+        # REVIEW -> DONE (every required PR merged into target branch).
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'done',
+                   completed_at = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = NULL,
+                   block_recurrences = 0
+             WHERE id = ? AND status = ?
+            """,
+            (now, task_id, current_status),
+        )
+    if cur.rowcount != 1:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+
+    payload = dict(evidence)
+    payload.update(
+        {
+            "source": "github",
+            "previous_status": current_status,
+            "new_status": desired,
+            "merge_authority": "human",
+            "auto_merge": False,
+        }
+    )
+    _append_sync_event(conn, task_id, payload)
+    return {
+        "task_id": task_id,
+        "status": desired,
+        "changed": True,
+        "reason": decision.reason,
+        "evidence": evidence,
+    }
+
+
+def _last_rework_event_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT MAX(created_at) FROM task_events "
+        "WHERE task_id = ? AND kind IN ('github_pr_rework', 'github_pr_rework_retry')",
+        (task_id,),
+    ).fetchone()
+    value = row[0] if row else None
+    return int(value) if value is not None else None
+
+
+def apply_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework: ReworkDecision,
+    ref: GithubTaskRef,
+) -> dict[str, Any]:
+    """REVIEW|BLOCKED -> READY with the refreshed sync context and one event.
+
+    Optimistic (``WHERE status = <current>``); the body update and the
+    ``github_pr_rework`` event are in the same transaction as the
+    transition.  BLOCKED sources additionally clear stale blocker
+    metadata (block_kind / block_recurrences) in the same UPDATE.
+    The caller owns the transaction.
+    """
+    row = conn.execute(
+        "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "changed": False, "reason": "task_missing"}
+    current_status = str(row["status"])
+    if current_status not in {"review", "blocked"}:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+    new_body = replace_sync_context(row["body"], rework.context_block)
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'ready',
+               completed_at = NULL,
+               assignee = NULL,
+               claim_lock = NULL,
+               claim_expires = NULL,
+               worker_pid = NULL,
+               block_kind = NULL,
+               block_recurrences = 0,
+               body = ?
+         WHERE id = ? AND status = ?
+        """,
+        (new_body, task_id, current_status),
+    )
+    if cur.rowcount != 1:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+    count_row = conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework'",
+        (task_id,),
+    ).fetchone()
+    rework_round = int(count_row[0]) + 1
+    payload = {
+        "previous_status": current_status,
+        "new_status": "ready",
+        "repository": ref.repository,
+        "issue_number": ref.issue_number,
+        "pr_number": rework.pr_number,
+        "head_sha": rework.head_sha,
+        "request_comment_id": rework.request_comment_id,
+        "reason": "agent_rework",
+        "rework_round": rework_round,
+        "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
+        "label_actor": rework.label_actor,
+        "merge_authority": "human",
+        "auto_merge": False,
+        "source": "github",
+    }
+    _append_sync_event(conn, task_id, payload, kind="github_pr_rework")
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            task_id,
+            "kanban-main",
+            "\n".join([
+                "## Rework delivery contract",
+                "",
+                "Update the EXISTING linked PR only; do not create a new PR.",
+                "Run the repository-required validation and publish the final head.",
+                "After the remote PR head is verified, add the following exact machine-readable lines to the PR:",
+                REWORK_COMPLETE_MARKER,
+                f"task={task_id}",
+                f"request_comment={rework.request_comment_id if rework.request_comment_id is not None else 'none'}",
+                "head=<full 40-character PR head SHA>",
+                "validation=passed",
+                "Keep the existing human-readable final report in the same comment.",
+            ]),
+            int(time.time()),
+        ),
+    )
+    return {
+        "task_id": task_id,
+        "status": "ready",
+        "changed": True,
+        "reason": "agent_rework",
+        "rework_round": rework_round,
+        "rework": rework.to_dict(),
+    }
+
+
+def _reconcile_blocked(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    row: Mapping[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """BLOCKED reconciliation (precedence: merged > rework > open PR > stay).
+
+    Never mutates anything when ``dry_run`` is set.  GitHub failures fail
+    closed: the task stays BLOCKED untouched.
+    """
+    task_id = str(row["id"])
+    block_kind = row["block_kind"] if "block_kind" in row.keys() else None
+
+    def _entry(reason: str, **extra: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "task_id": task_id,
+            "status": "blocked",
+            "changed": False,
+            "reason": reason,
+        }
+        entry.update(extra)
+        return entry
+
+    if not decision.authoritative:
+        return _entry(decision.reason, evidence=decision.to_dict())
+
+    # Precedence 1: merged completion evidence is stronger than a stale
+    # worker-created BLOCKED projection.
+    if decision.desired_status == "done":
+        if dry_run:
+            return _entry("blocked_merged_done_predicted", evidence=decision.to_dict())
+        try:
+            with conn:
+                result = apply_decision(
+                    conn, task_id, decision, allow_blocked_source=True
+                )
+        except sqlite3.Error as exc:
+            conn.rollback()
+            return _entry("db_write_failed", error=f"{type(exc).__name__}: {exc}")
+        return result
+
+    # Precedence 2: one-shot trusted agent-rework on exactly one open PR.
+    try:
+        rework = evaluate_rework(
+            client,
+            ref,
+            decision,
+            current_status="blocked",
+            last_rework_at=_last_rework_event_at(conn, task_id),
+        )
+    except GithubCompletionError as exc:
+        rework = ReworkDecision(reason="rework_query_failed", error=str(exc), authoritative=False)
+
+    if rework is not None and rework.authoritative and rework.reason == "agent_rework":
+        if dry_run:
+            return _entry(
+                "blocked_rework_ready_predicted", rework=rework.to_dict()
+            )
+        try:
+            with conn:
+                result = apply_rework(conn, task_id, rework, ref)
+        except sqlite3.Error as exc:
+            conn.rollback()
+            return _entry("db_write_failed", error=f"{type(exc).__name__}: {exc}")
+        return result
+
+    if rework is not None and rework.authoritative and rework.reason == "rework_claim_pending":
+        result = _entry("rework_claim_pending", rework=rework.to_dict())
+        return result
+
+    if rework is not None and rework.authoritative and rework.reason == "multiple_rework_prs":
+        # Ambiguity: fail closed, never guess which PR to rework.
+        return _entry("multiple_rework_prs", rework=rework.to_dict())
+
+    # Precedence 3: any open non-draft PR is a reviewable human handoff.
+    if any(pr.state == "open" and not pr.draft for pr in decision.pull_requests):
+        context_block: Optional[str] = None
+        try:
+            context_block = _build_context_block(client, ref, decision.pull_requests)
+        except GithubCompletionError:
+            context_block = None
+        if dry_run:
+            return _entry("blocked_open_pr_review_predicted", evidence=decision.to_dict())
+        try:
+            with conn:
+                result = apply_decision(
+                    conn,
+                    task_id,
+                    decision,
+                    context_block=context_block,
+                    allow_blocked_source=True,
+                )
+        except sqlite3.Error as exc:
+            conn.rollback()
+            return _entry("db_write_failed", error=f"{type(exc).__name__}: {exc}")
+        return result
+
+    # Precedence 4-6: staying BLOCKED — enforce durable GitHub evidence
+    # and, for no-PR cards, the human resolution loop.
+    try:
+        issue_payload, _ = client.get(f"/repos/{ref.repository}/issues/{ref.issue_number}")
+    except GithubCompletionError as exc:
+        return _entry("github_query_failed", error=str(exc))
+    if not isinstance(issue_payload, dict):
+        return _entry("github_query_failed", error="invalid issue payload")
+    # Re-attachment guard: a closed Issue must never receive a blocker
+    # marker comment or the agent-blocked label again, and no blocked
+    # resume may fire.  The merged-PR -> DONE precedence above is
+    # untouched — completion transitions still apply to closed Issues.
+    issue_state = str(issue_payload.get("state", "")).casefold()
+    if issue_state != "open":
+        return _entry("closed_issue_no_projection")
+    try:
+        issue_comments, _ = client.get(
+            f"/repos/{ref.repository}/issues/{ref.issue_number}/comments"
+        )
+    except GithubCompletionError as exc:
+        return _entry("github_query_failed", error=str(exc))
+    if not isinstance(issue_comments, list):
+        return _entry("github_query_failed", error="invalid issue comments payload")
+
+    marker = _find_blocker_marker(issue_comments, task_id)
+    baseline = str(marker.get("updated_at") or marker.get("created_at") or "") if marker else ""
+
+    # Resolution loop: only for no-PR cards (#7).
+    if not decision.pull_requests:
+        resume = evaluate_blocked_resume(
+            ref,
+            decision,
+            marker_comment=marker,
+            issue_payload=issue_payload,
+            issue_comments=issue_comments,
+            last_resume_response_at=_last_resume_response_at(conn, task_id),
+        )
+        if resume.reason == "agent_blocked_resolved":
+            if dry_run:
+                return _entry("blocked_resume_ready_predicted", resume=resume.to_dict())
+            try:
+                with conn:
+                    result = apply_blocked_resume(conn, task_id, resume, ref)
+            except sqlite3.Error as exc:
+                conn.rollback()
+                return _entry("db_write_failed", error=f"{type(exc).__name__}: {exc}")
+            return result
+        if resume.reason == "resume_consumed":
+            # One-shot guard hit: the same trusted response already resumed
+            # this card once; after the worker crash it must not re-fire.
+            # Keep the GitHub marker visible as consumed so the state stays
+            # observable and a NEW maintainer comment re-enables resume.
+            consumed_body = _resume_consumed_comment_body(
+                task_id, resume.response_at, resume.response_author
+            )
+            if dry_run:
+                return _entry("resume_consumed", resume=resume.to_dict())
+            try:
+                comment_action, comment_id = _upsert_blocker_comment(
+                    client, ref, task_id, consumed_body
+                )
+            except GithubCompletionError as exc:
+                return _entry("blocker_projection_failed", error=str(exc))
+            return _entry(
+                "resume_consumed",
+                resume=resume.to_dict(),
+                comment_action=comment_action,
+                comment_id=comment_id,
+            )
+
+    # Durable evidence: the sync-owned marker comment (B), or visible
+    # PR-side evidence (A): agent-rework label / trusted handoff content
+    # on an open or draft PR.
+    reason = _task_block_reason(conn, task_id)
+    needs = _NEEDS_FROM_MAINTAINER.get(block_kind) or _NEEDS_FROM_MAINTAINER[None]
+    body = _blocker_comment_body(
+        task_id, reason, needs, no_pr=not decision.pull_requests
+    )
+    issue_labels = {
+        str(item.get("name"))
+        for item in issue_payload.get("labels", [])
+        if isinstance(item, dict)
+    }
+    trusted_response = _trusted_response_after(issue_comments, baseline) if marker else None
+
+    comment_action: str = "unchanged"
+    label_action: str = "unchanged"
+    if marker is None:
+        try:
+            pr_evidence = (
+                _linked_pr_evidence(client, ref, decision.pull_requests)
+                if decision.pull_requests
+                else False
+            )
+        except GithubCompletionError as exc:
+            return _entry("github_query_failed", error=str(exc))
+        if pr_evidence:
+            return _entry("blocked_evidence_ok")
+
+    if marker is None or str(marker.get("body") or "") != body:
+        if dry_run:
+            return _entry("blocker_projection_predicted")
+        try:
+            comment_action, comment_id = _upsert_blocker_comment(
+                client, ref, task_id, body
+            )
+        except GithubCompletionError as exc:
+            return _entry("blocker_projection_failed", error=str(exc))
+    else:
+        comment_id = int(marker["id"]) if marker.get("id") is not None else None
+
+    # Hold label maintenance: keep the visible hold while no trusted
+    # maintainer response exists (a response means the label removal is
+    # the maintainer's step 2 — never re-add then).
+    if BLOCKED_LABEL not in issue_labels and trusted_response is None:
+        if dry_run:
+            label_action = "add_predicted"
+        else:
+            try:
+                _add_issue_label(client, ref, BLOCKED_LABEL)
+                label_action = "added"
+            except GithubCompletionError as exc:
+                return _entry("blocker_projection_failed", error=str(exc))
+
+    if dry_run:
+        return _entry(
+            "blocker_projection_predicted",
+            projection={"comment_action": comment_action, "label_action": label_action},
+        )
+    if comment_action != "unchanged":
+        # GitHub projection already succeeded; a local event-record failure
+        # must not abort the rest of the board — report and continue.
+        try:
+            with conn:
+                _append_blocked_projection_event(
+                    conn, task_id, ref, block_kind, comment_action, comment_id
+                )
+        except sqlite3.Error as exc:
+            conn.rollback()
+            return _entry(
+                "blocker_projected_event_failed",
+                projection_action=comment_action,
+                comment_id=comment_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return _entry(
+            "blocker_projected",
+            projection_action=comment_action,
+            comment_id=comment_id,
+            label_action=label_action,
+        )
+    return _entry("blocked_evidence_ok", label_action=label_action)
+
+
+# ---------------------------------------------------------------------------
+# Rework worker dispatch — edge-owned existing-PR rework lane
+# ---------------------------------------------------------------------------
+# The core dispatcher refuses to re-spawn a ``ready`` task whose comments
+# mention a GitHub PR URL (``respawn_guarded`` reason ``active_pr``, 24h
+# window).  That guard prevents duplicate PRs on one task and is left
+# untouched.  A consumed ``agent-rework`` (the ``github_pr_rework`` event)
+# is the operator's instruction to UPDATE THE EXISTING PR, so the respawn
+# for exactly those tasks is owned here, in the edge: the sync claims the
+# rework-pending task itself and launches its worker through the same core
+# spawn helpers the dispatcher uses.  Every other ``ready`` task keeps the
+# normal dispatcher protection — the bypass is scoped strictly to tasks
+# whose governing transition is a consumed rework.
+#
+# Gated by the ``HERMES_KANBAN_REWORK_DISPATCH=1`` environment variable
+# (set by the intake cron) so direct CLI invocations of this script stay
+# pure reconciliation.
+
+REWORK_DISPATCH_ENV = "HERMES_KANBAN_REWORK_DISPATCH"
+
+# Event kinds that define which transition currently governs a task's
+# state.  Everything else (assigned/spawned/claimed/heartbeat/
+# respawn_guarded/commented/...) never supersedes a rework.
+_REWORK_GOVERNING_KINDS = frozenset({
+    "created", "changes_requested", "github_pr_rework", "github_pr_sync",
+    "github_pr_rework_retry",
+    "github_blocked_resolved", "github_blocked_projection",
+    "blocked", "completed", "status", "promoted", "unblocked",
+    "reclaimed", "scheduled", "archived",
+})
+
+
+def _kanban_config() -> dict[str, Any]:
+    """Read the ``kanban:`` config section for the current HERMES_HOME."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        section = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _governing_event_kind(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Kind of the newest status-affecting event for a task (or None)."""
+    kinds = tuple(sorted(_REWORK_GOVERNING_KINDS))
+    placeholders = ",".join("?" * len(kinds))
+    row = conn.execute(
+        f"SELECT kind FROM task_events WHERE task_id = ? AND kind IN ({placeholders}) "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,) + kinds,
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def _latest_rework_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[dict[str, Any], int, str]]:
+    """Return the latest edge rework event payload, timestamp, and kind."""
+    row = conn.execute(
+        "SELECT payload, created_at, kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('github_pr_rework', 'github_pr_rework_retry') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return (
+        payload if isinstance(payload, dict) else {},
+        int(row["created_at"] or 0),
+        str(row["kind"]),
+    )
+
+
+def _task_run_after_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+) -> Optional[sqlite3.Row]:
+    """Return the newest finished run started by this rework round."""
+    return conn.execute(
+        "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? AND started_at >= ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, max(0, rework_at - 1)),
+    ).fetchone()
+
+
+def _run_metadata(run: Optional[sqlite3.Row]) -> dict[str, Any]:
+    if run is None or not run["metadata"]:
+        return {}
+    try:
+        value = json.loads(run["metadata"])
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _rework_head_candidates(run: Optional[sqlite3.Row]) -> set[str]:
+    """Extract full SHA evidence from the durable worker run metadata."""
+    metadata = _run_metadata(run)
+    candidates: set[str] = set()
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                visit(child_value, str(child_key))
+        elif isinstance(value, (list, tuple)):
+            for child_value in value:
+                visit(child_value, key)
+        elif isinstance(value, str) and key.casefold() in {
+            "head", "head_sha", "pr_head_sha", "commit", "sha", "oid",
+        }:
+            candidates.update(re.findall(r"\b[0-9a-fA-F]{40}\b", value))
+
+    visit(metadata)
+    text = "\n".join(
+        str(run[column] or "")
+        for column in ("summary", "error")
+        if run is not None and column in run.keys()
+    )
+    candidates.update(re.findall(r"\b[0-9a-fA-F]{40}\b", text))
+    return {item.casefold() for item in candidates}
+
+
+def _completion_marker(
+    client: Any,
+    ref: GithubTaskRef,
+    pr: GithubPullRequest,
+    task_id: str,
+    rework_at: int,
+    request_comment_id: Optional[int],
+) -> Optional[dict[str, Any]]:
+    """Find a trusted, post-rework machine-readable delivery handoff."""
+    comments = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr.number}/comments",
+        {"per_page": 100},
+    )
+    for comment in reversed(comments):
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "")
+        if author not in TRUSTED_GITHUB_ACTORS:
+            continue
+        created_at = _parse_iso_ts(comment.get("created_at"))
+        if created_at is None or created_at < rework_at:
+            continue
+        body = str(comment.get("body") or "")
+        if REWORK_COMPLETE_MARKER not in body:
+            continue
+        fields: dict[str, str] = {}
+        for line in body.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+        head = fields.get("head", "").casefold()
+        request_comment = fields.get("request_comment", "")
+        if fields.get("task") != task_id or not re.fullmatch(r"[0-9a-f]{40}", head):
+            continue
+        if fields.get("validation") != "passed" or head != pr.head_sha.casefold():
+            continue
+        if request_comment_id is not None and request_comment != str(request_comment_id):
+            continue
+        return {
+            "comment_id": comment.get("id"),
+            "author": author,
+            "created_at": created_at,
+            "task": task_id,
+            "request_comment": request_comment,
+            "head": head,
+            "validation": "passed",
+        }
+    return None
+
+
+def _rework_delivery_evidence(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    task_id: str,
+    pr: GithubPullRequest,
+    event: tuple[dict[str, Any], int, str],
+) -> tuple[bool, str, dict[str, Any]]:
+    """Check the complete remote-delivery contract without mutating state."""
+    payload, rework_at, _ = event
+    run = _task_run_after_rework(conn, task_id, rework_at)
+    if run is None or run["ended_at"] is None:
+        return False, "delivery_run_missing", {"rework_at": rework_at}
+    if str(run["outcome"] or "") not in {"completed", "blocked", "review_requested"}:
+        return False, "delivery_run_failed", {
+            "outcome": run["outcome"], "run_id": run["id"],
+        }
+    marker = _completion_marker(
+        client,
+        ref,
+        pr,
+        task_id,
+        rework_at,
+        int(payload["request_comment_id"])
+        if payload.get("request_comment_id") is not None
+        else None,
+    )
+    if marker is None:
+        return False, "completion_handoff_missing", {"run_id": run["id"]}
+    run_heads = _rework_head_candidates(run)
+    if run_heads and marker["head"] not in run_heads:
+        return False, "run_head_mismatch", {
+            "run_id": run["id"], "run_heads": sorted(run_heads),
+            "marker_head": marker["head"],
+        }
+    requested_head = str(payload.get("head_sha") or "").casefold()
+    if requested_head and requested_head == marker["head"]:
+        return False, "rework_head_unchanged", {
+            "requested_head": requested_head, "head": marker["head"],
+        }
+    evidence = {
+        "run_id": run["id"],
+        "run_outcome": run["outcome"],
+        "request_comment_id": payload.get("request_comment_id"),
+        "head": marker["head"],
+        "validation": marker["validation"],
+        "completion_comment_id": marker.get("comment_id"),
+    }
+    return True, "delivery_complete", evidence
+
+
+def _project_pr_lifecycle_labels(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    *,
+    add: Iterable[str] = (),
+    remove: Iterable[str] = (),
+) -> tuple[bool, str, dict[str, Any]]:
+    """Atomically reconcile the three lifecycle labels on one PR."""
+    current = _pr_labels(client, ref.repository, pr_number)
+    lifecycle = {REWORK_LABEL, WORKING_LABEL, REVIEW_READY_LABEL}
+    desired = (current - set(remove))
+    desired.difference_update(set(remove) & lifecycle)
+    desired.update(str(label) for label in add)
+    if desired == current:
+        return True, "labels_unchanged", {"labels": sorted(current)}
+    status, _ = client.patch(
+        f"/repos/{ref.repository}/issues/{pr_number}",
+        {"labels": sorted(desired)},
+    )
+    if not 200 <= status < 300:
+        raise GithubCompletionError(
+            f"could not reconcile lifecycle labels (HTTP {status})"
+        )
+    observed = _pr_labels(client, ref.repository, pr_number)
+    if observed != desired:
+        raise GithubCompletionError(
+            "lifecycle label read-back mismatch"
+        )
+    return True, "labels_updated", {
+        "before": sorted(current), "after": sorted(observed),
+    }
+
+
+def _append_rework_retry_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: Mapping[str, Any],
+    *,
+    reason: str,
+) -> None:
+    retry_payload = dict(payload)
+    retry_payload.update({
+        "reason": "agent_rework",
+        "retry": True,
+        "retry_reason": reason,
+        "source": "github_edge_rework_recovery",
+    })
+    _append_sync_event(conn, task_id, retry_payload, kind="github_pr_rework_retry")
+
+
+def _rework_human_attention(reason: str, run: Optional[sqlite3.Row]) -> bool:
+    text = " ".join(
+        str(run[column] or "")
+        for column in ("summary", "error")
+        if run is not None and column in run.keys()
+    ).casefold()
+    return any(marker in text for marker in (
+        "review-required", "needs_input", "needs maintainer",
+        "human review", "host_validation_required", "human_validation_required",
+    )) or reason in {"delivery_run_missing", "completion_handoff_missing"}
+
+
+def _rework_context(
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    task_id: str,
+    event: Optional[tuple[dict[str, Any], int, str]],
+) -> Optional[dict[str, Any]]:
+    """Build the exact PR/label context used by lifecycle and dispatch."""
+    if event is None:
+        return None
+    payload, event_at, event_kind = event
+    raw_pr_number = payload.get("pr_number")
+    try:
+        pr_number = int(raw_pr_number) if raw_pr_number is not None else None
+    except (TypeError, ValueError):
+        pr_number = None
+    prs = tuple(
+        pr for pr in decision.pull_requests
+        if pr_number is None or pr.number == pr_number
+    )
+    if len(prs) != 1:
+        return None
+    pr = prs[0]
+    labels = _pr_labels(client, ref.repository, pr.number)
+    return {
+        "task_id": task_id,
+        "repository": ref.repository,
+        "issue_number": ref.issue_number,
+        "pr_number": pr.number,
+        "head_sha": pr.head_sha,
+        "pr": pr,
+        "labels": labels,
+        "event": event,
+        "event_kind": event_kind,
+        "event_at": event_at,
+        "implicit_request": payload.get("trigger") == "changes_requested",
+    }
+
+
+def _task_has_active_rework_claim(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> bool:
+    status = (
+        str(row["status"])
+        if "status" in row.keys() and row["status"] is not None
+        else ""
+    )
+    if status != "running":
+        return False
+    claim_lock = row["claim_lock"] if "claim_lock" in row.keys() else None
+    run_id = row["current_run_id"] if "current_run_id" in row.keys() else None
+    if not claim_lock or run_id is None:
+        return False
+    run = conn.execute(
+        "SELECT ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), str(row["id"])),
+    ).fetchone()
+    return run is not None and run["ended_at"] is None
+
+
+def _record_rework_attention(
+    conn: sqlite3.Connection,
+    task_id: str,
+    context: Mapping[str, Any],
+    *,
+    reason: str,
+    evidence: Optional[Mapping[str, Any]] = None,
+) -> None:
+    event = context.get("event")
+    payload = dict(event[0]) if isinstance(event, tuple) else {}
+    payload.update({
+        "reason": "rework_human_attention",
+        "diagnostic": reason,
+        "source": "github_edge_rework_reconciliation",
+    })
+    if evidence:
+        payload["evidence"] = dict(evidence)
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'github_pr_rework_attention' AND payload LIKE ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, f"%{reason}%"),
+    ).fetchone()
+    if existing is not None:
+        return  # already recorded for this round/diagnostic
+    with conn:
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                "kanban-main",
+                f"{REWORK_ATTENTION_MARKER} task={task_id} reason={reason}",
+                int(time.time()),
+            ),
+        )
+        _append_sync_event(
+            conn,
+            task_id,
+            payload,
+            kind="github_pr_rework_attention",
+        )
+
+
+def _restore_rework_labels(
+    client: Any,
+    context: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    pr = context.get("pr")
+    if not isinstance(pr, GithubPullRequest):
+        raise GithubCompletionError("rework context has no pull request")
+    _, reason, evidence = _project_pr_lifecycle_labels(
+        client,
+        GithubTaskRef(
+            str(context["repository"]),
+            int(context["issue_number"]),
+        ),
+        int(pr.number),
+        add=(REWORK_LABEL,),
+        remove=(WORKING_LABEL, REVIEW_READY_LABEL),
+    )
+    return reason, evidence
+
+
+def _retry_failure_limit(cfg: Optional[Mapping[str, Any]] = None) -> Optional[int]:
+    section = cfg if cfg is not None else _kanban_config()
+    try:
+        value = section.get("failure_limit")
+        return int(value) if value is not None and int(value) > 0 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _requeue_rework_task(
+    conn: sqlite3.Connection,
+    kanban_db: Any,
+    task_id: str,
+    context: Mapping[str, Any],
+    *,
+    reason: str,
+    failure_limit: Optional[int],
+) -> dict[str, Any]:
+    """Return a failed/incomplete rework to READY without bypassing the breaker."""
+    event = context["event"]
+    payload = dict(event[0])
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "status": None, "changed": False, "reason": "task_missing"}
+    with conn:
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', completed_at = NULL, assignee = NULL,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL,
+                   block_recurrences = 0, last_heartbeat_at = NULL
+             WHERE id = ? AND status IN ('done', 'review', 'blocked', 'running', 'ready')
+            """,
+            (task_id,),
+        )
+        _append_rework_retry_event(conn, task_id, payload, reason=reason)
+    auto_blocked = bool(kanban_db._record_task_failure(
+        conn,
+        task_id,
+        f"rework delivery retry: {reason}",
+        outcome="rework_delivery_failed",
+        failure_limit=failure_limit,
+        release_claim=False,
+        end_run=False,
+    ))
+    return {
+        "task_id": task_id,
+        "status": "blocked" if auto_blocked else "ready",
+        "changed": True,
+        "reason": "rework_retry_scheduled" if not auto_blocked else "rework_retry_blocked",
+        "retry_reason": reason,
+        "auto_blocked": auto_blocked,
+    }
+
+
+def _label_is_newer_than_event(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    event_at: int,
+) -> bool:
+    """True when the newest agent-rework label addition postdates the round."""
+    events = _labeled_events(client, ref, pr_number)
+    if not events:
+        return False
+    latest_label_at, _ = max(events, key=lambda item: item[0])
+    return latest_label_at > event_at
+
+
+def _latest_delivery_head(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Head SHA of the newest recorded rework delivery event (idempotency)."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'github_pr_rework_delivery' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    head = payload.get("head") if isinstance(payload, dict) else None
+    return str(head).casefold() if head else None
+
+
+def _delivery_review_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    current_status: str,
+    ref: GithubTaskRef,
+    pr_number: int,
+    evidence: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Optimistic running/ready -> review once the delivery marker validates."""
+    with conn:
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'review', completed_at = NULL, assignee = NULL,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0
+             WHERE id = ? AND status = ?
+            """,
+            (task_id, current_status),
+        )
+        if cur.rowcount != 1:
+            return None
+        _append_sync_event(
+            conn,
+            task_id,
+            {
+                "previous_status": current_status,
+                "new_status": "review",
+                "reason": "agent_review_ready",
+                "repository": ref.repository,
+                "pr_number": pr_number,
+                **dict(evidence),
+            },
+            kind="github_pr_rework_delivery",
+        )
+    return {
+        "task_id": task_id,
+        "status": "review",
+        "changed": True,
+        "reason": "agent_review_ready",
+        "evidence": dict(evidence),
+    }
+
+
+def _reconcile_rework_lifecycle(
+    conn: sqlite3.Connection,
+    kanban_db: Any,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    row: Mapping[str, Any],
+    context: Optional[Mapping[str, Any]],
+    *,
+    dry_run: bool,
+    failure_limit: Optional[int],
+) -> Optional[dict[str, Any]]:
+    """Project worker ownership and delivery only for a known rework round."""
+    if context is None or "_error" in context:
+        return None
+    task_id = str(row["id"])
+    status = str(row["status"])
+    labels = set(context["labels"])
+    lifecycle = {REWORK_LABEL, WORKING_LABEL, REVIEW_READY_LABEL}
+    if len(labels & lifecycle) > 1:
+        print(
+            f"kanban-github-sync: lifecycle label conflict for {ref.repository}#{context['pr_number']} task={task_id}",
+            file=sys.stderr,
+        )
+        return {
+            "task_id": task_id,
+            "status": status,
+            "changed": False,
+            "reason": "lifecycle_label_conflict",
+            "lifecycle": {"labels": sorted(labels)},
+        }
+
+    # A freshly (re-)requested rework round stays owned by the classic intake
+    # transitions (REVIEW/BLOCKED -> READY) and by the dispatch lane.  The
+    # lifecycle layer only reconciles worker-owned states: once a claim
+    # exists (running) or the round is spent (done/review), the PR label is
+    # projected from Kanban ownership instead of being treated as intake.
+    if status == "blocked":
+        return None
+
+    # Merged PR: clear any lifecycle labels, then fall through so the classic
+    # completion transition records DONE in the same tick.
+    if context["pr"].is_merged_into_target and labels & lifecycle:
+        if dry_run:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "merged_rework_labels_predicted",
+            }
+        try:
+            _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                client, ref, int(context["pr_number"]),
+                remove=(REWORK_LABEL, WORKING_LABEL, REVIEW_READY_LABEL),
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "merged_lifecycle_cleanup_failed", "error": str(exc),
+            }
+        print(
+            f"kanban-github-sync: merged PR {ref.repository}#{context['pr_number']} "
+            f"lifecycle labels cleared for task={task_id} ({label_reason})",
+            file=sys.stderr,
+        )
+        return None
+
+    active = _task_has_active_rework_claim(conn, row)
+    if active:
+        if dry_run:
+            return {
+                "task_id": task_id, "status": "running", "changed": False,
+                "reason": "agent_working_predicted",
+                "lifecycle": {"labels": sorted(labels)},
+            }
+        try:
+            _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                client, ref, int(context["pr_number"]),
+                add=(WORKING_LABEL,),
+                remove=(REWORK_LABEL, REVIEW_READY_LABEL),
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id, "status": "running", "changed": False,
+                "reason": "working_label_projection_failed",
+                "error": str(exc),
+            }
+        return {
+            "task_id": task_id, "status": "running", "changed": False,
+            "reason": "agent_working", "label_action": label_reason,
+            "lifecycle": label_evidence,
+        }
+
+    # Intake states with a visible rework label belong to the classic
+    # transitions / dispatch lane.  A NEW label on a spent round (done) also
+    # flows through the classic DONE -> REVIEW path first.
+    if REWORK_LABEL in labels and status in {"ready", "review"}:
+        return None
+    if status == "ready":
+        if WORKING_LABEL in labels:
+            return {
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "working_label_present",
+                "lifecycle": {"labels": sorted(labels)},
+            }
+        return None  # dispatch lane owns intake
+    if REWORK_LABEL in labels and status == "done" and _label_is_newer_than_event(
+        client, ref, int(context["pr_number"]), int(context["event_at"]),
+    ):
+        return None
+
+    if context["pr"].state == "open":
+        try:
+            delivered, delivery_reason, evidence = _rework_delivery_evidence(
+                conn, client, ref, task_id, context["pr"], context["event"],
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "delivery_query_failed", "error": str(exc),
+            }
+        if delivered:
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": "review", "changed": False,
+                    "reason": "agent_review_ready_predicted", "evidence": evidence,
+                }
+            existing_head = _latest_delivery_head(conn, task_id)
+            if existing_head == str(evidence.get("head") or "").casefold():
+                return {
+                    "task_id": task_id, "status": "review", "changed": False,
+                    "reason": "agent_review_ready",
+                    "evidence": evidence,
+                }
+            db_result: Optional[dict[str, Any]] = None
+            if status in {"ready", "running"}:
+                db_result = _delivery_review_transition(
+                    conn, task_id, status, ref,
+                    int(context["pr_number"]), evidence,
+                )
+            elif status in {"done", "blocked"} and decision.desired_status == "review":
+                with conn:
+                    db_result = apply_decision(
+                        conn,
+                        task_id,
+                        decision,
+                        allow_blocked_source=status == "blocked",
+                    )
+            try:
+                _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                    client, ref, int(context["pr_number"]),
+                    add=(REVIEW_READY_LABEL,),
+                    remove=(REWORK_LABEL, WORKING_LABEL),
+                )
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id,
+                    "status": db_result.get("status", status) if db_result else status,
+                    "changed": bool(db_result and db_result.get("changed")),
+                    "reason": "review_ready_label_projection_failed",
+                    "error": str(exc),
+                    "evidence": evidence,
+                }
+            if db_result is None:
+                # Status was already review (or an optimistic transition lost
+                # the race): record the delivery event once for provenance.
+                delivery_new_status = "review"
+            else:
+                delivery_new_status = str(db_result.get("status") or "review")
+            with conn:
+                _append_sync_event(
+                    conn,
+                    task_id,
+                    {
+                        "previous_status": status,
+                        "new_status": delivery_new_status,
+                        "reason": "agent_review_ready",
+                        "repository": ref.repository,
+                        "pr_number": context["pr_number"],
+                        **dict(evidence),
+                        "label_action": label_reason,
+                    },
+                    kind="github_pr_rework_delivery",
+                )
+            return {
+                "task_id": task_id,
+                "status": db_result.get("status", "review") if db_result else "review",
+                "changed": bool(db_result and db_result.get("changed")),
+                "reason": "agent_review_ready",
+                "evidence": evidence,
+                "lifecycle": label_evidence,
+            }
+
+        if status == "review":
+            # The human review lane owns this card; never requeue from here.
+            return None
+        run = _task_run_after_rework(conn, task_id, int(context["event_at"]))
+        if _rework_human_attention(delivery_reason, run):
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "rework_human_attention_predicted",
+                    "diagnostic": delivery_reason, "evidence": evidence,
+                }
+            try:
+                label_reason, label_evidence = _restore_rework_labels(client, context)
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "rework_attention_label_projection_failed",
+                    "error": str(exc),
+                }
+            _record_rework_attention(
+                conn, task_id, context, reason=delivery_reason, evidence=evidence,
+            )
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "rework_human_attention",
+                "diagnostic": delivery_reason, "lifecycle": label_evidence,
+                "label_action": label_reason,
+            }
+        if dry_run:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "rework_retry_predicted", "diagnostic": delivery_reason,
+                "evidence": evidence,
+            }
+        try:
+            label_reason, label_evidence = _restore_rework_labels(client, context)
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "rework_retry_label_projection_failed", "error": str(exc),
+            }
+        result = _requeue_rework_task(
+            conn, kanban_db, task_id, context,
+            reason=delivery_reason, failure_limit=failure_limit,
+        )
+        result["lifecycle"] = label_evidence
+        result["label_action"] = label_reason
+        return result
+    return None
+
+
+def _canonical_open_pr_for_changes_requested(
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+) -> Optional[GithubPullRequest]:
+    """Return the single canonical open PR eligible for changes-requested rework.
+
+    ``decision.linked_pr_numbers`` is produced by the existing Issue-timeline
+    plus importer-owned handoff discovery, and every identifier is re-queried
+    from the exact repository before it reaches this helper.  Require exactly
+    one open linked PR and the expected target branch so a bare PR number,
+    unrelated open PR, or ambiguous multi-PR card can never bypass the core
+    ``active_pr`` guard.
+    """
+    if not decision.authoritative or decision.reason != "linked_pr_open":
+        return None
+    linked_numbers = {int(number) for number in decision.linked_pr_numbers}
+    open_prs = tuple(pr for pr in decision.pull_requests if pr.state == "open")
+    if len(open_prs) != 1:
+        return None
+    pr = open_prs[0]
+    if pr.number not in linked_numbers or pr.base_branch != ref.target_branch:
+        return None
+    return pr
+
+
+def _normalize_changes_requested_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    *,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    """Normalize one verified ``changes_requested`` transition to rework.
+
+    The normalization is deliberately idempotent: it only applies while the
+    newest governing event is ``changes_requested``.  A successful real run
+    records the same canonical ``github_pr_rework`` event consumed by the
+    existing edge dispatch lane; it does not change the READY status itself.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or str(row["status"]) != "ready":
+        return None
+    if row["claim_lock"] is not None:
+        return None
+    if _governing_event_kind(conn, task_id) != "changes_requested":
+        return None
+    pr = _canonical_open_pr_for_changes_requested(ref, decision)
+    if pr is None:
+        return None
+
+    count_row = conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework'",
+        (task_id,),
+    ).fetchone()
+    rework_round = int(count_row[0]) + 1
+    rework_evidence = {
+        "reason": "agent_rework",
+        "trigger": "changes_requested",
+        "canonical_open_pr": True,
+        "pr_number": pr.number,
+        "head_sha": pr.head_sha,
+        "rework_round": rework_round,
+    }
+    if dry_run:
+        return {
+            "task_id": task_id,
+            "status": "ready",
+            "changed": False,
+            "reason": "changes_requested_rework_predicted",
+            "rework": rework_evidence,
+            "evidence": decision.to_dict(),
+        }
+
+    payload = {
+        "previous_status": "ready",
+        "new_status": "ready",
+        "repository": ref.repository,
+        "issue_number": ref.issue_number,
+        "pr_number": pr.number,
+        "head_sha": pr.head_sha,
+        "reason": "agent_rework",
+        "trigger": "changes_requested",
+        "canonical_open_pr": True,
+        "canonical_pr_source": "github_linked_pr",
+        "rework_round": rework_round,
+        "merge_authority": "human",
+        "auto_merge": False,
+        "source": "github_edge_rework_normalization",
+    }
+    with conn:
+        latest = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            latest is None
+            or str(latest["status"]) != "ready"
+            or latest["claim_lock"] is not None
+            or _governing_event_kind(conn, task_id) != "changes_requested"
+        ):
+            return {
+                "task_id": task_id,
+                "status": str(latest["status"]) if latest is not None else "ready",
+                "changed": False,
+                "reason": "state_changed_during_sync",
+            }
+        source_row = conn.execute(
+            "SELECT MAX(created_at) FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested'",
+            (task_id,),
+        ).fetchone()
+        source_created_at = int(source_row[0] or 0)
+        _append_sync_event(
+            conn,
+            task_id,
+            payload,
+            kind="github_pr_rework",
+            created_at=max(int(time.time()), source_created_at + 1),
+        )
+    return {
+        "task_id": task_id,
+        "status": "ready",
+        "changed": False,
+        "reason": "changes_requested_rework_normalized",
+        "rework": rework_evidence,
+        "evidence": decision.to_dict(),
+    }
+
+
+def _pending_rework_tasks(
+    conn: sqlite3.Connection,
+    *,
+    task_ids: Optional[Iterable[str]] = None,
+    normalized_task_ids: Optional[Iterable[str]] = None,
+) -> list[dict[str, Any]]:
+    """``ready`` tasks whose governing transition is a consumed rework.
+
+    These are the tasks waiting for an existing-PR rework worker: the
+    core dispatcher's ``active_pr`` respawn guard will never spawn them,
+    so the edge lane owns their respawn.  ``normalized_task_ids`` is used
+    only by dry-run to represent a verified changes-requested normalization
+    without writing its canonical event.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee, workspace_path, branch_name, skills, claim_lock "
+        "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    selected = {str(tid) for tid in task_ids} if task_ids is not None else None
+    normalized = {
+        str(tid) for tid in normalized_task_ids
+    } if normalized_task_ids is not None else set()
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        task_id = str(row["id"])
+        if selected is not None and task_id not in selected:
+            continue
+        governing = _governing_event_kind(conn, task_id)
+        if governing != "github_pr_rework" and not (
+            governing == "changes_requested" and task_id in normalized
+        ):
+            continue
+        pending.append(dict(row))
+    return pending
+
+
+def _resolve_rework_assignee(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+    *,
+    default_assignee: Optional[str],
+    dry_run: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return (assignee, error_reason) for a rework-pending task.
+
+    ``apply_rework`` clears the assignee; mirror the core dispatcher's
+    auto-assign behaviour by persisting ``kanban.default_assignee`` on the
+    row (with an ``assigned`` event) before the worker is spawned.
+    """
+    assignee = str(row.get("assignee") or "").strip() or None
+    if assignee:
+        return assignee, None
+    if not default_assignee:
+        return None, "unassigned"
+    if dry_run:
+        return default_assignee, None
+    cur = conn.execute(
+        "UPDATE tasks SET assignee = ? WHERE id = ? "
+        "AND (assignee IS NULL OR assignee = '')",
+        (default_assignee, row["id"]),
+    )
+    if cur.rowcount == 1:
+        _append_sync_event(
+            conn, str(row["id"]),
+            {"assignee": default_assignee, "source": "edge_rework_dispatch"},
+            kind="assigned",
+        )
+    return default_assignee, None
+
+
+def _dispatch_pending_rework_locked(
+    conn: sqlite3.Connection,
+    kanban_db: Any,
+    board: str,
+    *,
+    dry_run: bool = False,
+    task_ids: Optional[Iterable[str]] = None,
+    normalized_task_ids: Optional[Iterable[str]] = None,
+    spawn_fn: Any = None,
+    cfg: Optional[Mapping[str, Any]] = None,
+    on_claim: Any = None,
+    on_failure: Any = None,
+    client: Any = None,
+    rework_contexts: Optional[Mapping[str, Optional[Mapping[str, Any]]]] = None,
+    active_pr_owners: Optional[Mapping[tuple[str, int], str]] = None,
+) -> list[dict[str, Any]]:
+    """Spawn the worker for the oldest rework-pending task on this board.
+
+    Bypasses the core ``active_pr`` respawn guard ONLY for tasks whose
+    governing transition is a consumed agent-rework.  At most one worker
+    per board per tick, and only while the board's running count is below
+    ``kanban.max_in_progress`` (default 1) — mirrors the dispatcher caps,
+    so the general active-PR duplicate-spawn protection is unchanged.
+
+    ``normalized_task_ids`` is a dry-run-only representation of a verified
+    ``changes_requested`` -> canonical rework normalization.  Real runs
+    persist the canonical event before entering this lane.
+
+    ``spawn_fn`` is injectable for tests; it receives the claimed
+    ``Task``, the resolved workspace and the board (dispatcher signature).
+    """
+    if cfg is None:
+        cfg = _kanban_config()
+    try:
+        max_in_progress = max(1, int(cfg.get("max_in_progress") or 1))
+    except (TypeError, ValueError):
+        max_in_progress = 1
+    default_assignee = str(cfg.get("default_assignee") or "").strip() or None
+    try:
+        raw_failure_limit = cfg.get("failure_limit")
+        failure_limit = (
+            int(raw_failure_limit) if raw_failure_limit is not None else None
+        )
+        if failure_limit is not None and failure_limit < 1:
+            failure_limit = None
+    except (TypeError, ValueError):
+        failure_limit = None
+
+    running = int(
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    )
+    if running >= max_in_progress:
+        return [{
+            "task_id": None, "status": None, "changed": False,
+            "reason": "board_busy",
+            "running": running, "max_in_progress": max_in_progress,
+        }]
+
+    pending = _pending_rework_tasks(
+        conn,
+        task_ids=task_ids,
+        normalized_task_ids=normalized_task_ids,
+    )
+    if not pending:
+        return []
+    row = pending[0]
+    task_id = str(row["id"])
+
+    # Duplicate-ownership guards (GitHub label + Kanban PR owner), applied
+    # before any claim so a second worker is never spawned beside a live one.
+    if client is not None and rework_contexts is not None:
+        ctx = rework_contexts.get(task_id)
+        if ctx is not None and "labels" in ctx and WORKING_LABEL in ctx["labels"]:
+            return [{
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "working_label_present",
+                "lifecycle": {"labels": sorted(ctx["labels"])},
+            }]
+        if ctx is not None and "labels" in ctx and active_pr_owners:
+            owner_key = (str(ctx["repository"]), int(ctx["pr_number"]))
+            for other_key, owner_task in active_pr_owners.items():
+                if other_key == owner_key and owner_task != task_id:
+                    return [{
+                        "task_id": task_id, "status": "ready", "changed": False,
+                        "reason": "pr_worker_active",
+                        "owner_task": owner_task,
+                        "repository": ctx["repository"],
+                        "pr_number": ctx["pr_number"],
+                    }]
+
+    assignee, err = _resolve_rework_assignee(
+        conn, row, default_assignee=default_assignee, dry_run=dry_run,
+    )
+    if err:
+        return [{"task_id": task_id, "status": "ready", "changed": False, "reason": err}]
+    if assignee is None:
+        return [{
+            "task_id": task_id,
+            "status": "ready",
+            "changed": False,
+            "reason": "unassigned",
+        }]
+
+    if dry_run:
+        return [{
+            "task_id": task_id, "status": "ready", "changed": False,
+            "reason": "rework_spawn_predicted",
+            "assignee": assignee, "board": board,
+        }]
+
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None
+    if profile_exists is not None:
+        try:
+            profile_ok = bool(profile_exists(assignee))
+        except Exception:
+            profile_ok = True
+        if not profile_ok:
+            return [{
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "assignee_profile_missing", "assignee": assignee,
+            }]
+
+    claimed = kanban_db.claim_task(conn, task_id)
+    if claimed is None:
+        return [{
+            "task_id": task_id, "status": "ready", "changed": False,
+            "reason": "claim_failed",
+        }]
+
+    if on_claim is not None:
+        try:
+            claim_projection = on_claim(claimed)
+        except Exception as exc:
+            claim_projection = {"ok": False, "error": str(exc)}
+        if not isinstance(claim_projection, Mapping) or not claim_projection.get("ok"):
+            try:
+                kanban_db.reclaim_task(
+                    conn, task_id,
+                    reason="rework working-label projection failed",
+                )
+            except Exception as exc:
+                return [{
+                    "task_id": task_id, "status": "running", "changed": True,
+                    "reason": "claim_projection_reclaim_failed",
+                    "error": f"{claim_projection!r}; {type(exc).__name__}: {exc}",
+                }]
+            return [{
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "working_label_projection_failed",
+                "error": str((claim_projection or {}).get("error") or "unknown"),
+                "lifecycle": dict(claim_projection or {}),
+            }]
+
+    # Resolve the workspace exactly like the core dispatcher does (the
+    # rework worktree already exists from the first run; re-resolution
+    # keeps parity if it was moved or recreated).
+    try:
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch = kanban_db._resolve_worktree_workspace(
+                claimed, board=board
+            )
+        else:
+            workspace = kanban_db.resolve_workspace(claimed, board=board)
+            resolved_branch = None
+    except Exception as exc:
+        auto_blocked = bool(kanban_db._record_spawn_failure(
+            conn, claimed.id, f"workspace: {exc}",
+            failure_limit=failure_limit,
+        ))
+        if on_failure is not None:
+            try:
+                on_failure(claimed, "workspace_resolve_failed")
+            except Exception as projection_exc:
+                print(
+                    f"kanban-github-sync: failed to restore rework label after workspace failure: {type(projection_exc).__name__}",
+                    file=sys.stderr,
+                )
+        return [{
+            "task_id": task_id,
+            "status": "blocked" if auto_blocked else "ready",
+            "changed": False,
+            "reason": "workspace_resolve_failed",
+            "error": str(exc),
+            "auto_blocked": auto_blocked,
+        }]
+    kanban_db.set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        kanban_db.set_branch_name(
+            conn, claimed.id,
+            resolved_branch or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+        )
+
+    spawn = spawn_fn if spawn_fn is not None else kanban_db._default_spawn
+    try:
+        pid = spawn(claimed, str(workspace), board=board)
+        if pid:
+            kanban_db._set_worker_pid(conn, claimed.id, int(pid))
+    except Exception as exc:
+        auto_blocked = bool(kanban_db._record_spawn_failure(
+            conn, claimed.id, str(exc), failure_limit=failure_limit,
+        ))
+        if on_failure is not None:
+            try:
+                on_failure(claimed, "spawn_failed")
+            except Exception as projection_exc:
+                print(
+                    f"kanban-github-sync: failed to restore rework label after spawn failure: {type(projection_exc).__name__}",
+                    file=sys.stderr,
+                )
+        return [{
+            "task_id": task_id,
+            "status": "blocked" if auto_blocked else "ready",
+            "changed": False,
+            "reason": "spawn_failed",
+            "error": str(exc),
+            "auto_blocked": auto_blocked,
+        }]
+
+    return [{
+        "task_id": task_id, "status": "running", "changed": True,
+        "reason": "rework_worker_spawned",
+        "pid": int(pid) if pid else None,
+        "run_id": getattr(claimed, "current_run_id", None),
+        "assignee": claimed.assignee,
+        "board": board,
+    }]
+
+
+def _dispatch_pending_rework(
+    conn: sqlite3.Connection,
+    kanban_db: Any,
+    board: str,
+    *,
+    dry_run: bool = False,
+    task_ids: Optional[Iterable[str]] = None,
+    normalized_task_ids: Optional[Iterable[str]] = None,
+    spawn_fn: Any = None,
+    cfg: Optional[Mapping[str, Any]] = None,
+    on_claim: Any = None,
+    on_failure: Any = None,
+    client: Any = None,
+    rework_contexts: Optional[Mapping[str, Optional[Mapping[str, Any]]]] = None,
+    active_pr_owners: Optional[Mapping[tuple[str, int], str]] = None,
+) -> list[dict[str, Any]]:
+    """Run one rework admission under the core's board-scoped dispatch lock.
+
+    The edge lane must serialize its running-count snapshot with claim/spawn;
+    otherwise two overlapping intake ticks can both pass ``max_in_progress``
+    before claiming different ready tasks.  Reuse the existing core lock
+    without changing Hermes core behavior.  Fail closed if the lock API or
+    board path cannot be resolved.
+    """
+    try:
+        db_path = kanban_db.kanban_db_path(board=board)
+    except Exception as exc:
+        return [{
+            "task_id": None,
+            "status": None,
+            "changed": False,
+            "reason": "dispatch_lock_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "board": board,
+        }]
+    lock_factory = getattr(kanban_db, "_dispatch_tick_lock", None)
+    if not callable(lock_factory):
+        return [{
+            "task_id": None,
+            "status": None,
+            "changed": False,
+            "reason": "dispatch_lock_unavailable",
+            "board": board,
+        }]
+    lock_context: Any = lock_factory(db_path)
+    with lock_context as held:
+        if not held:
+            return [{
+                "task_id": None,
+                "status": None,
+                "changed": False,
+                "reason": "dispatch_locked",
+                "board": board,
+            }]
+        return _dispatch_pending_rework_locked(
+            conn,
+            kanban_db,
+            board,
+            dry_run=dry_run,
+            task_ids=task_ids,
+            normalized_task_ids=normalized_task_ids,
+            spawn_fn=spawn_fn,
+            cfg=cfg,
+            on_claim=on_claim,
+            on_failure=on_failure,
+            client=client,
+            rework_contexts=rework_contexts,
+            active_pr_owners=active_pr_owners,
+        )
+
+
+def sync_board(
+    board: str,
+    task_ids: Optional[list[str]] = None,
+    *,
+    dry_run: bool = False,
+    client: Any = None,
+) -> list[dict[str, Any]]:
+    """Reconcile every non-archived GitHub-backed card on one board.
+
+    GitHub API lookups happen outside any DB transaction; only the final
+    optimistic transition is transactional.  A single card failure (e.g.
+    GitHub query error) never aborts the rest of the board.
+    """
+    kanban_db = _import_kanban_db()
+
+    def _annotate(
+        entry: dict[str, Any], row: Mapping[str, Any], ref: GithubTaskRef
+    ) -> dict[str, Any]:
+        """Minimal structured-result extension for the intake Telegram observer.
+
+        ``repository``/``issue_number`` are attached to every entry;
+        ``from_state``/``to_state`` only when the entry records an actual
+        transition (``changed=True``).  No state machine behavior changes.
+        """
+        entry["repository"] = ref.repository
+        entry["issue_number"] = ref.issue_number
+        entry["issue_title"] = ref.issue_title
+        if entry.get("changed") and entry.get("status"):
+            entry["from_state"] = str(row["status"])
+            entry["to_state"] = str(entry["status"])
+        return entry
+
+    with kanban_db.connect_closing(board=board) as conn:
+        verify_schema(conn, kanban_db)
+        requested = {str(tid) for tid in task_ids} if task_ids else None
+        rows = conn.execute(
+            "SELECT id, body, status, block_kind, claim_lock, current_run_id, "
+            "worker_pid FROM tasks WHERE status != 'archived' "
+            "AND body IS NOT NULL ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        normalized_rework_ids: set[str] = set()
+        lifecycle_contexts_by_task: dict[str, Optional[dict[str, Any]]] = {}
+        for row in rows:
+            task_id = str(row["id"])
+            if requested is not None and task_id not in requested:
+                continue
+            ref = parse_task_ref(row["body"])
+            if ref is None:
+                continue
+            text_sources: list[str] = [str(row["body"] or "")]
+            try:
+                for comment in kanban_db.list_comments(conn, task_id):
+                    text_sources.append(comment.body)
+                for run in kanban_db.list_runs(conn, task_id):
+                    for item in (run.summary, run.error):
+                        if item:
+                            text_sources.append(item)
+                    if run.metadata:
+                        text_sources.append(
+                            json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                        )
+            except Exception as exc:  # run/comment API drift -> fail closed
+                results.append(
+                    _annotate(
+                        {
+                            "task_id": task_id,
+                            "status": row["status"],
+                            "changed": False,
+                            "reason": "text_source_lookup_failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                        row,
+                        ref,
+                    )
+                )
+                continue
+
+            decision = verify_completion(client, ref, text_sources)
+
+            # PR rework lifecycle: when a consumed rework round governs this
+            # task, GitHub-visible worker ownership (agent-working /
+            # agent-review-ready) is projected from Kanban state, and stale or
+            # failed rounds are recovered.  Classic REVIEW/BLOCKED intake with
+            # a fresh agent-rework label stays on the existing paths below.
+            lifecycle_event = _latest_rework_event(conn, task_id)
+            lifecycle_context: Optional[dict[str, Any]] = None
+            if lifecycle_event is not None:
+                try:
+                    lifecycle_context = _rework_context(
+                        client, ref, decision, task_id, lifecycle_event,
+                    )
+                except GithubCompletionError as exc:
+                    lifecycle_context = {"_error": str(exc)}
+                lifecycle_contexts_by_task[task_id] = lifecycle_context
+                if lifecycle_context is not None and "_error" in lifecycle_context:
+                    results.append(
+                        _annotate(
+                            {
+                                "task_id": task_id,
+                                "status": row["status"],
+                                "changed": False,
+                                "reason": "rework_context_failed",
+                                "error": lifecycle_context["_error"],
+                            },
+                            row,
+                            ref,
+                        )
+                    )
+                    continue
+
+            # An internal review can return a READY card through
+            # ``changes_requested`` without producing the historical
+            # ``github_pr_rework`` event.  Normalize only when the current
+            # governing event is exactly changes_requested and the existing
+            # GitHub decision proves one canonical OPEN PR.  This keeps the
+            # normal active-PR guard intact for every other READY card.
+            normalized_rework: Optional[dict[str, Any]] = None
+            if row["status"] == "ready":
+                try:
+                    normalized_rework = _normalize_changes_requested_rework(
+                        conn,
+                        task_id,
+                        ref,
+                        decision,
+                        dry_run=dry_run,
+                    )
+                except sqlite3.Error as exc:
+                    results.append(
+                        _annotate(
+                            {
+                                "task_id": task_id,
+                                "status": row["status"],
+                                "changed": False,
+                                "reason": "db_write_failed",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                            row,
+                            ref,
+                        )
+                    )
+                    continue
+            if normalized_rework is not None:
+                if dry_run:
+                    normalized_rework_ids.add(task_id)
+                else:
+                    # The canonical event was just written: rebuild the
+                    # lifecycle context so this same tick can dispatch it.
+                    lifecycle_event2 = _latest_rework_event(conn, task_id)
+                    if lifecycle_event2 is not None:
+                        try:
+                            lifecycle_contexts_by_task[task_id] = _rework_context(
+                                client, ref, decision, task_id, lifecycle_event2,
+                            )
+                        except GithubCompletionError:
+                            lifecycle_contexts_by_task[task_id] = None
+                results.append(_annotate(normalized_rework, row, ref))
+                continue
+
+            if row["status"] == "blocked":
+                results.append(
+                    _annotate(
+                        _reconcile_blocked(
+                            conn,
+                            client,
+                            ref,
+                            decision,
+                            row,
+                            dry_run=dry_run,
+                        ),
+                        row,
+                        ref,
+                    )
+                )
+                continue
+
+            # Worker-owned lifecycle reconciliation (running/ready/review/done
+            # with a consumed rework round).  Returns an entry for every state
+            # it owns; None means the classic paths below apply.
+            if lifecycle_context is not None:
+                lifecycle_entry = _reconcile_rework_lifecycle(
+                    conn,
+                    kanban_db,
+                    client,
+                    ref,
+                    decision,
+                    row,
+                    lifecycle_context,
+                    dry_run=dry_run,
+                    failure_limit=_retry_failure_limit(),
+                )
+                if lifecycle_entry is not None:
+                    results.append(_annotate(lifecycle_entry, row, ref))
+                    continue
+
+            rework: Optional[ReworkDecision] = None
+            if decision.authoritative and row["status"] in {"review", "ready"}:
+                try:
+                    rework = evaluate_rework(
+                        client,
+                        ref,
+                        decision,
+                        current_status=row["status"],
+                        last_rework_at=_last_rework_event_at(conn, task_id),
+                    )
+                except GithubCompletionError as exc:
+                    rework = ReworkDecision(
+                        reason="rework_query_failed", error=str(exc), authoritative=False
+                    )
+
+            if dry_run or not decision.authoritative:
+                entry = {
+                    "task_id": task_id,
+                    "status": row["status"],
+                    "changed": False,
+                    "reason": decision.reason,
+                    "evidence": decision.to_dict(),
+                }
+                if rework is not None:
+                    entry["rework"] = rework.to_dict()
+                results.append(_annotate(entry, row, ref))
+                continue
+
+            # Rework transition: REVIEW -> READY (body context + event in one
+            # transaction, label removal LAST and outside the transaction).
+            if (
+                rework is not None
+                and rework.authoritative
+                and rework.reason == "agent_rework"
+                and row["status"] == "review"
+            ):
+                try:
+                    with conn:
+                        result = apply_rework(conn, task_id, rework, ref)
+                except sqlite3.Error as exc:
+                    conn.rollback()
+                    results.append(
+                        _annotate(
+                            {
+                                "task_id": task_id,
+                                "status": row["status"],
+                                "changed": False,
+                                "reason": "db_write_failed",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                            row,
+                            ref,
+                        )
+                    )
+                    continue
+                if result.get("changed"):
+                    # The agent-rework label intentionally stays on the PR
+                    # until the edge dispatcher claims the Kanban task and
+                    # atomically swaps it for agent-working.
+                    pass
+                results.append(_annotate(result, row, ref))
+                continue
+
+            context_block: Optional[str] = None
+            if decision.desired_status == "review" and row["status"] == "done":
+                # DONE -> REVIEW: refresh the sync context best-effort; a
+                # context fetch failure never blocks the transition.
+                try:
+                    context_block = _build_context_block(
+                        client, ref, decision.pull_requests
+                    )
+                except GithubCompletionError:
+                    context_block = None
+            try:
+                with conn:
+                    result = apply_decision(
+                        conn, task_id, decision, context_block=context_block
+                    )
+            except sqlite3.Error as exc:
+                conn.rollback()
+                results.append(
+                    _annotate(
+                        {
+                            "task_id": task_id,
+                            "status": row["status"],
+                            "changed": False,
+                            "reason": "db_write_failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                        row,
+                        ref,
+                    )
+                )
+                continue
+            if rework is not None:
+                result["rework"] = rework.to_dict()
+            results.append(_annotate(result, row, ref))
+
+        # Edge-owned rework respawn lane (existing-PR rework): the core
+        # dispatcher's ``active_pr`` respawn guard intentionally never
+        # spawns these, so the edge does — but ONLY for tasks whose
+        # governing transition is a consumed agent-rework, and only when
+        # the intake cron enables this lane via the env flag.  A transition
+        # normalized earlier in this same tick (including
+        # changes_requested -> github_pr_rework) is picked up immediately
+        # here.
+        if os.environ.get(REWORK_DISPATCH_ENV, "").strip() == "1":
+            def _claim_projection(claimed: Any) -> dict[str, Any]:
+                ctx = lifecycle_contexts_by_task.get(str(claimed.id))
+                if not ctx or "_error" in ctx or "labels" not in ctx:
+                    return {"ok": False, "error": "rework context unavailable"}
+                try:
+                    _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                        client,
+                        GithubTaskRef(str(ctx["repository"]), int(ctx["issue_number"])),
+                        int(ctx["pr_number"]),
+                        add=(WORKING_LABEL,),
+                        remove=(REWORK_LABEL, REVIEW_READY_LABEL),
+                    )
+                except GithubCompletionError as exc:
+                    return {"ok": False, "error": str(exc)}
+                return {"ok": True, "label_action": label_reason, "lifecycle": label_evidence}
+
+            def _failure_projection(claimed: Any, stage: str) -> None:
+                ctx = lifecycle_contexts_by_task.get(str(claimed.id))
+                if not ctx or "_error" in ctx:
+                    return
+                try:
+                    _restore_rework_labels(client, ctx)
+                except GithubCompletionError as exc:
+                    print(
+                        f"kanban-github-sync: failed to restore rework label after {stage} (task {claimed.id}): {type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+
+            active_pr_owners: dict[tuple[str, int], str] = {}
+            for other_row in rows:
+                if str(other_row["status"]) != "running":
+                    continue
+                other_ctx = lifecycle_contexts_by_task.get(str(other_row["id"]))
+                if other_ctx and "pr_number" in other_ctx and "_error" not in other_ctx:
+                    active_pr_owners[
+                        (str(other_ctx["repository"]), int(other_ctx["pr_number"]))
+                    ] = str(other_row["id"])
+            try:
+                dispatch_entries = _dispatch_pending_rework(
+                    conn,
+                    kanban_db,
+                    board,
+                    dry_run=dry_run,
+                    task_ids=requested,
+                    normalized_task_ids=normalized_rework_ids,
+                    client=client,
+                    rework_contexts=lifecycle_contexts_by_task,
+                    active_pr_owners=active_pr_owners,
+                    on_claim=_claim_projection,
+                    on_failure=_failure_projection,
+                )
+            except Exception as exc:  # never let the spawn lane break the sync
+                dispatch_entries = [{
+                    "task_id": None, "status": None, "changed": False,
+                    "reason": "rework_dispatch_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }]
+            # Structured-result extension (intake Telegram observer): a
+            # spawned rework worker is a READY -> RUNNING transition; every
+            # dispatch entry carrying a task id gets its repository/issue
+            # number attached via the task body ref.
+            for entry in dispatch_entries:
+                if not entry.get("task_id"):
+                    continue
+                if entry.get("changed") and entry.get("status") == "running":
+                    entry["from_state"] = "ready"
+                    entry["to_state"] = "running"
+                if "repository" not in entry:
+                    body_row = conn.execute(
+                        "SELECT body FROM tasks WHERE id = ?", (entry["task_id"],)
+                    ).fetchone()
+                    if body_row is not None:
+                        dref = parse_task_ref(str(body_row["body"] or ""))
+                        if dref is not None:
+                            entry["repository"] = dref.repository
+                            entry["issue_number"] = dref.issue_number
+                            entry["issue_title"] = dref.issue_title
+            results.extend(dispatch_entries)
+        return results
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--board", required=True, help="Kanban board slug to reconcile")
+    parser.add_argument(
+        "task_ids", nargs="*",
+        help="Optional task ids; omit to sync every GitHub-backed task on the board",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Query only; never mutate")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    args = parser.parse_args(argv)
+
+    try:
+        client = GithubApiClient.from_environment()
+        results = sync_board(
+            args.board,
+            args.task_ids or None,
+            dry_run=args.dry_run,
+            client=client,
+        )
+    except SyncError as exc:
+        print(f"kanban-github-sync: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    else:
+        for item in results:
+            marker = "changed" if item.get("changed") else "kept"
+            suffix = ""
+            if "label_removed" in item:
+                suffix = f"; label_removed={item['label_removed']}"
+            print(
+                f"{item.get('task_id')}: {item.get('status', '?')} "
+                f"({marker}; {item.get('reason', '')}){suffix}"
+            )
+        if not results:
+            print("(no GitHub-backed tasks)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
