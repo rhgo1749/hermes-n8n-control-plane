@@ -404,6 +404,32 @@ def registry_snapshot(
     }
 
 
+
+def live_registry_snapshot(
+    token: str,
+    owner: str,
+    topic: str,
+    checkout_root: Path,
+    kanban_root: Path,
+) -> dict[str, Any]:
+    """Build the authoritative live registry snapshot without mutating state."""
+    repositories = discover_repositories(token, owner, topic)
+    board_evidence = _kanban_board_repository_evidence(kanban_root)
+
+    return registry_snapshot(
+        repositories,
+        checkout_root,
+        contract_reader=lambda repository, branch: _github_contracts(
+            token,
+            repository,
+            branch,
+        ),
+        board_resolver=lambda repository: _resolve_board(
+            repository,
+            board_evidence,
+        ),
+    )
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner", default=os.environ.get("HERMES_GITHUB_OWNER", "rhgo1749"))
@@ -418,21 +444,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.fixture_json:
             repositories = _fixture_repositories(args.fixture_json)
             contract_reader = _fixture_contract_reader(repositories)
-        else:
-            token = _github_token()
-            repositories = discover_repositories(token, args.owner, args.topic)
-            contract_reader = lambda repository, branch: _github_contracts(
-                token, repository, branch
+            board_evidence = _kanban_board_repository_evidence(args.kanban_root)
+            snapshot = registry_snapshot(
+                repositories,
+                args.checkout_root,
+                contract_reader=contract_reader,
+                board_resolver=lambda repository: _resolve_board(
+                    repository,
+                    board_evidence,
+                ),
             )
-
-        board_evidence = _kanban_board_repository_evidence(args.kanban_root)
-        board_resolver = lambda repository: _resolve_board(repository, board_evidence)
-        snapshot = registry_snapshot(
-            repositories,
-            args.checkout_root,
-            contract_reader=contract_reader,
-            board_resolver=board_resolver,
-        )
+        else:
+            snapshot = live_registry_snapshot(
+                _github_token(),
+                args.owner,
+                args.topic,
+                args.checkout_root,
+                args.kanban_root,
+            )
         text = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
