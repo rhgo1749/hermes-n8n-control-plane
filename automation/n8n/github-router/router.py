@@ -604,6 +604,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/github/hermes-intake":
             self._github_event()
             return
+        authorization = self.headers.get("Authorization", "").strip()
+        if not _service_authorized(authorization):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"ok": False, "error": "authorization_required"},
+            )
+            return
         if parsed.path == "/scope/claim":
             try:
                 item = _claim_scope()
@@ -614,13 +621,6 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(HTTPStatus.OK, {"ok": True, **item})
-            return
-        authorization = self.headers.get("Authorization", "").strip()
-        if not _service_authorized(authorization):
-            self._send_json(
-                HTTPStatus.UNAUTHORIZED,
-                {"ok": False, "error": "authorization_required"},
-            )
             return
         if parsed.path == "/reconcile":
             try:

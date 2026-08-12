@@ -139,6 +139,35 @@ def test_invalid_signature_is_rejected() -> None:
             _restore(original)
 
 
+def test_scope_claim_requires_authorization() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            router._enqueue_scope(
+                full=False,
+                repository="rhgo1749/ctrl-hangul",
+            )
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/scope/claim",
+                )
+                auth_status, claim = _request(
+                    server.base_url,
+                    "POST",
+                    "/scope/claim",
+                    headers={"Authorization": "Bearer hermes-token"},
+                )
+            assert status == 401
+            assert payload["error"] == "authorization_required"
+            assert auth_status == 200
+            assert claim["mode"] == "event"
+            assert claim["repositories"] == ["rhgo1749/ctrl-hangul"]
+        finally:
+            _restore(original)
+
+
 def test_valid_event_enqueues_one_repo_scope() -> None:
     with tempfile.TemporaryDirectory() as td:
         original = _install_temp_paths(Path(td))
@@ -166,6 +195,7 @@ def test_valid_event_enqueues_one_repo_scope() -> None:
                     server.base_url,
                     "POST",
                     "/scope/claim",
+                    headers={"Authorization": "Bearer hermes-token"},
                 )
             assert status == 202
             assert payload["queued"] is True
@@ -224,6 +254,7 @@ def test_fallback_survives_reconcile_failure() -> None:
                     server.base_url,
                     "POST",
                     "/scope/claim",
+                    headers={"Authorization": "Bearer hermes-token"},
                 )
             assert status == 200
             assert payload["reconcile_ok"] is False

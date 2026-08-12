@@ -54,6 +54,10 @@ def validate_dashboard_url_policy() -> None:
         "http://example.com",
         "http://8.8.8.8",
         "http://user:password@100.107.12.90",
+        "http://100.107.12.90:not-a-port",
+        "http://100.107.12.90:9119/path",
+        "http://100.107.12.90:9119?query=1",
+        "http://100.107.12.90:9119#fragment",
     ):
         try:
             normalize_dashboard_url(value)
@@ -88,6 +92,8 @@ def validate_single_intake_boundary() -> None:
     )
     assert installer_match is not None
     assert ast.literal_eval(installer_match.group("mapping")) == expected_jobs
+    assert "create_job" not in plugin_source
+    assert "delete" not in plugin_source
 
 
 def main() -> int:
@@ -124,6 +130,15 @@ def main() -> int:
     assert lease["user"] == "1000:1000"
     assert lease["environment"]["LEASE_LISTEN_PORT"] == "5680"
     assert lease["environment"]["LEASE_HERMES_JOB_ID"] == "bf431b2a6ba6"
+    assert lease["environment"]["LEASE_HERMES_PROFILE"] == "default"
+    assert (
+        lease["environment"]["LEASE_STATE_PATH"]
+        == "/state/hermes-intake-lease.json"
+    )
+
+    assert n8n["environment"]["N8N_DIAGNOSTICS_ENABLED"] == "false"
+    assert n8n["environment"]["N8N_PERSONALIZATION_ENABLED"] == "false"
+    assert n8n["environment"]["N8N_TEMPLATES_ENABLED"] == "false"
 
     router = compose["services"]["github-router"]
     assert router["restart"] == "unless-stopped"
@@ -150,9 +165,30 @@ def main() -> int:
     assert '"/reconcile"' in router_source
     assert "_enqueue_scope" in router_source
     assert "_claim_scope" in router_source
+    post_start = router_source.index("    def do_POST(self) -> None:")
+    auth_index = router_source.index(
+        'authorization = self.headers.get("Authorization", "").strip()',
+        post_start,
+    )
+    claim_index = router_source.index(
+        'if parsed.path == "/scope/claim":',
+        post_start,
+    )
+    assert auth_index < claim_index
+
+    intake_source = (
+        ROOT
+        / "automation"
+        / "hermes"
+        / "scripts"
+        / "github-agent-ready-kanban-intake.py"
+    ).read_text(encoding="utf-8")
+    assert "HERMES_INTAKE_SCOPE_TOKEN_FILE" in intake_source
+    assert 'headers={"Authorization": f"Bearer {token}"}' in intake_source
 
     env_example = (N8N / ".env.example").read_text(encoding="utf-8")
     assert "N8N_PORT=5678" in env_example
+    assert "N8N_HOST_PORT" not in env_example
     assert "LEASE_HERMES_BASE_URL=" in env_example
     assert "GITHUB_ROUTER_OWNER=" in env_example
     assert "GITHUB_ROUTER_TOPIC=" in env_example

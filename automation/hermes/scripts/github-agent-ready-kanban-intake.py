@@ -98,7 +98,29 @@ def _claim_wake_scope() -> WakeScope | None:
     ).strip()
     if not url:
         return None
-    request = Request(url, method="POST", data=b"")
+
+    token_file = Path(
+        os.environ.get(
+            "HERMES_INTAKE_SCOPE_TOKEN_FILE",
+            (
+                f"{DEFAULT_HERMES_HOME}/plugins/"
+                "hermes-n8n-cron-auth/.n8n-cron-token"
+            ),
+        )
+    )
+    try:
+        token = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not token:
+        return None
+
+    request = Request(
+        url,
+        method="POST",
+        data=b"",
+        headers={"Authorization": f"Bearer {token}"},
+    )
     try:
         with urlopen(request, timeout=2) as response:
             payload = json.loads(response.read().decode("utf-8"))
