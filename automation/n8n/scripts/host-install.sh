@@ -50,7 +50,7 @@ command -v docker >/dev/null || {
 }
 
 install -d -m 700 "$N8N_DIR/state" "$N8N_DIR/state/rendered-workflows" \
-  "$N8N_DIR/state/exports" "$N8N_DIR/state/backups"
+  "$N8N_DIR/state/exports" "$N8N_DIR/state/backups" "$N8N_DIR/state/secrets"
 if [[ ! -f "$ENV_FILE" ]]; then
   cp "$N8N_DIR/.env.example" "$ENV_FILE"
 fi

@@ -2,24 +2,16 @@ name: hermes-n8n-control-plane
 
 services:
   n8n:
-    # Pin to the n8n upstream stable release selected for this migration.
     image: ${N8N_IMAGE:?set N8N_IMAGE in .env}
     restart: unless-stopped
     env_file:
       - .env
-    # Host networking is required so n8n can reach the host's Tailscale-only
-    # Hermes dashboard. n8n itself remains loopback-only via N8N_LISTEN_ADDRESS.
     network_mode: host
     environment:
       NODE_ENV: production
       N8N_LISTEN_ADDRESS: 127.0.0.1
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
-      # The five GitHub event workflows and the temporary polling fallback all
-      # control the same Hermes intake job with trigger -> wait -> pause. Keep
-      # production executions strictly FIFO so an older execution can never
-      # pause the job after a newer execution has triggered it.
       N8N_CONCURRENCY_PRODUCTION_LIMIT: "1"
-      # Workflow expressions and Code nodes cannot read process env/secrets.
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
       N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES: "true"
       N8N_RESTRICT_FILE_ACCESS_TO: /files
@@ -34,8 +26,6 @@ services:
       EXECUTIONS_DATA_PRUNE_MAX_COUNT: "10000"
     volumes:
       - n8n_data:/home/node/.n8n
-      # Rendered workflow imports and exports only. No Docker socket, Hermes
-      # home, source checkout, or host command mount is exposed to n8n.
       - ./state:/files
     healthcheck:
       test:
@@ -46,7 +36,6 @@ services:
       timeout: 5s
       retries: 8
       start_period: 30s
-
 
   lease-controller:
     image: python:3.12-alpine
@@ -78,8 +67,54 @@ services:
       test:
         - CMD-SHELL
         - >-
-          python3 -c "import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:5680/healthz', timeout=3)"
+          python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5680/healthz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  github-router:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      GITHUB_ROUTER_LISTEN_PORT: "5681"
+      GITHUB_ROUTER_OWNER: ${GITHUB_ROUTER_OWNER:-rhgo1749}
+      GITHUB_ROUTER_TOPIC: ${GITHUB_ROUTER_TOPIC:-hermes-agent}
+      GITHUB_ROUTER_PUBLIC_URL: ${GITHUB_ROUTER_PUBLIC_URL:-}
+      GITHUB_ROUTER_LEASE_BASE_URL: http://127.0.0.1:5680
+      GITHUB_ROUTER_WAIT_SECONDS: "75"
+      GITHUB_ROUTER_SCOPE_TTL_SECONDS: "300"
+      GITHUB_ROUTER_STATE_PATH: /state/github-router.json
+      GITHUB_ROUTER_REGISTRY_SCRIPT: /app/repository_registry.py
+      GITHUB_ROUTER_GITHUB_TOKEN_FILE: /run/secrets/github-token
+      GITHUB_ROUTER_WEBHOOK_SECRET_FILE: /run/secrets/github-webhook-secret
+      GITHUB_ROUTER_HERMES_TOKEN_FILE: /run/secrets/hermes-cron-token
+    command:
+      - python3
+      - /app/router.py
+    volumes:
+      - ./github-router/router.py:/app/router.py:ro
+      - ./scripts/repository_registry.py:/app/repository_registry.py:ro
+      - ./state:/state
+      - ./state/secrets:/run/secrets:ro
+    tmpfs:
+      - /tmp:size=8m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5681/healthz', timeout=3)"
       interval: 15s
       timeout: 5s
       retries: 5

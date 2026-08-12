@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Static regression checks for n8n templates, Compose hardening, and allowlists."""
 from __future__ import annotations
 
 import ast
@@ -15,12 +14,8 @@ N8N = ROOT / "automation" / "n8n"
 sys.path.insert(0, str(N8N / "scripts"))
 from render_workflows import (  # noqa: E402
     ACTIVE_JOBS,
-    GITHUB_REPOSITORIES,
-    INTAKE_JOB,
-    PAUSE_TIMEOUT_MS,
-    PLACEHOLDER_URL,
-    TRIGGER_TIMEOUT_MS,
-    WAIT_SECONDS,
+    FALLBACK_TIMEOUT_MS,
+    ROUTER_FALLBACK_URL,
     normalize_dashboard_url,
 )
 
@@ -29,83 +24,41 @@ def load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def http_urls(workflow: dict) -> list[str]:
-    return [
-        node["parameters"]["url"]
-        for node in workflow["nodes"]
-        if node["type"] == "n8n-nodes-base.httpRequest"
-    ]
-
-
-def assert_compensating_http_nodes(nodes: dict[str, dict], trigger_name: str, pause_name: str) -> None:
-    trigger = nodes[trigger_name]
-    pause = nodes[pause_name]
-    trigger_response = trigger["parameters"]["options"]["response"]["response"]
-    pause_response = pause["parameters"]["options"]["response"]["response"]
-    assert trigger["parameters"]["options"]["timeout"] == TRIGGER_TIMEOUT_MS
-    assert trigger_response["neverError"] is True
-    assert pause["parameters"]["options"]["timeout"] == PAUSE_TIMEOUT_MS
-    assert pause_response["neverError"] is False
-
-
 def validate_schedule(job: dict[str, str]) -> None:
     path = N8N / "workflows" / f"schedule-{job['slug']}.json"
     data = load(path)
     assert data["active"] is False
     nodes = {node["name"]: node for node in data["nodes"]}
+    assert set(nodes) == {"Schedule Trigger", "Run registry fallback"}
     schedule = nodes["Schedule Trigger"]
     assert schedule["type"] == "n8n-nodes-base.scheduleTrigger"
-    rule = schedule["parameters"]["rule"]["interval"]
-    assert rule == [{"field": "cronExpression", "expression": job["schedule"]}]
-    wait = nodes["Wait for Hermes ticker"]
-    assert wait["parameters"] == {"resume": "timeInterval", "amount": WAIT_SECONDS, "unit": "seconds"}
-    assert_compensating_http_nodes(
-        nodes,
-        "Trigger existing Hermes cron job",
-        "Pause legacy Hermes schedule",
-    )
-    expected = {
-        "http://127.0.0.1:5680/trigger",
-        (
-            "={{ 'http://127.0.0.1:5680/pause?lease=' + "
-            "$('Trigger existing Hermes cron job').item.json.body.lease }}"
-        ),
-    }
-    assert set(http_urls(data)) == expected
-    assert "credentials" not in json.dumps(data).lower()
-
-
-def validate_github(repo: dict[str, str]) -> None:
-    path = N8N / "workflows" / f"github-{repo['slug']}-intake.json"
-    data = load(path)
-    assert data["active"] is False
-    nodes = {node["name"]: node for node in data["nodes"]}
-    github = nodes["GitHub Trigger"]
-    assert github["type"] == "n8n-nodes-base.githubTrigger"
-    parameters = github["parameters"]
-    assert parameters["owner"]["value"] == repo["owner"]
-    assert parameters["repository"]["value"] == repo["repository"]
-    assert parameters["events"] == ["issues", "issue_comment", "pull_request"]
-    assert_compensating_http_nodes(
-        nodes,
-        "Trigger existing Hermes intake",
-        "Pause legacy Hermes intake schedule",
-    )
-    expected = {
-        "http://127.0.0.1:5680/trigger",
-        (
-            "={{ 'http://127.0.0.1:5680/pause?lease=' + "
-            "$('Trigger existing Hermes intake').item.json.body.lease }}"
-        ),
-    }
-    assert set(http_urls(data)) == expected
-    assert "credentials" not in json.dumps(data).lower()
+    assert schedule["parameters"]["rule"]["interval"] == [
+        {"field": "cronExpression", "expression": job["schedule"]}
+    ]
+    fallback = nodes["Run registry fallback"]
+    assert fallback["type"] == "n8n-nodes-base.httpRequest"
+    assert fallback["parameters"]["url"] == ROUTER_FALLBACK_URL
+    assert fallback["parameters"]["authentication"] == "genericCredentialType"
+    assert fallback["parameters"]["genericAuthType"] == "httpHeaderAuth"
+    assert fallback["parameters"]["options"]["timeout"] == FALLBACK_TIMEOUT_MS
+    serialized = json.dumps(data)
+    assert "/api/cron/jobs/" not in serialized
+    assert "127.0.0.1:5680" not in serialized
+    assert "credentials" not in serialized.lower()
 
 
 def validate_dashboard_url_policy() -> None:
     assert normalize_dashboard_url("https://n8n.example.com") == "https://n8n.example.com"
     assert normalize_dashboard_url("http://100.107.12.90:9119") == "http://100.107.12.90:9119"
-    for value in ("http://example.com", "http://8.8.8.8", "http://user:password@100.107.12.90"):
+    for value in (
+        "http://example.com",
+        "http://8.8.8.8",
+        "http://user:password@100.107.12.90",
+        "http://100.107.12.90:not-a-port",
+        "http://100.107.12.90:9119/path",
+        "http://100.107.12.90:9119?query=1",
+        "http://100.107.12.90:9119#fragment",
+    ):
         try:
             normalize_dashboard_url(value)
         except ValueError:
@@ -115,53 +68,60 @@ def validate_dashboard_url_policy() -> None:
 
 def validate_single_intake_boundary() -> None:
     expected_jobs = {"bf431b2a6ba6": "default"}
-    plugin_source = (ROOT / "hermes-plugin" / "n8n-cron-auth" / "__init__.py").read_text(encoding="utf-8")
+    plugin_source = (
+        ROOT / "hermes-plugin" / "n8n-cron-auth" / "__init__.py"
+    ).read_text(encoding="utf-8")
     plugin_tree = ast.parse(plugin_source)
     allowed_jobs = None
     for node in ast.walk(plugin_tree):
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ALLOWED_JOBS":
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "ALLOWED_JOBS"
+        ):
             assert node.value is not None
             allowed_jobs = ast.literal_eval(node.value)
             break
     assert allowed_jobs == expected_jobs
-
-    installer_source = (N8N / "scripts" / "configure-hermes-service-auth.sh").read_text(encoding="utf-8")
-    installer_match = re.search(r"(?ms)^expected = (?P<mapping>\{.*?^\})", installer_source)
+    installer_source = (
+        N8N / "scripts" / "configure-hermes-service-auth.sh"
+    ).read_text(encoding="utf-8")
+    installer_match = re.search(
+        r"(?ms)^expected = (?P<mapping>\{.*?^\})",
+        installer_source,
+    )
     assert installer_match is not None
     assert ast.literal_eval(installer_match.group("mapping")) == expected_jobs
-
-    cutover_source = (N8N / "scripts" / "cutover.sh").read_text(encoding="utf-8")
-    target_match = re.search(r"(?ms)^TARGETS=\(\n(?P<entries>.*?)^\)", cutover_source)
-    assert target_match is not None
-    targets = re.findall(r'^\s*"([^"]+)"\s*$', target_match.group("entries"), flags=re.MULTILINE)
-    assert targets == ["default:bf431b2a6ba6"]
+    assert "create_job" not in plugin_source
+    assert "delete" not in plugin_source
 
 
 def main() -> int:
     assert {job["id"] for job in ACTIVE_JOBS} == {"bf431b2a6ba6"}
-    expected_schedule_files = {f"schedule-{job['slug']}.json" for job in ACTIVE_JOBS}
-    actual_schedule_files = {path.name for path in (N8N / "workflows").glob("schedule-*.json")}
+    expected_schedule_files = {
+        f"schedule-{job['slug']}.json" for job in ACTIVE_JOBS
+    }
+    actual_schedule_files = {
+        path.name for path in (N8N / "workflows").glob("schedule-*.json")
+    }
     assert actual_schedule_files == expected_schedule_files
+    github_workflows = sorted((N8N / "workflows").glob("github-*-intake.json"))
+    assert github_workflows == []
     for job in ACTIVE_JOBS:
         validate_schedule(job)
-    for repo in GITHUB_REPOSITORIES:
-        validate_github(repo)
     validate_dashboard_url_policy()
     validate_single_intake_boundary()
 
     compose_text = (N8N / "compose.yaml").read_text(encoding="utf-8")
     compose = yaml.safe_load(compose_text)
-    service = compose["services"]["n8n"]
-    assert service["restart"] == "unless-stopped"
-    assert service["network_mode"] == "host"
-    assert "ports" not in service
-    assert service["environment"]["N8N_LISTEN_ADDRESS"] == "127.0.0.1"
-    assert "/var/run/docker.sock" not in compose_text
-    environment = service["environment"]
-    # Keep the single production slot as a burst/load limiter only.
-    # n8n Wait nodes can yield the production slot, so this setting is not the
-    # stale-pause correctness boundary. The lease-controller is.
-    assert environment["N8N_CONCURRENCY_PRODUCTION_LIMIT"] == "1"
+    n8n = compose["services"]["n8n"]
+    assert n8n["restart"] == "unless-stopped"
+    assert n8n["network_mode"] == "host"
+    assert "ports" not in n8n
+    assert n8n["environment"]["N8N_LISTEN_ADDRESS"] == "127.0.0.1"
+    assert n8n["environment"]["N8N_CONCURRENCY_PRODUCTION_LIMIT"] == "1"
+    assert n8n["environment"]["N8N_BLOCK_ENV_ACCESS_IN_NODE"] == "true"
+    assert n8n["environment"]["N8N_PUBLIC_API_DISABLED"] == "true"
 
     lease = compose["services"]["lease-controller"]
     assert lease["restart"] == "unless-stopped"
@@ -171,22 +131,79 @@ def main() -> int:
     assert lease["environment"]["LEASE_LISTEN_PORT"] == "5680"
     assert lease["environment"]["LEASE_HERMES_JOB_ID"] == "bf431b2a6ba6"
     assert lease["environment"]["LEASE_HERMES_PROFILE"] == "default"
-    assert lease["environment"]["LEASE_STATE_PATH"] == "/state/hermes-intake-lease.json"
-    assert environment["N8N_BLOCK_ENV_ACCESS_IN_NODE"] == "true"
-    assert environment["N8N_DIAGNOSTICS_ENABLED"] == "false"
-    assert environment["N8N_PUBLIC_API_DISABLED"] == "true"
+    assert (
+        lease["environment"]["LEASE_STATE_PATH"]
+        == "/state/hermes-intake-lease.json"
+    )
 
-    plugin = (ROOT / "hermes-plugin" / "n8n-cron-auth" / "__init__.py").read_text(encoding="utf-8")
-    for job in ACTIVE_JOBS:
-        assert job["id"] in plugin
-    assert "create_job" not in plugin and "delete" not in plugin
+    assert n8n["environment"]["N8N_DIAGNOSTICS_ENABLED"] == "false"
+    assert n8n["environment"]["N8N_PERSONALIZATION_ENABLED"] == "false"
+    assert n8n["environment"]["N8N_TEMPLATES_ENABLED"] == "false"
+
+    router = compose["services"]["github-router"]
+    assert router["restart"] == "unless-stopped"
+    assert router["network_mode"] == "host"
+    assert router["read_only"] is True
+    assert router["user"] == "1000:1000"
+    assert router["environment"]["GITHUB_ROUTER_LISTEN_PORT"] == "5681"
+    assert (
+        router["environment"]["GITHUB_ROUTER_LEASE_BASE_URL"]
+        == "http://127.0.0.1:5680"
+    )
+    assert router["environment"]["GITHUB_ROUTER_STATE_PATH"] == "/state/github-router.json"
+    router_volumes = "\n".join(router["volumes"])
+    assert "./state/secrets:/run/secrets:ro" in router_volumes
+    assert "/var/run/docker.sock" not in compose_text
+
+    router_source = (N8N / "github-router" / "router.py").read_text(encoding="utf-8")
+    assert 'LISTEN_HOST = "127.0.0.1"' in router_source
+    assert "X-Hub-Signature-256" in router_source
+    assert "hmac.compare_digest" in router_source
+    assert '"/github/hermes-intake"' in router_source
+    assert '"/scope/claim"' in router_source
+    assert '"/fallback"' in router_source
+    assert '"/reconcile"' in router_source
+    assert "_enqueue_scope" in router_source
+    assert "_claim_scope" in router_source
+    post_start = router_source.index("    def do_POST(self) -> None:")
+    auth_index = router_source.index(
+        'authorization = self.headers.get("Authorization", "").strip()',
+        post_start,
+    )
+    claim_index = router_source.index(
+        'if parsed.path == "/scope/claim":',
+        post_start,
+    )
+    assert auth_index < claim_index
+
+    intake_source = (
+        ROOT
+        / "automation"
+        / "hermes"
+        / "scripts"
+        / "github-agent-ready-kanban-intake.py"
+    ).read_text(encoding="utf-8")
+    assert "HERMES_INTAKE_SCOPE_TOKEN_FILE" in intake_source
+    assert 'headers={"Authorization": f"Bearer {token}"}' in intake_source
 
     env_example = (N8N / ".env.example").read_text(encoding="utf-8")
     assert "N8N_PORT=5678" in env_example
     assert "N8N_HOST_PORT" not in env_example
     assert "LEASE_HERMES_BASE_URL=" in env_example
+    assert "GITHUB_ROUTER_OWNER=" in env_example
+    assert "GITHUB_ROUTER_TOPIC=" in env_example
+    assert "GITHUB_ROUTER_PUBLIC_URL=" in env_example
 
-    print(json.dumps({"ok": True, "schedule_workflows": len(ACTIVE_JOBS), "github_workflows": len(GITHUB_REPOSITORIES)}))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "schedule_workflows": len(ACTIVE_JOBS),
+                "github_workflows": 0,
+                "github_event_router": 1,
+            }
+        )
+    )
     return 0
 
 
