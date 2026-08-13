@@ -1,0 +1,14 @@
+{
+  "name": "h4v3-overview",
+  "label": "H4V3 Overview",
+  "description": "Read-only multi-board operator overview for Hermes Kanban.",
+  "icon": "Eye",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/h4v3-overview",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
