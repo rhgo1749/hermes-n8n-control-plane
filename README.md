@@ -52,6 +52,8 @@ See [operations](docs/OPERATIONS.md) for the controlled host rollout, [GitHub ev
 | `automation/n8n/workflows/*.json` | Inactive, credential-free n8n workflow templates tracked in Git |
 | `automation/n8n/scripts/` | Host install, service-auth deployment, render/import/export, cutover/rollback, static validation |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Authoritative GitHub intake + reconciliation tick and Telegram notification policy |
+| `automation/hermes/scripts/install-h4v3-overview.sh` | Optional standalone Overview dashboard plugin installer (candidate copy, validation, atomic replace, rollback) |
+| `automation/hermes/scripts/deploy-intake-edge.sh` | Safe host deploy of intake/edge runtime copies (candidate copy, validation, atomic replace, rollback; never touches cron) |
 | `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation (completion, rework lifecycle, human-attention evidence) |
 | `hermes-plugin/n8n-cron-auth/` | User plugin that token-authenticates only exact existing cron trigger/pause routes |
 | `hermes-plugin/h4v3-overview/` | Read-only H4V3 Overview dashboard plugin (multi-board projection) |
@@ -69,10 +71,17 @@ See [operations](docs/OPERATIONS.md) for the controlled host rollout, [GitHub ev
 #    This enables Docker boot recovery only when explicitly requested.
 automation/n8n/scripts/host-install.sh --enable-docker-service
 
-# 2. Deploy the least-privilege Hermes service token plugin and the
-#    read-only H4V3 Overview dashboard plugin.
+# 2. Deploy the least-privilege Hermes service token plugin.
 #    Restart the existing Hermes dashboard using its current supervisor afterward.
 automation/n8n/scripts/configure-hermes-service-auth.sh --hermes-home "$HOME/.hermes"
+
+# 2b. Optional: install the read-only H4V3 Overview dashboard plugin
+#     (independent of service-auth; restart the dashboard afterward).
+automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
+
+# 2c. Optional: deploy the intake/edge runtime scripts (see docs/H4V3_OVERVIEW.md —
+#     the live cron executes deployed copies under $HERMES_HOME/scripts, not this checkout).
+automation/hermes/scripts/deploy-intake-edge.sh --hermes-home "$HOME/.hermes"
 
 # 3. Render/import inactive workflows for the current dashboard bind address.
 automation/n8n/scripts/import-workflows.sh \

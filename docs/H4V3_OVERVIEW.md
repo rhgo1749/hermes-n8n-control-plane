@@ -47,6 +47,13 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
   with status counts, rework count, provenance repositories (derived from
   `tasks.idempotency_key`, never hardcoded), and the most recent meaningful
   edge event. Board names come from `board.json` metadata.
+* **Rework counts**: the board aggregate counts `github_pr_rework` events of
+  **actionable tasks only** (`ready`/`running`/`review`/`blocked`) — rework on
+  finished (`done`) cards is excluded so past work does not look like current
+  risk. Per-task rework history is still shown on each task.
+* **Recent meaningful state**: the single newest meaningful event on the
+  board, selected by `(created_at, id)` across all tasks — not per-task
+  iteration order.
 * **Need You items**: computed projections with a one-line reason.
 * **Deep links**: every board/task links to the existing Kanban tab
   (`/kanban?board=<slug>&task=<id>`); the Kanban plugin understands `board`,
@@ -58,17 +65,20 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
 
 ### Need You projection rules
 
-`Need You` is **not** a Kanban status. A blocked task is classified as
-`need_you` only when existing Kanban/GitHub evidence says a human action is
-required:
+`Need You` is **not** a Kanban status. A task is classified as `need_you`
+only when existing Kanban/GitHub evidence says a human action is required:
 
-* `block_kind` is `needs_input` or `capability`;
-* a task event/body carries an explicit human marker (`needs_input`,
-  `needs maintainer`, `review-required`, `host_validation_required`,
-  `human_validation_required`, `human review`).
+* `blocked` + `block_kind` is `needs_input` or `capability`;
+* any status (e.g. `review`) with explicit human-validation /
+  maintainer-attention evidence in the durable event stream:
+  `needs_input`, `needs maintainer`, `review-required`,
+  `host_validation_required`, `human_validation_required`, `human review`.
 
-A plain `blocked` without such evidence stays **Blocked** — never guessed into
-Need You.
+A plain `review` or a plain `blocked` without such evidence stays in its own
+bucket — never guessed into Need You. Evidence is read from `task_events`
+payloads only; the static intake card body is excluded because it contains
+contract prose ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
+BLOCKED states honest") that would false-positive every card.
 
 ### Source of truth
 
@@ -123,32 +133,64 @@ not explicitly classified can never silently start an alert storm.
 
 ## Installation / update / rollback
 
-### Install (host, Ubuntu)
+### Overview plugin (separate installer)
 
 ```bash
-automation/n8n/scripts/configure-hermes-service-auth.sh --hermes-home "$HOME/.hermes"
+automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
 ```
 
-The installer copies `hermes-plugin/h4v3-overview/` to
-`$HERMES_HOME/plugins/h4v3-overview/` and runs
+Independent from the n8n service-auth installer: `configure-hermes-service-auth.sh`
+never installs the Overview, so an Overview failure cannot block service-auth
+provisioning. The installer validates the backend (`py_compile`), installs the
+plugin into `$HERMES_HOME/plugins/h4v3-overview/` atomically (previous version
+kept as `h4v3-overview.bak-<ts>`), and runs
 `hermes plugins enable h4v3-overview --no-allow-tool-override` (dashboard
 plugins only load when enabled). Restart the existing Hermes dashboard with
 its current supervisor, then open the **H4V3 Overview** tab.
 
+### Intake/edge runtime deployment (verified live path)
+
+**The live Hermes cron does not run this repository checkout.** Verified
+2026-08-13 on the host: cron job `bf431b2a6ba6` (profile `default`) stores
+`script: github-agent-ready-kanban-intake.py` with `workdir: null`, so the
+scheduler executes `$HERMES_HOME/scripts/github-agent-ready-kanban-intake.py`
+— a deployed copy whose hash matched the then-current repository `main`
+exactly. The intake resolves its edge counterpart as a sibling
+(`$HERMES_HOME/scripts/kanban-github-sync.py`), so the two files must be
+updated together.
+
+```bash
+automation/hermes/scripts/deploy-intake-edge.sh --hermes-home "$HOME/.hermes"
+```
+
+The deploy script provides:
+
+1. **candidate copy** into `$HERMES_HOME/scripts/.deploy-candidate-<ts>/`;
+2. **validation** — `py_compile` + `--help` smoke for both candidates;
+3. **atomic replace** — same-filesystem `mv` over the live files;
+4. **verification** — installed SHA-256 must equal the checkout;
+5. **rollback** — previous files kept as `.bak-<name>-<ts>` (matching the
+   existing host convention), exact restore command printed;
+6. **no cron changes** — job id, schedule, and enabled state are never
+   touched.
+
 ### Update
 
-Re-run the installer after pulling the repository (files are overwritten
-in place; the enablement flag is untouched).
+Re-run the relevant installer after pulling the repository (files are
+overwritten in place; the plugin enablement flag is untouched).
 
 ### Rollback
 
+Overview:
+
 ```bash
-rm -rf "$HERMES_HOME/plugins/h4v3-overview"
-hermes plugins disable h4v3-overview
+mv "$HERMES_HOME/plugins/h4v3-overview.bak-<ts>" "$HERMES_HOME/plugins/h4v3-overview"
+hermes plugins disable h4v3-overview   # 또는 enable 유지 후 재시작
 ```
 
-Restart the dashboard. No Kanban data, n8n workflows, or cron jobs are
-touched by install or rollback.
+Intake/edge: run the `mv` command printed by `deploy-intake-edge.sh` (restores
+the timestamped backup). Kanban data, n8n workflows, and cron jobs are not
+touched by either rollback.
 
 ## Fail-closed behavior
 
@@ -163,9 +205,10 @@ touched by install or rollback.
 ## Tests
 
 ```bash
-python3 tests/test_h4v3_overview.py          # projection: counts, Need You, read-only
+python3 tests/test_h4v3_overview.py          # projection: counts, Need You (status-agnostic), recent event, rework, read-only
 python3 tests/test_h4v3_notification_policy.py  # suppress/send matrix + dedupe
 python3 tests/test_repo_scoped_intake.py     # intake regression
 /ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py  # edge regression
 python3 automation/n8n/scripts/validate.py   # n8n static validation
+bash -n automation/hermes/scripts/install-h4v3-overview.sh automation/hermes/scripts/deploy-intake-edge.sh
 ```

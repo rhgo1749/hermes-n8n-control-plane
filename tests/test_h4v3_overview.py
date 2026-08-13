@@ -82,6 +82,114 @@ def test_plain_blocked_is_not_need_you() -> None:
     assert overview._need_you_reason({"status": "blocked", "block_kind": "capability"}) == "capability"
 
 
+def test_review_with_human_validation_evidence_is_need_you() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                ("t-review-attn", "Needs device check", "review", None, None, 0, 0, None, None, ""),
+                ("t-review-plain", "Plain review", "review", None, None, 0, 0, None, None, ""),
+            ],
+            [
+                (
+                    "t-review-attn",
+                    "github_pr_rework_attention",
+                    json.dumps({"reason": "rework_human_attention", "diagnostic": "human_validation_required"}),
+                    200,
+                ),
+            ],
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        by_id = {task["id"]: task for task in result["tasks"]}
+        # REVIEW + explicit evidence -> Need You
+        assert overview._need_you_reason(by_id["t-review-attn"]) is not None
+        # plain REVIEW -> not Need You
+        assert overview._need_you_reason(by_id["t-review-plain"]) is None
+
+
+def test_recent_meaningful_picks_newest_event_across_tasks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                ("t-old", "Old task", "blocked", None, None, 0, 0, None, None, ""),
+                ("t-new", "New task", "ready", None, None, 0, 0, None, None, ""),
+            ],
+            [
+                ("t-old", "github_pr_rework", json.dumps({"reason": "agent_rework", "rework_round": 1}), 100),
+                ("t-new", "github_pr_rework", json.dumps({"reason": "agent_rework", "rework_round": 2}), 300),
+                ("t-old", "github_pr_rework", json.dumps({"reason": "agent_rework", "rework_round": 1}), 50),
+            ],
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        recent = result["recent_meaningful"]
+        assert recent is not None
+        assert recent["task_id"] == "t-new"
+        assert recent["created_at"] == 300
+
+
+def test_board_rework_counts_actionable_tasks_only() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                ("t-done", "Finished", "done", None, None, 0, 0, None, None, ""),
+                ("t-ready", "Active", "ready", None, None, 0, 0, None, None, ""),
+                ("t-blocked", "Blocked", "blocked", None, None, 0, 0, None, None, ""),
+            ],
+            [
+                ("t-done", "github_pr_rework", json.dumps({"reason": "agent_rework"}), 100),
+                ("t-ready", "github_pr_rework", json.dumps({"reason": "agent_rework"}), 200),
+                ("t-blocked", "github_pr_rework", json.dumps({"reason": "agent_rework"}), 300),
+            ],
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        # done task's rework excluded from the operational board aggregate
+        assert result["rework_count"] == 2
+        by_id = {task["id"]: task for task in result["tasks"]}
+        assert by_id["t-done"]["rework_count"] == 1  # per-task history kept
+
+
+def test_need_you_summary_through_build_overview() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                ("t-review-attn", "Device check", "review", None, None, 0, 0, None, None, ""),
+                ("t-plain", "Plain", "blocked", None, None, 0, 0, None, None, ""),
+            ],
+            [
+                (
+                    "t-review-attn",
+                    "github_operator_attention",
+                    json.dumps({"reason": "human_validation_required", "attention_key": "x:1"}),
+                    100,
+                ),
+            ],
+        )
+        original = getattr(overview, "kanban_db")
+        try:
+            setattr(
+                overview,
+                "kanban_db",
+                type(
+                    "StubKanbanDb",
+                    (),
+                    {"list_boards": staticmethod(lambda include_archived=True: [{"slug": "demo", "name": "Demo", "db_path": str(path)}])},
+                ),
+            )
+            payload = overview.build_overview()
+        finally:
+            setattr(overview, "kanban_db", original)
+        assert payload["summary"]["need_you"] == 1
+        assert payload["summary"]["review"] == 1
+        assert payload["need_you"][0]["task"]["id"] == "t-review-attn"
+
+
 def test_missing_board_db_is_safe() -> None:
     result = overview._load_board_projection({"slug": "empty", "name": "Empty", "db_path": "/does/not/exist"})
     assert result["read_error"] is None

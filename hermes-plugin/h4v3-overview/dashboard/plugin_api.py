@@ -55,6 +55,9 @@ _MEANINGFUL_EVENT_KINDS = (
     "github_pr_rework_retry",
     "github_operator_attention",
 )
+# Board-level rework aggregates must reflect current operational risk only:
+# rework on finished cards must not look like an active problem.
+_ACTIONABLE_STATUSES = frozenset({"ready", "running", "review", "blocked"})
 _HUMAN_MARKERS = (
     "needs_input",
     "needs maintainer",
@@ -158,7 +161,6 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             "consecutive_failures": "0",
             "last_failure_error": "NULL",
             "idempotency_key": "NULL",
-            "body": "NULL",
         }
         select_optional = ", ".join(
             f"{name}" if name in columns else f"{default} AS {name}"
@@ -174,7 +176,7 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
         if ids:
             placeholders = ",".join("?" for _ in ids)
             event_rows = conn.execute(
-                f"SELECT task_id, kind, payload, created_at FROM task_events "
+                f"SELECT id, task_id, kind, payload, created_at FROM task_events "
                 f"WHERE task_id IN ({placeholders}) ORDER BY created_at DESC, id DESC LIMIT ?",
                 (*ids, _MAX_RECENT_EVENTS),
             ).fetchall()
@@ -182,9 +184,24 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
         for event in event_rows:
             events_by_task.setdefault(str(event["task_id"]), []).append(event)
 
+        # The truly newest meaningful event on the board: event_rows are
+        # globally ordered newest-first, so the first matching row wins
+        # regardless of which task it belongs to.
+        recent_meaningful: Optional[dict[str, Any]] = None
+        for event in event_rows:
+            if event["kind"] not in _MEANINGFUL_EVENT_KINDS:
+                continue
+            recent_meaningful = {
+                "kind": str(event["kind"]),
+                "created_at": int(event["created_at"]),
+                "event_id": int(event["id"]),
+                "task_id": str(event["task_id"]),
+                "reason": _safe_text(_json_payload(event["payload"]).get("reason")),
+            }
+            break
+
         repositories: set[str] = set()
         tasks: list[dict[str, Any]] = []
-        recent_meaningful: Optional[dict[str, Any]] = None
         rework_count = 0
         for row in rows:
             status = str(row["status"] or "")
@@ -196,18 +213,21 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
                 repositories.add(repository)
             task_events = events_by_task.get(task_id, [])
             rework_events = [event for event in task_events if event["kind"] in _REWORK_EVENT_KINDS]
-            rework_count += len(rework_events)
+            if status in _ACTIONABLE_STATUSES:
+                rework_count += len(rework_events)
 
             attention = False
             attention_reason = ""
-            evidence_text = str(row["body"] or "")
+            # Evidence is taken from the durable event stream only. The intake
+            # card body is excluded: it contains static contract prose
+            # ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
+            # BLOCKED states honest") that would false-positive every card.
             for event in task_events:
                 payload = _json_payload(event["payload"])
                 event_text = " ".join(
                     str(payload.get(key) or "")
                     for key in ("reason", "diagnostic", "retry_reason")
                 )
-                evidence_text += " " + event_text
                 if any(marker in event_text.casefold() for marker in _HUMAN_MARKERS):
                     attention = True
                     attention_reason = _safe_text(event_text)
@@ -216,12 +236,6 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             if status == "blocked" and block_kind in {"needs_input", "capability"}:
                 attention = True
                 attention_reason = block_kind
-            elif not attention:
-                lowered = evidence_text.casefold()
-                marker = next((item for item in _HUMAN_MARKERS if item in lowered), None)
-                if marker:
-                    attention = True
-                    attention_reason = marker
 
             task = {
                 "id": task_id,
@@ -240,16 +254,6 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             }
             tasks.append(task)
 
-            meaningful_events = [event for event in task_events if event["kind"] in _MEANINGFUL_EVENT_KINDS]
-            if meaningful_events and recent_meaningful is None:
-                event = meaningful_events[0]
-                recent_meaningful = {
-                    "kind": str(event["kind"]),
-                    "created_at": int(event["created_at"]),
-                    "task_id": task_id,
-                    "reason": _safe_text(_json_payload(event["payload"]).get("reason")),
-                }
-
         board["repositories"] = sorted(repositories, key=str.casefold)
         board["rework_count"] = rework_count
         board["recent_meaningful"] = recent_meaningful
@@ -264,9 +268,15 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _need_you_reason(task: Mapping[str, Any]) -> Optional[str]:
-    if task.get("status") != "blocked":
-        return None
-    if task.get("block_kind") in {"needs_input", "capability"}:
+    """Operator-attention projection from durable evidence (status-agnostic).
+
+    Rules:
+    * ``blocked`` + ``block_kind`` in {needs_input, capability} → Need You
+    * any status with explicit human-validation / maintainer-attention
+      evidence (attention event markers) → Need You
+    * plain REVIEW, or plain BLOCKED without evidence → not Need You
+    """
+    if task.get("status") == "blocked" and task.get("block_kind") in {"needs_input", "capability"}:
         return str(task["block_kind"])
     if task.get("attention") and task.get("attention_reason"):
         return str(task["attention_reason"])
