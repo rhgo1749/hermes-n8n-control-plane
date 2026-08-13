@@ -66,6 +66,10 @@ _HUMAN_MARKERS = (
     "human_validation_required",
     "human review",
 )
+_ATTENTION_EVENT_KINDS = frozenset({
+    "github_operator_attention",
+    "github_pr_rework_attention",
+})
 _MAX_RECENT_EVENTS = 200
 _MAX_REASON_CHARS = 180
 
@@ -80,6 +84,103 @@ def _json_payload(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _human_attention_reason(event: Any) -> Optional[str]:
+    payload = _json_payload(event["payload"])
+    event_text = " ".join(
+        str(payload.get(key) or "")
+        for key in ("reason", "diagnostic", "retry_reason")
+    )
+    if any(marker in event_text.casefold() for marker in _HUMAN_MARKERS):
+        return _safe_text(event_text)
+    return None
+
+
+def _event_cursors(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    *,
+    excluded_kinds: frozenset[str],
+) -> dict[str, int]:
+    if not task_ids:
+        return {}
+    task_placeholders = ",".join("?" for _ in task_ids)
+    kind_placeholders = ",".join("?" for _ in excluded_kinds)
+    rows = conn.execute(
+        "SELECT task_id, MAX(id) AS cursor FROM task_events "
+        f"WHERE task_id IN ({task_placeholders}) "
+        f"AND kind NOT IN ({kind_placeholders}) GROUP BY task_id",
+        (*task_ids, *sorted(excluded_kinds)),
+    ).fetchall()
+    return {str(row["task_id"]): int(row["cursor"]) for row in rows}
+
+
+def _attention_key_cursor(payload: Mapping[str, Any]) -> Optional[int]:
+    raw_key = str(payload.get("attention_key") or "")
+    if ":" not in raw_key:
+        return None
+    suffix = raw_key.rsplit(":", 1)[1]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _load_attention_events(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+) -> dict[str, sqlite3.Row]:
+    """Load the newest unresolved explicit human-attention evidence.
+
+    The recent-event window is intentionally bounded for board activity. It
+    must not also bound durable attention evidence: an active task can remain
+    actionable after more than ``_MAX_RECENT_EVENTS`` unrelated events. An
+    attention event is unresolved only while its non-attention cursor remains
+    current. ``github_operator_attention`` reuses the edge's
+    ``attention_key=reason:<max-event-id-excluding-operator-attention>``
+    contract; legacy attention events fall back to their event id against the
+    lifecycle cursor.
+    """
+    if not task_ids:
+        return {}
+    task_placeholders = ",".join("?" for _ in task_ids)
+    marker_clauses = " OR ".join(
+        "instr(lower(COALESCE(payload, '')), ?) > 0"
+        for _ in _HUMAN_MARKERS
+    )
+    candidates = conn.execute(
+        "SELECT id, task_id, kind, payload, created_at FROM task_events "
+        f"WHERE task_id IN ({task_placeholders}) AND ({marker_clauses}) "
+        "ORDER BY created_at DESC, id DESC",
+        (*task_ids, *(marker.casefold() for marker in _HUMAN_MARKERS)),
+    ).fetchall()
+    operator_cursors = _event_cursors(
+        conn,
+        task_ids,
+        excluded_kinds=frozenset({"github_operator_attention"}),
+    )
+    lifecycle_cursors = _event_cursors(
+        conn,
+        task_ids,
+        excluded_kinds=_ATTENTION_EVENT_KINDS,
+    )
+    evidence: dict[str, sqlite3.Row] = {}
+    for event in candidates:
+        task_id = str(event["task_id"])
+        if task_id in evidence:
+            continue
+        if _human_attention_reason(event) is None:
+            continue
+        payload = _json_payload(event["payload"])
+        if event["kind"] == "github_operator_attention":
+            cursor = _attention_key_cursor(payload)
+            if cursor is None:
+                unresolved = lifecycle_cursors.get(task_id, 0) <= int(event["id"])
+            else:
+                unresolved = operator_cursors.get(task_id, 0) <= cursor
+        else:
+            unresolved = lifecycle_cursors.get(task_id, 0) <= int(event["id"])
+        if unresolved:
+            evidence[task_id] = event
+    return evidence
 
 
 def _safe_text(value: Any, limit: int = _MAX_REASON_CHARS) -> str:
@@ -183,6 +284,12 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
         events_by_task: dict[str, list[sqlite3.Row]] = {}
         for event in event_rows:
             events_by_task.setdefault(str(event["task_id"]), []).append(event)
+        attention_task_ids = [
+            str(row["id"])
+            for row in rows
+            if str(row["status"] or "") not in {"done", "archived"}
+        ]
+        attention_events_by_task = _load_attention_events(conn, attention_task_ids)
 
         # The truly newest meaningful event on the board: event_rows are
         # globally ordered newest-first, so the first matching row wins
@@ -222,16 +329,10 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             # card body is excluded: it contains static contract prose
             # ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
             # BLOCKED states honest") that would false-positive every card.
-            for event in task_events:
-                payload = _json_payload(event["payload"])
-                event_text = " ".join(
-                    str(payload.get(key) or "")
-                    for key in ("reason", "diagnostic", "retry_reason")
-                )
-                if any(marker in event_text.casefold() for marker in _HUMAN_MARKERS):
-                    attention = True
-                    attention_reason = _safe_text(event_text)
-                    break
+            attention_event = attention_events_by_task.get(task_id)
+            if attention_event is not None:
+                attention_reason = _human_attention_reason(attention_event) or ""
+                attention = bool(attention_reason)
             block_kind = str(row["block_kind"] or "")
             if status == "blocked" and block_kind in {"needs_input", "capability"}:
                 attention = True
@@ -268,15 +369,20 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _need_you_reason(task: Mapping[str, Any]) -> Optional[str]:
-    """Operator-attention projection from durable evidence (status-agnostic).
+    """Project current operator attention from durable task evidence.
 
     Rules:
+    * terminal ``done``/``archived`` tasks are never Need You, even when
+      historical attention evidence remains in the event stream
     * ``blocked`` + ``block_kind`` in {needs_input, capability} → Need You
-    * any status with explicit human-validation / maintainer-attention
+    * any non-terminal status with explicit human-validation / maintainer-attention
       evidence (attention event markers) → Need You
     * plain REVIEW, or plain BLOCKED without evidence → not Need You
     """
-    if task.get("status") == "blocked" and task.get("block_kind") in {"needs_input", "capability"}:
+    status = task.get("status")
+    if status in {"done", "archived"}:
+        return None
+    if status == "blocked" and task.get("block_kind") in {"needs_input", "capability"}:
         return str(task["block_kind"])
     if task.get("attention") and task.get("attention_reason"):
         return str(task["attention_reason"])

@@ -69,16 +69,27 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
 only when existing Kanban/GitHub evidence says a human action is required:
 
 * `blocked` + `block_kind` is `needs_input` or `capability`;
-* any status (e.g. `review`) with explicit human-validation /
+* any non-terminal status (e.g. `review`) with explicit human-validation /
   maintainer-attention evidence in the durable event stream:
   `needs_input`, `needs maintainer`, `review-required`,
   `host_validation_required`, `human_validation_required`, `human review`.
 
+`done` and `archived` tasks are never classified as `need_you`; their historical
+attention events remain untouched but cannot keep a terminal task actionable.
 A plain `review` or a plain `blocked` without such evidence stays in its own
 bucket — never guessed into Need You. Evidence is read from `task_events`
 payloads only; the static intake card body is excluded because it contains
 contract prose ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
 BLOCKED states honest") that would false-positive every card.
+The board's 200-row recent-activity window does not expire attention evidence:
+active tasks query their newest explicit human-attention event separately.
+That evidence is still required to be unresolved: the existing
+`github_operator_attention` `attention_key` points to the latest event cursor
+excluding prior `github_operator_attention` rows, so a later lifecycle event
+(for example REVIEW → READY/RUNNING) stales the prior incident. A new
+attention event keyed to the new cursor makes Need You actionable again.
+Legacy rework-attention rows use their event id against a lifecycle cursor that
+excludes attention rows, without deleting or rewriting any history.
 
 ### Source of truth
 
@@ -122,10 +133,10 @@ not explicitly classified can never silently start an alert storm.
 
 * The edge records a durable `github_operator_attention` event in the
   existing `task_events` table (no new notification DB) only for the first
-  tick of an incident. The dedupe key is `reason:<max-non-attention-event-id>`,
-  so an unchanged incident stays quiet on every five-minute tick, while a
-  **new** ordinary lifecycle event (incident resolved/recurred) permits a
-  re-send.
+  tick of an incident. The dedupe key is
+  `reason:<max-event-id-excluding-operator-attention>`, so an unchanged
+  incident stays quiet on every five-minute tick, while a **new** ordinary
+  lifecycle event (incident resolved/recurred) permits a re-send.
 * Rework attention keeps its existing round-aware `github_pr_rework_attention`
   writer (deduped per round/diagnostic).
 * `hermes send` failures are observer-only warnings; they never fail or roll
@@ -205,7 +216,7 @@ touched by either rollback.
 ## Tests
 
 ```bash
-python3 tests/test_h4v3_overview.py          # projection: counts, Need You (status-agnostic), recent event, rework, read-only
+python3 tests/test_h4v3_overview.py          # projection: counts, terminal-aware Need You, recent event, rework, read-only
 python3 tests/test_h4v3_notification_policy.py  # suppress/send matrix + dedupe
 python3 tests/test_repo_scoped_intake.py     # intake regression
 /ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py  # edge regression

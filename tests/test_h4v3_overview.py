@@ -78,11 +78,18 @@ def test_projection_counts_and_need_you_are_read_only() -> None:
 
 
 def test_plain_blocked_is_not_need_you() -> None:
+    assert overview._need_you_reason({"status": "blocked", "block_kind": "needs_input"}) == "needs_input"
     assert overview._need_you_reason({"status": "blocked", "block_kind": None, "attention": False}) is None
     assert overview._need_you_reason({"status": "blocked", "block_kind": "capability"}) == "capability"
 
 
-def test_review_with_human_validation_evidence_is_need_you() -> None:
+def test_terminal_tasks_are_never_need_you_with_human_attention_evidence() -> None:
+    stale_attention = {"attention": True, "attention_reason": "review-required"}
+    assert overview._need_you_reason({"status": "done", **stale_attention}) is None
+    assert overview._need_you_reason({"status": "archived", **stale_attention}) is None
+
+
+def test_review_with_review_required_evidence_is_need_you() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"
         _db(
@@ -94,8 +101,12 @@ def test_review_with_human_validation_evidence_is_need_you() -> None:
             [
                 (
                     "t-review-attn",
-                    "github_pr_rework_attention",
-                    json.dumps({"reason": "rework_human_attention", "diagnostic": "human_validation_required"}),
+                    "github_operator_attention",
+                    json.dumps({
+                        "reason": "review-required",
+                        "diagnostic": "human_validation_required",
+                        "attention_key": "review-required:0",
+                    }),
                     200,
                 ),
             ],
@@ -106,6 +117,151 @@ def test_review_with_human_validation_evidence_is_need_you() -> None:
         assert overview._need_you_reason(by_id["t-review-attn"]) is not None
         # plain REVIEW -> not Need You
         assert overview._need_you_reason(by_id["t-review-plain"]) is None
+
+
+def test_review_attention_survives_recent_event_window() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        events = [
+            (
+                "t-review-old",
+                "github_operator_attention",
+                json.dumps({"reason": "review-required"}),
+                1,
+            ),
+        ]
+        events.extend(
+            ("t-noise", "lifecycle", "{}", 2 + index)
+            for index in range(200)
+        )
+        _db(
+            path,
+            [
+                ("t-review-old", "Old review", "review", None, None, 0, 0, None, None, ""),
+                ("t-noise", "Recent activity", "ready", None, None, 0, 0, None, None, ""),
+            ],
+            events,
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        by_id = {task["id"]: task for task in result["tasks"]}
+        assert by_id["t-review-old"]["attention"] is True
+        assert overview._need_you_reason(by_id["t-review-old"]) == "review-required"
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 201
+
+
+def test_review_attention_stales_after_ready_or_running_progress() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                ("t-ready", "Ready after review", "ready", None, None, 0, 0, None, None, ""),
+                ("t-running", "Running after review", "running", "worker", None, 0, 0, None, None, ""),
+            ],
+            [
+                (
+                    "t-ready",
+                    "github_operator_attention",
+                    json.dumps({"reason": "review-required", "attention_key": "review-required:0"}),
+                    1,
+                ),
+                (
+                    "t-ready",
+                    "github_pr_rework",
+                    json.dumps({"previous_status": "review", "new_status": "ready", "reason": "agent_rework"}),
+                    2,
+                ),
+                (
+                    "t-running",
+                    "github_operator_attention",
+                    json.dumps({"reason": "human_validation_required", "attention_key": "human_validation_required:0"}),
+                    3,
+                ),
+                (
+                    "t-running",
+                    "claimed",
+                    json.dumps({"source_status": "ready", "new_status": "running"}),
+                    4,
+                ),
+            ],
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        by_id = {task["id"]: task for task in result["tasks"]}
+        assert overview._need_you_reason(by_id["t-ready"]) is None
+        assert overview._need_you_reason(by_id["t-running"]) is None
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 4
+
+
+def test_new_attention_incident_reactivates_need_you_after_progress() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [("t-review", "Review again", "review", None, None, 0, 0, None, None, "")],
+            [
+                (
+                    "t-review",
+                    "github_operator_attention",
+                    json.dumps({"reason": "review-required", "attention_key": "review-required:0"}),
+                    1,
+                ),
+                (
+                    "t-review",
+                    "github_pr_rework",
+                    json.dumps({"previous_status": "review", "new_status": "ready", "reason": "agent_rework"}),
+                    2,
+                ),
+            ],
+        )
+        first = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        assert overview._need_you_reason(first["tasks"][0]) is None
+
+        # The edge's existing cursor contract identifies this as a new
+        # incident: the key points at the latest non-attention event (id=2).
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = 't-review'")
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "t-review",
+                    "github_operator_attention",
+                    json.dumps({"reason": "review-required", "attention_key": "review-required:2"}),
+                    3,
+                ),
+            )
+            conn.commit()
+
+        second = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        assert overview._need_you_reason(second["tasks"][0]) == "review-required"
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 3
+
+
+def test_legacy_attention_event_stales_after_lifecycle_progress() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [("t-review", "Review", "ready", None, None, 0, 0, None, None, "")],
+            [
+                (
+                    "t-review",
+                    "github_pr_rework_attention",
+                    json.dumps({"reason": "review-required", "diagnostic": "human_validation_required"}),
+                    1,
+                ),
+                (
+                    "t-review",
+                    "github_pr_rework",
+                    json.dumps({"previous_status": "review", "new_status": "ready", "reason": "agent_rework"}),
+                    2,
+                ),
+            ],
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        assert overview._need_you_reason(result["tasks"][0]) is None
 
 
 def test_recent_meaningful_picks_newest_event_across_tasks() -> None:
@@ -161,6 +317,7 @@ def test_need_you_summary_through_build_overview() -> None:
             [
                 ("t-review-attn", "Device check", "review", None, None, 0, 0, None, None, ""),
                 ("t-plain", "Plain", "blocked", None, None, 0, 0, None, None, ""),
+                ("t-done-stale", "Finished", "done", None, None, 0, 0, None, None, ""),
             ],
             [
                 (
@@ -168,6 +325,12 @@ def test_need_you_summary_through_build_overview() -> None:
                     "github_operator_attention",
                     json.dumps({"reason": "human_validation_required", "attention_key": "x:1"}),
                     100,
+                ),
+                (
+                    "t-done-stale",
+                    "github_operator_attention",
+                    json.dumps({"reason": "review-required", "attention_key": "stale:1"}),
+                    200,
                 ),
             ],
         )
@@ -188,6 +351,7 @@ def test_need_you_summary_through_build_overview() -> None:
         assert payload["summary"]["need_you"] == 1
         assert payload["summary"]["review"] == 1
         assert payload["need_you"][0]["task"]["id"] == "t-review-attn"
+        assert "t-done-stale" not in {item["task"]["id"] for item in payload["need_you"]}
 
 
 def test_missing_board_db_is_safe() -> None:
