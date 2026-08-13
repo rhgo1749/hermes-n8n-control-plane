@@ -81,6 +81,8 @@ bucket — never guessed into Need You. Evidence is read from `task_events`
 payloads only; the static intake card body is excluded because it contains
 contract prose ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
 BLOCKED states honest") that would false-positive every card.
+The board's 200-row recent-activity window does not expire attention evidence:
+active tasks query their newest explicit human-attention event separately.
 
 ### Source of truth
 
@@ -207,7 +209,7 @@ touched by either rollback.
 ## Tests
 
 ```bash
-python3 tests/test_h4v3_overview.py          # projection: counts, Need You (status-agnostic), recent event, rework, read-only
+python3 tests/test_h4v3_overview.py          # projection: counts, terminal-aware Need You, recent event, rework, read-only
 python3 tests/test_h4v3_notification_policy.py  # suppress/send matrix + dedupe
 python3 tests/test_repo_scoped_intake.py     # intake regression
 /ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py  # edge regression

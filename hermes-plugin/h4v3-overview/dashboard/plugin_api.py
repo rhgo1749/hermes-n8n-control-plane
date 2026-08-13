@@ -82,6 +82,50 @@ def _json_payload(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _human_attention_reason(event: Any) -> Optional[str]:
+    payload = _json_payload(event["payload"])
+    event_text = " ".join(
+        str(payload.get(key) or "")
+        for key in ("reason", "diagnostic", "retry_reason")
+    )
+    if any(marker in event_text.casefold() for marker in _HUMAN_MARKERS):
+        return _safe_text(event_text)
+    return None
+
+
+def _load_attention_events(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+) -> dict[str, sqlite3.Row]:
+    """Load the newest explicit human-attention evidence for each task.
+
+    The recent-event window is intentionally bounded for board activity. It
+    must not also bound durable attention evidence: an active task can remain
+    actionable after more than ``_MAX_RECENT_EVENTS`` unrelated events.
+    """
+    if not task_ids:
+        return {}
+    task_placeholders = ",".join("?" for _ in task_ids)
+    marker_clauses = " OR ".join(
+        "instr(lower(COALESCE(payload, '')), ?) > 0"
+        for _ in _HUMAN_MARKERS
+    )
+    candidates = conn.execute(
+        "SELECT id, task_id, kind, payload, created_at FROM task_events "
+        f"WHERE task_id IN ({task_placeholders}) AND ({marker_clauses}) "
+        "ORDER BY created_at DESC, id DESC",
+        (*task_ids, *(marker.casefold() for marker in _HUMAN_MARKERS)),
+    ).fetchall()
+    evidence: dict[str, sqlite3.Row] = {}
+    for event in candidates:
+        task_id = str(event["task_id"])
+        if task_id in evidence:
+            continue
+        if _human_attention_reason(event) is not None:
+            evidence[task_id] = event
+    return evidence
+
+
 def _safe_text(value: Any, limit: int = _MAX_REASON_CHARS) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
@@ -183,6 +227,12 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
         events_by_task: dict[str, list[sqlite3.Row]] = {}
         for event in event_rows:
             events_by_task.setdefault(str(event["task_id"]), []).append(event)
+        attention_task_ids = [
+            str(row["id"])
+            for row in rows
+            if str(row["status"] or "") not in {"done", "archived"}
+        ]
+        attention_events_by_task = _load_attention_events(conn, attention_task_ids)
 
         # The truly newest meaningful event on the board: event_rows are
         # globally ordered newest-first, so the first matching row wins
@@ -222,16 +272,10 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             # card body is excluded: it contains static contract prose
             # ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
             # BLOCKED states honest") that would false-positive every card.
-            for event in task_events:
-                payload = _json_payload(event["payload"])
-                event_text = " ".join(
-                    str(payload.get(key) or "")
-                    for key in ("reason", "diagnostic", "retry_reason")
-                )
-                if any(marker in event_text.casefold() for marker in _HUMAN_MARKERS):
-                    attention = True
-                    attention_reason = _safe_text(event_text)
-                    break
+            attention_event = attention_events_by_task.get(task_id)
+            if attention_event is not None:
+                attention_reason = _human_attention_reason(attention_event) or ""
+                attention = bool(attention_reason)
             block_kind = str(row["block_kind"] or "")
             if status == "blocked" and block_kind in {"needs_input", "capability"}:
                 attention = True

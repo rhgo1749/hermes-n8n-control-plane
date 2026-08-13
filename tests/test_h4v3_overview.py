@@ -115,6 +115,37 @@ def test_review_with_review_required_evidence_is_need_you() -> None:
         assert overview._need_you_reason(by_id["t-review-plain"]) is None
 
 
+def test_review_attention_survives_recent_event_window() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        events = [
+            (
+                "t-review-old",
+                "github_operator_attention",
+                json.dumps({"reason": "review-required"}),
+                1,
+            ),
+        ]
+        events.extend(
+            ("t-noise", "lifecycle", "{}", 2 + index)
+            for index in range(200)
+        )
+        _db(
+            path,
+            [
+                ("t-review-old", "Old review", "review", None, None, 0, 0, None, None, ""),
+                ("t-noise", "Recent activity", "ready", None, None, 0, 0, None, None, ""),
+            ],
+            events,
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        by_id = {task["id"]: task for task in result["tasks"]}
+        assert by_id["t-review-old"]["attention"] is True
+        assert overview._need_you_reason(by_id["t-review-old"]) == "review-required"
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 201
+
+
 def test_recent_meaningful_picks_newest_event_across_tasks() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"
