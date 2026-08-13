@@ -78,6 +78,7 @@ def test_projection_counts_and_need_you_are_read_only() -> None:
 
 
 def test_plain_blocked_is_not_need_you() -> None:
+    assert overview._need_you_reason({"status": "blocked", "block_kind": "needs_input"}) == "needs_input"
     assert overview._need_you_reason({"status": "blocked", "block_kind": None, "attention": False}) is None
     assert overview._need_you_reason({"status": "blocked", "block_kind": "capability"}) == "capability"
 

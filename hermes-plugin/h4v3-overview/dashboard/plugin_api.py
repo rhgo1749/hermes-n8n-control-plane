@@ -274,7 +274,7 @@ def _need_you_reason(task: Mapping[str, Any]) -> Optional[str]:
     * terminal ``done``/``archived`` tasks are never Need You, even when
       historical attention evidence remains in the event stream
     * ``blocked`` + ``block_kind`` in {needs_input, capability} → Need You
-    * any status with explicit human-validation / maintainer-attention
+    * any non-terminal status with explicit human-validation / maintainer-attention
       evidence (attention event markers) → Need You
     * plain REVIEW, or plain BLOCKED without evidence → not Need You
     """
