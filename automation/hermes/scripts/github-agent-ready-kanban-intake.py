@@ -816,8 +816,6 @@ def _run_closed_issue_cleanup(
 # Telegram; it only annotates its JSON results with repository/issue_number
 # and from_state/to_state for actual transitions.
 
-TELEGRAM_API_DEFAULT = "https://api.telegram.org"
-TELEGRAM_SEND_TIMEOUT_SECONDS = 15
 # A card is "actually created" when its created_at falls inside this tick
 # (ticks are 5 minutes apart; 120s grace is safe against clock skew).
 _CREATE_FRESHNESS_SECONDS = 120
@@ -830,37 +828,63 @@ _BOARD_SHORT_NAMES = {
     "h4v3-meowcore-voice-lab": "Voice-Lab",
 }
 
-# Sync dry-run reasons that predict a blocked-card transition (from -> to).
-_PREDICTED_BLOCKED_TO = {
-    "blocked_merged_done_predicted": "done",
-    "blocked_rework_ready_predicted": "ready",
-    "blocked_open_pr_review_predicted": "review",
-    "blocked_resume_ready_predicted": "ready",
-}
+# Telegram is an action channel, not a second Kanban event stream. Keep the
+# normal lifecycle quiet and classify only existing edge evidence as an
+# operator incident. Unknown results are suppressed (fail-closed).
+_SUPPRESSED_TRANSITIONS = frozenset({
+    ("ready", "running"),
+    ("running", "done"),
+    ("done", "review"),
+    ("review", "ready"),
+})
+_HUMAN_ATTENTION_REASONS = frozenset({
+    "rework_human_attention",
+    "rework_retry_blocked",
+    "rework_attention_label_projection_failed",
+    "rework_retry_label_projection_failed",
+    "rework_dispatch_failed",
+    "claim_projection_reclaim_failed",
+    "workspace_resolve_failed",
+    "spawn_failed",
+    "lifecycle_label_conflict",
+    "rework_context_failed",
+    "delivery_query_failed",
+    "review_ready_label_projection_failed",
+    "merged_lifecycle_cleanup_failed",
+    "stale_review_ready_normalize_failed",
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
+})
+_HUMAN_ATTENTION_TEXT_MARKERS = (
+    "needs_input",
+    "needs maintainer",
+    "review-required",
+    "human review",
+    "host_validation_required",
+    "human_validation_required",
+)
+_REWORK_ATTENTION_THRESHOLD = 3
 
 
-def _telegram_config() -> tuple[str, str, str] | None:
-    """Return ``(bot_token, chat_id, thread_id)`` or None when unconfigured.
+def _telegram_config() -> tuple[str, str] | None:
+    """Return ``(chat_id, thread_id)`` or None when unconfigured.
 
     Resolution order: environment, then ``~/.hermes/.env``.  Reuses the
-    host's existing ``TELEGRAM_BOT_TOKEN``; the target is the operator-
-    created "칸반 인테이크" Telegram thread (``TELEGRAM_KANBAN_INTAKE_CHAT_ID``
-    / ``TELEGRAM_KANBAN_INTAKE_THREAD_ID``).  None disables notifications.
+    operator-created "칸반 인테이크" Telegram thread.  Credentials are
+    deliberately not read here: ``hermes send`` resolves them through the
+    existing Hermes messaging/Gateway path.  None disables notifications.
     """
     env = os.environ
-    token = (env.get("HERMES_TELEGRAM_BOT_TOKEN") or env.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (env.get("HERMES_TELEGRAM_CHAT_ID") or "").strip()
     thread_id = (env.get("HERMES_TELEGRAM_THREAD_ID") or "").strip()
     env_path = _hermes_home() / ".env"
-    if not token:
-        token = _env_value(env_path, "TELEGRAM_BOT_TOKEN")
     if not chat_id:
         chat_id = _env_value(env_path, "TELEGRAM_KANBAN_INTAKE_CHAT_ID")
     if not thread_id:
         thread_id = _env_value(env_path, "TELEGRAM_KANBAN_INTAKE_THREAD_ID")
-    if not token or not chat_id:
+    if not chat_id:
         return None
-    return token, chat_id, thread_id
+    return chat_id, thread_id
 
 
 def _board_short_name(board: str) -> str:
@@ -877,15 +901,6 @@ def _board_for_repository(
     return str(repository).split("/")[-1]
 
 
-def _transition_icon(to_state: str) -> str:
-    return {
-        "done": "✅",
-        "running": "▶️",
-        "ready": "🔄",
-        "review": "📝",
-    }.get(str(to_state).lower(), "🔄")
-
-
 def _truncate_title(title: str, limit: int = 80) -> str:
     """Compact a GitHub title for a one-line Telegram notification."""
     title = str(title or "").strip()
@@ -894,36 +909,21 @@ def _truncate_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
-def _create_notification_line(
+def _attention_notification_line(
     board: str,
     short_name: str,
     issue_number: int,
-    status: str,
-    title: str = "",
+    entry: dict[str, Any],
 ) -> str:
-    line = f"🆕 [{board}] {short_name} #{issue_number} → {str(status).upper()}"
-    if title:
-        line += f" — {_truncate_title(title)}"
-    return line
-
-
-def _transition_notification_line(
-    board: str,
-    short_name: str,
-    issue_number: int,
-    from_state: str,
-    to_state: str,
-    pr_number: int | None = None,
-    issue_title: str = "",
-) -> str:
-    line = (
-        f"{_transition_icon(to_state)} [{board}] {short_name} #{issue_number} "
-        f"{str(from_state).upper()} → {str(to_state).upper()}"
-    )
+    reason = _entry_attention_reason(entry) or "human_attention_required"
+    line = f"⚠️ [{board}] {short_name} #{issue_number} · 확인 필요"
+    pr_number = _entry_pr_number(entry)
     if pr_number is not None:
         line += f" (PR #{pr_number})"
-    if issue_title:
-        line += f" — {_truncate_title(issue_title)}"
+    line += f" — {reason}"
+    title = str(entry.get("issue_title") or "").strip()
+    if title:
+        line += f" — {_truncate_title(title)}"
     return line
 
 
@@ -945,58 +945,100 @@ def _entry_pr_number(entry: dict[str, Any]) -> int | None:
     return None
 
 
-def _predicted_transition(entry: dict[str, Any]) -> tuple[str, str, int | None] | None:
-    """``(from_state, to_state, pr_number)`` predicted by a dry-run sync entry.
-
-    Only transitions the sync itself can actually perform are predicted:
-    the sync never writes into running/triage/todo/scheduled/archived
-    cards, so those are excluded (their real transitions are DONE->REVIEW
-    etc. once the core changes the status).
-    """
-    status = str(entry.get("status") or "")
-    if status not in ("review", "done", "blocked", "ready"):
-        return None
+def _entry_attention_reason(entry: dict[str, Any]) -> str | None:
+    """Return a human-action reason from already-emitted edge evidence."""
+    recorded = entry.get("operator_attention")
+    if isinstance(recorded, dict) and recorded.get("reason"):
+        return str(recorded["reason"])
+    predicted = entry.get("operator_attention_predicted")
+    if isinstance(predicted, dict) and predicted.get("reason"):
+        return str(predicted["reason"])
     reason = str(entry.get("reason") or "")
-    if reason in _PREDICTED_BLOCKED_TO:
-        return "blocked", _PREDICTED_BLOCKED_TO[reason], _entry_pr_number(entry)
-    if reason == "rework_spawn_predicted":
-        return "ready", "running", None
-    rework = entry.get("rework") or {}
-    if rework.get("reason") == "agent_rework" and status in ("review", "blocked"):
-        return status, "ready", _entry_pr_number(entry)
-    desired = (entry.get("evidence") or {}).get("desired_status")
-    if desired and str(desired) != status and str(desired) in ("review", "done"):
-        return status, str(desired), _entry_pr_number(entry)
+    if reason in _HUMAN_ATTENTION_REASONS:
+        return reason
+    block_kind = str(entry.get("block_kind") or "")
+    if block_kind in {"needs_input", "capability"} and str(entry.get("status") or "") == "blocked":
+        return block_kind
+    evidence = entry.get("evidence")
+    evidence_reason = evidence.get("reason") if isinstance(evidence, dict) else ""
+    haystack = " ".join(
+        str(value or "")
+        for value in (
+            reason,
+            entry.get("retry_reason"),
+            entry.get("diagnostic"),
+            entry.get("error"),
+            evidence_reason,
+        )
+    ).casefold()
+    if any(marker in haystack for marker in _HUMAN_ATTENTION_TEXT_MARKERS):
+        return reason or "human_attention_required"
+    for value in (entry.get("rework"), entry):
+        if not isinstance(value, dict):
+            continue
+        try:
+            if int(value.get("rework_round") or 0) >= _REWORK_ATTENTION_THRESHOLD:
+                return "rework_threshold_exceeded"
+        except (TypeError, ValueError):
+            continue
     return None
 
 
-def _send_telegram_batch(lines: list[str], cfg: tuple[str, str, str]) -> bool:
-    """Send one plain-text batch message; never raises (observer semantics).
+def _should_notify_entry(entry: dict[str, Any]) -> bool:
+    """Apply the suppress/send policy to one sync result."""
+    if not entry.get("repository") or not entry.get("issue_number"):
+        return False
+    if _entry_attention_reason(entry) is not None:
+        return True
+    if not entry.get("changed"):
+        return False
+    transition = (str(entry.get("from_state") or ""), str(entry.get("to_state") or ""))
+    # Deliberately return False for unknown transitions too: adding a new edge
+    # result cannot silently start a Telegram alert storm.
+    return transition not in _SUPPRESSED_TRANSITIONS and False
 
-    The bot token is part of the request URL, so neither the URL nor the
-    token is ever logged.  Failures are warnings only and the tick
-    continues normally.  ``HERMES_TELEGRAM_API_BASE`` overrides the API
-    endpoint for tests/mocks (never points at real Telegram by default).
+
+def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
+    """Send one batch through the existing Hermes messaging path.
+
+    The intake does not implement Telegram HTTP, credentials, retries, or
+    formatting.  ``hermes send`` reuses ``send_message_tool`` and the
+    installed Hermes platform/Gateway configuration.  Delivery is an observer
+    side effect: a failure warns but never rolls back reconciliation.
     """
-    token, chat_id, thread_id = cfg
+    chat_id, thread_id = cfg
     text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
-    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    target = f"telegram:{chat_id}"
     if thread_id:
-        payload["message_thread_id"] = thread_id
-    base = (os.environ.get("HERMES_TELEGRAM_API_BASE") or TELEGRAM_API_DEFAULT).rstrip("/")
-    url = f"{base}/bot{token}/sendMessage"
-    request = Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+        target += f":{thread_id}"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(_hermes_home())
     try:
-        with urlopen(request, timeout=TELEGRAM_SEND_TIMEOUT_SECONDS) as response:
-            return 200 <= int(response.status) < 300
+        proc = subprocess.run(
+            [_hermes_bin(), "send", "--to", target, "--file", "-", "--quiet"],
+            input=text,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        print(
+            f"kanban-intake: Hermes send skipped (warning only): exit={proc.returncode}",
+            file=sys.stderr,
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        print(
+            "kanban-intake: Hermes send skipped (warning only): timeout",
+            file=sys.stderr,
+        )
+        return False
     except Exception as exc:  # observer: never fail the reconciliation
         print(
-            f"kanban-intake: telegram notify skipped (warning only): {type(exc).__name__}",
+            f"kanban-intake: Hermes send skipped (warning only): {type(exc).__name__}",
             file=sys.stderr,
         )
         return False
@@ -1219,16 +1261,9 @@ def _run(args: argparse.Namespace) -> int:
             continue
         created = _create_task(config, issue, snapshot, imported_at, tick_started=tick_started)
         results.append(created)
-        if created.get("created") and telegram_cfg:
-            notification_lines.append(
-                _create_notification_line(
-                    config.board,
-                    _board_short_name(config.board),
-                    int(created["issue_number"]),
-                    str(created.get("status") or ""),
-                    str(issue.get("title") or ""),
-                )
-            )
+        # Card creation is intake work, not an operator incident: it is
+        # visible on the H4V3 Overview and deliberately produces no Telegram
+        # alert. Only human-attention events below may notify.
     # Intake and completion reconciliation share the same five-minute cron
     # tick.  Reconcile every configured board even when there are no new
     # agent-ready Issues; this detects merges performed outside Hermes.
@@ -1241,38 +1276,30 @@ def _run(args: argparse.Namespace) -> int:
     telegram_sent = False
     if args.dry_run:
         for entry in sync_results:
-            if not entry.get("repository") or not entry.get("issue_number"):
+            if not _should_notify_entry(entry):
                 continue
-            transition = _predicted_transition(entry)
-            if transition is None:
-                continue
-            from_state, to_state, pr_number = transition
+            board = _board_for_repository(str(entry["repository"]), selected_configs)
+            short_name = _board_short_name(board)
             predicted.append(
-                _transition_notification_line(
-                    _board_for_repository(str(entry["repository"]), selected_configs),
-                    _board_short_name(_board_for_repository(str(entry["repository"]), selected_configs)),
+                _attention_notification_line(
+                    board,
+                    short_name,
                     int(entry["issue_number"]),
-                    from_state,
-                    to_state,
-                    pr_number,
-                    str(entry.get("issue_title") or ""),
+                    entry,
                 )
             )
     else:
         for entry in sync_results:
-            if not entry.get("changed") or not entry.get("from_state") or not entry.get("to_state"):
+            if not _should_notify_entry(entry):
                 continue
-            if not entry.get("repository") or not entry.get("issue_number"):
-                continue
+            board = _board_for_repository(str(entry["repository"]), selected_configs)
+            short_name = _board_short_name(board)
             notification_lines.append(
-                _transition_notification_line(
-                    _board_for_repository(str(entry["repository"]), selected_configs),
-                    _board_short_name(_board_for_repository(str(entry["repository"]), selected_configs)),
+                _attention_notification_line(
+                    board,
+                    short_name,
                     int(entry["issue_number"]),
-                    str(entry["from_state"]),
-                    str(entry["to_state"]),
-                    _entry_pr_number(entry),
-                    str(entry.get("issue_title") or ""),
+                    entry,
                 )
             )
         # Telegram is a side-effect observer: a send failure is a warning

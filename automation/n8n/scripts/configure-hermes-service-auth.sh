@@ -24,6 +24,24 @@ script prints the required manual action.
 EOF
 }
 
+install_dashboard_overview() {
+  local source="$ROOT/hermes-plugin/h4v3-overview"
+  local target="$HERMES_HOME/plugins/h4v3-overview"
+  [[ -f "$source/plugin.yaml" && -f "$source/dashboard/manifest.json" ]] || {
+    echo "H4V3 Overview source missing: $source" >&2
+    exit 1
+  }
+  install -d -m 700 "$target/dashboard/dist"
+  install -m 644 "$source/plugin.yaml" "$target/plugin.yaml"
+  install -m 644 "$source/__init__.py" "$target/__init__.py"
+  install -m 644 "$source/dashboard/manifest.json" "$target/dashboard/manifest.json"
+  install -m 644 "$source/dashboard/plugin_api.py" "$target/dashboard/plugin_api.py"
+  install -m 644 "$source/dashboard/dist/index.js" "$target/dashboard/dist/index.js"
+  install -m 644 "$source/dashboard/dist/style.css" "$target/dashboard/dist/style.css"
+  HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" plugins enable h4v3-overview --no-allow-tool-override
+  echo "H4V3 Overview installed at: $target"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --hermes-home) HERMES_HOME="$2"; shift 2 ;;
@@ -81,6 +99,7 @@ print(f"verified {len(expected)} allowlisted job IDs are unique to their expecte
 PY
 }
 verify_allowlisted_job_ids
+install_dashboard_overview
 
 TARGET="$HERMES_HOME/plugins/hermes-n8n-cron-auth"
 install -d -m 700 "$TARGET"

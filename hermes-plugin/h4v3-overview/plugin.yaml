@@ -1,0 +1,5 @@
+name: h4v3-overview
+version: "0.1.0"
+description: "Read-only H4V3 multi-board Hermes Kanban Overview dashboard plugin."
+author: "Hermes n8n Control Plane"
+kind: backend

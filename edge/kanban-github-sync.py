@@ -2290,7 +2290,7 @@ def _record_rework_attention(
     *,
     reason: str,
     evidence: Optional[Mapping[str, Any]] = None,
-) -> None:
+) -> bool:
     event = context.get("event")
     payload = dict(event[0]) if isinstance(event, tuple) else {}
     payload.update({
@@ -2307,7 +2307,7 @@ def _record_rework_attention(
         (task_id, f"%{reason}%"),
     ).fetchone()
     if existing is not None:
-        return  # already recorded for this round/diagnostic
+        return False  # already recorded for this round/diagnostic
     with conn:
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -2325,6 +2325,103 @@ def _record_rework_attention(
             payload,
             kind="github_pr_rework_attention",
         )
+    return True
+
+
+_OPERATOR_ATTENTION_REASONS = frozenset({
+    "rework_retry_blocked",
+    "rework_dispatch_failed",
+    "claim_projection_reclaim_failed",
+    "workspace_resolve_failed",
+    "spawn_failed",
+    "lifecycle_label_conflict",
+    "rework_context_failed",
+    "delivery_query_failed",
+    "review_ready_label_projection_failed",
+    "merged_lifecycle_cleanup_failed",
+    "stale_review_ready_normalize_failed",
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
+})
+_OPERATOR_ATTENTION_MARKERS = (
+    "needs_input",
+    "needs maintainer",
+    "review-required",
+    "host_validation_required",
+    "human_validation_required",
+    "human review",
+)
+
+
+def _operator_attention_reason(entry: Mapping[str, Any]) -> Optional[str]:
+    reason = str(entry.get("reason") or "")
+    if reason == "rework_human_attention":
+        return reason
+    if reason in _OPERATOR_ATTENTION_REASONS:
+        return reason
+    block_kind = str(entry.get("block_kind") or "")
+    if block_kind in {"needs_input", "capability"} and str(entry.get("status") or "") == "blocked":
+        return block_kind
+    evidence = entry.get("evidence")
+    evidence_reason = evidence.get("reason") if isinstance(evidence, Mapping) else ""
+    text = " ".join(
+        str(value or "")
+        for value in (reason, entry.get("diagnostic"), entry.get("retry_reason"), entry.get("error"), evidence_reason)
+    ).casefold()
+    if any(marker in text for marker in _OPERATOR_ATTENTION_MARKERS):
+        return reason or "human_attention_required"
+    rework = entry.get("rework")
+    for value in (rework, entry):
+        if not isinstance(value, Mapping):
+            continue
+        try:
+            if int(value.get("rework_round") or 0) >= 3:
+                return "rework_threshold_exceeded"
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _record_operator_attention(
+    conn: sqlite3.Connection,
+    entry: dict[str, Any],
+) -> bool:
+    """Record one deduped operator-attention event in existing task_events."""
+    reason = _operator_attention_reason(entry)
+    task_id = str(entry.get("task_id") or "")
+    repository = str(entry.get("repository") or "")
+    issue_number = entry.get("issue_number")
+    if reason is None or not task_id or not repository or not issue_number:
+        return False
+    # Exclude prior operator-attention rows from the cursor. A new ordinary
+    # lifecycle event therefore permits a later recurrence, while an unchanged
+    # incident remains quiet on every five-minute tick.
+    cursor_row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events "
+        "WHERE task_id = ? AND kind != 'github_operator_attention'",
+        (task_id,),
+    ).fetchone()
+    cursor = int(cursor_row[0] or 0)
+    key = f"{reason}:{cursor}"
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'github_operator_attention' "
+        "AND payload LIKE ? LIMIT 1",
+        (task_id, f"%attention_key%{key}%"),
+    ).fetchone()
+    if existing is not None:
+        return False
+    payload = {
+        "reason": reason,
+        "attention_key": key,
+        "repository": repository,
+        "issue_number": int(issue_number),
+        "previous_status": entry.get("from_state"),
+        "new_status": entry.get("to_state") or entry.get("status"),
+        "source": "github_edge_operator_attention",
+    }
+    with conn:
+        _append_sync_event(conn, task_id, payload, kind="github_operator_attention")
+    return True
 
 
 def _restore_rework_labels(
@@ -3525,9 +3622,18 @@ def sync_board(
         entry["repository"] = ref.repository
         entry["issue_number"] = ref.issue_number
         entry["issue_title"] = ref.issue_title
+        entry["block_kind"] = row["block_kind"] if "block_kind" in row.keys() else None
         if entry.get("changed") and entry.get("status"):
             entry["from_state"] = str(row["status"])
             entry["to_state"] = str(entry["status"])
+        attention_reason = _operator_attention_reason(entry)
+        if attention_reason is not None:
+            if dry_run:
+                entry["operator_attention_predicted"] = {
+                    "reason": attention_reason,
+                }
+            elif _record_operator_attention(conn, entry):
+                entry["operator_attention"] = {"reason": attention_reason}
         return entry
 
     with kanban_db.connect_closing(board=board) as conn:
