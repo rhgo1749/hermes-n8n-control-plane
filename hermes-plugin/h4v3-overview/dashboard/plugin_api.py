@@ -66,6 +66,10 @@ _HUMAN_MARKERS = (
     "human_validation_required",
     "human review",
 )
+_ATTENTION_EVENT_KINDS = frozenset({
+    "github_operator_attention",
+    "github_pr_rework_attention",
+})
 _MAX_RECENT_EVENTS = 200
 _MAX_REASON_CHARS = 180
 
@@ -93,15 +97,47 @@ def _human_attention_reason(event: Any) -> Optional[str]:
     return None
 
 
+def _event_cursors(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    *,
+    excluded_kinds: frozenset[str],
+) -> dict[str, int]:
+    if not task_ids:
+        return {}
+    task_placeholders = ",".join("?" for _ in task_ids)
+    kind_placeholders = ",".join("?" for _ in excluded_kinds)
+    rows = conn.execute(
+        "SELECT task_id, MAX(id) AS cursor FROM task_events "
+        f"WHERE task_id IN ({task_placeholders}) "
+        f"AND kind NOT IN ({kind_placeholders}) GROUP BY task_id",
+        (*task_ids, *sorted(excluded_kinds)),
+    ).fetchall()
+    return {str(row["task_id"]): int(row["cursor"]) for row in rows}
+
+
+def _attention_key_cursor(payload: Mapping[str, Any]) -> Optional[int]:
+    raw_key = str(payload.get("attention_key") or "")
+    if ":" not in raw_key:
+        return None
+    suffix = raw_key.rsplit(":", 1)[1]
+    return int(suffix) if suffix.isdigit() else None
+
+
 def _load_attention_events(
     conn: sqlite3.Connection,
     task_ids: list[str],
 ) -> dict[str, sqlite3.Row]:
-    """Load the newest explicit human-attention evidence for each task.
+    """Load the newest unresolved explicit human-attention evidence.
 
     The recent-event window is intentionally bounded for board activity. It
     must not also bound durable attention evidence: an active task can remain
-    actionable after more than ``_MAX_RECENT_EVENTS`` unrelated events.
+    actionable after more than ``_MAX_RECENT_EVENTS`` unrelated events. An
+    attention event is unresolved only while its non-attention cursor remains
+    current. ``github_operator_attention`` reuses the edge's
+    ``attention_key=reason:<max-event-id-excluding-operator-attention>``
+    contract; legacy attention events fall back to their event id against the
+    lifecycle cursor.
     """
     if not task_ids:
         return {}
@@ -116,12 +152,33 @@ def _load_attention_events(
         "ORDER BY created_at DESC, id DESC",
         (*task_ids, *(marker.casefold() for marker in _HUMAN_MARKERS)),
     ).fetchall()
+    operator_cursors = _event_cursors(
+        conn,
+        task_ids,
+        excluded_kinds=frozenset({"github_operator_attention"}),
+    )
+    lifecycle_cursors = _event_cursors(
+        conn,
+        task_ids,
+        excluded_kinds=_ATTENTION_EVENT_KINDS,
+    )
     evidence: dict[str, sqlite3.Row] = {}
     for event in candidates:
         task_id = str(event["task_id"])
         if task_id in evidence:
             continue
-        if _human_attention_reason(event) is not None:
+        if _human_attention_reason(event) is None:
+            continue
+        payload = _json_payload(event["payload"])
+        if event["kind"] == "github_operator_attention":
+            cursor = _attention_key_cursor(payload)
+            if cursor is None:
+                unresolved = lifecycle_cursors.get(task_id, 0) <= int(event["id"])
+            else:
+                unresolved = operator_cursors.get(task_id, 0) <= cursor
+        else:
+            unresolved = lifecycle_cursors.get(task_id, 0) <= int(event["id"])
+        if unresolved:
             evidence[task_id] = event
     return evidence
 

@@ -83,6 +83,13 @@ contract prose ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
 BLOCKED states honest") that would false-positive every card.
 The board's 200-row recent-activity window does not expire attention evidence:
 active tasks query their newest explicit human-attention event separately.
+That evidence is still required to be unresolved: the existing
+`github_operator_attention` `attention_key` points to the latest event cursor
+excluding prior `github_operator_attention` rows, so a later lifecycle event
+(for example REVIEW → READY/RUNNING) stales the prior incident. A new
+attention event keyed to the new cursor makes Need You actionable again.
+Legacy rework-attention rows use their event id against a lifecycle cursor that
+excludes attention rows, without deleting or rewriting any history.
 
 ### Source of truth
 
@@ -126,10 +133,10 @@ not explicitly classified can never silently start an alert storm.
 
 * The edge records a durable `github_operator_attention` event in the
   existing `task_events` table (no new notification DB) only for the first
-  tick of an incident. The dedupe key is `reason:<max-non-attention-event-id>`,
-  so an unchanged incident stays quiet on every five-minute tick, while a
-  **new** ordinary lifecycle event (incident resolved/recurred) permits a
-  re-send.
+  tick of an incident. The dedupe key is
+  `reason:<max-event-id-excluding-operator-attention>`, so an unchanged
+  incident stays quiet on every five-minute tick, while a **new** ordinary
+  lifecycle event (incident resolved/recurred) permits a re-send.
 * Rework attention keeps its existing round-aware `github_pr_rework_attention`
   writer (deduped per round/diagnostic).
 * `hermes send` failures are observer-only warnings; they never fail or roll
