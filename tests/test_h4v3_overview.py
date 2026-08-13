@@ -82,7 +82,13 @@ def test_plain_blocked_is_not_need_you() -> None:
     assert overview._need_you_reason({"status": "blocked", "block_kind": "capability"}) == "capability"
 
 
-def test_review_with_human_validation_evidence_is_need_you() -> None:
+def test_terminal_tasks_are_never_need_you_with_human_attention_evidence() -> None:
+    stale_attention = {"attention": True, "attention_reason": "review-required"}
+    assert overview._need_you_reason({"status": "done", **stale_attention}) is None
+    assert overview._need_you_reason({"status": "archived", **stale_attention}) is None
+
+
+def test_review_with_review_required_evidence_is_need_you() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"
         _db(
@@ -95,7 +101,7 @@ def test_review_with_human_validation_evidence_is_need_you() -> None:
                 (
                     "t-review-attn",
                     "github_pr_rework_attention",
-                    json.dumps({"reason": "rework_human_attention", "diagnostic": "human_validation_required"}),
+                    json.dumps({"reason": "review-required", "diagnostic": "human_validation_required"}),
                     200,
                 ),
             ],
@@ -161,6 +167,7 @@ def test_need_you_summary_through_build_overview() -> None:
             [
                 ("t-review-attn", "Device check", "review", None, None, 0, 0, None, None, ""),
                 ("t-plain", "Plain", "blocked", None, None, 0, 0, None, None, ""),
+                ("t-done-stale", "Finished", "done", None, None, 0, 0, None, None, ""),
             ],
             [
                 (
@@ -168,6 +175,12 @@ def test_need_you_summary_through_build_overview() -> None:
                     "github_operator_attention",
                     json.dumps({"reason": "human_validation_required", "attention_key": "x:1"}),
                     100,
+                ),
+                (
+                    "t-done-stale",
+                    "github_operator_attention",
+                    json.dumps({"reason": "review-required", "attention_key": "stale:1"}),
+                    200,
                 ),
             ],
         )
@@ -188,6 +201,7 @@ def test_need_you_summary_through_build_overview() -> None:
         assert payload["summary"]["need_you"] == 1
         assert payload["summary"]["review"] == 1
         assert payload["need_you"][0]["task"]["id"] == "t-review-attn"
+        assert "t-done-stale" not in {item["task"]["id"] for item in payload["need_you"]}
 
 
 def test_missing_board_db_is_safe() -> None:

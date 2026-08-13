@@ -268,15 +268,20 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _need_you_reason(task: Mapping[str, Any]) -> Optional[str]:
-    """Operator-attention projection from durable evidence (status-agnostic).
+    """Project current operator attention from durable task evidence.
 
     Rules:
+    * terminal ``done``/``archived`` tasks are never Need You, even when
+      historical attention evidence remains in the event stream
     * ``blocked`` + ``block_kind`` in {needs_input, capability} → Need You
     * any status with explicit human-validation / maintainer-attention
       evidence (attention event markers) → Need You
     * plain REVIEW, or plain BLOCKED without evidence → not Need You
     """
-    if task.get("status") == "blocked" and task.get("block_kind") in {"needs_input", "capability"}:
+    status = task.get("status")
+    if status in {"done", "archived"}:
+        return None
+    if status == "blocked" and task.get("block_kind") in {"needs_input", "capability"}:
         return str(task["block_kind"])
     if task.get("attention") and task.get("attention_reason"):
         return str(task["attention_reason"])

@@ -69,11 +69,13 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
 only when existing Kanban/GitHub evidence says a human action is required:
 
 * `blocked` + `block_kind` is `needs_input` or `capability`;
-* any status (e.g. `review`) with explicit human-validation /
+* any non-terminal status (e.g. `review`) with explicit human-validation /
   maintainer-attention evidence in the durable event stream:
   `needs_input`, `needs maintainer`, `review-required`,
   `host_validation_required`, `human_validation_required`, `human review`.
 
+`done` and `archived` tasks are never classified as `need_you`; their historical
+attention events remain untouched but cannot keep a terminal task actionable.
 A plain `review` or a plain `blocked` without such evidence stays in its own
 bucket — never guessed into Need You. Evidence is read from `task_events`
 payloads only; the static intake card body is excluded because it contains
