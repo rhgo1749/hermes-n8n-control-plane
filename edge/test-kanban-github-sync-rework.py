@@ -10,6 +10,7 @@ Kanban DB layer is used (no mocks), and no real GitHub call is ever made.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -269,6 +270,44 @@ PASS: list[str] = []
 FAIL: list[str] = []
 
 
+# Dispatcher workers inherit these values, but the edge harness must resolve
+# every Kanban path from its temporary HERMES_HOME instead. Keep this list
+# broader than the DB resolver's current inputs so a future path consumer
+# cannot silently escape the test boundary.
+_KANBAN_PATH_ENV_KEYS = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_ROOT",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    "HERMES_KANBAN_LOGS_ROOT",
+    "HERMES_KANBAN_WORKSPACE",
+)
+_TEST_ENV_KEYS = ("HERMES_HOME", *_KANBAN_PATH_ENV_KEYS)
+
+
+def _prepare_isolated_environment() -> None:
+    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="rework-test-")
+    for key in _KANBAN_PATH_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+@contextlib.contextmanager
+def isolated_test_environment():
+    """Run one test with temporary Hermes/Kanban paths, then restore env."""
+    previous = {key: os.environ.get(key) for key in _TEST_ENV_KEYS}
+    try:
+        _prepare_isolated_environment()
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def check(name: str, cond: bool, detail: str = ""):
     if cond:
         PASS.append(name)
@@ -350,7 +389,7 @@ def run_sync(fake: FakeGitHub) -> list[dict]:
 
 
 def fresh_env() -> FakeGitHub:
-    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="rework-test-")
+    _prepare_isolated_environment()
     init_db()
     return FakeGitHub()
 
@@ -2074,6 +2113,58 @@ def test_78_round2_delivery_transitions_to_review_ready():
             str(entries2))
 
 
+def test_79_inherited_kanban_paths_are_isolated():
+    print("79. inherited Kanban path overrides -> temporary DB only")
+    sentinel_root = Path(tempfile.mkdtemp(prefix="rework-live-looking-"))
+    sentinel_db = sentinel_root / "kanban.db"
+    init_db(db_path=sentinel_db)
+    with sqlite3.connect(sentinel_db) as conn:
+        sentinel_before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    inherited = {
+        "HERMES_KANBAN_DB": str(sentinel_db),
+        "HERMES_KANBAN_HOME": str(sentinel_root / "home"),
+        "HERMES_KANBAN_BOARD": "live-looking",
+        "HERMES_KANBAN_ROOT": str(sentinel_root / "root"),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(sentinel_root / "workspaces"),
+        "HERMES_KANBAN_ATTACHMENTS_ROOT": str(sentinel_root / "attachments"),
+        "HERMES_KANBAN_LOGS_ROOT": str(sentinel_root / "logs"),
+        "HERMES_KANBAN_WORKSPACE": str(sentinel_root / "worker"),
+    }
+    previous = {key: os.environ.get(key) for key in _TEST_ENV_KEYS}
+    try:
+        os.environ.update(inherited)
+        fresh_env()
+        tid = new_task("review")
+        test_home = Path(os.environ["HERMES_HOME"]).resolve()
+        test_db = kanban_db.kanban_db_path().resolve()
+        with sqlite3.connect(sentinel_db) as conn:
+            sentinel_after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with sqlite3.connect(test_db) as conn:
+            test_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        check("inherited path overrides cleared",
+              not [key for key in _KANBAN_PATH_ENV_KEYS if os.environ.get(key)],
+              str({key: os.environ.get(key) for key in _KANBAN_PATH_ENV_KEYS}))
+        check("DB resolves under temporary home",
+              test_db == test_home / "kanban.db", str({"db": test_db, "home": test_home}))
+        check("workspace root resolves under temporary home",
+              kanban_db.workspaces_root().resolve() == test_home / "kanban" / "workspaces",
+              str(kanban_db.workspaces_root()))
+        check("board resolves to temporary default",
+              kanban_db.get_current_board() == "default", str(kanban_db.get_current_board()))
+        check("sentinel DB unchanged", sentinel_after == sentinel_before,
+              str({"before": sentinel_before, "after": sentinel_after}))
+        check("task created in temporary DB", test_tasks == 1
+              and task_row(tid)["id"] == tid, str({"db": test_db, "tasks": test_tasks}))
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2707,10 +2798,12 @@ def main() -> int:
         test_76_round2_pushed_new_head_no_marker_stays_working,
         test_77_stale_round1_marker_not_current_round_delivery,
         test_78_round2_delivery_transitions_to_review_ready,
+        test_79_inherited_kanban_paths_are_isolated,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
-        test()
+        with isolated_test_environment():
+            test()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", ", ".join(FAIL))
