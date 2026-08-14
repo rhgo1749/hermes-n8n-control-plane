@@ -1,6 +1,6 @@
 # REQ-016: H4V3 Overview compact project status matrix/list
 
-- Status: Rework correction applied; local validation PASS; existing PR #23 retained, exact-head GitHub re-verification unavailable in this worker
+- Status: Follow-up documentation correction applied; local validation PASS; existing PR #23 retained; authenticated exact-head/file/body verification is recorded in the final Kanban handoff
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN`
 - Validation profiles: `HERMES_PLUGIN`, `STATIC_UNIT`, `HOST_DASHBOARD`
@@ -33,7 +33,7 @@
 6. `hermes-plugin/h4v3-overview/dashboard/plugin_api.py`
 7. `tests/test_h4v3_overview.py`
 8. `.agent/REQ_REQUEST_TEMPLATE.md` 및 `.agent/pr-requests/README.md`
-9. Issue/PR live evidence는 이 worker에서 인증 없이 REST를 재확인했을 때 HTTP `404`를 반환했고 `gh` CLI도 설치되어 있지 않았다. Kanban parent handoff는 인증된 REST 기준 Issue #16이 open이고 comments가 0개라고 보고하지만, 이 worker는 인증된 Issue/PR thread를 독립적으로 읽지 못했다. Issue의 canonical body와 design handoff는 Kanban parent provenance로 보존되어 있다.
+9. Issue/PR live evidence는 authenticated GitHub REST로 확인했다: Issue #16은 open/comments 0, 기존 PR #23은 open, base `main`, head `wt/t_765929ec`, pre-follow-up HEAD `9a2edbaf1169fdeb7c92c24c1bd38e9ff5e21cdf`, changed files 5개, merge state `clean`이다. Issue의 canonical body와 design handoff는 Kanban parent provenance로 보존되어 있다.
 
 ## 1. Objective
 
@@ -47,7 +47,7 @@
 - Repository evidence: `docs/H4V3_OVERVIEW.md`, `dist/index.js`, `dist/style.css`, `plugin_api.py`, `tests/test_h4v3_overview.py`.
 - Source Issue product intent: Issue #16 및 `t_d4d8ff6d` handoff의 compact project status matrix/list 요구.
 - Runtime/host evidence: 이 worker는 설치된 Hermes dashboard/browser를 대상으로 하지 않는다. 실제 host dashboard render, mobile overflow, keyboard/screen-reader, theme contrast는 아직 확인하지 않았다.
-- Assumptions/unresolved facts: 이 worker의 인증 없는 GitHub REST probe는 HTTP `404`였고 `gh`도 미설치라 authenticated Issue/PR thread를 직접 재확인하지 못했으며, Issue 상태는 parent handoff의 authenticated provenance(open, 0 comments)를 함께 기록한다. `origin/main` remote fetch와 branch 조회는 HTTPS credential 없이 실패했지만 로컬에 보존된 최신 `origin/main` SHA를 확인했다. Candidate branch는 기존 base `7dc746fd2918e955b7028c4f00f6bb728f69940d`에서 유지되며 최신 `origin/main`과 merge-tree conflict는 없고 rebase/merge는 수행하지 않았다.
+- Assumptions/unresolved facts: 이 worker는 설치된 Hermes dashboard/browser를 대상으로 하지 않으며, 실제 host acceptance는 여전히 수행하지 않았다. `origin/main`은 `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`로 fetch되었고, candidate branch는 기존 base `7dc746fd2918e955b7028c4f00f6bb728f69940d`에서 유지되며 최신 `origin/main`과 merge-tree conflict는 없고 rebase/merge는 수행하지 않았다. Authenticated Issue/PR live evidence는 위 route와 final handoff에 기록한다.
 
 ## 3. Ownership and security gates
 
@@ -124,7 +124,7 @@ automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
 
 Exact candidate identity for this handoff:
 
-- Reviewed candidate before this bounded `read_error` documentation correction: HEAD `7f3c7a0fa372507afb6bcf54e59e942e9b4fe882`.
+- Reviewed candidate before this bounded missing-file/read-error documentation correction: HEAD `9a2edbaf1169fdeb7c92c24c1bd38e9ff5e21cdf`.
 - Candidate base used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`; latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`.
 - Candidate branch: `wt/t_765929ec`.
 - Candidate changed-file allowlist: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, and `tests/test_h4v3_overview_ui.py`.
@@ -164,15 +164,15 @@ If validation fails, preserve the installer backup and use the printed rollback 
 ### Git / PR
 - Candidate base SHA used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
 - Latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef` (candidate branch was not rebased or merged; local merge-tree conflict probe was clean)
-- Reviewed candidate HEAD before this bounded `read_error` documentation correction: `7f3c7a0fa372507afb6bcf54e59e942e9b4fe882`
+- Reviewed candidate HEAD before this bounded missing-file/read-error documentation correction: `9a2edbaf1169fdeb7c92c24c1bd38e9ff5e21cdf`
 - Branch: `wt/t_765929ec`
-- Candidate commits: `3b87b01` (`feat(overview): compact project status matrix`), `590eed3` (`docs(req): record overview validation evidence`), `6dba264` (`docs(req): record remote delivery boundary`), `7f3c7a0` (`docs(req): record exact overview candidate handoff`); this rework adds the bounded `read_error` documentation correction and the corresponding REQ handoff update.
-- Rework correction: `docs/H4V3_OVERVIEW.md` now documents unavailable/unknown counts with a `read_error` notice rather than claimed zeroes; the exact post-correction HEAD is recorded in the Kanban completion handoff because this commit cannot embed its own final SHA.
+- Candidate commits through the previous correction: `3b87b01` (`feat(overview): compact project status matrix`), `590eed3` (`docs(req): record overview validation evidence`), `6dba264` (`docs(req): record remote delivery boundary`), `7f3c7a0` (`docs(req): record exact overview candidate handoff`), `9a2edba` (`docs(overview): correct read_error count semantics`); this follow-up adds the bounded missing-file/read-error documentation distinction and corresponding REQ handoff update.
+- Rework correction: `docs/H4V3_OVERVIEW.md` now distinguishes the missing DB file's explicit empty/zero-count fallback (`read_error` unset) from true read failures such as incompatible schema or a locked DB (unavailable/unknown counts plus a `read_error` notice); the exact post-correction HEAD is recorded in the Kanban completion handoff because this commit cannot embed its own final SHA.
 - Changed-file allowlist against the candidate base: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, `tests/test_h4v3_overview_ui.py`; backend/API/schema/notification files are absent.
-- PR delivery target: existing PR #23 on `wt/t_765929ec` is retained per the Kanban rework handoff; this worker could not re-read or update the live PR because `gh` is unavailable and unauthenticated HTTPS fetch/push probes return exit 128 (`could not read Username for 'https://github.com': No such device or address`). Re-run the exact-head PR #23 verification when authenticated tooling is available.
-- Working tree: clean after applying this bounded documentation/REQ correction commit; no merge/auto-merge performed.
+- PR delivery target: existing PR #23 on `wt/t_765929ec` is retained per the Kanban rework handoff; authenticated REST/GitHub delivery is available, no new PR is created, and the final exact-head/file/body verification is recorded in the Kanban completion handoff.
+- Working tree: clean after applying this follow-up documentation/REQ correction commit; no merge/auto-merge performed.
 - Merge performed: NO
 
 ### Remaining risks / owner
 - Human/host owner must verify real dashboard layout and assistive technology behavior.
-- Remote GitHub delivery requires authenticated GitHub tooling; worker must record any inability to fetch/push/create the PR as an explicit delivery gap rather than fabricating success.
+- Human/remote owner retains merge authority; no merge or auto-merge is performed by this task.
