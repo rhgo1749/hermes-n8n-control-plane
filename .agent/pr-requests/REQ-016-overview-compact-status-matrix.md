@@ -156,7 +156,7 @@ If validation fails, preserve the installer backup and use the printed rollback 
 ### Git / PR
 - Base SHA: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
 - Branch: `wt/t_765929ec`
-- Commits: pending
+- Commits: `3b87b01` (`feat(overview): compact project status matrix`)
 - PR number/title/URL: pending; exactly one Korean PR against `main`, no merge/auto-merge
 - Working tree: pending final verification
 - Merge performed: NO
