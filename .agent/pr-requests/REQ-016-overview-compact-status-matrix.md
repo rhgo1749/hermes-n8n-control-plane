@@ -139,7 +139,7 @@ Exact candidate identity for this handoff:
 - Historical/previous candidate: `9a2edbaf1169fdeb7c92c24c1bd38e9ff5e21cdf` was the earlier documentation state; it is not the final candidate.
 - Final candidate implementation commit: `e447b92e552e9e267977e33e19f20baaea1d12c8` (`fix(overview): keep zero status cells muted`).
 - Candidate base used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`; latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`; no rebase or merge was performed.
-- Candidate branch: `wt/t_765929ec`; `origin/wt/t_765929ec` resolves to the same e447 full SHA at this verification.
+- Candidate branch: `wt/t_765929ec`; before this REQ-only correction, `origin/wt/t_765929ec` resolved to the e447 full SHA.
 - Candidate changed-file allowlist: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, and `tests/test_h4v3_overview_ui.py`.
 - CSS/test rework scope in e447: reorder the desktop/mobile zero and unavailable selectors after status-color selectors so muted zero precedence wins, while retaining specific non-zero Need You/Blocked emphasis; add the seventh UI regression test asserting both cascades.
 - This task's correction scope: only this REQ document. The candidate implementation/API/UI behavior is described from e447 and is not represented as unchanged-by-rework.
@@ -181,7 +181,7 @@ If validation fails, preserve the installer backup and use the printed rollback 
 ### Git / PR
 - Candidate base SHA used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
 - Latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`; candidate branch was not rebased or merged; merge-tree conflict probe is clean.
-- Final candidate implementation HEAD: `e447b92e552e9e267977e33e19f20baaea1d12c8`; branch: `wt/t_765929ec`; remote branch ref matches this full SHA.
+- Final candidate implementation HEAD: `e447b92e552e9e267977e33e19f20baaea1d12c8`; branch: `wt/t_765929ec` now contains this implementation plus the REQ-only correction commit; the exact current branch HEAD is returned in the Kanban completion handoff.
 - Historical/previous request evidence: `9a2edbaf1169fdeb7c92c24c1bd38e9ff5e21cdf` is retained only as a previous candidate label, not current state.
 - Candidate changed-file allowlist against its base: exactly the five paths listed in §4; backend/API/schema/notification files are absent.
 - Existing PR #23 on `wt/t_765929ec` remains the delivery target; no new PR, merge, or auto-merge is performed. Live PR title/base/state/body metadata is `NOT RUN / EXTERNAL` in this worker and is not claimed PASS.
