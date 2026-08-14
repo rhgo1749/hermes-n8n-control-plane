@@ -25,7 +25,8 @@ For every discovered repository the registry snapshot records:
 - GitHub full name and immutable repository ID
 - GitHub `default_branch`
 - canonical slug (`repo-name.casefold()`)
-- derived checkout path `/ws/projects/<slug>`
+- resolved checkout path: the resolved board's `board.json.default_workdir` when
+  declared, otherwise the legacy `/ws/projects/<slug>` fallback
 - whether the checkout origin matches the GitHub repository
 - repository contract files present on the GitHub default branch
 - existing Kanban board association derived from task provenance, or the bounded
@@ -38,12 +39,16 @@ The authority boundary is explicit:
 GitHub default branch
   └─ contract-file presence
 
-/ws/projects/<slug>
-  └─ checkout-path/origin verification only
-
 live Kanban board DBs
   ├─ durable repo → board association from tasks.idempotency_key
   └─ first-intake bootstrap only: empty-provenance board named exactly <slug>
+
+resolved board metadata
+  └─ board.json.default_workdir selects checkout LOCATION only
+     (repository identity is still verified from git origin)
+
+legacy fallback when board metadata has no default_workdir
+  └─ /ws/projects/<slug>
 ```
 
 A stale or branch-diverged local checkout must not hide or invent repository
@@ -64,14 +69,28 @@ There is no per-repository contract list.
 
 ## Checkout convention
 
-The current Hermes runtime uses `/ws/projects/<repo-name.casefold()>` for all
-managed repositories. The registry derives this path and verifies its `origin`
-normalizes to the discovered GitHub `owner/repository` identity.
+The checkout path is resolved only after the repository's Kanban board has been
+resolved. If that live board declares an absolute `default_workdir` in
+`board.json`, the registry uses that exact path and verifies its `origin`
+normalizes to the discovered GitHub `owner/repository` identity. This preserves
+Hermes board-owned paths such as `/ws/projects/H4V3-Meowcore` instead of
+silently inventing a second case-folded checkout.
+
+Legacy boards that do not have `board.json` or do not declare
+`default_workdir` retain the historical `/ws/projects/<repo-name.casefold()>`
+fallback.
+
+Board metadata is checkout-location authority only. It does **not** establish a
+repo→board association: that still comes from durable task provenance or the
+bounded empty-canonical-board bootstrap. A board workdir pointing at the wrong
+repository fails closed through the same origin check.
 
 The path convention is not sufficient by itself: missing checkouts, unavailable
 origins, and remote mismatches all fail closed. The registry does not scan and
 pick an arbitrary same-origin worktree because feature/validation worktrees may
-legitimately share the same remote.
+legitimately share the same remote. Malformed board metadata, a slug mismatch,
+or a relative `default_workdir` also fails closed rather than selecting an
+untrusted path.
 
 ## Existing board association from durable task provenance
 
@@ -217,7 +236,8 @@ Before any live cutover:
 1. Add `hermes-agent` only to repositories intended for Hermes management.
 2. Run the shadow registry and save the JSON output outside Git.
 3. Confirm the discovered repository set matches the current managed set.
-4. Confirm each existing checkout reports `verified` and its remote matches.
+4. Confirm each resolved board workdir (or legacy slug fallback) reports
+   `verified` and its remote matches the discovered repository.
 5. Confirm contract detection matches the GitHub default branch, even if the
    local checkout is stale or on another branch.
 6. For established repositories, confirm each resolves to exactly one live
@@ -225,13 +245,14 @@ Before any live cutover:
 7. For a first-intake repository with no provenance, confirm the only bootstrap
    candidate is an existing live board whose name equals the canonical slug and
    whose GitHub repository provenance is empty.
-8. Treat canonical-board conflicts, ambiguous provenance, and missing boards as
-   not ready; do not guess another board name.
+8. Treat canonical-board conflicts, ambiguous provenance, malformed board
+   metadata, checkout remote mismatches, and missing boards as not ready; do not
+   guess another board or checkout.
 9. Keep the polling fallback available until registry-driven event routing has
    sufficient production evidence.
 
 The first production shadow canary found exactly the intended five repositories
-and verified all five `/ws/projects/<slug>` origins. It also exposed local
+and verified all five then-current checkout origins. It also exposed local
 checkout drift in contract-file detection, which is why contract authority now
 comes from the GitHub default branch rather than the local working tree.
 
