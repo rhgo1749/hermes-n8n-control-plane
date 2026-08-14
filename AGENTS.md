@@ -1,12 +1,14 @@
 # Root agent policy
 
-## Issue-driven PR request routing
+## Issue-driven REQ request routing
 
-Issue-driven implementation must use the repository-owned request contract at `.agent/PR_REQUEST_TEMPLATE.md`.
+Issue-driven implementation must use the repository-owned request contract at `.agent/REQ_REQUEST_TEMPLATE.md`.
 
 - Start from the current GitHub Issue and latest fetched `origin/main`.
 - Read `README.md`, then the canonical document for the actual change surface, then target source/tests.
-- Create a **task-specific, shortened request** at `.agent/pr-requests/PR-NNN-<slug>.md`; do not copy the full template verbatim.
+- Create a **task-specific, shortened request** at `.agent/pr-requests/REQ-NNN-<slug>.md`; do not copy the full template verbatim.
+- `REQ-NNN` uses the Source GitHub Issue number. It is not the GitHub Pull Request number.
+- Refer to actual GitHub Pull Requests as `PR #<github-pr-number>` and refer to work primarily by `Issue #<issue-number>`.
 - Record Source Issue, Kanban task/idempotency provenance when available, scope/non-goals, validation profiles, and the final automation stop state.
 - Treat GitHub, Hermes Kanban, edge reconciliation, n8n, H4V3 Overview, and Telegram according to the ownership boundaries defined by the request template and repository docs.
 - PRs may be created or updated by agents, but merge/auto-merge remains human/user authority unless the user explicitly authorizes a merge.

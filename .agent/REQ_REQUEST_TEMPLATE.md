@@ -1,16 +1,24 @@
-# H4V3 Control-Plane Agentic PR Request Template
+# H4V3 Control-Plane Agentic Work Request Template
 
-> Lineage: H4V3 Agentic PR Request pattern
+> Lineage: H4V3 Agentic Work Request pattern
 > Repository specialization: `rhgo1749/hermes-n8n-control-plane`
 > Purpose: GitHub Issue → Hermes Kanban → worker/lead execution → human review
 
-이 파일은 `hermes-n8n-control-plane` 전용 **PR 요청서 생성 템플릿**이다. 실제 작업에서는 현재 Issue와 최신 저장소 상태를 조사한 뒤 필요한 항목만 남겨 `.agent/pr-requests/PR-NNN-<slug>.md`로 축약해 사용한다.
+이 파일은 `hermes-n8n-control-plane` 전용 **REQ 요청서 생성 템플릿**이다. 실제 작업에서는 현재 Issue와 최신 저장소 상태를 조사한 뒤 필요한 항목만 남겨 `.agent/pr-requests/REQ-NNN-<slug>.md`로 축약해 사용한다.
 
-새 worker/lead는 이전 ChatGPT/Hermes/사람 대화 맥락을 공유하지 않는다고 가정한다. 구현 판단에 필요한 내용은 GitHub Issue, 이 저장소의 canonical 문서, 실제 PR 요청서, Git history/PR, 실제 runtime evidence 중 하나에서 복구 가능해야 한다.
+## Naming contract
+
+- `REQ-NNN`의 `NNN`은 항상 **Source GitHub Issue 번호**다.
+- `REQ-NNN`은 GitHub Pull Request 번호가 아니다.
+- 실제 GitHub Pull Request는 언제나 `PR #<github-pr-number>`로 표기한다.
+- 사람/리뷰/Kanban에서 작업의 기본 식별자는 `Issue #<issue-number>`다.
+- 새 요청서 파일은 `.agent/pr-requests/REQ-NNN-<slug>.md`만 사용한다. `PR-NNN-*` 형식은 신규 생성하지 않는다.
+
+새 worker/lead는 이전 ChatGPT/Hermes/사람 대화 맥락을 공유하지 않는다고 가정한다. 구현 판단에 필요한 내용은 GitHub Issue, 이 저장소의 canonical 문서, 실제 REQ 요청서, Git history/PR, 실제 runtime evidence 중 하나에서 복구 가능해야 한다.
 
 ---
 
-# PR-NNN: 한글 제목
+# REQ-NNN: 한글 제목
 
 - Status: Draft
 - Project: `hermes-n8n-control-plane`
@@ -22,7 +30,7 @@
 - Remote delivery: Required
 - Pull request title/body/final report language: Korean
 - Request storage: REPOSITORY_OWNED_REQUEST
-- Request path: `.agent/pr-requests/PR-NNN-<slug>.md`
+- Request path: `.agent/pr-requests/REQ-NNN-<slug>.md`
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#NNN`
 - Source issue URL:
@@ -269,7 +277,7 @@ Lead는:
 
 1. Issue와 mandatory route를 먼저 읽는다.
 2. current main/open/conflicting work와 source-of-truth를 조사한다.
-3. 이 템플릿을 실제 요청서로 축약한다.
+3. 이 템플릿을 실제 REQ 요청서로 축약한다.
 4. 독립적인 bounded subtask만 worker에게 delegate한다.
 5. delegated output을 그대로 신뢰하지 않고 diff와 validation evidence를 다시 검토한다.
 6. deterministic gate가 실패하면 수정/재위임한다.
