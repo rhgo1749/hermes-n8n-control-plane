@@ -58,6 +58,19 @@ def test_zero_and_board_read_errors_are_not_presented_as_zero() -> None:
     assert 'role: "status"' in index
 
 
+def test_zero_colors_override_status_colors_on_desktop_and_mobile() -> None:
+    _, style = _source()
+    desktop_zero = style.index(".h4v3-matrix-cell--zero")
+    mobile_zero = style.index(".h4v3-mobile-status--zero")
+    for status in ("review", "running", "ready", "rework"):
+        assert desktop_zero > style.index(f".h4v3-matrix-status--{status}")
+        assert mobile_zero > style.index(f".h4v3-mobile-status--{status}")
+    assert ".h4v3-matrix-cell--nonzero.h4v3-matrix-status--need_you" in style
+    assert ".h4v3-matrix-cell--nonzero.h4v3-matrix-status--blocked" in style
+    assert ".h4v3-mobile-status--nonzero.h4v3-mobile-status--need_you" in style
+    assert ".h4v3-mobile-status--nonzero.h4v3-mobile-status--blocked" in style
+
+
 def test_recent_state_has_human_labels_without_raw_internal_names() -> None:
     index, _ = _source()
     assert 'return "Rework requested";' in index
