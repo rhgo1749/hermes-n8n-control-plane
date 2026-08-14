@@ -1,6 +1,6 @@
 # REQ-016: H4V3 Overview compact project status matrix/list
 
-- Status: Implementation complete; local validation PASS, PR delivery blocked by unavailable GitHub authentication
+- Status: Rework correction applied; local validation PASS; existing PR #23 retained, exact-head GitHub re-verification unavailable in this worker
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN`
 - Validation profiles: `HERMES_PLUGIN`, `STATIC_UNIT`, `HOST_DASHBOARD`
@@ -124,11 +124,11 @@ automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
 
 Exact candidate identity for this handoff:
 
-- Reviewed candidate before this bounded REQ correction: HEAD `6dba264018e7a8973911057f7fd00874a48c2c77`.
+- Reviewed candidate before this bounded `read_error` documentation correction: HEAD `7f3c7a0fa372507afb6bcf54e59e942e9b4fe882`.
 - Candidate base used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`; latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`.
 - Candidate branch: `wt/t_765929ec`.
 - Candidate changed-file allowlist: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, and `tests/test_h4v3_overview_ui.py`.
-- The reviewed implementation/API/UI bytes are unchanged by this rework; this rework is limited to the durable REQ handoff.
+- The reviewed implementation/API/UI bytes are unchanged by this rework; the correction is limited to `docs/H4V3_OVERVIEW.md` and this REQ handoff.
 
 PASS conditions:
 
@@ -164,13 +164,13 @@ If validation fails, preserve the installer backup and use the printed rollback 
 ### Git / PR
 - Candidate base SHA used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
 - Latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef` (candidate branch was not rebased or merged; local merge-tree conflict probe was clean)
-- Reviewed candidate HEAD before this bounded REQ correction: `6dba264018e7a8973911057f7fd00874a48c2c77`
+- Reviewed candidate HEAD before this bounded `read_error` documentation correction: `7f3c7a0fa372507afb6bcf54e59e942e9b4fe882`
 - Branch: `wt/t_765929ec`
-- Candidate commits: `3b87b01` (`feat(overview): compact project status matrix`), `590eed3` (`docs(req): record overview validation evidence`), `6dba264` (`docs(req): record remote delivery boundary`); this rework adds only the REQ correction described above.
-- Rework correction: one REQ-only commit after the reviewed candidate; the final post-correction HEAD is recorded in the Kanban handoff.
+- Candidate commits: `3b87b01` (`feat(overview): compact project status matrix`), `590eed3` (`docs(req): record overview validation evidence`), `6dba264` (`docs(req): record remote delivery boundary`), `7f3c7a0` (`docs(req): record exact overview candidate handoff`); this rework adds the bounded `read_error` documentation correction and the corresponding REQ handoff update.
+- Rework correction: `docs/H4V3_OVERVIEW.md` now documents unavailable/unknown counts with a `read_error` notice rather than claimed zeroes; the exact post-correction HEAD is recorded in the Kanban completion handoff because this commit cannot embed its own final SHA.
 - Changed-file allowlist against the candidate base: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, `tests/test_h4v3_overview_ui.py`; backend/API/schema/notification files are absent.
-- PR number/title/URL: NOT CREATED — unauthenticated `git ls-remote --heads origin wt/t_765929ec` returned exit 128 (`could not read Username for 'https://github.com': No such device or address`); the prior non-force `git push -u origin wt/t_765929ec` also failed exit 128 for missing HTTPS credentials. No remote branch or PR is claimed; create exactly one Korean PR against `main` only after authenticated delivery is available.
-- Working tree: clean after applying this bounded REQ correction commit; no merge/auto-merge performed.
+- PR delivery target: existing PR #23 on `wt/t_765929ec` is retained per the Kanban rework handoff; this worker could not re-read or update the live PR because `gh` is unavailable and unauthenticated HTTPS fetch/push probes return exit 128 (`could not read Username for 'https://github.com': No such device or address`). Re-run the exact-head PR #23 verification when authenticated tooling is available.
+- Working tree: clean after applying this bounded documentation/REQ correction commit; no merge/auto-merge performed.
 - Merge performed: NO
 
 ### Remaining risks / owner

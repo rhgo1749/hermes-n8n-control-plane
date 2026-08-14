@@ -65,8 +65,9 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
   and the `task` query is retained as a provenance hint for future Kanban
   deep-link support. No Kanban UI is re-implemented.
 * **Fail-closed rendering**: a board whose DB cannot be read (missing file,
-  incompatible schema, locked DB) renders with a `read_error` notice and zeroed
-  counts; one bad board never breaks the others or the dashboard.
+  incompatible schema, locked DB) renders an unavailable/unknown count state
+  with a `read_error` notice, never a claimed zero; one bad board never breaks
+  the others or the dashboard.
 
 ### Need You projection rules
 
