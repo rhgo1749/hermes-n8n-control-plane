@@ -6,7 +6,7 @@
 - Validation profiles: `HERMES_PLUGIN`, `STATIC_UNIT`, `HOST_DASHBOARD`
 - Integration target branch: `main`
 - Required work branch: `wt/t_765929ec`
-- Source-of-truth base: `origin/main` at `7dc746fd2918e955b7028c4f00f6bb728f69940d`
+- Source-of-truth base: candidate base used `7dc746fd2918e955b7028c4f00f6bb728f69940d` (branch merge-base); latest fetched `origin/main` at verification: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`
 - Remote delivery: Required
 - Pull request title/body/final report language: Korean
 - Request storage: `REPOSITORY_OWNED_REQUEST`
@@ -33,7 +33,7 @@
 6. `hermes-plugin/h4v3-overview/dashboard/plugin_api.py`
 7. `tests/test_h4v3_overview.py`
 8. `.agent/REQ_REQUEST_TEMPLATE.md` 및 `.agent/pr-requests/README.md`
-9. Issue/PR live evidence는 현재 worker 환경에서 확인을 시도했으나 GitHub URL은 `404`를 반환했고 `gh` CLI도 설치되어 있지 않았다. Issue의 canonical body와 design handoff는 Kanban parent provenance로 보존되어 있다.
+9. Issue/PR live evidence는 이 worker에서 인증 없이 REST를 재확인했을 때 HTTP `404`를 반환했고 `gh` CLI도 설치되어 있지 않았다. Kanban parent handoff는 인증된 REST 기준 Issue #16이 open이고 comments가 0개라고 보고하지만, 이 worker는 인증된 Issue/PR thread를 독립적으로 읽지 못했다. Issue의 canonical body와 design handoff는 Kanban parent provenance로 보존되어 있다.
 
 ## 1. Objective
 
@@ -47,7 +47,7 @@
 - Repository evidence: `docs/H4V3_OVERVIEW.md`, `dist/index.js`, `dist/style.css`, `plugin_api.py`, `tests/test_h4v3_overview.py`.
 - Source Issue product intent: Issue #16 및 `t_d4d8ff6d` handoff의 compact project status matrix/list 요구.
 - Runtime/host evidence: 이 worker는 설치된 Hermes dashboard/browser를 대상으로 하지 않는다. 실제 host dashboard render, mobile overflow, keyboard/screen-reader, theme contrast는 아직 확인하지 않았다.
-- Assumptions/unresolved facts: GitHub Issue live thread는 익명 URL/API 404와 `gh` 미설치로 직접 재확인하지 못했으며, parent handoff의 canonical Issue provenance를 사용했다. `origin/main` remote fetch는 credential 없이 실패했지만 로컬에 보존된 `origin/main` SHA를 확인하고 그 SHA에서 dedicated worktree branch를 reset했다.
+- Assumptions/unresolved facts: 이 worker의 인증 없는 GitHub REST probe는 HTTP `404`였고 `gh`도 미설치라 authenticated Issue/PR thread를 직접 재확인하지 못했으며, Issue 상태는 parent handoff의 authenticated provenance(open, 0 comments)를 함께 기록한다. `origin/main` remote fetch와 branch 조회는 HTTPS credential 없이 실패했지만 로컬에 보존된 최신 `origin/main` SHA를 확인했다. Candidate branch는 기존 base `7dc746fd2918e955b7028c4f00f6bb728f69940d`에서 유지되며 최신 `origin/main`과 merge-tree conflict는 없고 rebase/merge는 수행하지 않았다.
 
 ## 3. Ownership and security gates
 
@@ -122,6 +122,14 @@ No production deployment is requested for this implementation gate. If host acce
 automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
 ```
 
+Exact candidate identity for this handoff:
+
+- Reviewed candidate before this bounded REQ correction: HEAD `6dba264018e7a8973911057f7fd00874a48c2c77`.
+- Candidate base used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`; latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef`.
+- Candidate branch: `wt/t_765929ec`.
+- Candidate changed-file allowlist: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, and `tests/test_h4v3_overview_ui.py`.
+- The reviewed implementation/API/UI bytes are unchanged by this rework; this rework is limited to the durable REQ handoff.
+
 PASS conditions:
 
 - [ ] exact branch/PR candidate is installed through the atomic installer path;
@@ -154,11 +162,15 @@ If validation fails, preserve the installer backup and use the printed rollback 
 | GitHub Actions | NOT RUN / DISABLED BY POLICY | Local validation is authoritative. |
 
 ### Git / PR
-- Base SHA: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
+- Candidate base SHA used: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
+- Latest fetched `origin/main`: `87ae8be0078bb2e3fabd64da53dc5de4a03276ef` (candidate branch was not rebased or merged; local merge-tree conflict probe was clean)
+- Reviewed candidate HEAD before this bounded REQ correction: `6dba264018e7a8973911057f7fd00874a48c2c77`
 - Branch: `wt/t_765929ec`
-- Commits: `3b87b01` (`feat(overview): compact project status matrix`)
-- PR number/title/URL: NOT CREATED — `git push -u origin wt/t_765929ec` failed with exit 128 because HTTPS credentials were unavailable; create exactly one Korean PR against `main` after authenticated delivery is available.
-- Working tree: clean after local commits; merge/auto-merge not performed
+- Candidate commits: `3b87b01` (`feat(overview): compact project status matrix`), `590eed3` (`docs(req): record overview validation evidence`), `6dba264` (`docs(req): record remote delivery boundary`); this rework adds only the REQ correction described above.
+- Rework correction: one REQ-only commit after the reviewed candidate; the final post-correction HEAD is recorded in the Kanban handoff.
+- Changed-file allowlist against the candidate base: exactly `.agent/pr-requests/REQ-016-overview-compact-status-matrix.md`, `docs/H4V3_OVERVIEW.md`, `hermes-plugin/h4v3-overview/dashboard/dist/index.js`, `hermes-plugin/h4v3-overview/dashboard/dist/style.css`, `tests/test_h4v3_overview_ui.py`; backend/API/schema/notification files are absent.
+- PR number/title/URL: NOT CREATED — unauthenticated `git ls-remote --heads origin wt/t_765929ec` returned exit 128 (`could not read Username for 'https://github.com': No such device or address`); the prior non-force `git push -u origin wt/t_765929ec` also failed exit 128 for missing HTTPS credentials. No remote branch or PR is claimed; create exactly one Korean PR against `main` only after authenticated delivery is available.
+- Working tree: clean after applying this bounded REQ correction commit; no merge/auto-merge performed.
 - Merge performed: NO
 
 ### Remaining risks / owner
