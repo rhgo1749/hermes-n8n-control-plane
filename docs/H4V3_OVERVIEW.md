@@ -43,10 +43,15 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
 ### What the Overview shows
 
 * **Top summary**: Need You · Blocked · Review · Running · Ready + active worker count.
-* **Board cards**: one per existing Hermes board (from `kanban_db.list_boards`),
-  with status counts, rework count, provenance repositories (derived from
-  `tasks.idempotency_key`, never hardcoded), and the most recent meaningful
-  edge event. Board names come from `board.json` metadata.
+* **Board status matrix/list**: one row per existing Hermes board (from
+  `kanban_db.list_boards`) in the desktop semantic matrix, with `Project`,
+  `Need You`, `Blocked`, `Running`, `Review`, `Ready`, `Rework`, and `Recent
+  meaningful state` columns. At widths up to 900px the same projection uses a
+  compact labeled vertical list instead of a horizontal-scroll-only table.
+  Board names come from `board.json` metadata; zero values are visually muted
+  while their accessible names retain the numeric value. Repository provenance
+  remains in the API projection but is secondary to the board link and status
+  comparison in the default UI.
 * **Rework counts**: the board aggregate counts `github_pr_rework` events of
   **actionable tasks only** (`ready`/`running`/`review`/`blocked`) — rework on
   finished (`done`) cards is excluded so past work does not look like current
