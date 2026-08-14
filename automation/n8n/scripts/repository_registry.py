@@ -2,9 +2,9 @@
 """Read-only discovery of GitHub repositories opted into Hermes management.
 
 Shadow registry: discovers repositories by GitHub topic, derives repository
-metadata, and resolves existing Kanban board association from durable task
-provenance. It does not mutate GitHub, n8n, Hermes, Kanban, webhooks, or cron
-state.
+metadata, and resolves Kanban board association from durable task provenance or,
+for a first intake only, an empty canonical live board. It does not mutate GitHub,
+n8n, Hermes, Kanban, webhooks, or cron state.
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ CONTRACT_CANDIDATES: tuple[str, ...] = (
     "AGENTS.md",
     "AGENTS_PROJECT.md",
     "Docs/AGENTS.md",
+    ".agent/REQ_REQUEST_TEMPLATE.md",
     ".agent/PR_REQUEST_TEMPLATE.md",
 )
 
@@ -231,11 +232,59 @@ def _kanban_board_repository_evidence(boards_root: Path) -> dict[str, tuple[str,
     return evidence
 
 
+def _board_default_workdir(boards_root: Path, board: str | None) -> Path | None:
+    """Return a resolved board's declared workdir without inventing one.
+
+    Board metadata is trusted only for checkout LOCATION after the board itself
+    has already been resolved from task provenance/canonical-board policy. The
+    repository identity is still verified independently from the checkout's
+    ``origin`` remote before an entry can become ready.
+
+    Legacy boards without ``board.json`` (or without ``default_workdir``) keep
+    the historical ``checkout_root/canonical_slug`` fallback in ``build_entry``.
+    Malformed board metadata fails closed instead of silently selecting a path.
+    """
+    if board is None:
+        return None
+    metadata = boards_root / board / "board.json"
+    if not metadata.exists():
+        return None
+    if not metadata.is_file():
+        raise RegistryError(f"Kanban board metadata is not a file: {metadata}")
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"invalid Kanban board metadata for {board}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RegistryError(f"invalid Kanban board metadata for {board}: expected object")
+    declared_slug = str(payload.get("slug") or "").strip()
+    if declared_slug and declared_slug.casefold() != board.casefold():
+        raise RegistryError(
+            f"Kanban board metadata slug mismatch: directory={board} metadata={declared_slug}"
+        )
+    raw_workdir = str(payload.get("default_workdir") or "").strip()
+    if not raw_workdir:
+        return None
+    workdir = Path(raw_workdir)
+    if not workdir.is_absolute():
+        raise RegistryError(
+            f"Kanban board default_workdir must be absolute for {board}: {raw_workdir}"
+        )
+    return workdir
+
+
 def _resolve_board(
     repository: str,
     evidence: dict[str, tuple[str, ...]],
 ) -> tuple[str | None, str]:
-    """Resolve one existing board from durable GitHub issue task provenance."""
+    """Resolve one live board without inventing a repository association.
+
+    Durable ``tasks.idempotency_key`` provenance remains authoritative. The
+    only bootstrap exception is a live board whose directory name exactly
+    matches the repository canonical slug (case-insensitive) and which has no
+    GitHub repository provenance yet. Once the first intake task is written,
+    normal task provenance takes over on the next registry snapshot.
+    """
     repository_key = repository.casefold()
     exact: list[str] = []
     conflicted: list[str] = []
@@ -252,9 +301,24 @@ def _resolve_board(
         return None, "ambiguous_task_provenance"
     if len(exact) == 1:
         return exact[0], "resolved_task_provenance"
-    if not exact:
-        return None, "not_found_task_provenance"
-    return None, "ambiguous_multiple_boards"
+    if len(exact) > 1:
+        return None, "ambiguous_multiple_boards"
+
+    repo_name = repository.split("/", 1)[-1]
+    canonical_slug = repo_name.casefold()
+    canonical_matches = [
+        board for board in evidence if board.casefold() == canonical_slug
+    ]
+    if len(canonical_matches) > 1:
+        return None, "ambiguous_canonical_boards"
+    if len(canonical_matches) == 1:
+        board = canonical_matches[0]
+        board_repositories = evidence[board]
+        if board_repositories:
+            return None, "canonical_board_conflict"
+        return board, "resolved_empty_canonical_board"
+
+    return None, "not_found_task_provenance"
 
 
 def build_entry(
@@ -264,6 +328,7 @@ def build_entry(
     contract_paths: Iterable[str] = (),
     board: str | None = None,
     board_status: str = "not_found_task_provenance",
+    checkout_path: Path | None = None,
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> RegistryEntry:
     full_name = str(repo.get("full_name") or "").strip()
@@ -287,7 +352,7 @@ def build_entry(
 
     repo_name = full_name.split("/", 1)[1]
     slug = repo_name.casefold()
-    checkout = checkout_root / slug
+    checkout = checkout_path if checkout_path is not None else checkout_root / slug
     read_origin = origin_reader or _git_origin
     origin = read_origin(checkout) if checkout.is_dir() else None
 
@@ -336,7 +401,7 @@ def _fixture_repositories(path: Path) -> list[dict[str, Any]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise RegistryError(f"could not read fixture: {exc}") from exc
+        raise RegistryError(f"invalid fixture JSON: {path}") from exc
     if isinstance(payload, dict):
         payload = payload.get("items")
     if not isinstance(payload, list):
@@ -374,6 +439,7 @@ def registry_snapshot(
     *,
     contract_reader: Callable[[str, str], tuple[str, ...]],
     board_resolver: Callable[[str], tuple[str | None, str]],
+    checkout_resolver: Callable[[str, str | None], Path | None] | None = None,
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> dict[str, Any]:
     entries: list[RegistryEntry] = []
@@ -382,6 +448,11 @@ def registry_snapshot(
         default_branch = str(repo.get("default_branch") or "").strip()
         contracts = contract_reader(full_name, default_branch)
         board, board_status = board_resolver(full_name)
+        checkout_path = (
+            checkout_resolver(full_name, board)
+            if checkout_resolver is not None
+            else None
+        )
         entries.append(
             build_entry(
                 repo,
@@ -389,6 +460,7 @@ def registry_snapshot(
                 contract_paths=contracts,
                 board=board,
                 board_status=board_status,
+                checkout_path=checkout_path,
                 origin_reader=origin_reader,
             )
         )
@@ -402,7 +474,6 @@ def registry_snapshot(
             {**asdict(entry), "contract_paths": list(entry.contract_paths)} for entry in entries
         ],
     }
-
 
 
 def live_registry_snapshot(
@@ -428,7 +499,12 @@ def live_registry_snapshot(
             repository,
             board_evidence,
         ),
+        checkout_resolver=lambda repository, board: _board_default_workdir(
+            kanban_root,
+            board,
+        ),
     )
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -452,6 +528,10 @@ def main(argv: list[str] | None = None) -> int:
                 board_resolver=lambda repository: _resolve_board(
                     repository,
                     board_evidence,
+                ),
+                checkout_resolver=lambda repository, board: _board_default_workdir(
+                    args.kanban_root,
+                    board,
                 ),
             )
         else:

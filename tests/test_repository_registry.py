@@ -107,7 +107,7 @@ def test_contract_detection_reads_default_branch_not_checkout() -> None:
         calls.append((token, path, params, allow_not_found))
         if path.endswith("/contents/AGENTS.md"):
             return {"type": "file"}
-        if path.endswith("/contents/.agent/PR_REQUEST_TEMPLATE.md"):
+        if path.endswith("/contents/.agent/REQ_REQUEST_TEMPLATE.md"):
             return {"type": "file"}
         return None
 
@@ -117,7 +117,7 @@ def test_contract_detection_reads_default_branch_not_checkout() -> None:
         "develop",
         fetch_json=fake_fetch,
     )
-    assert contracts == ("AGENTS.md", ".agent/PR_REQUEST_TEMPLATE.md")
+    assert contracts == ("AGENTS.md", ".agent/REQ_REQUEST_TEMPLATE.md")
     assert len(calls) == len(registry.CONTRACT_CANDIDATES)
     assert all(call[2] == {"ref": "develop"} for call in calls)
     assert all(call[3] is True for call in calls)
@@ -135,7 +135,7 @@ def test_local_contract_drift_does_not_change_snapshot_contracts() -> None:
             root,
             contract_reader=lambda repository, branch: (
                 "AGENTS.md",
-                ".agent/PR_REQUEST_TEMPLATE.md",
+                ".agent/REQ_REQUEST_TEMPLATE.md",
             ),
             board_resolver=lambda repository: ("ctrlhangul", "resolved_task_provenance"),
             origin_reader=lambda _: "https://github.com/rhgo1749/ctrl-hangul.git",
@@ -143,7 +143,7 @@ def test_local_contract_drift_does_not_change_snapshot_contracts() -> None:
         entry = snapshot["repositories"][0]
         assert entry["contract_paths"] == [
             "AGENTS.md",
-            ".agent/PR_REQUEST_TEMPLATE.md",
+            ".agent/REQ_REQUEST_TEMPLATE.md",
         ]
         assert entry["board"] == "ctrlhangul"
         assert entry["ready"] is True

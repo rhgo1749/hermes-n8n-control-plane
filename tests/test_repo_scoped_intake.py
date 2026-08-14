@@ -204,7 +204,7 @@ def test_fixture_repository_config_is_offline_metadata() -> None:
                         "default_branch": "develop",
                         "contract_paths": [
                             "AGENTS.md",
-                            ".agent/PR_REQUEST_TEMPLATE.md",
+                            ".agent/REQ_REQUEST_TEMPLATE.md",
                         ],
                     },
                     "issues": [],
@@ -219,7 +219,7 @@ def test_fixture_repository_config_is_offline_metadata() -> None:
         assert configs[0].default_branch == "develop"
         assert configs[0].contract_paths == (
             "AGENTS.md",
-            ".agent/PR_REQUEST_TEMPLATE.md",
+            ".agent/REQ_REQUEST_TEMPLATE.md",
         )
 
 
@@ -310,6 +310,8 @@ def test_task_body_uses_discovered_default_branch() -> None:
     assert "repository contract paths on origin/develop: AGENTS.md" in body
     assert "Target branch: `develop`" in body
     assert "current `origin/develop`" in body
+    assert ".agent/PR_REQUEST_TEMPLATE.md" not in body
+    assert ".agent/pr-requests/PR-NNN-<slug>.md" not in body
 
 
 def test_board_lookup_uses_current_registry_scope() -> None:
