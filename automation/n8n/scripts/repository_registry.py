@@ -33,6 +33,7 @@ CONTRACT_CANDIDATES: tuple[str, ...] = (
     "AGENTS.md",
     "AGENTS_PROJECT.md",
     "Docs/AGENTS.md",
+    ".agent/REQ_REQUEST_TEMPLATE.md",
     ".agent/PR_REQUEST_TEMPLATE.md",
 )
 

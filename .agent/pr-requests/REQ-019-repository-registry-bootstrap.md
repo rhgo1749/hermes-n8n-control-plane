@@ -40,6 +40,7 @@ Host acceptance 중 추가로 확인된 registry 결함은 checkout 경로였다
 5. board metadata가 없는 legacy board만 기존 `/ws/projects/<canonical_slug>` 경로로 fallback한다.
 6. 어떤 checkout 경로를 선택하든 `origin`이 대상 GitHub repository와 일치해야 `ready=true`가 된다.
 7. resolver/checkout 회귀 테스트와 canonical registry 문서를 갱신한다.
+8. 최신 main의 `REQ_REQUEST_TEMPLATE.md` / `REQ-NNN` 계약과 registry·intake를 정렬하되 legacy PR template detection은 호환 목적으로 유지한다.
 
 ## Explicit non-goals
 

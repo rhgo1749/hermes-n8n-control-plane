@@ -62,10 +62,11 @@ Contract files are detected from one shared candidate set:
 AGENTS.md
 AGENTS_PROJECT.md
 Docs/AGENTS.md
+.agent/REQ_REQUEST_TEMPLATE.md
 .agent/PR_REQUEST_TEMPLATE.md
 ```
 
-There is no per-repository contract list.
+There is no per-repository contract list. `.agent/REQ_REQUEST_TEMPLATE.md` is the current request contract; `.agent/PR_REQUEST_TEMPLATE.md` remains discovery-only compatibility for repositories that have not migrated yet. Intake execution follows the repository-owned `AGENTS.md`/template naming contract rather than hard-coding a global request identifier.
 
 ## Checkout convention
 
