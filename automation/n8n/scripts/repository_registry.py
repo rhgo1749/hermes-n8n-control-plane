@@ -2,9 +2,9 @@
 """Read-only discovery of GitHub repositories opted into Hermes management.
 
 Shadow registry: discovers repositories by GitHub topic, derives repository
-metadata, and resolves existing Kanban board association from durable task
-provenance. It does not mutate GitHub, n8n, Hermes, Kanban, webhooks, or cron
-state.
+metadata, and resolves Kanban board association from durable task provenance or,
+for a first intake only, an empty canonical live board. It does not mutate GitHub,
+n8n, Hermes, Kanban, webhooks, or cron state.
 """
 from __future__ import annotations
 
@@ -235,7 +235,14 @@ def _resolve_board(
     repository: str,
     evidence: dict[str, tuple[str, ...]],
 ) -> tuple[str | None, str]:
-    """Resolve one existing board from durable GitHub issue task provenance."""
+    """Resolve one live board without inventing a repository association.
+
+    Durable ``tasks.idempotency_key`` provenance remains authoritative. The
+    only bootstrap exception is a live board whose directory name exactly
+    matches the repository canonical slug (case-insensitive) and which has no
+    GitHub repository provenance yet. Once the first intake task is written,
+    normal task provenance takes over on the next registry snapshot.
+    """
     repository_key = repository.casefold()
     exact: list[str] = []
     conflicted: list[str] = []
@@ -252,9 +259,24 @@ def _resolve_board(
         return None, "ambiguous_task_provenance"
     if len(exact) == 1:
         return exact[0], "resolved_task_provenance"
-    if not exact:
-        return None, "not_found_task_provenance"
-    return None, "ambiguous_multiple_boards"
+    if len(exact) > 1:
+        return None, "ambiguous_multiple_boards"
+
+    repo_name = repository.split("/", 1)[-1]
+    canonical_slug = repo_name.casefold()
+    canonical_matches = [
+        board for board in evidence if board.casefold() == canonical_slug
+    ]
+    if len(canonical_matches) > 1:
+        return None, "ambiguous_canonical_boards"
+    if len(canonical_matches) == 1:
+        board = canonical_matches[0]
+        board_repositories = evidence[board]
+        if board_repositories:
+            return None, "canonical_board_conflict"
+        return board, "resolved_empty_canonical_board"
+
+    return None, "not_found_task_provenance"
 
 
 def build_entry(
@@ -336,7 +358,7 @@ def _fixture_repositories(path: Path) -> list[dict[str, Any]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise RegistryError(f"could not read fixture: {exc}") from exc
+        raise RegistryError(f"invalid fixture JSON: {path}") from exc
     if isinstance(payload, dict):
         payload = payload.get("items")
     if not isinstance(payload, list):
@@ -404,7 +426,6 @@ def registry_snapshot(
     }
 
 
-
 def live_registry_snapshot(
     token: str,
     owner: str,
@@ -429,6 +450,7 @@ def live_registry_snapshot(
             board_evidence,
         ),
     )
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)

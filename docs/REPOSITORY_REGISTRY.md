@@ -28,7 +28,8 @@ For every discovered repository the registry snapshot records:
 - derived checkout path `/ws/projects/<slug>`
 - whether the checkout origin matches the GitHub repository
 - repository contract files present on the GitHub default branch
-- existing Kanban board association derived from task provenance
+- existing Kanban board association derived from task provenance, or the bounded
+  first-intake canonical-board bootstrap described below
 - readiness/fail-closed reason
 
 The authority boundary is explicit:
@@ -41,7 +42,8 @@ GitHub default branch
   └─ checkout-path/origin verification only
 
 live Kanban board DBs
-  └─ existing repo → board association from tasks.idempotency_key
+  ├─ durable repo → board association from tasks.idempotency_key
+  └─ first-intake bootstrap only: empty-provenance board named exactly <slug>
 ```
 
 A stale or branch-diverged local checkout must not hide or invent repository
@@ -73,11 +75,12 @@ legitimately share the same remote.
 
 ## Existing board association from durable task provenance
 
-Board directory names are not treated as repository identity. Historical boards
-may not equal the canonical repository slug, so a permanent override such as
-`ctrl-hangul -> ctrlhangul` would only move the hard-coding problem.
+Historical boards may not equal the canonical repository slug, so existing
+repository→board association continues to come from durable task provenance
+rather than a permanent override table. This preserves historical mappings such
+as `ctrl-hangul -> ctrlhangul`.
 
-Instead, the registry scans only direct live board databases under:
+The registry scans only direct live board databases under:
 
 ```text
 /home/hermes/.hermes/kanban/boards/*/kanban.db
@@ -94,22 +97,55 @@ only the existing durable intake key format:
 github:<owner>/<repository>:issue:<number>
 ```
 
-Resolution is fail-closed:
+Normal resolution is fail-closed:
 
 - exactly one repository identity on a board, and that repository appears on
   exactly one live board -> `resolved_task_provenance`
-- no matching task provenance -> `not_found_task_provenance`
 - one board contains provenance for multiple repositories ->
   `ambiguous_task_provenance`
 - the same repository appears on multiple live boards ->
   `ambiguous_multiple_boards`
 
-Only a verified checkout plus a uniquely resolved existing board makes an
-entry `ready=true`. The live intake consumes only ready entries. The registry
-still does **not** automatically provision or delete Kanban boards.
+Durable task provenance always takes precedence over bootstrap naming.
+
+## First-intake bootstrap for a new repository
+
+A newly opted-in repository cannot have GitHub-backed task provenance before its
+first Issue is admitted. Requiring that provenance unconditionally creates a
+cycle:
+
+```text
+new repo -> no task provenance -> registry not ready -> intake skipped
+         -> no task provenance can ever be created
+```
+
+The resolver therefore has one bounded bootstrap exception when **no durable
+provenance for the target repository exists**:
+
+1. derive the canonical slug from the GitHub repository name using
+   `repo-name.casefold()`;
+2. find a live board whose directory name matches that slug
+   case-insensitively;
+3. accept it only when that board has **no GitHub repository provenance at
+   all** -> `resolved_empty_canonical_board`;
+4. if the canonical board already carries provenance for another repository,
+   fail closed -> `canonical_board_conflict`;
+5. if multiple case-insensitive canonical boards exist, fail closed ->
+   `ambiguous_canonical_boards`;
+6. if no canonical board exists, remain `not_found_task_provenance`.
+
+This is an association bootstrap, **not board provisioning**. The registry does
+not create a missing board. It also never chooses a merely similar board name.
+
+Once the first GitHub-backed Issue task is created, the next registry snapshot
+sees its `github:<repo>:issue:<n>` key and returns
+`resolved_task_provenance`; the naming bootstrap is no longer needed.
+
+Only a verified checkout plus either uniquely resolved durable provenance or a
+valid empty canonical-board bootstrap makes an entry `ready=true`.
 
 The first live evidence check found exactly one repository identity on each of
-the five current boards, including recovery of the historical
+the original five boards, including recovery of the historical
 `ctrl-hangul -> ctrlhangul` association without an exception table.
 
 ## Authentication requirement for zero-touch onboarding
@@ -155,7 +191,6 @@ include `contract_paths` so tests can model the GitHub/default-branch result.
 Tests that exercise board resolution create isolated temporary SQLite board DBs
 and pass their root through `--kanban-root` or the resolver helpers.
 
-
 ## Runtime pairing
 
 The production intake and registry are separate scripts but one runtime unit.
@@ -173,7 +208,7 @@ placed in command-line arguments.
 A scoped `--repository owner/repo` wake fails closed when the repository is not
 discovered or is not ready. The no-argument fallback processes every ready
 entry and reports unready entries in `registry_unready` without guessing a
-board or checkout association.
+non-canonical board or checkout association.
 
 ## Cutover and canary gates
 
@@ -185,11 +220,15 @@ Before any live cutover:
 4. Confirm each existing checkout reports `verified` and its remote matches.
 5. Confirm contract detection matches the GitHub default branch, even if the
    local checkout is stale or on another branch.
-6. Confirm each existing repository resolves to exactly one live Kanban board
-   from task idempotency provenance.
-7. Treat missing or ambiguous board provenance as not ready; do not guess by
-   board name.
-8. Keep the polling fallback available until registry-driven event routing has sufficient production evidence.
+6. For established repositories, confirm each resolves to exactly one live
+   Kanban board from task idempotency provenance.
+7. For a first-intake repository with no provenance, confirm the only bootstrap
+   candidate is an existing live board whose name equals the canonical slug and
+   whose GitHub repository provenance is empty.
+8. Treat canonical-board conflicts, ambiguous provenance, and missing boards as
+   not ready; do not guess another board name.
+9. Keep the polling fallback available until registry-driven event routing has
+   sufficient production evidence.
 
 The first production shadow canary found exactly the intended five repositories
 and verified all five `/ws/projects/<slug>` origins. It also exposed local
@@ -207,20 +246,22 @@ rhgo1749/h4v3-meowcore-voice-lab      -> h4v3-meowcore-voice-lab
 rhgo1749/re-bound                     -> re-bound
 ```
 
-This is the evidence used by the registry-driven intake, so the legacy
-repository-name override table is no longer required.
+Legacy associations continue to use this durable evidence. The empty-canonical
+bootstrap exists only for repositories that have not produced their first
+GitHub-backed task yet.
 
 ## Next phases
 
 Issue #2 tracks the remaining work:
 
-- make the edge intake repository-scoped while preserving an explicit full scan
-- define provisioning behavior for opted-in repositories with no existing board
-- replace per-repository n8n workflow duplication with registry-driven webhook reconciliation
+- define an explicit operator-owned board provisioning path for opted-in
+  repositories whose canonical live board does not exist
+- continue replacing per-repository n8n workflow duplication with
+  registry-driven webhook reconciliation
 - filter echo events without losing blocked-resume/rework/completion signals
-- add a persisted wake lease/generation guard so stale delayed pauses are no-ops
-- canary the event-driven path before retiring polling
-
+- retain persisted wake lease/generation guards so stale delayed pauses are
+  no-ops
+- continue canarying the event-driven path before retiring polling
 
 ## Registry-driven GitHub webhook router
 
