@@ -1,6 +1,6 @@
 # REQ-016: H4V3 Overview compact project status matrix/list
 
-- Status: Implementation complete; local validation PASS, human review/PR delivery pending
+- Status: Implementation complete; local validation PASS, PR delivery blocked by unavailable GitHub authentication
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN`
 - Validation profiles: `HERMES_PLUGIN`, `STATIC_UNIT`, `HOST_DASHBOARD`
@@ -157,8 +157,8 @@ If validation fails, preserve the installer backup and use the printed rollback 
 - Base SHA: `7dc746fd2918e955b7028c4f00f6bb728f69940d`
 - Branch: `wt/t_765929ec`
 - Commits: `3b87b01` (`feat(overview): compact project status matrix`)
-- PR number/title/URL: pending; exactly one Korean PR against `main`, no merge/auto-merge
-- Working tree: pending final verification
+- PR number/title/URL: NOT CREATED — `git push -u origin wt/t_765929ec` failed with exit 128 because HTTPS credentials were unavailable; create exactly one Korean PR against `main` after authenticated delivery is available.
+- Working tree: clean after local commits; merge/auto-merge not performed
 - Merge performed: NO
 
 ### Remaining risks / owner
