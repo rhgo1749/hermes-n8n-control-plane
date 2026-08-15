@@ -61,7 +61,7 @@
 
 - Reviewed predecessor: `42ce8088afb17869a3aba3b43e97308967e15f75`
 - Rework implementation commit: `79b23fd344dd0f7ee43de9035b1a7699292c17a1`
-- Final/local/remote SHA: to be recorded after the docs refresh commit and push; no claim of remote update is made before push verification
+- Final source/local/pushed SHA: `daaa73b6f671dd89a37c9fd2fa0a0f6847c7adc6` (the pushed implementation + provenance commit; this follow-up records its verified identity)
 - Existing PR #25: `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/25`; requested state is OPEN against `main`, no merge/auto-merge. Live authenticated state/base/head/body/files read-back is unavailable in this environment because `gh` is not installed and unauthenticated private API returned HTTP 404.
 - Expected changed files remain exactly: `edge/kanban-github-sync.py`, `edge/test-kanban-github-sync-rework.py`, this REQ document.
 
