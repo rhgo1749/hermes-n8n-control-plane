@@ -1462,6 +1462,36 @@ def test_59_delivery_success_review_ready():
           any(r.get("reason") == "agent_review_ready" for r in results2), str(results2))
 
 
+def test_60_blocked_human_validation_delivery_review_ready():
+    print("60. BLOCKED + current-round complete delivery -> REVIEW + agent-review-ready")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000060"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(
+        tid, head=final_head, outcome="blocked",
+        summary="human_validation_required: device gate remains",
+    )
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,)
+        )
+        conn.commit()
+    _post_completion_marker(fake, tid, final_head)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    ready = [r for r in entries if r.get("reason") == "agent_review_ready"]
+    check("blocked delivery -> review-ready", len(ready) == 1, str(entries))
+    check("blocked task -> review", task_row(tid)["status"] == "review", str(task_row(tid)))
+    check("review-ready label projected",
+          fake.pr_labels.get(PR_N, []) == ["agent-review-ready"],
+          str(fake.pr_labels))
+    check("one delivery event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_delivery"
+    ]) == 1, str(task_events(tid)))
+
+
 def test_60_worker_crash_requeues_rework():
     print("60. crashed worker -> safe requeue to agent-rework (no review-ready)")
     fake = fresh_env()
@@ -2779,6 +2809,7 @@ def main() -> int:
         test_57_push_head_mismatch_no_review_ready,
         test_58_validation_not_passed_no_review_ready,
         test_59_delivery_success_review_ready,
+        test_60_blocked_human_validation_delivery_review_ready,
         test_60_worker_crash_requeues_rework,
         test_61_lifecycle_label_conflict_skip,
         test_62_merged_pr_done_and_labels_cleared,
