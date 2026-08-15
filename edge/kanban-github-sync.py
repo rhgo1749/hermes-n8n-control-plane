@@ -2806,10 +2806,35 @@ def _reconcile_rework_lifecycle(
                 "reason": "delivery_query_failed", "error": str(exc),
             }
         if not delivered:
-            # Keep BLOCKED for missing/partial/stale evidence; the normal
-            # blocked reconciliation below remains responsible for durable
-            # human-attention projection.
-            return None
+            # A consumed rework round owns this BLOCKED card even when the
+            # delivery evidence is incomplete or invalid.  Do not fall
+            # through to generic blocked reconciliation: an open PR would
+            # otherwise be projected to REVIEW while agent-working remains.
+            # Keep the card BLOCKED and record one idempotent attention event
+            # for every diagnostic, without emitting sync or delivery events.
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "rework_human_attention_predicted",
+                    "diagnostic": _delivery_reason, "evidence": evidence,
+                }
+            try:
+                label_reason, label_evidence = _restore_rework_labels(client, context)
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "rework_attention_label_projection_failed",
+                    "error": str(exc),
+                }
+            _record_rework_attention(
+                conn, task_id, context, reason=_delivery_reason, evidence=evidence,
+            )
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "rework_human_attention",
+                "diagnostic": _delivery_reason, "lifecycle": label_evidence,
+                "label_action": label_reason,
+            }
         if dry_run:
             return {
                 "task_id": task_id, "status": "review", "changed": False,

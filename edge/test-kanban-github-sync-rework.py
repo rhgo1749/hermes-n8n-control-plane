@@ -1492,6 +1492,82 @@ def test_60_blocked_human_validation_delivery_review_ready():
     ]) == 1, str(task_events(tid)))
 
 
+
+
+def _blocked_invalid_delivery_case(
+    *,
+    marker: str,
+    validation: str = "passed",
+) -> tuple[FakeGitHub, str]:
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000061"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="completed", summary="worker finished cleanly")
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,)
+        )
+        conn.commit()
+    if marker == "wrong_head":
+        _post_completion_marker(
+            fake, tid, "0123456789abcdef0123456789abcdef00000062",
+        )
+    elif marker == "invalid_validation":
+        _post_completion_marker(fake, tid, final_head, validation=validation)
+    return fake, tid
+
+
+def _assert_blocked_invalid_delivery(fake: FakeGitHub, tid: str, label: str) -> None:
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check(f"{label}: human attention", any(
+        r.get("reason") == "rework_human_attention" for r in entries
+    ), str(entries))
+    check(f"{label}: remains blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check(f"{label}: no review", not any(
+        r.get("status") == "review" or r.get("reason") == "agent_review_ready"
+        for r in entries
+    ), str(entries))
+    events_before = task_events(tid)
+    check(f"{label}: no generic sync/delivery", not any(
+        e["kind"] in {"github_pr_sync", "github_pr_rework_delivery"}
+        for e in events_before
+    ), str(events_before))
+    attention_before = len([
+        e for e in events_before if e["kind"] == "github_pr_rework_attention"
+    ])
+    results2 = run_sync(fake)
+    events_after = task_events(tid)
+    check(f"{label}: second tick remains blocked", task_row(tid)["status"] == "blocked", str(results2))
+    check(f"{label}: attention idempotent", len([
+        e for e in events_after if e["kind"] == "github_pr_rework_attention"
+    ]) == attention_before, str(events_after))
+    check(f"{label}: second tick no sync/delivery", not any(
+        e["kind"] in {"github_pr_sync", "github_pr_rework_delivery"}
+        for e in events_after
+    ), str(events_after))
+
+
+def test_60a_blocked_clean_run_without_marker_stays_attention():
+    print("60a. BLOCKED + clean finished run without marker -> attention, no generic review")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    _assert_blocked_invalid_delivery(fake, tid, "clean/no-marker")
+
+
+def test_60b_blocked_wrong_full_head_stays_attention():
+    print("60b. BLOCKED + wrong full head marker -> attention, no generic review")
+    fake, tid = _blocked_invalid_delivery_case(marker="wrong_head")
+    _assert_blocked_invalid_delivery(fake, tid, "wrong-head")
+
+
+def test_60c_blocked_validation_not_passed_stays_attention():
+    print("60c. BLOCKED + validation != passed -> attention, no generic review")
+    fake, tid = _blocked_invalid_delivery_case(marker="invalid_validation", validation="partial")
+    _assert_blocked_invalid_delivery(fake, tid, "validation")
+
+
 def test_60_worker_crash_requeues_rework():
     print("60. crashed worker -> safe requeue to agent-rework (no review-ready)")
     fake = fresh_env()
@@ -2810,6 +2886,9 @@ def main() -> int:
         test_58_validation_not_passed_no_review_ready,
         test_59_delivery_success_review_ready,
         test_60_blocked_human_validation_delivery_review_ready,
+        test_60a_blocked_clean_run_without_marker_stays_attention,
+        test_60b_blocked_wrong_full_head_stays_attention,
+        test_60c_blocked_validation_not_passed_stays_attention,
         test_60_worker_crash_requeues_rework,
         test_61_lifecycle_label_conflict_skip,
         test_62_merged_pr_done_and_labels_cleared,
