@@ -2328,6 +2328,73 @@ def _record_rework_attention(
     return True
 
 
+def _rework_provenance_attention(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    row: Mapping[str, Any],
+    decision: GithubCompletionDecision,
+    lifecycle_event: tuple[dict[str, Any], int, str],
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Fail-closed attention for a consumed round whose provenance is broken.
+
+    A consumed ``github_pr_rework`` event whose ``pr_number`` does not
+    resolve to exactly one canonical open PR (missing, ambiguous,
+    recreated or mismatched PR, wrong task) still leaves the BLOCKED card
+    owned by that round.  The card is never projected to REVIEW and never
+    reaches the generic blocked reconciliation: no ``github_pr_sync``, no
+    ``github_pr_rework_delivery``, and no label mutation — an active
+    worker keeps ``agent-working`` untouched.  One attention record is
+    kept per diagnostic so a repeated reconciliation stays idempotent.
+    """
+    task_id = str(row["id"])
+    status = str(row["status"])
+    payload, _event_at, _event_kind = lifecycle_event
+    raw_pr_number = payload.get("pr_number")
+    try:
+        pr_number = int(raw_pr_number) if raw_pr_number is not None else None
+    except (TypeError, ValueError):
+        pr_number = None
+    matching = tuple(
+        pr for pr in decision.pull_requests
+        if pr_number is None or pr.number == pr_number
+    )
+    diagnostic = (
+        "rework_pr_unresolved" if raw_pr_number is not None
+        else "rework_pr_ambiguous"
+    )
+    evidence = {
+        "round_pr_number": raw_pr_number,
+        "decision_pr_numbers": sorted(pr.number for pr in decision.pull_requests),
+        "matching_prs": len(matching),
+        "head_sha": payload.get("head_sha"),
+        "request_comment_id": payload.get("request_comment_id"),
+    }
+    if dry_run:
+        return {
+            "task_id": task_id,
+            "status": status,
+            "changed": False,
+            "reason": "rework_human_attention_predicted",
+            "diagnostic": diagnostic,
+            "evidence": evidence,
+        }
+    _record_rework_attention(
+        conn, task_id, {"event": lifecycle_event},
+        reason=diagnostic, evidence=evidence,
+    )
+    return {
+        "task_id": task_id,
+        "status": status,
+        "changed": False,
+        "reason": "rework_human_attention",
+        "diagnostic": diagnostic,
+        "evidence": evidence,
+    }
+
+
 _OPERATOR_ATTENTION_REASONS = frozenset({
     "rework_retry_blocked",
     "rework_dispatch_failed",
@@ -3850,6 +3917,36 @@ def sync_board(
                 if lifecycle_entry is not None:
                     results.append(_annotate(lifecycle_entry, row, ref))
                     continue
+
+            if (
+                row["status"] == "blocked"
+                and lifecycle_context is None
+                and lifecycle_event is not None
+            ):
+                # A consumed rework round still owns this BLOCKED card even
+                # when its provenance cannot be resolved (pr_number that
+                # does not match exactly one canonical PR, a recreated or
+                # mismatched PR, an ambiguous decision).  Preserve the round
+                # ownership and fail closed: never fall through to the
+                # generic blocked reconciliation, which would project the
+                # open PR to REVIEW via a github_pr_sync transition while
+                # the active worker keeps agent-working.
+                results.append(
+                    _annotate(
+                        _rework_provenance_attention(
+                            conn,
+                            client,
+                            ref,
+                            row,
+                            decision,
+                            lifecycle_event,
+                            dry_run=dry_run,
+                        ),
+                        row,
+                        ref,
+                    )
+                )
+                continue
 
             if row["status"] == "blocked":
                 results.append(
