@@ -100,6 +100,13 @@ WORKING_LABEL = "agent-working"
 REVIEW_READY_LABEL = "agent-review-ready"
 REWORK_COMPLETE_MARKER = "AGENT_REWORK_COMPLETE"
 REWORK_ATTENTION_MARKER = "HERMES_KANBAN_REWORK_ATTENTION"
+# Machine-readable explicit maintainer retry: a TRUSTED_GITHUB_ACTORS
+# comment on the current PR containing exactly ``AGENT_REWORK_RETRY`` plus a
+# ``task=<task_id>`` line, posted AFTER the last rework attention record.
+# It is the ONLY human signal that may start a new rework round from the
+# BLOCKED + rework_human_attention hold (label presence alone is never
+# retry evidence — the edge restores ``agent-rework`` during self-heal).
+REWORK_RETRY_MARKER = "AGENT_REWORK_RETRY"
 
 # Sync-owned body region.  Between these markers the whole block is
 # REPLACED on every refresh — never appended — so the body cannot grow.
@@ -1571,6 +1578,8 @@ def apply_rework(
     task_id: str,
     rework: ReworkDecision,
     ref: GithubTaskRef,
+    *,
+    retry_comment_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """REVIEW|BLOCKED -> READY with the refreshed sync context and one event.
 
@@ -1579,6 +1588,12 @@ def apply_rework(
     transition.  BLOCKED sources additionally clear stale blocker
     metadata (block_kind / block_recurrences) in the same UPDATE.
     The caller owns the transaction.
+
+    ``retry_comment_id`` marks the round as an explicit maintainer
+    retry: the new ``github_pr_rework`` event carries
+    ``trigger: "maintainer_retry"`` and the retry comment id, which
+    permanently disqualifies that comment from ever opening another
+    round (one-shot consumption).
     """
     row = conn.execute(
         "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
@@ -1639,6 +1654,9 @@ def apply_rework(
         "auto_merge": False,
         "source": "github",
     }
+    if retry_comment_id is not None:
+        payload["trigger"] = "maintainer_retry"
+        payload["retry_comment_id"] = int(retry_comment_id)
     _append_sync_event(conn, task_id, payload, kind="github_pr_rework")
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -2309,13 +2327,29 @@ def _record_rework_attention(
     if existing is not None:
         return False  # already recorded for this round/diagnostic
     with conn:
+        attention_body = "\n".join([
+            f"{REWORK_ATTENTION_MARKER} task={task_id} reason={reason}",
+            "",
+            "This rework round could not be completed autonomously. The task stays",
+            "BLOCKED and the PR keeps the agent-rework label; no automatic retry",
+            "will start.",
+            "",
+            "To explicitly start a NEW rework round, post a comment on the linked",
+            "PR (by a trusted maintainer, after this attention record) containing",
+            "exactly the following lines:",
+            "",
+            REWORK_RETRY_MARKER,
+            f"task={task_id}",
+            "",
+            "The retry signal is consumed exactly once for this task.",
+        ])
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
             (
                 task_id,
                 "kanban-main",
-                f"{REWORK_ATTENTION_MARKER} task={task_id} reason={reason}",
+                attention_body,
                 int(time.time()),
             ),
         )
@@ -2788,6 +2822,256 @@ def _normalize_stale_review_ready(
     }
 
 
+def _last_rework_attention_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[int]:
+    """Epoch time of the newest rework attention record, if any."""
+    row = conn.execute(
+        "SELECT MAX(created_at) FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework_attention'",
+        (task_id,),
+    ).fetchone()
+    value = row[0] if row else None
+    return int(value) if value is not None else None
+
+
+def _consumed_retry_comment_ids(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> set[int]:
+    """Retry comment ids already consumed by any rework round of this task."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'github_pr_rework'",
+        (task_id,),
+    ).fetchall()
+    consumed: set[int] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("retry_comment_id")
+        if raw is None:
+            continue
+        try:
+            consumed.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return consumed
+
+
+def _find_rework_retry_signal(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    task_id: str,
+    *,
+    baseline_at: int,
+    consumed_ids: set[int],
+) -> Optional[dict[str, Any]]:
+    """Newest trusted explicit retry comment on the current PR.
+
+    A retry signal is a PR comment by a TRUSTED_GITHUB_ACTORS maintainer
+    containing the exact ``AGENT_REWORK_RETRY`` line plus a
+    ``task=<task_id>`` line, created strictly after ``baseline_at`` (the
+    later of the governing rework event and the last attention record),
+    and never consumed before.  Everything else — untrusted author,
+    missing/wrong task binding, malformed marker, pre-attention timing,
+    or an already-consumed comment — is ignored (fails closed).
+    """
+    comments = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr_number}/comments",
+        {"per_page": 100},
+    )
+    for comment in reversed(comments):
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "")
+        if author not in TRUSTED_GITHUB_ACTORS:
+            continue
+        created_at = _parse_iso_ts(comment.get("created_at"))
+        if created_at is None or created_at <= baseline_at:
+            continue
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, int) or comment_id in consumed_ids:
+            continue
+        body = str(comment.get("body") or "")
+        lines = body.splitlines()
+        marker_present = any(
+            line.strip() == REWORK_RETRY_MARKER for line in lines
+        )
+        task_bound = any(
+            line.startswith("task=") and line.split("=", 1)[1].strip() == task_id
+            for line in lines
+        )
+        if not marker_present or not task_bound:
+            continue
+        return {
+            "comment_id": comment_id,
+            "author": author,
+            "created_at": created_at,
+        }
+    return None
+
+
+def _consume_explicit_rework_retry(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    task_id: str,
+    context: Mapping[str, Any],
+    *,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    """Start a NEW rework round from an explicit maintainer retry.
+
+    Runs only for a BLOCKED card held by a consumed rework round (the
+    rework_human_attention hold).  When a fresh trusted
+    ``AGENT_REWORK_RETRY`` comment exists, the held round is closed and a
+    new ``github_pr_rework`` event (``trigger: maintainer_retry``) is
+    written through the classic ``apply_rework`` intake, so the edge
+    dispatch lane claims the new round exactly like a label-requested
+    round.  Returns ``None`` when no valid retry signal exists — the
+    caller keeps the fail-closed attention path.
+    """
+    event = context["event"]
+    _, event_at, _ = event
+    baseline_at = max(
+        int(event_at or 0),
+        _last_rework_attention_at(conn, task_id) or 0,
+    )
+    consumed_ids = _consumed_retry_comment_ids(conn, task_id)
+    try:
+        retry_comment = _find_rework_retry_signal(
+            client,
+            ref,
+            int(context["pr_number"]),
+            task_id,
+            baseline_at=baseline_at,
+            consumed_ids=consumed_ids,
+        )
+    except GithubCompletionError as exc:
+        return {
+            "task_id": task_id, "status": "blocked", "changed": False,
+            "reason": "retry_signal_query_failed", "error": str(exc),
+        }
+    if retry_comment is None:
+        return None
+    # Re-verify the classic intake conditions: source Issue OPEN and
+    # agent-ready.  A closed Issue must never start a new round.
+    try:
+        issue_payload, _ = client.get(
+            f"/repos/{ref.repository}/issues/{ref.issue_number}"
+        )
+    except GithubCompletionError as exc:
+        return {
+            "task_id": task_id, "status": "blocked", "changed": False,
+            "reason": "retry_signal_query_failed", "error": str(exc),
+        }
+    if not isinstance(issue_payload, dict):
+        return {
+            "task_id": task_id, "status": "blocked", "changed": False,
+            "reason": "retry_signal_query_failed",
+            "error": "invalid issue payload",
+        }
+    issue_state = str(issue_payload.get("state", "")).casefold()
+    issue_labels = {
+        str(item.get("name"))
+        for item in issue_payload.get("labels", [])
+        if isinstance(item, dict)
+    }
+    if issue_state != "open" or AGENT_READY_LABEL not in issue_labels:
+        return {
+            "task_id": task_id, "status": "blocked", "changed": False,
+            "reason": "retry_issue_not_agent_ready",
+            "issue_state": issue_state,
+            "issue_agent_ready": AGENT_READY_LABEL in issue_labels,
+            "retry_comment_id": retry_comment["comment_id"],
+        }
+    retry_comment_id = int(retry_comment["comment_id"])
+    if dry_run:
+        return {
+            "task_id": task_id, "status": "ready", "changed": False,
+            "reason": "maintainer_retry_predicted",
+            "retry_comment_id": retry_comment_id,
+            "retry_comment_author": retry_comment["author"],
+            "baseline_at": baseline_at,
+        }
+    try:
+        context_block = _build_context_block(
+            client,
+            ref,
+            decision.pull_requests,
+            rework_pr_number=int(context["pr_number"]),
+        )
+    except GithubCompletionError as exc:
+        return {
+            "task_id": task_id, "status": "blocked", "changed": False,
+            "reason": "retry_context_failed", "error": str(exc),
+        }
+    rework = ReworkDecision(
+        reason="agent_rework",
+        pr_number=int(context["pr_number"]),
+        head_sha=context["pr"].head_sha,
+        request_comment_id=retry_comment_id,
+        context_block=context_block,
+        label_actor=retry_comment["author"],
+        authoritative=True,
+    )
+    try:
+        with conn:
+            result = apply_rework(
+                conn, task_id, rework, ref,
+                retry_comment_id=retry_comment_id,
+            )
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return {
+            "task_id": task_id, "status": "blocked", "changed": False,
+            "reason": "db_write_failed", "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not result.get("changed"):
+        return result
+    # A maintainer retry is a fresh human-authorized attempt: give the new
+    # round the full circuit-breaker budget instead of inheriting the
+    # failed round's failure count.
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = 0 WHERE id = ?",
+                (task_id,),
+            )
+    except sqlite3.Error:
+        pass  # non-critical; the new round is already open
+    # The request must stay visible until the dispatch claim atomically
+    # swaps it for agent-working (claim-first contract).  The self-heal
+    # already restored the label during the attention hold, so this is
+    # idempotent; a label projection failure never loses the new round.
+    try:
+        _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+            client,
+            ref,
+            int(context["pr_number"]),
+            add=(REWORK_LABEL,),
+            remove=(WORKING_LABEL, REVIEW_READY_LABEL),
+        )
+    except GithubCompletionError as exc:
+        result["label_action"] = "label_projection_failed"
+        result["label_error"] = str(exc)
+        return result
+    result["label_action"] = label_reason
+    result["lifecycle"] = label_evidence
+    result["reason"] = "maintainer_retry_consumed"
+    result["retry_comment_id"] = retry_comment_id
+    result["retry_comment_author"] = retry_comment["author"]
+    return result
+
+
 def _reconcile_rework_lifecycle(
     conn: sqlite3.Connection,
     kanban_db: Any,
@@ -2863,6 +3147,17 @@ def _reconcile_rework_lifecycle(
     if status == "blocked":
         if context["pr"].state != "open":
             return None
+        # Explicit maintainer retry (new round ingress): a fresh trusted
+        # AGENT_REWORK_RETRY comment on the PR closes the held round and
+        # opens a new one through the classic intake contract.  Without it
+        # the card stays BLOCKED with the attention record — the
+        # self-heal-restored agent-rework label is never retry evidence.
+        retry_result = _consume_explicit_rework_retry(
+            conn, client, ref, decision, task_id, context,
+            dry_run=dry_run,
+        )
+        if retry_result is not None:
+            return retry_result
         try:
             delivered, _delivery_reason, evidence = _rework_delivery_evidence(
                 conn, client, ref, task_id, context["pr"], context["event"],
