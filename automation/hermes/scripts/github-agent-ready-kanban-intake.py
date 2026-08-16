@@ -998,6 +998,17 @@ def _should_notify_entry(entry: dict[str, Any]) -> bool:
     return transition not in _SUPPRESSED_TRANSITIONS and False
 
 
+def _telegram_dedup_state_path() -> Path:
+    """State file for full-body delivery dedup (observer layer only).
+
+    This is NOT a reconciliation correctness cache: GitHub issue identity
+    and the Kanban idempotency key remain the only correctness boundary.
+    The file records the last delivered notification body so an unchanged
+    attention set stops re-alerting on every five-minute cron tick.
+    """
+    return _hermes_home() / "state" / "kanban-intake-last-sent.txt"
+
+
 def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
     """Send one batch through the existing Hermes messaging path.
 
@@ -1005,9 +1016,27 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
     formatting.  ``hermes send`` reuses ``send_message_tool`` and the
     installed Hermes platform/Gateway configuration.  Delivery is an observer
     side effect: a failure warns but never rolls back reconciliation.
+
+    Full-body dedup: when the assembled notification text exactly matches
+    the previously delivered body, the batch is skipped so an unchanged
+    attention set does not re-alert every tick.  State read failures fail
+    open (send); state write failures warn but never fail the send.
     """
     chat_id, thread_id = cfg
     text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
+    state_path = _telegram_dedup_state_path()
+    try:
+        if state_path.is_file() and state_path.read_text(encoding="utf-8") == text:
+            print(
+                "kanban-intake: identical notification body already sent; skipping",
+                file=sys.stderr,
+            )
+            return True
+    except OSError as exc:
+        print(
+            f"kanban-intake: dedup state unreadable (warning only): {exc}",
+            file=sys.stderr,
+        )
     target = f"telegram:{chat_id}"
     if thread_id:
         target += f":{thread_id}"
@@ -1024,6 +1053,16 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
             check=False,
         )
         if proc.returncode == 0:
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = state_path.with_name(state_path.name + ".tmp")
+                tmp_path.write_text(text, encoding="utf-8")
+                os.replace(tmp_path, state_path)
+            except OSError as exc:
+                print(
+                    f"kanban-intake: dedup state write failed (warning only): {exc}",
+                    file=sys.stderr,
+                )
             return True
         print(
             f"kanban-intake: Hermes send skipped (warning only): exit={proc.returncode}",
