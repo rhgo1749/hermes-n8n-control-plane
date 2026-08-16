@@ -115,15 +115,29 @@ task=<task_id>
 
 ## Delivery / stop state
 
-- Implementation commit: (push 후 기록)
-- Local/pushed SHA: (push 후 기록)
-- PR: (생성 후 URL 기록) — OPEN 유지, merge/auto-merge 금지
+- Implementation commit: `c4778d9c34c8ed59317867435444f3630acc1bc9`
+- Local/pushed SHA: `c4778d9c34c8ed59317867435444f3630acc1bc9`
+  (`origin/fix/edge-rework-explicit-retry-issue2`와 동일)
+- PR: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/28 — OPEN 유지,
+  merge/auto-merge 금지 (mergeable: MERGEABLE)
 - Expected changed files: `edge/kanban-github-sync.py`,
   `edge/test-kanban-github-sync-rework.py`, `docs/EDGE_REWORK_LIFECYCLE.md`,
   `.agent/pr-requests/REQ-002b-edge-rework-explicit-retry.md`
-- H4V3-Meowcore PR #3 acceptance: 패치 배포만으로 자동 READY 금지 —
-  maintainer의 명시적 `AGENT_REWORK_RETRY` comment 이후에만
-  BLOCKED → READY → claim → agent-working. live canary는 토큰 없어 NOT RUN.
+- Live deploy (2026-08-16): `automation/hermes/scripts/deploy-intake-edge.sh
+  --hermes-home /home/hermes/.hermes` 실행 완료 —
+  live `/home/hermes/.hermes/scripts/kanban-github-sync.py` SHA-256
+  `b6e156a57c833dc064c5315c700da8f0b39410a0266c73d983d00935b4cf53d7` ==
+  checkout `edge/kanban-github-sync.py` (intake/registry는 기존 live와 바이트
+  동일, edge만 변경). cron job `bf431b2a6ba6` id/schedule/enabled/script 무변경.
+  rollback backup: `/home/hermes/.hermes/scripts/.bak-kanban-github-sync.py-20260816T053858Z`
+- H4V3-Meowcore PR #3 acceptance (live read-only canary 시작 상태):
+  Issue #2 OPEN + `agent-ready`; PR #3 OPEN/DRAFT, head
+  `593e3bd12cbe609d7b4f5401fca877619fdfda4f`, merged=false, labels `[agent-rework]`;
+  Kanban `t_4093eec7`(h4v3-meowcore board) BLOCKED/needs_input, round-1
+  `github_pr_rework` + `github_pr_rework_attention`(completion_handoff_missing)
+  hold 유지. 패치 배포만으로는 자동 READY 없음 — maintainer의 명시적
+  `AGENT_REWORK_RETRY` comment 이후에만 BLOCKED → READY → claim → agent-working.
+  (다음 cron tick 후 BLOCKED 유지 재확인 결과는 최종 보고에 기록)
 
 ## Rollback
 
