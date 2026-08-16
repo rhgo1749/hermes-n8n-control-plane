@@ -2788,12 +2788,83 @@ def _reconcile_rework_lifecycle(
         }
 
     # A freshly (re-)requested rework round stays owned by the classic intake
-    # transitions (REVIEW/BLOCKED -> READY) and by the dispatch lane.  The
-    # lifecycle layer only reconciles worker-owned states: once a claim
-    # exists (running) or the round is spent (done/review), the PR label is
-    # projected from Kanban ownership instead of being treated as intake.
+    # transitions (REVIEW/BLOCKED -> READY) and by the dispatch lane.  A
+    # blocked task is different once its current-round worker has supplied a
+    # complete delivery handoff: the blocked outcome is a human-validation
+    # gate, not permission to lose the delivery projection.  Promote only
+    # from the same bounded marker/run/head evidence used for other states.
     if status == "blocked":
-        return None
+        if context["pr"].state != "open":
+            return None
+        try:
+            delivered, _delivery_reason, evidence = _rework_delivery_evidence(
+                conn, client, ref, task_id, context["pr"], context["event"],
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "delivery_query_failed", "error": str(exc),
+            }
+        if not delivered:
+            # A consumed rework round owns this BLOCKED card even when the
+            # delivery evidence is incomplete or invalid.  Do not fall
+            # through to generic blocked reconciliation: an open PR would
+            # otherwise be projected to REVIEW while agent-working remains.
+            # Keep the card BLOCKED and record one idempotent attention event
+            # for every diagnostic, without emitting sync or delivery events.
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "rework_human_attention_predicted",
+                    "diagnostic": _delivery_reason, "evidence": evidence,
+                }
+            try:
+                label_reason, label_evidence = _restore_rework_labels(client, context)
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "rework_attention_label_projection_failed",
+                    "error": str(exc),
+                }
+            _record_rework_attention(
+                conn, task_id, context, reason=_delivery_reason, evidence=evidence,
+            )
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "rework_human_attention",
+                "diagnostic": _delivery_reason, "lifecycle": label_evidence,
+                "label_action": label_reason,
+            }
+        if dry_run:
+            return {
+                "task_id": task_id, "status": "review", "changed": False,
+                "reason": "agent_review_ready_predicted", "evidence": evidence,
+            }
+        db_result = _delivery_review_transition(
+            conn, task_id, status, ref, int(context["pr_number"]), evidence,
+        )
+        if db_result is None:
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "state_changed_during_sync", "evidence": evidence,
+            }
+        try:
+            _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                client, ref, int(context["pr_number"]),
+                add=(REVIEW_READY_LABEL,),
+                remove=(REWORK_LABEL, WORKING_LABEL),
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id, "status": "review", "changed": True,
+                "reason": "review_ready_label_projection_failed",
+                "error": str(exc), "evidence": evidence,
+            }
+        return {
+            "task_id": task_id, "status": "review", "changed": True,
+            "reason": "agent_review_ready", "evidence": evidence,
+            "label_action": label_reason, "lifecycle": label_evidence,
+        }
 
     # Merged PR: clear any lifecycle labels, then fall through so the classic
     # completion transition records DONE in the same tick.
@@ -3763,6 +3834,22 @@ def sync_board(
                             lifecycle_contexts_by_task[task_id] = None
                 results.append(_annotate(normalized_rework, row, ref))
                 continue
+
+            if row["status"] == "blocked" and lifecycle_context is not None:
+                lifecycle_entry = _reconcile_rework_lifecycle(
+                    conn,
+                    kanban_db,
+                    client,
+                    ref,
+                    decision,
+                    row,
+                    lifecycle_context,
+                    dry_run=dry_run,
+                    failure_limit=_retry_failure_limit(),
+                )
+                if lifecycle_entry is not None:
+                    results.append(_annotate(lifecycle_entry, row, ref))
+                    continue
 
             if row["status"] == "blocked":
                 results.append(
