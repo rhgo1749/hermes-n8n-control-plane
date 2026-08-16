@@ -130,14 +130,16 @@ task=<task_id>
   checkout `edge/kanban-github-sync.py` (intake/registry는 기존 live와 바이트
   동일, edge만 변경). cron job `bf431b2a6ba6` id/schedule/enabled/script 무변경.
   rollback backup: `/home/hermes/.hermes/scripts/.bak-kanban-github-sync.py-20260816T053858Z`
-- H4V3-Meowcore PR #3 acceptance (live read-only canary 시작 상태):
-  Issue #2 OPEN + `agent-ready`; PR #3 OPEN/DRAFT, head
-  `593e3bd12cbe609d7b4f5401fca877619fdfda4f`, merged=false, labels `[agent-rework]`;
-  Kanban `t_4093eec7`(h4v3-meowcore board) BLOCKED/needs_input, round-1
-  `github_pr_rework` + `github_pr_rework_attention`(completion_handoff_missing)
-  hold 유지. 패치 배포만으로는 자동 READY 없음 — maintainer의 명시적
-  `AGENT_REWORK_RETRY` comment 이후에만 BLOCKED → READY → claim → agent-working.
-  (다음 cron tick 후 BLOCKED 유지 재확인 결과는 최종 보고에 기록)
+- H4V3-Meowcore PR #3 acceptance (live read-only canary):
+  배포 후 첫 cron tick(2026-08-16T14:40+09:00, job `bf431b2a6ba6`, completed
+  @14:41:13)에서 `t_4093eec7`(h4v3-meowcore board)은
+  `reason: rework_human_attention`, `diagnostic: completion_handoff_missing`,
+  `lifecycle.labels: [agent-rework]`, `label_action: labels_unchanged`로
+  **BLOCKED 유지 확인** — `maintainer_retry_consumed`/새 `github_pr_rework`
+  event/READY 없음. PR #3 labels `[agent-rework]` 불변. 동일 틱에서
+  ctrlhangul #71의 attention hold도 보존 확인 (live regression). maintainer의
+  명시적 `AGENT_REWORK_RETRY` comment 이후에만 BLOCKED → READY → claim →
+  agent-working으로 진입 (테스트 84/85로 고정, live 소비는 다음 사람 신호 시점).
 
 ## Rollback
 
