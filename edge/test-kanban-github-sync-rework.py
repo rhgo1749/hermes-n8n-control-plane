@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, "/ws/hermes-agent")
 
@@ -2453,6 +2454,479 @@ def test_82_consumed_round_mismatched_pr_stays_blocked():
     check("agent-working still retained", fake.pr_labels.get(PR_N) == ["agent-working"],
           str(fake.pr_labels))
 
+# ---------------------------------------------------------------------------
+# Explicit maintainer retry (AGENT_REWORK_RETRY) — new round ingress from the
+# rework_human_attention hold (BLOCKED + consumed round + restored label).
+# ---------------------------------------------------------------------------
+
+def _post_retry_comment(
+    fake: FakeGitHub,
+    tid: str,
+    *,
+    when: Optional[str] = None,
+    author: str = "rhgo1749",
+    task: Optional[str] = None,
+    marker: bool = True,
+) -> int:
+    """Post a machine-readable ``AGENT_REWORK_RETRY`` comment on the PR."""
+    if when is None:
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+    _MARKER_ID[0] += 1
+    lines: list[str] = []
+    if marker:
+        lines.append(mod.REWORK_RETRY_MARKER)
+    lines.append(f"task={task if task is not None else tid}")
+    fake.issue_comments.setdefault(PR_N, []).append({
+        "id": _MARKER_ID[0],
+        "user": {"login": author},
+        "body": "\n".join(lines),
+        "created_at": when,
+        "updated_at": when,
+    })
+    return _MARKER_ID[0]
+
+
+def _attention_blocked_retry_hold() -> tuple[FakeGitHub, str]:
+    """BLOCKED + clean finished run + no marker + one attention tick.
+
+    This is the fail-closed hold state: task BLOCKED, agent-rework label
+    restored by the self-heal, one ``github_pr_rework_attention`` event,
+    and the old governing ``github_pr_rework`` event still present.
+    """
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    assert any(r.get("reason") == "rework_human_attention" for r in entries), str(entries)
+    assert task_row(tid)["status"] == "blocked", str(task_row(tid))
+    assert fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels)
+    return fake, tid
+
+
+def test_83_blocked_attention_hold_no_auto_ready():
+    print("83. BLOCKED + clean run + no marker -> attention hold, no auto READY, "
+          "stable across ticks (no duplicate attention / rework event / spawn)")
+    fake, tid = _attention_blocked_retry_hold()
+    rework_before = len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ])
+    attention_before = len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_attention"
+    ])
+    for i in range(2):
+        results = run_sync(fake)
+        entries = [r for r in results if r.get("task_id") == tid]
+        check(f"tick {i + 2} stays blocked", task_row(tid)["status"] == "blocked",
+              str(task_row(tid)))
+        check(f"tick {i + 2} no auto READY", not any(
+            r.get("status") == "ready" and r.get("changed") for r in entries),
+            str(entries))
+        check(f"tick {i + 2} no new rework event", len([
+            e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+        ]) == rework_before, str(task_events(tid)))
+        check(f"tick {i + 2} no duplicate attention", len([
+            e for e in task_events(tid) if e["kind"] == "github_pr_rework_attention"
+        ]) == attention_before, str(task_events(tid)))
+        check(f"tick {i + 2} no worker spawn", not any(
+            r.get("reason") == "rework_worker_spawned" for r in entries), str(entries))
+        check(f"tick {i + 2} label still agent-rework",
+              fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+
+
+def test_84_stale_retry_before_attention_ignored():
+    print("84. retry comment BEFORE the attention record -> ignored, stays BLOCKED")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    # The comment predates the attention record (which is written at real
+    # now on the first tick).
+    _post_retry_comment(fake, tid, when="2026-08-10T00:00:30Z")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("attention recorded", any(
+        r.get("reason") == "rework_human_attention" for r in entries), str(entries))
+    check("retry NOT consumed", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries), str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check("no new rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == 1, str(task_events(tid)))
+
+
+def test_85_untrusted_retry_ignored():
+    print("85. retry comment by an untrusted actor -> ignored, stays BLOCKED")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid, author="not-a-trusted-actor")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("retry NOT consumed", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries), str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check("no new rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == 1, str(task_events(tid)))
+
+
+def test_86_malformed_retry_ignored():
+    print("86. malformed/ambiguous retry signal -> ignored, stays BLOCKED")
+    fake, tid = _attention_blocked_retry_hold()
+    # Marker without the task binding line.
+    fake.issue_comments.setdefault(PR_N, []).append(comment(
+        "rhgo1749", mod.REWORK_RETRY_MARKER, "2026-08-16T00:00:30Z", n=9001))
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("no-task-line retry NOT consumed", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries), str(entries))
+    check("stays blocked (no task line)", task_row(tid)["status"] == "blocked",
+          str(task_row(tid)))
+    # Marker bound to a DIFFERENT task id.
+    _post_retry_comment(fake, tid, task="t_other-task-id")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("wrong-task retry NOT consumed", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries), str(entries))
+    check("stays blocked (wrong task)", task_row(tid)["status"] == "blocked",
+          str(task_row(tid)))
+    check("no new rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == 1, str(task_events(tid)))
+
+
+def test_87_trusted_explicit_retry_opens_new_round():
+    print("87. trusted retry after attention -> exactly one new github_pr_rework "
+          "event (maintainer_retry), BLOCKED -> READY, idempotent next tick")
+    fake, tid = _attention_blocked_retry_hold()
+    rcid = _post_retry_comment(fake, tid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    consumed = [r for r in entries if r.get("reason") == "maintainer_retry_consumed"]
+    check("consumed exactly once", len(consumed) == 1, str(entries))
+    if consumed:
+        check("consumed entry ready+changed",
+              consumed[0].get("status") == "ready"
+              and consumed[0].get("changed") is True, str(consumed[0]))
+        check("retry identity in entry",
+              consumed[0].get("retry_comment_id") == rcid
+              and consumed[0].get("retry_comment_author") == "rhgo1749",
+              str(consumed[0]))
+    check("task blocked -> ready", task_row(tid)["status"] == "ready",
+          str(task_row(tid)))
+    rework_events = [e for e in task_events(tid)
+                     if e["kind"] == "github_pr_rework"]
+    check("exactly two rework events", len(rework_events) == 2, str(rework_events))
+    if len(rework_events) == 2:
+        p = rework_events[-1]["payload"]
+        check("maintainer_retry event provenance",
+              p.get("trigger") == "maintainer_retry"
+              and p.get("retry_comment_id") == rcid
+              and p.get("request_comment_id") == rcid
+              and p.get("rework_round") == 2
+              and p.get("previous_status") == "blocked"
+              and p.get("new_status") == "ready", str(p))
+    check("agent-rework kept visible until claim",
+          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    # Next tick: no duplicate rework event, no re-consumption.
+    events_before = len(task_events(tid))
+    results2 = run_sync(fake)
+    check("next tick no duplicate rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == 2, str(task_events(tid)))
+    check("next tick no new events at all",
+          len(task_events(tid)) == events_before, str(results2))
+    check("next tick no re-consumption", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in results2),
+        str(results2))
+
+
+def test_88_retry_dispatch_claim_running():
+    print("88. retry round dispatch: claim -> agent-rework removed, "
+          "agent-working added, RUNNING, one spawn")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready
+    check("ready after consumption", task_row(tid)["status"] == "ready")
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws85-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    results = _run_sync_with_dispatch(fake, stub)
+    spawned = [r for r in results if r.get("reason") == "rework_worker_spawned"]
+    check("spawned once", len(spawned) == 1, str(results))
+    check("task running", task_row(tid)["status"] == "running",
+          str(task_row(tid)))
+    check("one spawn call", len(stub.calls) == 1, str(stub.calls))
+    labels = fake.pr_labels.get(PR_N, [])
+    check("label swap to agent-working",
+          "agent-working" in labels and "agent-rework" not in labels, str(labels))
+
+
+def test_89_retry_claim_failure_keeps_request():
+    print("89. retry round claim failure -> READY kept, agent-rework retained, "
+          "no spawn, request not lost")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws86-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    orig_claim = kanban_db.claim_task
+    kanban_db.claim_task = lambda *args, **kwargs: None  # type: ignore[assignment]
+    try:
+        results = _run_sync_with_dispatch(fake, stub)
+        failed = [r for r in results if r.get("reason") == "claim_failed"]
+        check("claim_failed entry", len(failed) == 1, str(results))
+        check("no spawn", stub.calls == [], str(stub.calls))
+        check("task stays ready", task_row(tid)["status"] == "ready",
+              str(task_row(tid)))
+        check("agent-rework retained", "agent-rework" in fake.pr_labels.get(PR_N, []),
+              str(fake.pr_labels))
+        # A later tick retries the claim under the same failure; the request
+        # survives and no request/event is lost.
+        results2 = _run_sync_with_dispatch(fake, stub)
+        check("claim retried on next tick", any(
+            r.get("reason") == "claim_failed" for r in results2), str(results2))
+        check("still no spawn", stub.calls == [], str(stub.calls))
+        check("request not lost (ready + label)",
+              task_row(tid)["status"] == "ready"
+              and "agent-rework" in fake.pr_labels.get(PR_N, []),
+              str(task_row(tid)))
+    finally:
+        kanban_db.claim_task = orig_claim
+
+
+def test_90_old_completion_marker_not_delivery_in_retry_round():
+    print("90. old AGENT_REWORK_COMPLETE marker -> never delivery for the retry round")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready (round 2)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    new_head = "0123456789abcdef0123456789abcdef00000087"
+    fake.prs[PR_N]["head"]["sha"] = new_head
+    _close_rework_run(tid, head=new_head, outcome="completed",
+                      summary="worker finished cleanly")
+    # The round-1 completion marker predates the retry round's event.
+    _post_completion_marker(fake, tid, new_head,
+                            when="2026-08-10T00:00:30Z")
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,)
+        )
+        conn.commit()
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("no review-ready from stale marker", not any(
+        r.get("reason") == "agent_review_ready" for r in entries), str(entries))
+    check("attention recorded", any(
+        r.get("reason") == "rework_human_attention" for r in entries), str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+
+
+def test_91_retry_round_delivery_review_ready():
+    print("91. retry round complete delivery (marker + task + request_comment + "
+          "head + validation + finished run) -> REVIEW + agent-review-ready")
+    fake, tid = _attention_blocked_retry_hold()
+    rcid = _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready (round 2)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    new_head = "0123456789abcdef0123456789abcdef00000088"
+    fake.prs[PR_N]["head"]["sha"] = new_head
+    _close_rework_run(tid, head=new_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, new_head, request_comment=rcid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    ready = [r for r in entries if r.get("reason") == "agent_review_ready"]
+    check("review-ready entry", len(ready) == 1, str(entries))
+    if ready:
+        ev = ready[0].get("evidence") or {}
+        check("evidence head/validation", ev.get("head") == new_head
+              and ev.get("validation") == "passed", str(ev))
+    check("task -> review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    labels = fake.pr_labels.get(PR_N, [])
+    check("agent-review-ready projected",
+          "agent-review-ready" in labels
+          and "agent-working" not in labels and "agent-rework" not in labels,
+          str(labels))
+    delivery_events = [e for e in task_events(tid)
+                       if e["kind"] == "github_pr_rework_delivery"]
+    check("one delivery event", len(delivery_events) == 1, str(delivery_events))
+    # Idempotent second tick.
+    before = len(task_events(tid))
+    results2 = run_sync(fake)
+    check("second tick no new events", len(task_events(tid)) == before,
+          str(results2))
+
+
+def test_92_retry_round_blocked_outcome_complete_delivery_review():
+    print("92. retry round: worker outcome=blocked (human/device validation) but "
+          "complete delivery evidence -> REVIEW + agent-review-ready (PR #25 contract)")
+    fake, tid = _attention_blocked_retry_hold()
+    rcid = _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready (round 2)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    new_head = "0123456789abcdef0123456789abcdef00000089"
+    fake.prs[PR_N]["head"]["sha"] = new_head
+    _close_rework_run(tid, head=new_head, outcome="blocked",
+                      summary="human_validation_required: device gate remains")
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,)
+        )
+        conn.commit()
+    _post_completion_marker(fake, tid, new_head, request_comment=rcid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    ready = [r for r in entries if r.get("reason") == "agent_review_ready"]
+    check("blocked delivery -> review-ready", len(ready) == 1, str(entries))
+    check("blocked task -> review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    check("review-ready label projected",
+          fake.pr_labels.get(PR_N) == ["agent-review-ready"],
+          str(fake.pr_labels))
+
+
+def test_93_retry_round_merged_done():
+    print("93. retry round delivered -> PR merged -> labels cleanup + DONE")
+    fake, tid = _attention_blocked_retry_hold()
+    rcid = _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    new_head = "0123456789abcdef0123456789abcdef00000090"
+    fake.prs[PR_N]["head"]["sha"] = new_head
+    _close_rework_run(tid, head=new_head, outcome="completed",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, new_head, request_comment=rcid)
+    run_sync(fake)  # delivery -> review
+    check("delivered review", task_row(tid)["status"] == "review")
+    fake.prs[PR_N] = make_pr(PR_N, state="closed", merged=True)
+    results = run_sync(fake)
+    row = task_row(tid)
+    check("merged -> done", row["status"] == "done"
+          and row["completed_at"] is not None, str(row))
+    check("lifecycle labels cleared", fake.pr_labels.get(PR_N, []) == [],
+          str(fake.pr_labels))
+    check("github_pr_sync done event", any(
+        e["kind"] == "github_pr_sync"
+        and e["payload"].get("new_status") == "done"
+        for e in task_events(tid)), str(task_events(tid)))
+
+
+def test_94_generic_blocked_retry_comment_unaffected():
+    print("94. generic BLOCKED (no consumed rework) + retry-looking comment -> "
+          "classic blocked paths unchanged (no lifecycle interception)")
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="open", head_sha="sha-generic")
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    fake.issue_comments[PR_N] = [comment(
+        "rhgo1749", f"{mod.REWORK_RETRY_MARKER}\ntask=whatever",
+        "2026-08-10T00:00:30Z")]
+    tid = blocked_task(reason="needs maintainer decision", kind="needs_input")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("no retry consumption", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries),
+        str(entries))
+    check("classic open-PR review projection",
+          task_row(tid)["status"] == "review", str(task_row(tid)))
+
+
+def test_95_retry_dry_run_predicts_without_mutation():
+    print("95. dry-run with a fresh trusted retry -> maintainer_retry_predicted, "
+          "no mutation")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid)
+    events_before = len(task_events(tid))
+    patches_before = len(fake.patch_calls)
+    results = mod.sync_board("default", dry_run=True, client=fake)
+    predicted = [r for r in results if r.get("reason") == "maintainer_retry_predicted"]
+    check("predicted", len(predicted) == 1, str(results))
+    if predicted:
+        check("prediction carries retry identity",
+              predicted[0].get("status") == "ready"
+              and predicted[0].get("changed") is False, str(predicted[0]))
+    check("status untouched", task_row(tid)["status"] == "blocked",
+          str(task_row(tid)))
+    check("no events written", len(task_events(tid)) == events_before)
+    check("no label mutation", len(fake.patch_calls) == patches_before)
+
+
+def test_96_consumed_retry_comment_not_reusable():
+    print("96. consumed retry comment -> permanently ineligible for later rounds")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid)
+    run_sync(fake)  # consumed -> ready (round 2, payload carries retry_comment_id)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    # Round 2 fails without any delivery -> attention hold again.
+    with connect_closing() as conn:
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET ended_at=?, outcome='completed', status='done', "
+            "summary='round2 ended without marker' "
+            "WHERE id=? AND ended_at IS NULL",
+            (now, claimed.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,)
+        )
+        conn.commit()
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("attention hold restored", any(
+        r.get("reason") == "rework_human_attention" for r in entries), str(entries))
+    check("old retry comment NOT re-consumed", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries),
+        str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked",
+          str(task_row(tid)))
+    check("still exactly two rework events", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == 2, str(task_events(tid)))
+
+
+def test_97_retry_requires_issue_open_agent_ready():
+    print("97. retry with closed Issue / no agent-ready -> ignored, stays BLOCKED")
+    fake, tid = _attention_blocked_retry_hold()
+    _post_retry_comment(fake, tid)
+    fake.issue_state = "closed"
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("retry_issue_not_agent_ready entry", any(
+        r.get("reason") == "retry_issue_not_agent_ready" for r in entries),
+        str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked",
+          str(task_row(tid)))
+    check("no new rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == 1, str(task_events(tid)))
+    # agent-ready removed but Issue still open.
+    fake2, tid2 = _attention_blocked_retry_hold()
+    _post_retry_comment(fake2, tid2)
+    fake2.issue_labels = []
+    results2 = run_sync(fake2)
+    check("no-agent-ready retry ignored", any(
+        r.get("reason") == "retry_issue_not_agent_ready" for r in results2),
+        str(results2))
+    check("stays blocked (no agent-ready)", task_row(tid2)["status"] == "blocked",
+          str(task_row(tid2)))
+
+
 
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
@@ -3095,6 +3569,23 @@ def main() -> int:
         test_80_wrong_task_completion_marker_stays_blocked,
         test_81_consumed_round_unresolved_pr_stays_blocked,
         test_82_consumed_round_mismatched_pr_stays_blocked,
+
+        test_83_blocked_attention_hold_no_auto_ready,
+        test_84_stale_retry_before_attention_ignored,
+        test_85_untrusted_retry_ignored,
+        test_86_malformed_retry_ignored,
+        test_87_trusted_explicit_retry_opens_new_round,
+        test_88_retry_dispatch_claim_running,
+        test_89_retry_claim_failure_keeps_request,
+        test_90_old_completion_marker_not_delivery_in_retry_round,
+        test_91_retry_round_delivery_review_ready,
+        test_92_retry_round_blocked_outcome_complete_delivery_review,
+        test_93_retry_round_merged_done,
+        test_94_generic_blocked_retry_comment_unaffected,
+        test_95_retry_dry_run_predicts_without_mutation,
+        test_96_consumed_retry_comment_not_reusable,
+        test_97_retry_requires_issue_open_agent_ready,
+
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

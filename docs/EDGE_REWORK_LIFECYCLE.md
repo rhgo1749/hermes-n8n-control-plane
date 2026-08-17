@@ -62,7 +62,8 @@ Rules:
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `agent-working` → `agent-rework` (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | task requeued `→ ready`, `github_pr_rework_retry` event, failure counted against `kanban.failure_limit` (circuit breaker preserved) |
-| `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / no run, or worker text asks for human input | labels restored, `HERMES_KANBAN_REWORK_ATTENTION` comment + `github_pr_rework_attention` event (idempotent per round) |
+| `agent-rework` restored (BLOCKED hold) → new round | explicit trusted `AGENT_REWORK_RETRY` comment after the last attention, Issue open + `agent-ready`, comment id never consumed | `apply_rework` BLOCKED → READY + one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`), delivery contract comment bound to the retry comment id; label kept until the dispatch claim (see “Explicit maintainer retry”) |
+| `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / no run, or worker text asks for human input | labels restored, `HERMES_KANBAN_REWORK_ATTENTION` comment + `github_pr_rework_attention` event (idempotent per round); the comment body carries the exact `AGENT_REWORK_RETRY` retry instructions |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same tick |
 
 ## Ordering / race safety
@@ -98,6 +99,59 @@ The rework contract (with the marker template) is appended to the task
 comments when the rework round is consumed, so the next worker sees it
 without any core change.
 
+## Explicit maintainer retry (new round ingress)
+
+A consumed rework round whose delivery is incomplete fails closed:
+BLOCKED + `rework_human_attention` + the `agent-rework` label restored by
+the self-heal.  The restored label alone is **never** retry evidence (the
+edge re-applies it during recovery, so label presence cannot distinguish a
+human request from self-heal), and no automatic or timer-based retry may
+start from that state.
+
+The **only** signal that opens a NEW rework round from the hold is a
+machine-readable comment on the current PR by a `TRUSTED_GITHUB_ACTORS`
+maintainer:
+
+```text
+AGENT_REWORK_RETRY
+task=<task_id>
+```
+
+Acceptance requires ALL of:
+
+- author in `TRUSTED_GITHUB_ACTORS` (comment on the PR, trusted-actor check);
+- exact `AGENT_REWORK_RETRY` line plus an exact `task=<task_id>` binding
+  (no fuzzy natural-language matching);
+- comment `created_at` strictly AFTER the later of the governing rework
+  event and the last `github_pr_rework_attention` record;
+- the comment id was never consumed before (each consumed retry comment id
+  is recorded in the new round's `github_pr_rework` event payload as
+  `retry_comment_id`, making it permanently ineligible);
+- source Issue still OPEN with `agent-ready`.
+
+When accepted, the held round is closed through the classic intake
+contract: `apply_rework` writes exactly one fresh `github_pr_rework` event
+with `trigger: "maintainer_retry"` (+ `retry_comment_id`), the task goes
+BLOCKED → READY with the rework delivery contract comment (whose
+`request_comment` is the retry comment id — the new round's completion
+marker must reference it), and the edge dispatch lane claims it exactly
+like a label-requested round (claim → `agent-working`).  A failed GitHub
+lookup, closed Issue, missing `agent-ready`, malformed marker, untrusted
+author, pre-attention timing, or already-consumed comment all fail closed:
+the task stays BLOCKED.  Dry-run predicts `maintainer_retry_predicted`
+without mutating anything.
+
+```text
+incomplete old delivery
+  -> BLOCKED -> rework_human_attention -> agent-rework restored
+  -> WAIT (no auto retry; label presence is never retry evidence)
+
+explicit trusted retry comment (AGENT_REWORK_RETRY + task=..., after attention)
+  -> old round closed
+  -> fresh github_pr_rework event (trigger: maintainer_retry)
+  -> BLOCKED -> READY -> claim -> agent-working  (new round)
+```
+
 ## Deployment (host)
 
 The live cron path is `~/.hermes/scripts/kanban-github-sync.py` driven by the
@@ -109,18 +163,34 @@ does **not** auto-deploy and does **not** merge itself.
 ## Verification
 
 `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py`
-covers the lifecycle matrix (349 checks): claim transition, claim failure,
+covers the lifecycle matrix (554 checks): claim transition, claim failure,
 duplicate-spawn guards (label + same-PR owner), working-label maintenance,
 local-commit-only, head mismatch, validation incomplete, handoff failure,
 full delivery, worker crash requeue, label conflict skip, merged cleanup,
-and the pre-existing rework/blocked/annotation regressions.  Tests 63–70
+the pre-existing rework/blocked/annotation regressions, the DONE + OPEN PR
+invariants, the consumed-rework provenance fail-closed guard (PR #27 merge,
+tests 80–82), and the explicit maintainer retry (AGENT_REWORK_RETRY) ingress
+(tests 83–97; renumbered after PR #27 occupied 80–82).  Tests 63–70
 pin the DONE + OPEN PR invariants: reviewer completion repair (63), rework
 completion → REVIEW on the same PR (64), delivered + merged → DONE (65),
 DONE + OPEN PR + stale `agent-working` self-heal (66, acceptance fixture
 t_560e6a71 / PR #9), live-worker non-transition + post-delivery label
 stability (67), generic READY + OPEN PR keeps the core `active_pr` guard
 (68), repeated-tick idempotency (69), and dry-run repair prediction without
-mutation (70).
+mutation (70).  Tests 80–82 pin the consumed-rework provenance fail-closed
+guard: wrong-task completion marker stays blocked (80), unresolved
+consumed-round `pr_number` stays blocked with attention (81), mismatched/
+recreated PR stays blocked (82).  Tests 83–97 pin the explicit retry
+contract: BLOCKED attention hold without auto READY (83), pre-attention
+retry ignored (84), untrusted actor ignored (85), malformed/ambiguous retry
+ignored (86), trusted retry → exactly one fresh `github_pr_rework` event +
+READY + next-tick idempotency (87), dispatch claim → agent-working/RUNNING
+(88), claim failure keeps the request (89), stale completion marker never a
+delivery for the retry round (90), complete retry-round delivery → REVIEW
+(91), blocked outcome + complete delivery → REVIEW (92), merged → DONE (93),
+generic BLOCKED unaffected (94), dry-run prediction without mutation (95),
+consumed retry comment permanently ineligible (96), and Issue open +
+`agent-ready` requirement (97).
 
 Hermes core (`kanban_db.py`, tools, CLI) is untouched; all mutations are edge
 direct-DB writes inside the operator-approved reconciliation scope.
