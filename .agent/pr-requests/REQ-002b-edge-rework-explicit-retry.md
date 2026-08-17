@@ -1,13 +1,16 @@
 # REQ-002b: rework_human_attention 이후 명시적 retry로 새 rework round 재시작 (AGENT_REWORK_RETRY)
 
-- Status: Rework implemented / Review pending
+- Status: Rework implemented / Review pending (rebase onto post-PR #27 main)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT` / `N8N_VALIDATE` / `EDGE_REWORK`
 - Integration target branch: `main`
 - Required work branch: `fix/edge-rework-explicit-retry-issue2`
-- Source-of-truth base: `origin/main` at `9a3fd5f` (PR #25 merge)
-- Remote delivery: Required; new control-plane PR (previous PR #25 already merged)
+- Source-of-truth base: `origin/main` at `19461e2` (PR #25 `9a3fd5f` + PR #27 merge)
+- Rebase: PR #27 merge (`19461e2`, consumed-rework provenance fail-closed guard) 후
+  `fix/edge-rework-explicit-retry-issue2`를 최신 `origin/main` 위에 rebase
+  (2026-08-18) — PR #27 guard와 본 PR의 retry contract 둘 다 보존
+- Remote delivery: Required; existing control-plane PR #28 (OPEN, mergeable MERGEABLE 목표)
 - Request storage: REPOSITORY_OWNED_REQUEST
 - Request path: `.agent/pr-requests/REQ-002b-edge-rework-explicit-retry.md`
 - Merge authority: Human/user only; no merge or auto-merge performed
@@ -15,7 +18,8 @@
 - Source issue URL: `https://github.com/rhgo1749/H4V3-Meowcore/issues/2`
 - Kanban task ID: source-task 기준 edge lifecycle (H4V3-Meowcore PR #3 연결 task)
 - Planning/lead owner: `kanban-main`
-- Implementation owner: `kanban-developer` (본 PR은 lead가 직접 bounded 구현)
+- Implementation owner: `kanban-developer` (본 PR은 lead가 직접 bounded 구현;
+  rebase/재구성도 lead가 직접 수행, 리뷰 게이트는 별도 reviewer 태스크)
 - Automation stop state: `HUMAN_VALIDATION_REQUIRED`
 
 ## Objective
@@ -80,8 +84,10 @@ task=<task_id>
    `_reconcile_rework_lifecycle` blocked 분기에 retry 검사 선행,
    `_record_rework_attention` comment에 retry 지침 추가,
    소비 시 `consecutive_failures` 리셋(사람 명시 retry = fresh attempt).
-2. `edge/test-kanban-github-sync-rework.py`: 테스트 80–94 추가
-   (regression 1–14 전부 + dry-run + one-shot + Issue 조건).
+2. `edge/test-kanban-github-sync-rework.py`: 테스트 83–97 추가
+   (rebase 후 재번호: PR #27 merge로 80/81/82가 consumed-rework provenance
+   fail-closed 테스트에 점유됨; 본 PR 테스트는 83–97로 재배치 — 둘 다 보존,
+   regression 1–14 전부 + dry-run + one-shot + Issue 조건).
 3. `docs/EDGE_REWORK_LIFECYCLE.md`: explicit maintainer retry 섹션/테이블/검증 수치.
 4. 이 REQ 문서.
 
@@ -97,7 +103,8 @@ task=<task_id>
 ## Validation contract and evidence
 
 - `EDGE_REWORK`: `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py`
-  — **517 passed, 0 failed** (기존 439 + 신규 78)
+  — **554 passed, 0 failed** (rebase 후: PR #27 merge 포함 476 + 본 PR 신규 78;
+  PR #27 테스트 80/81/82 + 본 PR 테스트 83–97 전부 통과)
 - Python compile: `python3 -m py_compile edge/kanban-github-sync.py edge/test-kanban-github-sync-rework.py` — PASS
 - `python3 tests/test_repo_scoped_intake.py` — PASS (15)
 - `python3 tests/test_h4v3_overview.py` — PASS (12)
@@ -115,11 +122,14 @@ task=<task_id>
 
 ## Delivery / stop state
 
-- Implementation commit: `c4778d9c34c8ed59317867435444f3630acc1bc9`
-- Local/pushed SHA: `c4778d9c34c8ed59317867435444f3630acc1bc9`
+- Implementation commit: `c4778d9c34c8ed59317867435444f3630acc1bc9` (rebase 전 원본)
+- Rebase commits (2026-08-18, onto `origin/main` `19461e2`):
+  `8e4b904` (fix: explicit maintainer retry) → `80110cc` (REQ-002b delivery 기록)
+  → `d63e762` (live canary 기록); HEAD == `d63e762…` (아래 최종 SHA로 갱신)
+- Local/pushed SHA: rebase 후 새 head로 갱신 (아래 PR re-read 시점 값)
   (`origin/fix/edge-rework-explicit-retry-issue2`와 동일)
 - PR: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/28 — OPEN 유지,
-  merge/auto-merge 금지 (mergeable: MERGEABLE)
+  merge/auto-merge 금지 (rebase 후 mergeable 상태는 push 후 실제 재확인)
 - Expected changed files: `edge/kanban-github-sync.py`,
   `edge/test-kanban-github-sync-rework.py`, `docs/EDGE_REWORK_LIFECYCLE.md`,
   `.agent/pr-requests/REQ-002b-edge-rework-explicit-retry.md`
@@ -139,7 +149,7 @@ task=<task_id>
   event/READY 없음. PR #3 labels `[agent-rework]` 불변. 동일 틱에서
   ctrlhangul #71의 attention hold도 보존 확인 (live regression). maintainer의
   명시적 `AGENT_REWORK_RETRY` comment 이후에만 BLOCKED → READY → claim →
-  agent-working으로 진입 (테스트 84/85로 고정, live 소비는 다음 사람 신호 시점).
+  agent-working으로 진입 (rebase 후 테스트 87/88로 고정, live 소비는 다음 사람 신호 시점).
 
 ## Rollback
 

@@ -163,30 +163,34 @@ does **not** auto-deploy and does **not** merge itself.
 ## Verification
 
 `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py`
-covers the lifecycle matrix (517 checks): claim transition, claim failure,
+covers the lifecycle matrix (554 checks): claim transition, claim failure,
 duplicate-spawn guards (label + same-PR owner), working-label maintenance,
 local-commit-only, head mismatch, validation incomplete, handoff failure,
 full delivery, worker crash requeue, label conflict skip, merged cleanup,
 the pre-existing rework/blocked/annotation regressions, the DONE + OPEN PR
-invariants, and the explicit maintainer retry (AGENT_REWORK_RETRY) ingress
-(tests 80–94).  Tests 63–70
+invariants, the consumed-rework provenance fail-closed guard (PR #27 merge,
+tests 80–82), and the explicit maintainer retry (AGENT_REWORK_RETRY) ingress
+(tests 83–97; renumbered after PR #27 occupied 80–82).  Tests 63–70
 pin the DONE + OPEN PR invariants: reviewer completion repair (63), rework
 completion → REVIEW on the same PR (64), delivered + merged → DONE (65),
 DONE + OPEN PR + stale `agent-working` self-heal (66, acceptance fixture
 t_560e6a71 / PR #9), live-worker non-transition + post-delivery label
 stability (67), generic READY + OPEN PR keeps the core `active_pr` guard
 (68), repeated-tick idempotency (69), and dry-run repair prediction without
-mutation (70).  Tests 80–94 pin the explicit retry contract: BLOCKED
-attention hold without auto READY (80), pre-attention retry ignored (81),
-untrusted actor ignored (82), malformed/ambiguous retry ignored (83),
-trusted retry → exactly one fresh `github_pr_rework` event + READY +
-next-tick idempotency (84), dispatch claim → agent-working/RUNNING (85),
-claim failure keeps the request (86), stale completion marker never a
-delivery for the retry round (87), complete retry-round delivery → REVIEW
-(88), blocked outcome + complete delivery → REVIEW (89), merged → DONE (90),
-generic BLOCKED unaffected (91), dry-run prediction without mutation (92),
-consumed retry comment permanently ineligible (93), and Issue open +
-`agent-ready` requirement (94).
+mutation (70).  Tests 80–82 pin the consumed-rework provenance fail-closed
+guard: wrong-task completion marker stays blocked (80), unresolved
+consumed-round `pr_number` stays blocked with attention (81), mismatched/
+recreated PR stays blocked (82).  Tests 83–97 pin the explicit retry
+contract: BLOCKED attention hold without auto READY (83), pre-attention
+retry ignored (84), untrusted actor ignored (85), malformed/ambiguous retry
+ignored (86), trusted retry → exactly one fresh `github_pr_rework` event +
+READY + next-tick idempotency (87), dispatch claim → agent-working/RUNNING
+(88), claim failure keeps the request (89), stale completion marker never a
+delivery for the retry round (90), complete retry-round delivery → REVIEW
+(91), blocked outcome + complete delivery → REVIEW (92), merged → DONE (93),
+generic BLOCKED unaffected (94), dry-run prediction without mutation (95),
+consumed retry comment permanently ineligible (96), and Issue open +
+`agent-ready` requirement (97).
 
 Hermes core (`kanban_db.py`, tools, CLI) is untouched; all mutations are edge
 direct-DB writes inside the operator-approved reconciliation scope.
