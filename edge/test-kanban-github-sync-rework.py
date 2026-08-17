@@ -3502,6 +3502,104 @@ def test_51_spawn_failure_honors_failure_limit_and_state():
           and row["consecutive_failures"] == 5, str(row))
 
 
+class _LabelsStub:
+    """Minimal client stub: fixed labels payload or a raised HTTP error."""
+
+    def __init__(self, labels=None, error=None, status=None):
+        self._labels = labels
+        self._error = error
+        self._status = status
+        self.calls: list[str] = []
+
+    def get(self, path, params=None):
+        self.calls.append(path)
+        if self._error is not None:
+            raise mod.GithubCompletionError(self._error, status=self._status)
+        return self._labels, {}
+
+
+def test_98_pr_labels_404_fallback_requires_authoritative_existence():
+    print("98. labels-404 -> empty labels only with pr_exists; endpoint must be the exact labels endpoint")
+    err = f"GitHub API 404 for /repos/{REPO}/issues/{PR_N}/labels"
+    # Authoritative existence: exact labels-endpoint 404 becomes empty set.
+    client = _LabelsStub(error=err, status=404)
+    check(
+        "404 with pr_exists -> empty set",
+        mod._pr_labels(client, REPO, PR_N, pr_exists=True) == set(),
+        str(mod._pr_labels(client, REPO, PR_N, pr_exists=True)),
+    )
+    # Without proof of existence the same 404 fails closed.
+    client = _LabelsStub(error=err, status=404)
+    try:
+        mod._pr_labels(client, REPO, PR_N)
+        check("404 without pr_exists raises", False, "no raise")
+    except mod.GithubCompletionError:
+        check("404 without pr_exists raises", True)
+    # A 404 from any other endpoint never falls back, even with pr_exists.
+    client = _LabelsStub(error=f"GitHub API 404 for /repos/{REPO}/pulls/{PR_N}", status=404)
+    try:
+        mod._pr_labels(client, REPO, PR_N, pr_exists=True)
+        check("non-labels 404 raises even with pr_exists", False, "no raise")
+    except mod.GithubCompletionError:
+        check("non-labels 404 raises even with pr_exists", True)
+
+
+def test_99_pr_labels_auth_transport_invalid_fail_closed():
+    print("99. 401/403/500/transport/malformed label lookups fail closed")
+    for code in (401, 403, 500):
+        client = _LabelsStub(
+            error=f"GitHub API {code} for /repos/{REPO}/issues/{PR_N}/labels",
+            status=code,
+        )
+        try:
+            mod._pr_labels(client, REPO, PR_N, pr_exists=True)
+            check(f"{code} fails closed", False, "no raise")
+        except mod.GithubCompletionError:
+            check(f"{code} fails closed", True)
+    client = _LabelsStub(
+        error=f"GitHub API request failed for /repos/{REPO}/issues/{PR_N}/labels: URLError"
+    )
+    try:
+        mod._pr_labels(client, REPO, PR_N, pr_exists=True)
+        check("transport error fails closed", False, "no raise")
+    except mod.GithubCompletionError:
+        check("transport error fails closed", True)
+    client = _LabelsStub(labels={"not": "a list"})
+    try:
+        mod._pr_labels(client, REPO, PR_N, pr_exists=True)
+        check("malformed payload fails closed", False, "no raise")
+    except mod.GithubCompletionError:
+        check("malformed payload fails closed", True)
+
+
+def test_100_pr_labels_real_rework_label_preserved():
+    print("100. real agent-rework label still detected")
+    client = _LabelsStub(labels=[{"name": "agent-rework"}, {"name": "triaged"}])
+    names = mod._pr_labels(client, REPO, PR_N, pr_exists=True)
+    check("agent-rework detected", mod.REWORK_LABEL in names, str(names))
+    check("other labels preserved", "triaged" in names, str(names))
+
+
+def test_101_evaluate_rework_labels_404_not_a_rework_request():
+    print("101. evaluate_rework treats a labels-404 on an existing PR as no rework label")
+    client = _LabelsStub(
+        error=f"GitHub API 404 for /repos/{REPO}/issues/{PR_N}/labels", status=404
+    )
+    pr = mod.GithubPullRequest(
+        number=PR_N, state="open", merged=False, base_branch="main",
+        html_url=f"https://github.com/{REPO}/pull/{PR_N}", title="t",
+        head_sha="sha-404",
+    )
+    decision = mod.GithubCompletionDecision(
+        desired_status=None, reason="linked_pr_open", pull_requests=(pr,),
+    )
+    result = mod.evaluate_rework(
+        client, mod.GithubTaskRef(REPO, ISSUE_N), decision,
+        current_status="review", last_rework_at=None,
+    )
+    check("no ReworkDecision for shadow PR without label", result is None, str(result))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -3569,7 +3667,6 @@ def main() -> int:
         test_80_wrong_task_completion_marker_stays_blocked,
         test_81_consumed_round_unresolved_pr_stays_blocked,
         test_82_consumed_round_mismatched_pr_stays_blocked,
-
         test_83_blocked_attention_hold_no_auto_ready,
         test_84_stale_retry_before_attention_ignored,
         test_85_untrusted_retry_ignored,
@@ -3585,7 +3682,10 @@ def main() -> int:
         test_95_retry_dry_run_predicts_without_mutation,
         test_96_consumed_retry_comment_not_reusable,
         test_97_retry_requires_issue_open_agent_ready,
-
+        test_98_pr_labels_404_fallback_requires_authoritative_existence,
+        test_99_pr_labels_auth_transport_invalid_fail_closed,
+        test_100_pr_labels_real_rework_label_preserved,
+        test_101_evaluate_rework_labels_404_not_a_rework_request,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

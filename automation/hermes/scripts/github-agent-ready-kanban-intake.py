@@ -1009,7 +1009,7 @@ def _telegram_dedup_state_path() -> Path:
     return _hermes_home() / "state" / "kanban-intake-last-sent.txt"
 
 
-def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
+def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
     """Send one batch through the existing Hermes messaging path.
 
     The intake does not implement Telegram HTTP, credentials, retries, or
@@ -1021,6 +1021,9 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
     the previously delivered body, the batch is skipped so an unchanged
     attention set does not re-alert every tick.  State read failures fail
     open (send); state write failures warn but never fail the send.
+
+    Returns ``"sent"`` when the batch was delivered, ``"skipped"`` when
+    the dedup suppressed a duplicate, and ``False`` on any delivery failure.
     """
     chat_id, thread_id = cfg
     text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
@@ -1031,7 +1034,7 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
                 "kanban-intake: identical notification body already sent; skipping",
                 file=sys.stderr,
             )
-            return True
+            return "skipped"
     except OSError as exc:
         print(
             f"kanban-intake: dedup state unreadable (warning only): {exc}",
@@ -1063,7 +1066,7 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> bool:
                     f"kanban-intake: dedup state write failed (warning only): {exc}",
                     file=sys.stderr,
                 )
-            return True
+            return "sent"
         print(
             f"kanban-intake: Hermes send skipped (warning only): exit={proc.returncode}",
             file=sys.stderr,
@@ -1313,6 +1316,7 @@ def _run(args: argparse.Namespace) -> int:
             sync_results.extend(_sync_board(config, token, dry_run=bool(args.dry_run)))
     predicted: list[str] = []
     telegram_sent = False
+    telegram_skipped = False
     if args.dry_run:
         for entry in sync_results:
             if not _should_notify_entry(entry):
@@ -1343,9 +1347,15 @@ def _run(args: argparse.Namespace) -> int:
             )
         # Telegram is a side-effect observer: a send failure is a warning
         # only and never fails or rolls back the reconciliation.  Without
-        # a configured bot/chat nothing is sent.
+        # a configured bot/chat nothing is sent.  ``telegram_sent`` is true
+        # ONLY for an actual delivery; a dedup-skipped duplicate reports
+        # ``telegram_skipped=true`` instead of masquerading as a send.
         if notification_lines and telegram_cfg:
-            telegram_sent = _send_telegram_batch(notification_lines, telegram_cfg)
+            result = _send_telegram_batch(notification_lines, telegram_cfg)
+            if result == "sent":
+                telegram_sent = True
+            elif result == "skipped":
+                telegram_skipped = True
     output = {
         "source": "github-issue",
         "filter": {"state": "open", "label": GITHUB_LABEL},
@@ -1369,6 +1379,7 @@ def _run(args: argparse.Namespace) -> int:
         "telegram_notifications": notification_lines,
         "telegram_notifications_predicted": predicted,
         "telegram_sent": telegram_sent,
+        "telegram_skipped": telegram_skipped,
     }
     print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     return 0
