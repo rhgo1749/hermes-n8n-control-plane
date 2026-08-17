@@ -141,7 +141,16 @@ class SyncError(RuntimeError):
 
 
 class GithubCompletionError(RuntimeError):
-    """A source-of-truth lookup could not be completed safely."""
+    """A source-of-truth lookup could not be completed safely.
+
+    ``status`` carries the HTTP status code when the failure came from a
+    GitHub API HTTP error response; it is ``None`` for transport, decode,
+    and locally raised failures.
+    """
+
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -239,7 +248,9 @@ class GithubApiClient:
                 headers = {str(k).lower(): str(v) for k, v in response.headers.items()}
                 return payload, headers
         except HTTPError as exc:
-            raise GithubCompletionError(f"GitHub API {exc.code} for {path}") from exc
+            raise GithubCompletionError(
+                f"GitHub API {exc.code} for {path}", status=int(exc.code)
+            ) from exc
         except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise GithubCompletionError(
                 f"GitHub API request failed for {path}: {type(exc).__name__}"
@@ -641,8 +652,9 @@ def evaluate_rework(
         return None
     rework_prs: list[GithubPullRequest] = []
     for pr in open_prs:
-        labels, _ = client.get(f"/repos/{ref.repository}/issues/{pr.number}/labels")
-        names = {str(item.get("name")) for item in labels if isinstance(item, dict)}
+        # PRs come from the current decision, freshly fetched from
+        # ``/pulls/{n}`` in this sync run: existence is authoritative.
+        names = _pr_labels(client, ref.repository, pr.number, pr_exists=True)
         if REWORK_LABEL in names:
             rework_prs.append(pr)
     if not rework_prs:
@@ -1172,8 +1184,37 @@ def _remove_label(
     )
 
 
-def _pr_labels(client: Any, repository: str, pr_number: int) -> set[str]:
-    labels, _ = client.get(f"/repos/{repository}/issues/{pr_number}/labels")
+def _pr_labels(
+    client: Any,
+    repository: str,
+    pr_number: int,
+    *,
+    pr_exists: bool = False,
+) -> set[str]:
+    """Return label names for a PR, failing closed on lookup errors.
+
+    GitHub serves some valid PRs (their ``pulls/{n}`` view exists and was
+    fetched in the current decision) whose issues-side
+    ``issues/{n}/labels`` endpoint answers 404 even though the PR carries
+    no labels.  A 404 from this exact labels endpoint is treated as an
+    empty label set ONLY when the caller has already authoritatively
+    established PR existence in the current decision/context
+    (``pr_exists=True``).  Every other failure — 401/403, other HTTP
+    errors, transport/timeout, malformed payloads, and a labels-404
+    without that proof — remains fail-closed.
+    """
+    try:
+        labels, _ = client.get(f"/repos/{repository}/issues/{pr_number}/labels")
+    except GithubCompletionError as exc:
+        labels_404 = (
+            pr_exists
+            and exc.status == 404
+            and re.search(r"/repos/[^/]+/[^/]+/issues/\d+/labels$", str(exc))
+            is not None
+        )
+        if not labels_404:
+            raise
+        return set()
     if not isinstance(labels, list):
         raise GithubCompletionError(
             f"GitHub returned invalid labels for {repository}#{pr_number}"
@@ -1225,8 +1266,9 @@ def _linked_pr_evidence(client: Any, ref: GithubTaskRef, pull_requests: Iterable
     """GitHub-visible blocker evidence on linked PRs: agent-rework label or
     trusted-actor content on an open/draft PR (a blocker handoff)."""
     for pr in pull_requests:
-        labels, _ = client.get(f"/repos/{ref.repository}/issues/{pr.number}/labels")
-        names = {str(item.get("name")) for item in labels if isinstance(item, dict)}
+        # PRs come from the current decision, freshly fetched from
+        # ``/pulls/{n}`` in this sync run: existence is authoritative.
+        names = _pr_labels(client, ref.repository, pr.number, pr_exists=True)
         if REWORK_LABEL in names:
             return True
         if pr.state != "open" and not pr.draft:
@@ -2263,7 +2305,9 @@ def _rework_context(
     if len(prs) != 1:
         return None
     pr = prs[0]
-    labels = _pr_labels(client, ref.repository, pr.number)
+    # The PR comes from the current decision, freshly fetched from
+    # ``/pulls/{n}`` in this sync run: existence is authoritative.
+    labels = _pr_labels(client, ref.repository, pr.number, pr_exists=True)
     return {
         "task_id": task_id,
         "repository": ref.repository,
