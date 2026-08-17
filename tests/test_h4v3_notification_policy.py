@@ -120,6 +120,62 @@ def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
         conn.close()
 
 
+def test_send_dedup_skip_reports_skipped_and_never_invokes_hermes_send() -> None:
+    import shutil
+    import tempfile
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-skip-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        state_dir = home / "state"
+        state_dir.mkdir(parents=True)
+        lines = ["⚠️ [re-bound] Re-Bound #106 · 확인 필요 — rework_context_failed — t"]
+        text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
+        (state_dir / "kanban-intake-last-sent.txt").write_text(text, encoding="utf-8")
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("hermes send must not run on a dedup skip")
+
+        setattr(intake.subprocess, "run", fail_if_called)
+        result = intake._send_telegram_batch(lines, ("123", ""))
+        assert result == "skipped", result
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_delivery_reports_sent_and_writes_state() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-send-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        lines = ["line-one"]
+        result = intake._send_telegram_batch(lines, ("123", "456"))
+        assert result == "sent", result
+        assert len(captured) == 1
+        state = (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
+        assert state == "🤖 Hermes Kanban\n\nline-one", state
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def main() -> int:
     tests = [
         value
