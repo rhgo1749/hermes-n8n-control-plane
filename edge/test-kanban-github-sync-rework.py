@@ -2271,6 +2271,189 @@ def test_79_inherited_kanban_paths_are_isolated():
                 os.environ[key] = value
 
 
+def _set_consumed_round_pr_number(tid: str, pr_number: int) -> None:
+    """Point the consumed round's governing event at another PR number."""
+    with connect_closing() as conn:
+        row = conn.execute(
+            "SELECT payload, id FROM task_events WHERE task_id = ? "
+            "AND kind = 'github_pr_rework' ORDER BY created_at DESC, id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert row is not None, "no consumed github_pr_rework event"
+        payload = json.loads(row[0])
+        payload["pr_number"] = pr_number
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), row[1]),
+        )
+        conn.commit()
+
+
+def _assert_consumed_round_fail_closed(
+    fake: FakeGitHub, tid: str, diagnostic: str, label: str,
+) -> None:
+    """BLOCKED consumed round with broken provenance stays fail-closed.
+
+    The card is never projected to REVIEW, no generic ``github_pr_sync``
+    or ``github_pr_rework_delivery`` event is written, an active worker
+    keeps ``agent-working``, and a second reconciliation adds no duplicate
+    attention or operator events.
+    """
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check(f"{label}: provenance attention", any(
+        r.get("reason") == "rework_human_attention"
+        and r.get("diagnostic") == diagnostic for r in entries
+    ), str(entries))
+    check(f"{label}: remains blocked", task_row(tid)["status"] == "blocked",
+          str(task_row(tid)))
+    check(f"{label}: no review projection", not any(
+        r.get("status") == "review"
+        or r.get("reason") in {"agent_review_ready", "linked_pr_open"}
+        for r in entries
+    ), str(entries))
+    events = task_events(tid)
+    check(f"{label}: no generic sync/delivery", not any(
+        e["kind"] in {"github_pr_sync", "github_pr_rework_delivery"}
+        for e in events
+    ), str(events))
+    attention = len([e for e in events if e["kind"] == "github_pr_rework_attention"])
+    operator = len([e for e in events if e["kind"] == "github_operator_attention"])
+    check(f"{label}: one attention event", attention == 1, str(events))
+    results2 = run_sync(fake)
+    entries2 = [r for r in results2 if r.get("task_id") == tid]
+    check(f"{label}: second tick remains blocked",
+          task_row(tid)["status"] == "blocked", str(entries2))
+    check(f"{label}: second tick attention retained", any(
+        r.get("reason") == "rework_human_attention"
+        and r.get("diagnostic") == diagnostic for r in entries2
+    ), str(entries2))
+    check(f"{label}: second tick no review projection", not any(
+        r.get("status") == "review"
+        or r.get("reason") in {"agent_review_ready", "linked_pr_open"}
+        for r in entries2
+    ), str(entries2))
+    events2 = task_events(tid)
+    check(f"{label}: attention idempotent", len([
+        e for e in events2 if e["kind"] == "github_pr_rework_attention"
+    ]) == attention, str(events2))
+    check(f"{label}: operator attention idempotent", len([
+        e for e in events2 if e["kind"] == "github_operator_attention"
+    ]) == operator, str(events2))
+    check(f"{label}: second tick no sync/delivery", not any(
+        e["kind"] in {"github_pr_sync", "github_pr_rework_delivery"}
+        for e in events2
+    ), str(events2))
+
+
+def test_80_wrong_task_completion_marker_stays_blocked():
+    print("80. BLOCKED + delivery marker naming a DIFFERENT task -> attention, no review")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    # A different, non-GitHub-backed task the marker wrongly names.
+    other_tid = new_task("done")
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?",
+                     ("unrelated task", other_tid))
+        conn.commit()
+    final_head = "0123456789abcdef0123456789abcdef00000801"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(
+        tid, head=final_head, outcome="blocked",
+        summary="human_validation_required: device gate remains",
+    )
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,))
+        conn.commit()
+    # Complete marker, but bound to the other task: wrong-task provenance.
+    _post_completion_marker(fake, other_tid, final_head, request_comment=1)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("human attention (handoff missing)", any(
+        r.get("reason") == "rework_human_attention"
+        and r.get("diagnostic") == "completion_handoff_missing" for r in entries
+    ), str(entries))
+    check("remains blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check("no review projection", not any(
+        r.get("status") == "review" or r.get("reason") == "agent_review_ready"
+        for r in entries
+    ), str(entries))
+    events = task_events(tid)
+    check("no generic sync/delivery", not any(
+        e["kind"] in {"github_pr_sync", "github_pr_rework_delivery"}
+        for e in events
+    ), str(events))
+    with connect_closing() as conn:
+        comments = kanban_db.list_comments(conn, tid)
+    check("attention comment recorded", any(
+        mod.REWORK_ATTENTION_MARKER in c.body for c in comments
+    ), str([c.body for c in comments]))
+    check("agent-rework label retained",
+          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    attention = len([e for e in events if e["kind"] == "github_pr_rework_attention"])
+    results2 = run_sync(fake)
+    entries2 = [r for r in results2 if r.get("task_id") == tid]
+    check("second tick remains blocked", task_row(tid)["status"] == "blocked",
+          str(entries2))
+    check("second tick no review projection", not any(
+        r.get("status") == "review" or r.get("reason") == "agent_review_ready"
+        for r in entries2
+    ), str(entries2))
+    events2 = task_events(tid)
+    check("attention idempotent on second tick", len([
+        e for e in events2 if e["kind"] == "github_pr_rework_attention"
+    ]) == attention, str(events2))
+    check("second tick no sync/delivery", not any(
+        e["kind"] in {"github_pr_sync", "github_pr_rework_delivery"}
+        for e in events2
+    ), str(events2))
+    check("unrelated task untouched", task_row(other_tid)["status"] == "done",
+          str(task_row(other_tid)))
+
+
+def test_81_consumed_round_unresolved_pr_stays_blocked():
+    print("81. BLOCKED + consumed round pr_number=999 (does not resolve) -> attention, no review")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    _set_consumed_round_pr_number(tid, 999)
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,))
+        conn.commit()
+    # The round's worker was claimed: the live PR carries agent-working.
+    fake.pr_labels[PR_N] = ["agent-working"]
+    _assert_consumed_round_fail_closed(fake, tid, "rework_pr_unresolved", "unresolved-pr")
+    check("agent-working retained", fake.pr_labels.get(PR_N) == ["agent-working"],
+          str(fake.pr_labels))
+    results = run_sync(fake)
+    check("agent-working still retained", fake.pr_labels.get(PR_N) == ["agent-working"],
+          str(fake.pr_labels))
+
+
+def test_82_consumed_round_mismatched_pr_stays_blocked():
+    print("82. BLOCKED + consumed round pointing at a recreated/other PR -> attention, no review")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    _set_consumed_round_pr_number(tid, PR2_N)
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "completed_at=NULL WHERE id=?", (tid,))
+        conn.commit()
+    # A closed PR #82 exists but is not the issue's canonical PR: the
+    # round must not re-bind to it or fall through to generic review.
+    fake.prs[PR2_N] = make_pr(PR2_N, state="closed", merged=False, title="other PR")
+    fake.pr_labels[PR_N] = ["agent-working"]
+    _assert_consumed_round_fail_closed(fake, tid, "rework_pr_unresolved", "mismatched-pr")
+    check("agent-working retained", fake.pr_labels.get(PR_N) == ["agent-working"],
+          str(fake.pr_labels))
+    check("agent-working still retained", fake.pr_labels.get(PR_N) == ["agent-working"],
+          str(fake.pr_labels))
+
+
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2909,6 +3092,9 @@ def main() -> int:
         test_77_stale_round1_marker_not_current_round_delivery,
         test_78_round2_delivery_transitions_to_review_ready,
         test_79_inherited_kanban_paths_are_isolated,
+        test_80_wrong_task_completion_marker_stays_blocked,
+        test_81_consumed_round_unresolved_pr_stays_blocked,
+        test_82_consumed_round_mismatched_pr_stays_blocked,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
