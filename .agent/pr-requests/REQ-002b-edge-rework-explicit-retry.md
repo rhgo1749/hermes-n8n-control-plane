@@ -125,11 +125,12 @@ task=<task_id>
 - Implementation commit: `c4778d9c34c8ed59317867435444f3630acc1bc9` (rebase 전 원본)
 - Rebase commits (2026-08-18, onto `origin/main` `19461e2`):
   `8e4b904` (fix: explicit maintainer retry) → `80110cc` (REQ-002b delivery 기록)
-  → `d63e762` (live canary 기록); HEAD == `d63e762…` (아래 최종 SHA로 갱신)
-- Local/pushed SHA: rebase 후 새 head로 갱신 (아래 PR re-read 시점 값)
-  (`origin/fix/edge-rework-explicit-retry-issue2`와 동일)
+  → `d63e762` (live canary 기록) → `f164460` (rebase 프로비넌스/테스트 재번호 기록)
+- Local/pushed SHA: `f164460c0a44749ce42deec4ea005ec1aefb9531`
+  (`origin/fix/edge-rework-explicit-retry-issue2`와 동일, PR head 재확인)
 - PR: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/28 — OPEN 유지,
-  merge/auto-merge 금지 (rebase 후 mergeable 상태는 push 후 실제 재확인)
+  merge/auto-merge 금지 (rebase 후 재확인: **mergeable: MERGEABLE,
+  mergeStateStatus: CLEAN**)
 - Expected changed files: `edge/kanban-github-sync.py`,
   `edge/test-kanban-github-sync-rework.py`, `docs/EDGE_REWORK_LIFECYCLE.md`,
   `.agent/pr-requests/REQ-002b-edge-rework-explicit-retry.md`
