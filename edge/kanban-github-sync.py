@@ -2168,6 +2168,74 @@ def _completion_marker(
     return None
 
 
+def _malformed_completion_marker(
+    client: Any,
+    ref: GithubTaskRef,
+    pr: GithubPullRequest,
+    task_id: str,
+    rework_at: int,
+    request_comment_id: Optional[int],
+) -> Optional[tuple[int, list[str]]]:
+    """Locate the newest trust-eligible completion comment that FAILED parsing.
+
+    A comment that merely contains the ``AGENT_REWORK_COMPLETE`` marker
+    string but omits the strict key=value contract (``task=``,
+    ``request_comment=``, ``head=<40-hex>``, ``validation=passed``) is the
+    exact recurrence this helper exists to expose (ctrl-hangul PR #74
+    round 12: the marker was posted as a prose title line and the delivery
+    was silently rejected).  Structural validity is checked only — a comment
+    whose fields parse correctly is NOT malformed even when it cannot bind to
+    the live head (that is a separate ``run_head_mismatch`` /
+    ``rework_head_unchanged`` diagnostic, not a formatting defect).
+
+    Returns ``(comment_id, missing_fields)`` for the newest malformed
+    marker comment after the rework event, or ``None`` when no such comment
+    exists.
+    """
+    comments = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr.number}/comments",
+        {"per_page": 100},
+    )
+    for comment in reversed(comments):
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "")
+        if author not in TRUSTED_GITHUB_ACTORS:
+            continue
+        created_at = _parse_iso_ts(comment.get("created_at"))
+        if created_at is None or created_at < rework_at:
+            continue
+        body = str(comment.get("body") or "")
+        if REWORK_COMPLETE_MARKER not in body:
+            continue
+        fields: dict[str, str] = {}
+        for line in body.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+        missing: list[str] = []
+        if fields.get("task") != task_id:
+            missing.append("task")
+        head = fields.get("head", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            missing.append("head")
+        if fields.get("validation") != "passed":
+            missing.append("validation")
+        if (
+            request_comment_id is not None
+            and fields.get("request_comment") != str(request_comment_id)
+        ):
+            missing.append("request_comment")
+        if not missing:
+            return None  # a structurally valid marker exists on the PR
+        comment_id = comment.get("id")
+        if comment_id is None:
+            continue
+        return comment_id, missing
+    return None
+
+
 def _rework_delivery_evidence(
     conn: sqlite3.Connection,
     client: Any,
@@ -2196,6 +2264,23 @@ def _rework_delivery_evidence(
         else None,
     )
     if marker is None:
+        malformed = _malformed_completion_marker(
+            client,
+            ref,
+            pr,
+            task_id,
+            rework_at,
+            int(payload["request_comment_id"])
+            if payload.get("request_comment_id") is not None
+            else None,
+        )
+        if malformed is not None:
+            comment_id, missing_fields = malformed
+            return False, "completion_marker_malformed", {
+                "run_id": run["id"],
+                "completion_comment_id": comment_id,
+                "missing_fields": missing_fields,
+            }
         return False, "completion_handoff_missing", {"run_id": run["id"]}
     run_heads = _rework_head_candidates(run)
     if run_heads and marker["head"] not in run_heads:
@@ -2279,7 +2364,10 @@ def _rework_human_attention(reason: str, run: Optional[sqlite3.Row]) -> bool:
     return any(marker in text for marker in (
         "review-required", "needs_input", "needs maintainer",
         "human review", "host_validation_required", "human_validation_required",
-    )) or reason in {"delivery_run_missing", "completion_handoff_missing"}
+    )) or reason in {
+        "delivery_run_missing", "completion_handoff_missing",
+        "completion_marker_malformed",
+    }
 
 
 def _rework_context(
@@ -2402,6 +2490,82 @@ def _record_rework_attention(
             task_id,
             payload,
             kind="github_pr_rework_attention",
+        )
+    return True
+
+
+def _post_rework_attention_pr_comment(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    task_id: str,
+    reason: str,
+    evidence: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Post one idempotent machine-readable attention comment on the PR.
+
+    The Kanban-side attention record (task_comments + task_events) is
+    invisible on GitHub.  Without PR feedback a rejected completion marker
+    leaves the worker/reviewer blind and the round stalls silently
+    (ctrl-hangul PR #74 round 12 regression: the malformed marker was never
+    answered on the PR and the hold sat for two days).  The comment is
+    posted at most once per (task, reason) and never changes any state — the
+    fail-closed hold (BLOCKED card + restored agent-rework label, no
+    automatic retry) is untouched.  The exact regeneration templates are
+    included so the next round can proceed without guessing.
+
+    Returns True when a new comment was posted, False when it already
+    exists; raises :class:`GithubCompletionError` on API failure (callers
+    degrade to the existing hold without aborting the reconciliation).
+    """
+    existing = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr_number}/comments",
+        {"per_page": 100},
+    )
+    needle = f"{REWORK_ATTENTION_MARKER} task={task_id} reason={reason}"
+    for comment in existing:
+        if isinstance(comment, dict) and needle in str(comment.get("body") or ""):
+            return False
+    lines = [
+        f"{REWORK_ATTENTION_MARKER} task={task_id} reason={reason}",
+        "",
+        "This rework round's delivery could not be accepted automatically. The "
+        "Kanban task stays BLOCKED and the PR keeps the agent-rework label; no "
+        "automatic retry will start.",
+    ]
+    missing = evidence.get("missing_fields") if isinstance(evidence, dict) else None
+    if isinstance(missing, list) and missing:
+        lines += [
+            "",
+            "The newest completion comment contains AGENT_REWORK_COMPLETE but "
+            "failed the strict machine-readable contract. "
+            "Missing/invalid fields: " + ", ".join(str(x) for x in missing) + ".",
+        ]
+    lines += [
+        "",
+        "Re-post the completion handoff on this PR with a comment whose first "
+        "line is exactly AGENT_REWORK_COMPLETE, followed by these lines:",
+        "",
+        REWORK_COMPLETE_MARKER,
+        f"task={task_id}",
+        "request_comment=<github_comment_id | none>",
+        "head=<full 40-char PR head SHA>",
+        "validation=passed",
+        "",
+        "To open a NEW rework round instead, a trusted maintainer posts:",
+        "",
+        REWORK_RETRY_MARKER,
+        f"task={task_id}",
+        "",
+        "Each signal is consumed exactly once.",
+    ]
+    status, _ = client.post(
+        f"/repos/{ref.repository}/issues/{pr_number}/comments",
+        {"body": "\n".join(lines)},
+    )
+    if not 200 <= status < 300:
+        raise GithubCompletionError(
+            f"could not post rework attention comment (HTTP {status})"
         )
     return True
 
@@ -3235,6 +3399,17 @@ def _reconcile_rework_lifecycle(
             _record_rework_attention(
                 conn, task_id, context, reason=_delivery_reason, evidence=evidence,
             )
+            try:
+                _post_rework_attention_pr_comment(
+                    client, ref, int(context["pr_number"]), task_id,
+                    reason=_delivery_reason, evidence=evidence,
+                )
+            except GithubCompletionError as exc:
+                print(
+                    f"kanban-github-sync: attention PR comment failed for "
+                    f"{ref.repository}#{context['pr_number']} task={task_id}: {exc}",
+                    file=sys.stderr,
+                )
             return {
                 "task_id": task_id, "status": status, "changed": False,
                 "reason": "rework_human_attention",
@@ -3538,6 +3713,17 @@ def _reconcile_rework_lifecycle(
             _record_rework_attention(
                 conn, task_id, context, reason=delivery_reason, evidence=evidence,
             )
+            try:
+                _post_rework_attention_pr_comment(
+                    client, ref, int(context["pr_number"]), task_id,
+                    reason=delivery_reason, evidence=evidence,
+                )
+            except GithubCompletionError as exc:
+                print(
+                    f"kanban-github-sync: attention PR comment failed for "
+                    f"{ref.repository}#{context['pr_number']} task={task_id}: {exc}",
+                    file=sys.stderr,
+                )
             return {
                 "task_id": task_id, "status": status, "changed": False,
                 "reason": "rework_human_attention",
