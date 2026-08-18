@@ -42,7 +42,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 
 RESOURCE_CONFIG_KEY = "worker_resources"
@@ -214,13 +214,17 @@ def _worker_identity(pid: int, task_id: str) -> Optional[bool]:
 
 
 def _terminate_verified_worker(pid: int, grace_seconds: float) -> bool:
-    """Terminate a verified detached Hermes worker process group."""
+    """Terminate a verified Hermes worker, using its process group only when safe."""
     target = int(pid)
 
     def send(sig: int) -> None:
         try:
-            if hasattr(os, "killpg"):
-                os.killpg(target, sig)
+            # The core normally spawns detached workers as session/process
+            # group leaders, but do not assume that contract forever.  Only
+            # signal the group when its PGID is exactly the verified PID.
+            pgid = os.getpgid(target) if hasattr(os, "getpgid") else None
+            if pgid == target and hasattr(os, "killpg"):
+                os.killpg(pgid, sig)
             else:
                 os.kill(target, sig)
         except ProcessLookupError:
@@ -581,7 +585,19 @@ def install_resource_admission(edge_module: Any) -> None:
                         active_workers=active,
                     )
 
-                result = original(conn, kanban_db, board, *args, **kwargs)
+                # The resource policy above was resolved for this exact
+                # candidate.  Pin delegation to that task so a concurrent
+                # board change cannot make the core dispatcher silently fall
+                # through to a different pending task with another resource.
+                delegated_kwargs = dict(kwargs)
+                delegated_kwargs["task_ids"] = [task_id]
+                result = original(
+                    conn,
+                    kanban_db,
+                    board,
+                    *args,
+                    **delegated_kwargs,
+                )
                 for item in result:
                     if not isinstance(item, dict):
                         continue
