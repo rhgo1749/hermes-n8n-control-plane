@@ -2372,9 +2372,16 @@ def test_80_wrong_task_completion_marker_stays_blocked():
     _post_completion_marker(fake, other_tid, final_head, request_comment=1)
     results = run_sync(fake)
     entries = [r for r in results if r.get("task_id") == tid]
+    # A wrong-task marker is from THIS task's perspective a malformed marker
+    # (the required task= field does not bind): the delivery validator now
+    # reports completion_marker_malformed with missing_fields=['task'] so the
+    # PR feedback comment can name the defect.  The containment contract
+    # (blocked + attention + no sync/delivery + label retained) is unchanged.
     check("human attention (handoff missing)", any(
         r.get("reason") == "rework_human_attention"
-        and r.get("diagnostic") == "completion_handoff_missing" for r in entries
+        and r.get("diagnostic") in (
+            "completion_handoff_missing", "completion_marker_malformed",
+        ) for r in entries
     ), str(entries))
     check("remains blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
     check("no review projection", not any(
@@ -3600,6 +3607,123 @@ def test_101_evaluate_rework_labels_404_not_a_rework_request():
     check("no ReworkDecision for shadow PR without label", result is None, str(result))
 
 
+# ---------------------------------------------------------------------------
+# Attention PR feedback comment (recurrence prevention — ctrl-hangul PR #74
+# round-12 regression: a malformed AGENT_REWORK_COMPLETE marker was rejected
+# silently, with no PR-side feedback, and the hold stalled for two days).
+# ---------------------------------------------------------------------------
+
+def _pr_attention_comments(fake: FakeGitHub, tid: str, reason: str) -> list[str]:
+    needle = f"{mod.REWORK_ATTENTION_MARKER} task={tid} reason={reason}"
+    return [str(c.get("body") or "") for c in fake.issue_comments.get(PR_N, [])
+            if needle in str(c.get("body") or "")]
+
+
+def _all_pr_comment_bodies(fake: FakeGitHub) -> list[str]:
+    return [str(c.get("body") or "") for c in fake.issue_comments.get(PR_N, [])]
+
+
+def _malformed_marker_like_round12(fake: FakeGitHub, head: str) -> None:
+    """Post the exact ctrl-hangul PR #74 round-12 regression shape: the marker
+    string as a prose title line with NO key=value fields at all."""
+    _MARKER_ID[0] += 1
+    when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 400))
+    fake.issue_comments.setdefault(PR_N, []).append({
+        "id": _MARKER_ID[0],
+        "user": {"login": "rhgo1749"},
+        "body": f"AGENT_REWORK_COMPLETE (round 12, exact head {head})",
+        "created_at": when,
+        "updated_at": when,
+    })
+
+
+def test_102_malformed_marker_attention_posts_pr_feedback():
+    print("102. malformed AGENT_REWORK_COMPLETE marker -> completion_marker_malformed "
+          "+ one idempotent PR attention comment, stays BLOCKED")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    final_head = fake.prs[PR_N]["head"]["sha"]
+    _malformed_marker_like_round12(fake, final_head)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("attention recorded", any(
+        r.get("reason") == "rework_human_attention" for r in entries), str(entries))
+    check("diagnostic completion_marker_malformed", any(
+        r.get("diagnostic") == "completion_marker_malformed" for r in entries),
+        str(entries))
+    ev = [e for e in task_events(tid)
+          if e["kind"] == "github_pr_rework_attention"][-1]
+    check("event payload names missing fields", sorted(
+        (ev["payload"].get("evidence") or {}).get("missing_fields", [])) == sorted(
+            ["task", "head", "validation"]), str(ev["payload"]))
+    check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check("label agent-rework restored", fake.pr_labels.get(PR_N) == ["agent-rework"],
+          str(fake.pr_labels))
+    posted = _pr_attention_comments(fake, tid, "completion_marker_malformed")
+    check("PR feedback comment posted once", len(posted) == 1, str(posted))
+    check("comment lists missing fields", bool(posted) and (
+        "task, head, validation" in posted[0]), posted[0] if posted else "(none)")
+    check("comment carries marker template", bool(posted) and (
+        mod.REWORK_COMPLETE_MARKER in posted[0]),
+        posted[0] if posted else "(none)")
+    check("comment carries retry template", bool(posted) and (
+        mod.REWORK_RETRY_MARKER in posted[0]), posted[0] if posted else "(none)")
+
+
+def test_103_attention_pr_feedback_idempotent_across_ticks():
+    print("103. repeated ticks -> attention PR feedback stays single, hold stable")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    final_head = fake.prs[PR_N]["head"]["sha"]
+    _malformed_marker_like_round12(fake, final_head)
+    run_sync(fake)
+    attention_before = len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_attention"])
+    for i in range(2):
+        run_sync(fake)
+        check(f"tick {i + 1} stays blocked",
+              task_row(tid)["status"] == "blocked", str(task_row(tid)))
+        check(f"tick {i + 1} attention idempotent", len([
+            e for e in task_events(tid)
+            if e["kind"] == "github_pr_rework_attention"
+        ]) == attention_before, str(task_events(tid)))
+        check(f"tick {i + 1} PR feedback single", len(
+            _pr_attention_comments(fake, tid, "completion_marker_malformed")) == 1,
+            str(_all_pr_comment_bodies(fake)))
+
+
+def test_104_valid_marker_no_attention_feedback():
+    print("104. structurally valid marker -> review transition, no attention comment")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    final_head = fake.prs[PR_N]["head"]["sha"]
+    _post_completion_marker(fake, tid, final_head)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("delivery accepted", any(
+        r.get("reason") == "agent_review_ready" for r in entries), str(entries))
+    check("no attention record", not any(
+        e["kind"] == "github_pr_rework_attention" for e in task_events(tid)),
+        str(task_events(tid)))
+    check("no attention PR comment", not any(
+        mod.REWORK_ATTENTION_MARKER in b for b in _all_pr_comment_bodies(fake)),
+        str(_all_pr_comment_bodies(fake)))
+    check("label agent-review-ready",
+          fake.pr_labels.get(PR_N) == ["agent-review-ready"], str(fake.pr_labels))
+
+
+def test_105_no_marker_attention_feedback_generic():
+    print("105. no marker at all -> generic completion_handoff_missing feedback "
+          "comment without missing-fields detail")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("diagnostic completion_handoff_missing", any(
+        r.get("diagnostic") == "completion_handoff_missing" for r in entries),
+        str(entries))
+    posted = _pr_attention_comments(fake, tid, "completion_handoff_missing")
+    check("PR feedback comment posted", len(posted) == 1, str(posted))
+    check("no missing-fields detail", bool(posted) and (
+        "Missing/invalid fields" not in posted[0]), posted[0] if posted else "(none)")
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -3686,6 +3810,10 @@ def main() -> int:
         test_99_pr_labels_auth_transport_invalid_fail_closed,
         test_100_pr_labels_real_rework_label_preserved,
         test_101_evaluate_rework_labels_404_not_a_rework_request,
+        test_102_malformed_marker_attention_posts_pr_feedback,
+        test_103_attention_pr_feedback_idempotent_across_ticks,
+        test_104_valid_marker_no_attention_feedback,
+        test_105_no_marker_attention_feedback_generic,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

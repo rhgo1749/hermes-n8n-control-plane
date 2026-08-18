@@ -3,6 +3,20 @@
 Durable design record for the GitHub-visible PR rework lifecycle projected by
 the legacy edge reconciliation script (`edge/kanban-github-sync.py`).
 
+## Label meanings
+
+The five `agent-*` labels are the shared GitHub surface contract across
+`hermes-agent`-topic repositories (Issue vs PR scope is part of the
+contract and enforced by the sync):
+
+| Label | Scope | Meaning |
+|---|---|---|
+| `agent-ready` | Issues only | Hermes가 이 Issue를 자동 intake/작업해도 된다는 지속적 작업 허가. PR에는 붙이지 않음. |
+| `agent-rework` | Pull Requests only | maintainer가 이 PR을 다시 작업하라는 1회성 명령. Issue에는 붙이지 않음. |
+| `agent-working` | Pull Requests only | Hermes가 이 PR의 rework를 소유하고 작업 중인 상태. 완료 시 agent-review-ready로 전환. |
+| `agent-review-ready` | Pull Requests only | Hermes의 rework 배송이 완료되어 maintainer의 리뷰/머지를 기다리는 상태. |
+| `agent-blocked` | Issues only | 작업이 maintainer의 결정·입력·권한을 기다리는 상태. 해결 답변 후 제거하면 재개 가능. PR에는 붙이지 않음. |
+
 ## Goal
 
 Close the visibility gap where a rework worker owns a Kanban task while the
@@ -63,7 +77,7 @@ Rules:
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `agent-working` → `agent-rework` (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | task requeued `→ ready`, `github_pr_rework_retry` event, failure counted against `kanban.failure_limit` (circuit breaker preserved) |
 | `agent-rework` restored (BLOCKED hold) → new round | explicit trusted `AGENT_REWORK_RETRY` comment after the last attention, Issue open + `agent-ready`, comment id never consumed | `apply_rework` BLOCKED → READY + one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`), delivery contract comment bound to the retry comment id; label kept until the dispatch claim (see “Explicit maintainer retry”) |
-| `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / no run, or worker text asks for human input | labels restored, `HERMES_KANBAN_REWORK_ATTENTION` comment + `github_pr_rework_attention` event (idempotent per round); the comment body carries the exact `AGENT_REWORK_RETRY` retry instructions |
+| `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | labels restored, idempotent `HERMES_KANBAN_REWORK_ATTENTION` comment on the PR + Kanban `github_pr_rework_attention` event (per task + reason); the PR comment body carries the exact regeneration/`AGENT_REWORK_RETRY` instructions and — for `completion_marker_malformed` — the missing fields |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same tick |
 
 ## Ordering / race safety
@@ -94,6 +108,46 @@ request_comment=<github_comment_id | none>
 head=<full 40-char PR head SHA>
 validation=passed
 ```
+
+### Worker pre-post checklist (mandatory)
+
+Before posting `AGENT_REWORK_COMPLETE`, verify ALL of the following — a
+comment that merely contains the marker string without these exact
+key=value lines is REJECTED (ctrl-hangul PR #74 round-12 regression:
+`AGENT_REWORK_COMPLETE (round 12, exact head …)` as a prose title line was
+silently rejected and the hold stalled for two days):
+
+- [ ] first line is exactly `AGENT_REWORK_COMPLETE` — no suffix, no
+      parenthetical, no surrounding text on that line;
+- [ ] `task=<task_id>` matches the Kanban task id of the current round;
+- [ ] `request_comment=<github_comment_id | none>` — the retry comment id
+      when the round was opened by `AGENT_REWORK_RETRY`, else `none`;
+- [ ] `head=<full 40-char SHA>` — exactly 40 lowercase hex characters AND
+      equal to the live remote PR head (`git rev-parse HEAD` == remote PR
+      head, verified by a fresh GitHub read);
+- [ ] `validation=passed` exactly;
+- [ ] the comment is posted by a `TRUSTED_GITHUB_ACTORS` author after the
+      round event.
+
+### PR attention feedback comment
+
+The Kanban-side attention record alone is invisible on GitHub.  Whenever a
+delivery is rejected (`completion_handoff_missing`,
+`completion_marker_malformed`, provenance failures), the edge posts ONE
+idempotent machine-readable comment on the PR (per task + reason):
+
+```text
+HERMES_KANBAN_REWORK_ATTENTION
+task=<task_id>
+reason=<diagnostic>
+```
+
+The comment body always carries the exact `AGENT_REWORK_COMPLETE`
+regeneration template and the `AGENT_REWORK_RETRY` instruction; for
+`completion_marker_malformed` it additionally lists the missing/invalid
+fields so the worker can re-post correctly without guessing.  The comment is
+feedback only: it never changes state, never auto-retries, and posting
+failure degrades to the existing hold without aborting reconciliation.
 
 The rework contract (with the marker template) is appended to the task
 comments when the rework round is consumed, so the next worker sees it
@@ -170,7 +224,11 @@ full delivery, worker crash requeue, label conflict skip, merged cleanup,
 the pre-existing rework/blocked/annotation regressions, the DONE + OPEN PR
 invariants, the consumed-rework provenance fail-closed guard (PR #27 merge,
 tests 80–82), and the explicit maintainer retry (AGENT_REWORK_RETRY) ingress
-(tests 83–97; renumbered after PR #27 occupied 80–82).  Tests 63–70
+(tests 83–97; renumbered after PR #27 occupied 80–82), and the PR attention
+feedback comment + malformed-marker diagnostic (tests 102–105: malformed
+marker → `completion_marker_malformed` + one idempotent PR feedback comment,
+repeated-tick idempotency, valid marker → no attention comment, no-marker →
+generic feedback without missing-fields detail).  Tests 63–70
 pin the DONE + OPEN PR invariants: reviewer completion repair (63), rework
 completion → REVIEW on the same PR (64), delivered + merged → DONE (65),
 DONE + OPEN PR + stale `agent-working` self-heal (66, acceptance fixture
