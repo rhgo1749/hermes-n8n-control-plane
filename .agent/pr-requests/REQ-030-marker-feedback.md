@@ -82,8 +82,8 @@ ctrl-hangul PR #74 round-12의 완료 코멘트가 `AGENT_REWORK_COMPLETE (round
 ## Delivery / stop state
 
 - Branch: `fix/edge-marker-feedback-issue30`
-- Implementation commits: (커밋 후 기록)
-- PR: `rhgo1749/hermes-n8n-control-plane` PR 번호/URL (생성 후 기록)
+- Implementation commits: `3aad2fa` (초기 구현), 이후 REQ/PR 기록 갱신 커밋
+- PR: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/31 (PR #31, base main, head `3aad2fa·이후`)
 - Merge: 사용자가 chat에서 명시 승인(``머지``). 머지 수행 여부/시각을 PR body에 기록.
 - Deploy: 머지 후 라이브 `~/.hermes/scripts/kanban-github-sync.py`에 `deploy-intake-edge.sh`로 적용 + SHA 검증.
 
