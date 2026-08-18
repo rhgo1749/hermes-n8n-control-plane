@@ -23,6 +23,7 @@
 # Safety guarantees:
 #   * candidate copy + validation (py_compile, --help smoke) before any write
 #   * atomic replace via same-filesystem mv
+#   * edge dependencies are installed before the live wrapper switch
 #   * timestamped backup of the previous files (existing .bak-* convention)
 #   * rollback = restore the backup (exact command printed)
 #   * NEVER touches cron jobs.json / job id / schedule / enabled state
@@ -50,6 +51,9 @@ The live kanban-github-sync.py is a small resource-admission entrypoint. The
 canonical reconciliation implementation is deployed beside it as
 kanban-github-sync-core.py, plus kanban_resource_admission.py. If no
 kanban.worker_resources are configured, scheduling behavior is unchanged.
+The two edge dependencies are replaced before the live entrypoint, so a cron
+invocation during deploy sees either the old standalone sync or a fully backed
+new wrapper — never a wrapper whose imports have not been installed yet.
 
 Run this where the supplied --hermes-home path is the active Hermes runtime.
 For the current containerized deployment:
@@ -118,24 +122,28 @@ python3 "$CANDIDATE/repository_registry.py" --help >/dev/null 2>&1 || {
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run: candidate validated at $CANDIDATE"
-  echo "dry-run: would atomically replace:"
-  echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
-  echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
+  echo "dry-run: would atomically replace (dependencies before wrapper):"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync-core.py"
   echo "dry-run:   $TARGET_DIR/kanban_resource_admission.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
+  echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
+  echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
   rm -rf "$CANDIDATE"
   exit 0
 fi
 
-# 3) backups + atomic replace (mv is atomic on the same filesystem)
+# 3) backups + atomic replace (mv is atomic on the same filesystem).
+# Install the new edge dependencies first and switch the historical live
+# kanban-github-sync.py entrypoint LAST.  Until that final mv, an overlapping
+# cron invocation still executes the old standalone sync; after it, both
+# imports are already present.
 BACKUPS=()
 for name in \
-  github-agent-ready-kanban-intake.py \
-  kanban-github-sync.py \
   kanban-github-sync-core.py \
   kanban_resource_admission.py \
-  repository_registry.py
+  repository_registry.py \
+  github-agent-ready-kanban-intake.py \
+  kanban-github-sync.py
 do
   if [[ -f "$TARGET_DIR/$name" ]]; then
     backup="$TARGET_DIR/.bak-$name-$TS"
