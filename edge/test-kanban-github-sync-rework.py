@@ -3724,6 +3724,70 @@ def test_105_no_marker_attention_feedback_generic():
         "Missing/invalid fields" not in posted[0]), posted[0] if posted else "(none)")
 
 
+def test_106_same_head_rejection_posts_advance_feedback():
+    print("106. rework_head_unchanged -> one idempotent PR feedback comment "
+          "requiring a new head, retry routing preserved")
+    fake, tid = _attention_blocked_retry_hold()
+    retry_id = _post_retry_comment(fake, tid)
+    run_sync(fake)  # consume explicit retry -> ready (round 2)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    requested_head = fake.prs[PR_N]["head"]["sha"]
+    _close_rework_run(tid, head=requested_head, outcome="completed",
+                      summary="worker posted a valid marker without advancing head")
+    _post_completion_marker(fake, tid, requested_head, request_comment=retry_id)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("same-head diagnostic", any(
+        r.get("diagnostic") == "rework_head_unchanged"
+        or r.get("retry_reason") == "rework_head_unchanged" for r in entries),
+        str(entries))
+    check("retry routing preserved", any(
+        r.get("reason") == "rework_retry_scheduled" for r in entries), str(entries))
+    posted = _pr_attention_comments(fake, tid, "rework_head_unchanged")
+    check("advance feedback posted once", len(posted) == 1, str(posted))
+    check("feedback names requested head", bool(posted) and requested_head in posted[0],
+          posted[0] if posted else "(none)")
+    check("feedback requires different head", bool(posted) and (
+        "must DIFFER" in posted[0] and "advance the PR head" in posted[0]),
+        posted[0] if posted else "(none)")
+    run_sync(fake)
+    check("advance feedback idempotent", len(
+        _pr_attention_comments(fake, tid, "rework_head_unchanged")) == 1,
+        str(_all_pr_comment_bodies(fake)))
+
+
+def test_107_run_head_mismatch_posts_advance_feedback():
+    print("107. run_head_mismatch -> one PR feedback comment, generic crash retry "
+          "reasons still do not post head feedback")
+    fake, tid = _attention_blocked_retry_hold()
+    retry_id = _post_retry_comment(fake, tid)
+    run_sync(fake)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "retry round claim failed"
+        conn.commit()
+    requested_head = fake.prs[PR_N]["head"]["sha"]
+    live_head = "0123456789abcdef0123456789abcdef00000107"
+    fake.prs[PR_N]["head"]["sha"] = live_head
+    run_head = "0123456789abcdef0123456789abcdef00000108"
+    _close_rework_run(tid, head=run_head, outcome="completed",
+                      summary="worker run recorded a different head")
+    _post_completion_marker(fake, tid, live_head, request_comment=retry_id)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("run-head diagnostic", any(
+        r.get("diagnostic") == "run_head_mismatch"
+        or r.get("retry_reason") == "run_head_mismatch" for r in entries),
+        str(entries))
+    posted = _pr_attention_comments(fake, tid, "run_head_mismatch")
+    check("run-head feedback posted", len(posted) == 1, str(posted))
+    check("run-head feedback names requested head", bool(posted) and requested_head in posted[0],
+          posted[0] if posted else "(none)")
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -3814,6 +3878,8 @@ def main() -> int:
         test_103_attention_pr_feedback_idempotent_across_ticks,
         test_104_valid_marker_no_attention_feedback,
         test_105_no_marker_attention_feedback_generic,
+        test_106_same_head_rejection_posts_advance_feedback,
+        test_107_run_head_mismatch_posts_advance_feedback,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

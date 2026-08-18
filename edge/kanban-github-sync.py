@@ -108,6 +108,16 @@ REWORK_ATTENTION_MARKER = "HERMES_KANBAN_REWORK_ATTENTION"
 # retry evidence — the edge restores ``agent-rework`` during self-heal).
 REWORK_RETRY_MARKER = "AGENT_REWORK_RETRY"
 
+# Delivery rejections caused by PR-head binding (as opposed to a missing or
+# malformed marker).  For these the worker posted a structurally valid marker
+# but it cannot bind to the round: the head equals the round-requested head
+# (``rework_head_unchanged``) or no finished run recorded the live head
+# (``run_head_mismatch``).  The machine fails closed (retry, no state change)
+# and, since PR #32, posts one idempotent PR feedback comment telling the
+# worker EXACTLY that the head must advance — otherwise this class of
+# rejection stays silent (ctrl-hangul PR #74 round-13 regression).
+HEAD_BINDING_REJECT_REASONS = frozenset({"rework_head_unchanged", "run_head_mismatch"})
+
 # Sync-owned body region.  Between these markers the whole block is
 # REPLACED on every refresh — never appended — so the body cannot grow.
 SYNC_CONTEXT_BEGIN = "<!-- BEGIN GITHUB SYNC CONTEXT -->"
@@ -2501,22 +2511,29 @@ def _post_rework_attention_pr_comment(
     task_id: str,
     reason: str,
     evidence: Optional[Mapping[str, Any]] = None,
+    *,
+    requested_head: Optional[str] = None,
 ) -> bool:
     """Post one idempotent machine-readable attention comment on the PR.
 
     The Kanban-side attention record (task_comments + task_events) is
     invisible on GitHub.  Without PR feedback a rejected completion marker
     leaves the worker/reviewer blind and the round stalls silently
-    (ctrl-hangul PR #74 round 12 regression: the malformed marker was never
-    answered on the PR and the hold sat for two days).  The comment is
-    posted at most once per (task, reason) and never changes any state — the
-    fail-closed hold (BLOCKED card + restored agent-rework label, no
-    automatic retry) is untouched.  The exact regeneration templates are
-    included so the next round can proceed without guessing.
+    (ctrl-hangul PR #74 round 12/13 regressions: a malformed marker was never
+    answered on the PR, and later a same-head delivery was rejected without
+    explanation).  The comment is posted at most once per (task, reason) and
+    never changes any state — the fail-closed routing (attention hold or
+    retry) is untouched.  The exact regeneration templates are included so
+    the next round can proceed without guessing.
+
+    When ``requested_head`` is supplied the comment targets a head-binding
+    rejection (``rework_head_unchanged`` / ``run_head_mismatch``): the carrier
+    preamble is replaced with the head-advance requirement and the requested
+    head is named, so the worker does not re-post the same head and loop.
 
     Returns True when a new comment was posted, False when it already
     exists; raises :class:`GithubCompletionError` on API failure (callers
-    degrade to the existing hold without aborting the reconciliation).
+    degrade to the existing routing without aborting the reconciliation).
     """
     existing = client.get_paginated(
         f"/repos/{ref.repository}/issues/{pr_number}/comments",
@@ -2526,13 +2543,28 @@ def _post_rework_attention_pr_comment(
     for comment in existing:
         if isinstance(comment, dict) and needle in str(comment.get("body") or ""):
             return False
-    lines = [
+    lines: list[str] = [
         f"{REWORK_ATTENTION_MARKER} task={task_id} reason={reason}",
         "",
-        "This rework round's delivery could not be accepted automatically. The "
-        "Kanban task stays BLOCKED and the PR keeps the agent-rework label; no "
-        "automatic retry will start.",
     ]
+    if requested_head:
+        lines += [
+            "This delivery was rejected because the completion handoff cannot "
+            "bind to this round: the marker head must be the LIVE PR head AND "
+            "must DIFFER from the round-requested head.",
+            "",
+            f"Round-requested head: {requested_head}",
+            "Push at least one bounded commit to advance the PR head beyond the "
+            "requested head (do not reuse it), verify the new live PR head, then "
+            "re-post AGENT_REWORK_COMPLETE with the NEW 40-char head. Do not post "
+            "the marker with the requested head again — it will keep being rejected.",
+        ]
+    else:
+        lines += [
+            "This rework round's delivery could not be accepted automatically. The "
+            "Kanban task stays BLOCKED and the PR keeps the agent-rework label; "
+            "no automatic retry will start.",
+        ]
     missing = evidence.get("missing_fields") if isinstance(evidence, dict) else None
     if isinstance(missing, list) and missing:
         lines += [
@@ -3743,6 +3775,31 @@ def _reconcile_rework_lifecycle(
                 "task_id": task_id, "status": status, "changed": False,
                 "reason": "rework_retry_label_projection_failed", "error": str(exc),
             }
+        if delivery_reason in HEAD_BINDING_REJECT_REASONS:
+            # Same-head / unbindable-head rejections are silent today: the
+            # marker is structurally valid so nothing is posted, and the worker
+            # re-posts the same head into another retry (ctrl-hangul PR #74
+            # round-13 regression).  Post exactly one PR feedback comment
+            # naming the requested head and the head-advance requirement.  It
+            # is feedback only — the requeue/retry routing below is unchanged.
+            try:
+                requested_head = ""
+                event_payload = context.get("event")
+                if isinstance(event_payload, tuple) and event_payload and isinstance(
+                    event_payload[0], dict
+                ):
+                    requested_head = str(event_payload[0].get("head_sha") or "")
+                _post_rework_attention_pr_comment(
+                    client, ref, int(context["pr_number"]), task_id,
+                    reason=delivery_reason, evidence=evidence,
+                    requested_head=requested_head or None,
+                )
+            except GithubCompletionError as exc:
+                print(
+                    f"kanban-github-sync: head-bind feedback comment failed for "
+                    f"{ref.repository}#{context['pr_number']} task={task_id}: {exc}",
+                    file=sys.stderr,
+                )
         result = _requeue_rework_task(
             conn, kanban_db, task_id, context,
             reason=delivery_reason, failure_limit=failure_limit,

@@ -125,6 +125,12 @@ silently rejected and the hold stalled for two days):
 - [ ] `head=<full 40-char SHA>` — exactly 40 lowercase hex characters AND
       equal to the live remote PR head (`git rev-parse HEAD` == remote PR
       head, verified by a fresh GitHub read);
+- [ ] For a rework delivery, the new marker head MUST DIFFER from the
+      round-requested `head_sha`. A same-head marker is rejected as
+      `rework_head_unchanged`; push at least one bounded commit first.
+- [ ] The worker run's final summary/metadata records that same full head.
+      A live PR head pushed outside the worker run is not sufficient: if the
+      run records another head, the edge rejects it as `run_head_mismatch`.
 - [ ] `validation=passed` exactly;
 - [ ] the comment is posted by a `TRUSTED_GITHUB_ACTORS` author after the
       round event.
@@ -133,8 +139,9 @@ silently rejected and the hold stalled for two days):
 
 The Kanban-side attention record alone is invisible on GitHub.  Whenever a
 delivery is rejected (`completion_handoff_missing`,
-`completion_marker_malformed`, provenance failures), the edge posts ONE
-idempotent machine-readable comment on the PR (per task + reason):
+`completion_marker_malformed`, `rework_head_unchanged`, `run_head_mismatch`,
+provenance failures), the edge posts ONE idempotent machine-readable comment
+on the PR (per task + reason):
 
 ```text
 HERMES_KANBAN_REWORK_ATTENTION
@@ -145,8 +152,10 @@ reason=<diagnostic>
 The comment body always carries the exact `AGENT_REWORK_COMPLETE`
 regeneration template and the `AGENT_REWORK_RETRY` instruction; for
 `completion_marker_malformed` it additionally lists the missing/invalid
-fields so the worker can re-post correctly without guessing.  The comment is
-feedback only: it never changes state, never auto-retries, and posting
+fields so the worker can re-post correctly without guessing. For
+`rework_head_unchanged` and `run_head_mismatch`, it names the requested head
+and explicitly requires a new worker-owned head before re-posting. The comment
+is feedback only: it never changes state, never auto-retries, and posting
 failure degrades to the existing hold without aborting reconciliation.
 
 The rework contract (with the marker template) is appended to the task
