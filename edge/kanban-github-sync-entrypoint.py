@@ -2,12 +2,14 @@
 """Deployment entrypoint for GitHub/Kanban edge reconciliation.
 
 The large canonical reconciliation implementation stays in
-``kanban-github-sync.py`` in the repository.  During deployment it is copied
+``kanban-github-sync.py`` in the repository. During deployment it is copied
 beside this entrypoint as ``kanban-github-sync-core.py`` while this file is
 installed under the historical live name ``kanban-github-sync.py``.
 
-Keeping the admission overlay separate makes the scheduler extension small
-and replaceable while preserving the existing reconciliation code and tests.
+Small, independently reviewable overlays are installed here so the canonical
+state machine can stay unchanged: resource admission controls worker capacity,
+and head-binding feedback adds observational PR guidance without changing
+rework transitions.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+from kanban_head_binding_feedback import install_head_binding_feedback
 from kanban_resource_admission import install_resource_admission
 
 
@@ -43,6 +46,7 @@ def _load_core() -> ModuleType:
     sys.modules[name] = module
     spec.loader.exec_module(module)
     install_resource_admission(module)
+    install_head_binding_feedback(module)
     return module
 
 
