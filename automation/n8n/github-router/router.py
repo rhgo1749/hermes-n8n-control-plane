@@ -37,6 +37,12 @@ SCOPE_TTL_SECONDS = int(
         str(max(WAIT_SECONDS + 120, 300)),
     )
 )
+DELIVERY_TTL_SECONDS = int(
+    os.environ.get("GITHUB_ROUTER_DELIVERY_TTL_SECONDS", "3600")
+)
+DELIVERY_MAX_ENTRIES = int(
+    os.environ.get("GITHUB_ROUTER_DELIVERY_MAX_ENTRIES", "4096")
+)
 STATE_PATH = Path(
     os.environ.get("GITHUB_ROUTER_STATE_PATH", "/state/github-router.json")
 )
@@ -61,6 +67,7 @@ HERMES_TOKEN_FILE = Path(
 MAX_BODY_BYTES = 1024 * 1024
 SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request"}
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+_DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _STATE_LOCK = threading.Lock()
 
 
@@ -244,6 +251,97 @@ def _queue_status() -> dict[str, Any]:
         "queued_scopes": len(queue),
         "managed_count": len(managed),
     }
+
+
+def _prune_deliveries(raw_map: object, now: int | None = None) -> dict[str, dict[str, int]]:
+    now = int(time.time()) if now is None else now
+    if not isinstance(raw_map, dict):
+        return {}
+    kept: dict[str, dict[str, int]] = {}
+    for raw_id, raw_entry in raw_map.items():
+        delivery_id = str(raw_id).strip()
+        if not _DELIVERY_ID_RE.match(delivery_id):
+            continue
+        if not isinstance(raw_entry, dict):
+            continue
+        try:
+            expires_at = int(raw_entry.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if expires_at <= now:
+            continue
+        try:
+            created_at = int(raw_entry.get("created_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        kept[delivery_id] = {"created_at": created_at, "expires_at": expires_at}
+    return kept
+
+
+def _cap_deliveries(
+    kept: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    if len(kept) <= DELIVERY_MAX_ENTRIES:
+        return kept
+    oldest_first = sorted(kept.items(), key=lambda item: item[1]["created_at"])
+    overflow = len(kept) - DELIVERY_MAX_ENTRIES
+    evicted = {item[0] for item in oldest_first[:overflow]}
+    for delivery_id in evicted:
+        del kept[delivery_id]
+    return kept
+
+
+def _bounded_deliveries(
+    raw_map: object, now: int | None = None
+) -> dict[str, dict[str, int]]:
+    return _cap_deliveries(_prune_deliveries(raw_map, now))
+
+
+def _claim_delivery(
+    delivery_id: str, now: int | None = None
+) -> tuple[str, bool]:
+    """Atomically claim a signed delivery ID for downstream dispatch.
+
+    Returns ("duplicate", True) when the ID was already recorded inside its
+    TTL (replay), or ("fresh", False) when this call owns the dispatch. The
+    claim persists in the router state file so restarts keep deduplicating.
+    The cap is applied after the insert so the stored set never exceeds
+    DELIVERY_MAX_ENTRIES.
+    """
+    now = int(time.time()) if now is None else now
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        kept = _bounded_deliveries(state.get("delivery_dedupe"), now)
+        if delivery_id in kept:
+            state["delivery_dedupe"] = kept
+            _write_state_unlocked(state)
+            return "duplicate", True
+        kept[delivery_id] = {
+            "created_at": now,
+            "expires_at": now + DELIVERY_TTL_SECONDS,
+        }
+        kept = _cap_deliveries(kept)
+        state["delivery_dedupe"] = kept
+        _write_state_unlocked(state)
+        return "fresh", False
+
+
+def _release_delivery(
+    delivery_id: str, now: int | None = None
+) -> None:
+    """Drop a recorded delivery so a later retry can dispatch again.
+
+    Used when dispatching failed (5xx): GitHub retries failed deliveries and
+    the operator can resend, so a failed delivery must not be suppressed.
+    """
+    now = int(time.time()) if now is None else now
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        kept = _bounded_deliveries(state.get("delivery_dedupe"), now)
+        if delivery_id in kept:
+            del kept[delivery_id]
+        state["delivery_dedupe"] = kept
+        _write_state_unlocked(state)
 
 
 def _service_authorized(header: str) -> bool:
@@ -602,7 +700,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/github/hermes-intake":
-            self._github_event()
+            try:
+                self._github_event()
+            except UnicodeEncodeError:
+                # A header value (e.g. X-GitHub-Delivery) is not ASCII: the
+                # signed-ingress surface must fail closed instead of killing
+                # the request handler.
+                try:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": "invalid_header"},
+                    )
+                except Exception:
+                    self.close_connection = True
             return
         authorization = self.headers.get("Authorization", "").strip()
         if not _service_authorized(authorization):
@@ -687,9 +797,43 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "invalid_signature"},
             )
             return
+        delivery_id = self.headers.get("X-GitHub-Delivery", "").strip()
+        if not _DELIVERY_ID_RE.match(delivery_id):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_delivery_id"},
+            )
+            return
+        try:
+            decision, is_duplicate = _claim_delivery(delivery_id)
+        except RouterError as exc:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "error": str(exc)},
+            )
+            return
+        if is_duplicate:
+            print(
+                "github-router duplicate/no-op delivery "
+                f"delivery={delivery_id}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {
+                    "ok": True,
+                    "duplicate": True,
+                    "reason": "duplicate_delivery",
+                    "delivery": delivery_id,
+                },
+            )
+            return
         event = self.headers.get("X-GitHub-Event", "").strip()
         if event == "ping":
-            self._send_json(HTTPStatus.OK, {"ok": True, "event": "ping"})
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, "event": "ping", "delivery": delivery_id},
+            )
             return
         if event not in SUPPORTED_EVENTS:
             self._send_json(
@@ -699,6 +843,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ignored": True,
                     "reason": "unsupported_event",
                     "event": event,
+                    "delivery": delivery_id,
                 },
             )
             return
@@ -728,12 +873,17 @@ class Handler(BaseHTTPRequestHandler):
                         "ignored": True,
                         "reason": "repository_not_managed",
                         "repository": repository,
+                        "delivery": delivery_id,
                     },
                 )
                 return
             scope = _enqueue_scope(full=False, repository=repository)
             wake = _wake()
         except RouterError as exc:
+            # A failed dispatch (lease-controller/GitHub error) must not
+            # suppress the delivery: release the claim so the GitHub 5xx
+            # retry or an operator resend can dispatch again.
+            _release_delivery(delivery_id)
             self._send_json(
                 HTTPStatus.BAD_GATEWAY,
                 {"ok": False, "error": str(exc)},
@@ -746,6 +896,7 @@ class Handler(BaseHTTPRequestHandler):
                 "queued": True,
                 "repository": repository,
                 "event": event,
+                "delivery": delivery_id,
                 "scope": scope,
                 "wake": wake,
             },

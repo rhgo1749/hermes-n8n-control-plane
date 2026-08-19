@@ -45,6 +45,9 @@ def main() -> int:
     assert "_enqueue_scope" in router_source
     assert "_claim_scope" in router_source
     assert "X-Hub-Signature-256" in router_source
+    assert "X-GitHub-Delivery" in router_source
+    assert "_claim_delivery" in router_source
+    assert "delivery_dedupe" in router_source
     assert '"/github/hermes-intake"' in router_source
     assert '"/fallback"' in router_source
     assert '"/reconcile"' in router_source

@@ -14,6 +14,7 @@ GitHub repository event
           ▼
    github-router :5681
      HMAC verify
+     delivery dedupe (X-GitHub-Delivery)
      enqueue repo scope
           │
           ▼
