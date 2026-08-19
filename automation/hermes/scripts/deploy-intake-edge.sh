@@ -14,6 +14,14 @@
 # repository registry from the same runtime directory, so all deployed files
 # must be updated together.
 #
+# The canonical intake source remains
+# automation/hermes/scripts/github-agent-ready-kanban-intake.py. Deployment
+# installs it as github-agent-ready-kanban-intake-core.py and installs the small
+# completion-contract entrypoint under the historical live name
+# github-agent-ready-kanban-intake.py. The wrapper keeps worker completion on
+# core kanban_complete while the edge remains the sole GitHub done<->review
+# projection owner, preventing core review-worker self-reclaim loops.
+#
 # The canonical edge reconciliation source remains edge/kanban-github-sync.py.
 # Deployment installs it as kanban-github-sync-core.py and installs the small
 # resource-admission entrypoint under the historical live name
@@ -24,14 +32,15 @@
 # Safety guarantees:
 #   * candidate copy + validation (py_compile, --help smoke) before any write
 #   * atomic replace via same-filesystem mv
-#   * edge dependencies are installed before the live wrapper switch
+#   * wrapper dependencies are installed before either live wrapper switch
 #   * timestamped backup of the previous files (existing .bak-* convention)
 #   * rollback = restore the backup (exact command printed)
 #   * NEVER touches cron jobs.json / job id / schedule / enabled state
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-INT_SOURCE="$ROOT/automation/hermes/scripts/github-agent-ready-kanban-intake.py"
+INT_ENTRY_SOURCE="$ROOT/automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py"
+INT_CORE_SOURCE="$ROOT/automation/hermes/scripts/github-agent-ready-kanban-intake.py"
 EDGE_ENTRY_SOURCE="$ROOT/edge/kanban-github-sync-entrypoint.py"
 EDGE_CORE_SOURCE="$ROOT/edge/kanban-github-sync.py"
 EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
@@ -49,13 +58,19 @@ $HERMES_HOME/scripts/ using candidate copy -> validation -> atomic replace,
 keeping timestamped backups (.bak-<name>-<ts>). Rollback command is printed
 after deploy.
 
+The live github-agent-ready-kanban-intake.py is a small completion-contract
+entrypoint. The canonical intake implementation is deployed beside it as
+github-agent-ready-kanban-intake-core.py. GitHub-backed workers use core
+kanban_complete as their terminal action; the edge owns parked review/done
+projection from fresh GitHub state.
+
 The live kanban-github-sync.py is a small overlay entrypoint. The canonical
 reconciliation implementation is deployed beside it as kanban-github-sync-core.py,
 plus kanban_resource_admission.py and kanban_head_binding_feedback.py. If no
 kanban.worker_resources are configured, scheduling behavior is unchanged.
-All edge dependencies are replaced before the live entrypoint, so a cron
-invocation during deploy sees either the old standalone sync or a fully backed
-new wrapper — never a wrapper whose imports have not been installed yet.
+All wrapper dependencies are replaced before the corresponding live entrypoint,
+so a cron invocation during deploy sees either the old standalone script or a
+fully backed new wrapper — never a wrapper whose imports have not been installed.
 
 Run this where the supplied --hermes-home path is the active Hermes runtime.
 For the current containerized deployment:
@@ -75,7 +90,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 for source in \
-  "$INT_SOURCE" \
+  "$INT_ENTRY_SOURCE" \
+  "$INT_CORE_SOURCE" \
   "$EDGE_ENTRY_SOURCE" \
   "$EDGE_CORE_SOURCE" \
   "$EDGE_ADMISSION_SOURCE" \
@@ -95,7 +111,8 @@ TARGET_DIR="$HERMES_HOME/scripts"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 CANDIDATE="$TARGET_DIR/.deploy-candidate-${TS}"
 install -d -m 700 "$CANDIDATE"
-cp -p "$INT_SOURCE" "$CANDIDATE/github-agent-ready-kanban-intake.py"
+cp -p "$INT_ENTRY_SOURCE" "$CANDIDATE/github-agent-ready-kanban-intake.py"
+cp -p "$INT_CORE_SOURCE" "$CANDIDATE/github-agent-ready-kanban-intake-core.py"
 cp -p "$EDGE_ENTRY_SOURCE" "$CANDIDATE/kanban-github-sync.py"
 cp -p "$EDGE_CORE_SOURCE" "$CANDIDATE/kanban-github-sync-core.py"
 cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
@@ -105,6 +122,7 @@ cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 # 2) validation: compile + argparse smoke (--help exits 0)
 python3 -m py_compile \
   "$CANDIDATE/github-agent-ready-kanban-intake.py" \
+  "$CANDIDATE/github-agent-ready-kanban-intake-core.py" \
   "$CANDIDATE/kanban-github-sync.py" \
   "$CANDIDATE/kanban-github-sync-core.py" \
   "$CANDIDATE/kanban_resource_admission.py" \
@@ -113,7 +131,10 @@ python3 -m py_compile \
   rm -rf "$CANDIDATE"; echo "candidate validation failed (py_compile)" >&2; exit 1;
 }
 python3 "$CANDIDATE/github-agent-ready-kanban-intake.py" --help >/dev/null 2>&1 || {
-  rm -rf "$CANDIDATE"; echo "candidate validation failed (intake --help)" >&2; exit 1;
+  rm -rf "$CANDIDATE"; echo "candidate validation failed (intake wrapper --help)" >&2; exit 1;
+}
+python3 "$CANDIDATE/github-agent-ready-kanban-intake-core.py" --help >/dev/null 2>&1 || {
+  rm -rf "$CANDIDATE"; echo "candidate validation failed (intake core --help)" >&2; exit 1;
 }
 python3 "$CANDIDATE/kanban-github-sync.py" --help >/dev/null 2>&1 || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (edge wrapper --help)" >&2; exit 1;
@@ -127,11 +148,12 @@ python3 "$CANDIDATE/repository_registry.py" --help >/dev/null 2>&1 || {
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run: candidate validated at $CANDIDATE"
-  echo "dry-run: would atomically replace (dependencies before wrapper):"
+  echo "dry-run: would atomically replace (dependencies before wrappers):"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync-core.py"
   echo "dry-run:   $TARGET_DIR/kanban_resource_admission.py"
   echo "dry-run:   $TARGET_DIR/kanban_head_binding_feedback.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
+  echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake-core.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
   rm -rf "$CANDIDATE"
@@ -139,16 +161,16 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 # 3) backups + atomic replace (mv is atomic on the same filesystem).
-# Install the new edge dependencies first and switch the historical live
-# kanban-github-sync.py entrypoint LAST. Until that final mv, an overlapping
-# cron invocation still executes the old standalone sync; after it, every
-# overlay import is already present.
+# Install dependencies first and switch each historical live wrapper only after
+# its backing files are present. The edge wrapper remains LAST because it
+# imports the edge overlays in addition to its canonical core.
 BACKUPS=()
 for name in \
   kanban-github-sync-core.py \
   kanban_resource_admission.py \
   kanban_head_binding_feedback.py \
   repository_registry.py \
+  github-agent-ready-kanban-intake-core.py \
   github-agent-ready-kanban-intake.py \
   kanban-github-sync.py
 do
@@ -164,6 +186,9 @@ rm -rf "$CANDIDATE"
 source_path_for() {
   case "$1" in
     github-agent-ready-kanban-intake.py)
+      printf '%s\n' "$ROOT/automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py"
+      ;;
+    github-agent-ready-kanban-intake-core.py)
       printf '%s\n' "$ROOT/automation/hermes/scripts/github-agent-ready-kanban-intake.py"
       ;;
     kanban-github-sync.py)
@@ -190,6 +215,7 @@ source_path_for() {
 # 4) verify installed bytes match the checkout
 for name in \
   github-agent-ready-kanban-intake.py \
+  github-agent-ready-kanban-intake-core.py \
   kanban-github-sync.py \
   kanban-github-sync-core.py \
   kanban_resource_admission.py \
