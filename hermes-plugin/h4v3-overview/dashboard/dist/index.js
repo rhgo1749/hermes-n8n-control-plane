@@ -16,10 +16,71 @@
     ready: "Ready",
   };
   const STATUS_ORDER = ["need_you", "blocked", "review", "running", "ready"];
+  const BOARD_COLUMNS = [
+    { key: "project", label: "Project" },
+    { key: "need_you", label: "Need You" },
+    { key: "blocked", label: "Blocked" },
+    { key: "running", label: "Running" },
+    { key: "review", label: "Review" },
+    { key: "ready", label: "Ready" },
+    { key: "rework", label: "Rework" },
+    { key: "recent", label: "Recent meaningful state" },
+  ];
+  const HUMAN_ATTENTION_MARKERS = [
+    "needs_input",
+    "needs maintainer",
+    "review-required",
+    "host_validation_required",
+    "human_validation_required",
+    "human review",
+  ];
 
   function formatTimestamp(value) {
-    if (!value) return "—";
-    try { return new Date(Number(value) * 1000).toLocaleString(); } catch (_) { return "—"; }
+    const timestamp = Number(value);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "—";
+    const date = new Date(timestamp * 1000);
+    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+  }
+
+  function timestampDateTime(value) {
+    const timestamp = Number(value);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+    const date = new Date(timestamp * 1000);
+    return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+  }
+
+  function countOf(value) {
+    const count = Number(value);
+    return Number.isFinite(count) && count >= 0 ? count : 0;
+  }
+
+  function attentionTasks(board) {
+    const tasks = board && Array.isArray(board.tasks) ? board.tasks : [];
+    return tasks.filter(function (task) { return task && task.attention === true; });
+  }
+
+  function boardValue(board, key) {
+    if (board && board.read_error) return null;
+    if (key === "need_you") return attentionTasks(board).length;
+    if (key === "rework") return countOf(board && board.rework_count);
+    return countOf(board && board.counts && board.counts[key]);
+  }
+
+  function recentLabel(recent) {
+    if (!recent) return "No recent activity";
+    const kind = String(recent.kind || "").toLowerCase();
+    const reason = String(recent.reason || "").toLowerCase();
+    if (
+      kind === "github_pr_rework" ||
+      kind === "github_pr_rework_retry" ||
+      reason.indexOf("agent_rework") >= 0 ||
+      reason.indexOf("github_pr_rework") >= 0
+    ) return "Rework requested";
+    if (
+      kind === "github_operator_attention" ||
+      HUMAN_ATTENTION_MARKERS.some(function (marker) { return reason.indexOf(marker) >= 0; })
+    ) return "Human action required";
+    return "Recent activity";
   }
 
   function linkFor(item) {
@@ -39,17 +100,6 @@
         h("div", { className: "h4v3-summary-value" }, String(summary.active_workers || 0)),
         h("div", { className: "h4v3-summary-label" }, "Active workers"),
       ),
-    );
-  }
-
-  function StatusCounts(props) {
-    const counts = props.counts || {};
-    return h("div", { className: "h4v3-counts" },
-      ["running", "review", "blocked", "ready"].map(function (key) {
-        return h("span", { className: "h4v3-count h4v3-count--" + key, key: key },
-          key[0].toUpperCase() + key.slice(1) + " " + String(counts[key] || 0),
-        );
-      }),
     );
   }
 
@@ -76,43 +126,117 @@
     );
   }
 
-  function BoardCard(props) {
-    const board = props.board || {};
-    const recent = board.recent_meaningful;
-    const tasks = (board.tasks || []).filter(function (task) { return task.attention; }).slice(0, 3);
-    return h("article", { className: "h4v3-board-card" },
-      h("div", { className: "h4v3-board-heading" },
-        h("div", null,
-          h("h2", null, board.name || board.slug),
-          h("div", { className: "h4v3-board-slug" }, board.slug),
-        ),
-        h("a", { className: "h4v3-board-link", href: board.kanban_url || "/kanban" }, "Open board →"),
-      ),
-      h(StatusCounts, { counts: board.counts }),
-      board.repositories && board.repositories.length
-        ? h("div", { className: "h4v3-provenance" }, "Repository: ", board.repositories.join(", "))
-        : null,
-      board.rework_count
-        ? h("div", { className: "h4v3-rework" }, "Rework ×", String(board.rework_count))
-        : null,
+  function CountValue(props) {
+    const unavailable = props.value === null;
+    const value = unavailable ? "unavailable" : String(props.value);
+    return h("span", {
+      className: "h4v3-matrix-value" + (unavailable ? " h4v3-matrix-value--unavailable" : ""),
+      "aria-label": props.label + ": " + value,
+    },
+      unavailable || props.value === 0
+        ? h("span", { "aria-hidden": "true" }, "—")
+        : String(props.value),
+    );
+  }
+
+  function RecentMeaningful(props) {
+    const recent = props.recent;
+    return h("div", { className: "h4v3-recent-content" },
+      h("strong", { className: "h4v3-recent-label" }, recentLabel(recent)),
       recent
-        ? h("div", { className: "h4v3-recent" },
-            h("span", { className: "h4v3-muted" }, "Recent meaningful state"),
-            h("strong", null, recent.reason || recent.kind),
-            h("small", null, formatTimestamp(recent.created_at)),
-          )
-        : h("div", { className: "h4v3-recent h4v3-muted" }, "No recent attention evidence"),
-      board.read_error
-        ? h("div", { className: "h4v3-read-error", role: "status" }, "Board read unavailable: ", board.read_error)
-        : null,
-      tasks.length
-        ? h("div", { className: "h4v3-board-attention" }, tasks.map(function (task) {
-            return h("a", { href: linkFor(task), key: task.id },
-              "⚠ ", task.title || task.id, " — ", task.attention_reason || "attention",
-            );
-          }))
+        ? h("time", { dateTime: timestampDateTime(recent.created_at) }, formatTimestamp(recent.created_at))
         : null,
     );
+  }
+
+  function ProjectLink(props) {
+    const board = props.board || {};
+    const slug = board.slug || "default";
+    return h("a", { className: "h4v3-project-link", href: board.kanban_url || "/kanban" },
+      h("span", { className: "h4v3-board-name" }, board.name || slug),
+      h("span", { className: "h4v3-visually-hidden" }, " Board slug: ", slug),
+    );
+  }
+
+  function BoardReadError(props) {
+    const board = props.board || {};
+    return board.read_error
+      ? h("div", { className: "h4v3-board-read-error", role: "status" }, "Board read unavailable: ", String(board.read_error))
+      : null;
+  }
+
+  function MatrixStatusCell(props) {
+    const value = boardValue(props.board, props.column.key);
+    const nonZero = value !== null && value > 0;
+    const cellClass = [
+      "h4v3-matrix-cell",
+      "h4v3-matrix-status",
+      "h4v3-matrix-status--" + props.column.key,
+      value === null ? "h4v3-matrix-cell--unavailable" : nonZero ? "h4v3-matrix-cell--nonzero" : "h4v3-matrix-cell--zero",
+    ].join(" ");
+    return h("td", { className: cellClass, "data-label": props.column.label },
+      h(CountValue, { label: props.column.label, value: value }),
+    );
+  }
+
+  function BoardMatrixRow(props) {
+    const board = props.board || {};
+    return h("tr", { className: "h4v3-matrix-row", key: board.slug },
+      h("th", { className: "h4v3-matrix-cell h4v3-matrix-project-cell", scope: "row" },
+        h(ProjectLink, { board: board }),
+        h(BoardReadError, { board: board }),
+      ),
+      BOARD_COLUMNS.slice(1, 7).map(function (column) {
+        return h(MatrixStatusCell, { board: board, column: column, key: column.key });
+      }),
+      h("td", { className: "h4v3-matrix-cell h4v3-matrix-recent-cell", "data-label": "Recent meaningful state" },
+        h(RecentMeaningful, { recent: board.recent_meaningful }),
+      ),
+    );
+  }
+
+  function BoardMatrix(props) {
+    const boards = props.boards || [];
+    return h("div", { className: "h4v3-board-matrix-shell" },
+      h("table", { className: "h4v3-board-matrix" },
+        h("caption", { className: "h4v3-visually-hidden" }, "Project status comparison"),
+        h("thead", null,
+          h("tr", null, BOARD_COLUMNS.map(function (column) {
+            return h("th", { key: column.key, scope: "col" }, column.label);
+          })),
+        ),
+        h("tbody", null, boards.map(function (board) {
+          return h(BoardMatrixRow, { board: board, key: board.slug });
+        })),
+      ),
+    );
+  }
+
+  function MobileBoardItem(props) {
+    const board = props.board || {};
+    return h("article", { className: "h4v3-mobile-board", key: board.slug },
+      h("h3", { className: "h4v3-mobile-board-heading" }, h(ProjectLink, { board: board })),
+      h(BoardReadError, { board: board }),
+      h("dl", { className: "h4v3-mobile-status-grid" }, BOARD_COLUMNS.slice(1, 7).map(function (column) {
+        const value = boardValue(board, column.key);
+        const modifier = value === null ? " h4v3-mobile-status--unavailable" : value > 0 ? " h4v3-mobile-status--nonzero" : " h4v3-mobile-status--zero";
+        return h("div", { className: "h4v3-mobile-status h4v3-mobile-status--" + column.key + modifier, key: column.key },
+          h("dt", null, column.label),
+          h("dd", null, h(CountValue, { label: column.label, value: value })),
+        );
+      })),
+      h("div", { className: "h4v3-mobile-recent" },
+        h("span", { className: "h4v3-mobile-field-label" }, "Recent meaningful state"),
+        h(RecentMeaningful, { recent: board.recent_meaningful }),
+      ),
+    );
+  }
+
+  function MobileBoardList(props) {
+    const boards = props.boards || [];
+    return h("div", { className: "h4v3-mobile-board-list" }, boards.map(function (board) {
+      return h(MobileBoardItem, { board: board, key: board.slug });
+    }));
   }
 
   function EmptyState() {
@@ -148,7 +272,7 @@
     }, [load]);
 
     if (loading && !data) {
-      return h("main", { className: "h4v3-page" }, h("div", { className: "h4v3-loading" }, "Loading H4V3 Overview…"));
+      return h("main", { className: "h4v3-page" }, h("div", { className: "h4v3-loading", role: "status", "aria-live": "polite" }, "Loading H4V3 Overview…"));
     }
     if (error && !data) {
       return h("main", { className: "h4v3-page" },
@@ -169,7 +293,7 @@
         ),
         h("div", { className: "h4v3-header-actions" },
           h("span", { className: "h4v3-refresh" }, lastLoaded ? "Updated " + new Date(lastLoaded).toLocaleTimeString() : ""),
-          h("button", { type: "button", className: "h4v3-refresh-button", onClick: load }, "Refresh"),
+          h("button", { type: "button", className: "h4v3-refresh-button", "aria-label": "Refresh overview", onClick: load }, "Refresh"),
         ),
       ),
       data && data.read_only ? h("div", { className: "h4v3-read-only-note" }, "읽기 전용 · 상태 변경/worker 제어/Issue·PR 생성 없음") : null,
@@ -178,9 +302,12 @@
       h(NeedYou, { items: data && data.need_you }),
       h("section", { className: "h4v3-boards", "aria-labelledby": "h4v3-boards-title" },
         h("div", { className: "h4v3-section-title", id: "h4v3-boards-title" }, "Boards"),
-        boards.length ? h("div", { className: "h4v3-board-grid" }, boards.map(function (board) {
-          return h(BoardCard, { board: board, key: board.slug });
-        })) : h(EmptyState),
+        boards.length
+          ? h("div", { className: "h4v3-board-views" },
+              h(BoardMatrix, { boards: boards }),
+              h(MobileBoardList, { boards: boards }),
+            )
+          : h(EmptyState),
       ),
     );
   }

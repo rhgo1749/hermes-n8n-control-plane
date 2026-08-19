@@ -43,10 +43,15 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
 ### What the Overview shows
 
 * **Top summary**: Need You · Blocked · Review · Running · Ready + active worker count.
-* **Board cards**: one per existing Hermes board (from `kanban_db.list_boards`),
-  with status counts, rework count, provenance repositories (derived from
-  `tasks.idempotency_key`, never hardcoded), and the most recent meaningful
-  edge event. Board names come from `board.json` metadata.
+* **Board status matrix/list**: one row per existing Hermes board (from
+  `kanban_db.list_boards`) in the desktop semantic matrix, with `Project`,
+  `Need You`, `Blocked`, `Running`, `Review`, `Ready`, `Rework`, and `Recent
+  meaningful state` columns. At widths up to 900px the same projection uses a
+  compact labeled vertical list instead of a horizontal-scroll-only table.
+  Board names come from `board.json` metadata; zero values are visually muted
+  while their accessible names retain the numeric value. Repository provenance
+  remains in the API projection but is secondary to the board link and status
+  comparison in the default UI.
 * **Rework counts**: the board aggregate counts `github_pr_rework` events of
   **actionable tasks only** (`ready`/`running`/`review`/`blocked`) — rework on
   finished (`done`) cards is excluded so past work does not look like current
@@ -59,9 +64,12 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
   (`/kanban?board=<slug>&task=<id>`); the Kanban plugin understands `board`,
   and the `task` query is retained as a provenance hint for future Kanban
   deep-link support. No Kanban UI is re-implemented.
-* **Fail-closed rendering**: a board whose DB cannot be read (missing file,
-  incompatible schema, locked DB) renders with a `read_error` notice and zeroed
-  counts; one bad board never breaks the others or the dashboard.
+* **Fail-closed rendering**: a missing board DB file follows the backend's
+  explicit empty-board fallback: counts remain zero and `read_error` is unset.
+  This is distinct from an existing DB that cannot be read (incompatible
+  schema, locked DB, etc.), which renders unavailable/unknown counts with a
+  `read_error` notice instead of claimed zeroes. One bad board never breaks
+  the others or the dashboard.
 
 ### Need You projection rules
 
