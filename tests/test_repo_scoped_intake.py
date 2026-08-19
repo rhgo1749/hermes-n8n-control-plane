@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -607,6 +608,264 @@ def test_event_router_claim_limits_live_run() -> None:
         for name, value in originals.items():
             setattr(intake, name, value)
 
+
+
+
+def _bootstrap_entry(repository: str, board: str, checkout: str) -> dict:
+    entry = _entry(repository, ready=False, reason="board_not_found_task_provenance")
+    entry["bootstrap"] = {"board": board, "checkout": checkout}
+    return entry
+
+
+def test_provision_creates_missing_board_with_checkout_workdir() -> None:
+    existing: set[str] = {"ctrlhangul"}
+    created: list[str] = []
+
+    def fake_run_hermes(*args: str, **kwargs: Any) -> str:
+        board = args[args.index("create") + 1]
+        created.append(board)
+        existing.add(board)
+        return f"Board '{board}' created."
+
+    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    try:
+        intake._board_slugs = lambda: set(existing)
+        intake._run_hermes = fake_run_hermes
+        snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
+        report = intake._provision_bootstrap_boards(snapshot, dry_run=False)
+        assert report == [
+            {"repository": "rhgo1749/brand-new", "board": "brand-new", "action": "provisioned"}
+        ]
+        assert created == ["brand-new"]
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_provision_skips_existing_board_idempotently() -> None:
+    existing: set[str] = {"brand-new", "ctrlhangul"}
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not create an already-existing board")
+
+    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    try:
+        intake._board_slugs = lambda: set(existing)
+        intake._run_hermes = forbidden
+        snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
+        assert intake._provision_bootstrap_boards(snapshot, dry_run=False) == []
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_provision_dry_run_never_mutates() -> None:
+    existing: set[str] = {"ctrlhangul"}
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("dry-run must never invoke the Hermes CLI")
+
+    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    try:
+        intake._board_slugs = lambda: set(existing)
+        intake._run_hermes = forbidden
+        snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
+        report = intake._provision_bootstrap_boards(snapshot, dry_run=True)
+        assert report == [
+            {"repository": "rhgo1749/brand-new", "board": "brand-new", "action": "would-provision"}
+        ]
+        assert existing == {"ctrlhangul"}
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_provision_scope_restricts_provisioning() -> None:
+    existing: set[str] = {"ctrlhangul"}
+    created: list[str] = []
+
+    def fake_run_hermes(*args: str, **kwargs: Any) -> str:
+        board = args[args.index("create") + 1]
+        created.append(board)
+        existing.add(board)
+        return f"Board '{board}' created."
+
+    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    try:
+        intake._board_slugs = lambda: set(existing)
+        intake._run_hermes = fake_run_hermes
+        snapshot = _snapshot(
+            [
+                _bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new"),
+                _bootstrap_entry("rhgo1749/other-new", "other-new", "/ws/projects/other-new"),
+            ]
+        )
+        report = intake._provision_bootstrap_boards(
+            snapshot,
+            dry_run=False,
+            scope=("RHGO1749/BRAND-NEW",),
+        )
+        assert [item["board"] for item in report] == ["brand-new"]
+        assert created == ["brand-new"]
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_provision_fails_closed_if_board_does_not_land() -> None:
+    existing: set[str] = {"ctrlhangul"}
+
+    def fake_run_hermes(*args: str, **kwargs: Any) -> str:
+        return "Board created."  # claims success but the board never lands
+
+    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    try:
+        intake._board_slugs = lambda: set(existing)
+        intake._run_hermes = fake_run_hermes
+        snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
+        try:
+            intake._provision_bootstrap_boards(snapshot, dry_run=False)
+        except intake.IntakeError as exc:
+            assert "did not land" in str(exc)
+        else:
+            raise AssertionError("provisioning that did not land must fail closed")
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_provision_malformed_intent_fails_closed() -> None:
+    entry = _entry("rhgo1749/brand-new", ready=False, reason="board_not_found_task_provenance")
+    entry["bootstrap"] = {"board": "brand-new"}  # checkout missing
+    snapshot = _snapshot([entry])
+    try:
+        intake._provision_bootstrap_boards(snapshot, dry_run=True)
+    except intake.IntakeError as exc:
+        assert "malformed" in str(exc)
+    else:
+        raise AssertionError("malformed bootstrap intent must fail closed")
+
+
+def test_provision_without_intents_makes_no_board_calls() -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no bootstrap intent, no Hermes CLI calls")
+
+    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    try:
+        intake._board_slugs = forbidden
+        intake._run_hermes = forbidden
+        snapshot = _snapshot([_entry("rhgo1749/ctrl-hangul")])
+        assert intake._provision_bootstrap_boards(snapshot, dry_run=True) == []
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
+    """End-to-end: a new opted-in repository with no board gets its canonical
+    board provisioned and its first agent-ready Issue imported in the SAME
+    tick (the just-created empty canonical board resolves via the
+    empty-canonical-board rule after the same-tick snapshot reload)."""
+    existing_boards: set[str] = {"ctrlhangul"}
+    created_boards: list[str] = []
+    tasks_created: list[str] = []
+
+    def fake_board_slugs() -> set[str]:
+        return set(existing_boards)
+
+    def fake_run_hermes(*args: str, **kwargs: Any) -> str:
+        if "boards" in args and "create" in args:
+            board = args[args.index("create") + 1]
+            existing_boards.add(board)
+            created_boards.append(board)
+            return f"Board '{board}' created."
+        raise AssertionError(f"unexpected hermes call: {args}")
+
+    def fake_load_registry_snapshot(token: str) -> dict:
+        # First load: no board, bootstrap intent present. After the board is
+        # provisioned, the same-tick reload resolves the empty canonical
+        # board and returns a ready entry.
+        if "brand-new" in existing_boards:
+            return _snapshot([_entry("rhgo1749/brand-new")])
+        return _snapshot(
+            [_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")]
+        )
+
+    issue = {
+        "number": 1,
+        "title": "First",
+        "body": "",
+        "labels": [{"name": "agent-ready"}],
+    }
+
+    names = (
+        "_github_token",
+        "_load_registry_snapshot",
+        "_claim_wake_scope",
+        "_telegram_config",
+        "_run_closed_issue_cleanup",
+        "_issue_candidates",
+        "_repo_snapshot",
+        "_create_task",
+        "_sync_board",
+        "_board_slugs",
+        "_run_hermes",
+    )
+    originals = {name: getattr(intake, name) for name in names}
+
+    try:
+        intake._github_token = lambda: "token"
+        intake._load_registry_snapshot = fake_load_registry_snapshot
+        intake._claim_wake_scope = lambda: None
+        intake._telegram_config = lambda: None
+        intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
+        intake._board_slugs = fake_board_slugs
+        intake._run_hermes = fake_run_hermes
+        intake._issue_candidates = lambda token, fixture_path, configs: [(configs[0], issue)]
+        intake._repo_snapshot = lambda config: intake.RepoSnapshot(
+            origin_sha="abc",
+            remote="https://github.com/rhgo1749/brand-new.git",
+            contract_paths=("AGENTS.md",),
+        )
+
+        def fake_create_task(config, issue_arg, snapshot, imported_at, *, tick_started):
+            tasks_created.append(config.board)
+            return {
+                "key": f"github:{config.name}:issue:1",
+                "board": config.board,
+                "task_id": "t_test",
+                "status": "ready",
+                "created": True,
+                "issue_number": 1,
+            }
+
+        intake._create_task = fake_create_task
+        intake._sync_board = lambda config, token, *, dry_run=False: []
+
+        args = argparse.Namespace(
+            dry_run=False,
+            fixture_json=None,
+            repository="rhgo1749/brand-new",
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert intake._run(args) == 0
+
+        output = json.loads(stdout.getvalue())
+        assert created_boards == ["brand-new"]
+        assert tasks_created == ["brand-new"]
+        assert output["board_provisioning"] == [
+            {
+                "repository": "rhgo1749/brand-new",
+                "board": "brand-new",
+                "action": "provisioned",
+            }
+        ]
+        assert output["upserted_count"] == 1
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
 
 def main() -> int:
     tests = [

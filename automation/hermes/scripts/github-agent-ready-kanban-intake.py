@@ -608,7 +608,11 @@ def _json_from_stdout(stdout: str) -> Any:
     raise IntakeError("Hermes CLI returned non-JSON output")
 
 
-def _run_hermes(*args: str, extra_env: dict[str, str] | None = None) -> Any:
+def _run_hermes(
+    *args: str,
+    extra_env: dict[str, str] | None = None,
+    parse_json: bool = True,
+) -> Any:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(_hermes_home())
     if extra_env:
@@ -623,6 +627,8 @@ def _run_hermes(*args: str, extra_env: dict[str, str] | None = None) -> Any:
     if completed.returncode != 0:
         detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "unknown CLI error"
         raise IntakeError(f"Hermes CLI failed ({completed.returncode}): {detail[:240]}")
+    if not parse_json:
+        return completed.stdout
     return _json_from_stdout(completed.stdout)
 
 
@@ -635,6 +641,89 @@ def _board_slugs() -> set[str]:
     if not isinstance(items, list):
         raise IntakeError("Hermes board list has an unexpected shape")
     return {str(item.get("slug")) for item in items if isinstance(item, dict) and item.get("slug")}
+
+
+def _provision_bootstrap_boards(
+    snapshot: dict[str, Any],
+    *,
+    dry_run: bool,
+    scope: tuple[str, ...] | None = None,
+) -> list[dict[str, str]]:
+    """Idempotently provision missing canonical boards for new opted-in repos.
+
+    The registry is read-only: it declares a ``bootstrap`` intent for a
+    verified checkout whose canonical board does not exist yet. The intake is
+    the only mutation owner — it creates the board through the existing
+    ``hermes kanban boards create`` surface and verifies the result landed.
+    Fail-closed entries (conflict / ambiguous / already-resolved) carry no
+    bootstrap intent and are never touched. Board creation is idempotent
+    (``mkdir -p`` semantics), so re-running a tick is safe.
+
+    ``scope`` optionally restricts provisioning to the given repositories
+    (case-insensitive); ``None`` provisions every bootstrap-intent entry.
+    """
+    entries = snapshot.get("repositories")
+    if not isinstance(entries, list):
+        entries = []
+    scope_keys = {key.casefold() for key in scope} if scope else None
+
+    # Candidate intents within the tick scope (validated, ordered).
+    candidates: list[tuple[str, str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        bootstrap = entry.get("bootstrap")
+        if not isinstance(bootstrap, dict):
+            continue
+        repository = str(entry.get("repository") or "").strip()
+        board = str(bootstrap.get("board") or "").strip()
+        checkout = str(bootstrap.get("checkout") or "").strip()
+        if not repository or not board or not checkout:
+            raise IntakeError(
+                f"malformed bootstrap intent for {repository or '(unknown)'}: "
+                "requires repository, board, and checkout"
+            )
+        if scope_keys is not None and repository.casefold() not in scope_keys:
+            continue
+        candidates.append((repository, board, checkout))
+
+    if not candidates:
+        return []
+
+    existing = _board_slugs()
+    provisioned: list[dict[str, str]] = []
+    for repository, board, checkout in candidates:
+        if board in existing:
+            continue
+        if dry_run:
+            provisioned.append(
+                {
+                    "repository": repository,
+                    "board": board,
+                    "action": "would-provision",
+                }
+            )
+            continue
+        _run_hermes(
+            "kanban",
+            "boards",
+            "create",
+            board,
+            "--default-workdir",
+            checkout,
+            parse_json=False,
+        )
+        # Fail closed if the board did not actually land.
+        if board not in _board_slugs():
+            raise IntakeError(f"board provisioning did not land for {board}")
+        provisioned.append(
+            {
+                "repository": repository,
+                "board": board,
+                "action": "provisioned",
+            }
+        )
+    return provisioned
 
 
 def _issue_labels(issue: dict[str, Any]) -> list[str]:
@@ -1192,6 +1281,7 @@ def _run(args: argparse.Namespace) -> int:
     wake_scope_mode = "fixture" if fixture_path else "legacy-full"
     wake_scope_repositories: tuple[str, ...] = ()
     scope_skipped: list[dict[str, str]] = []
+    board_provisioning: list[dict[str, str]] = []
 
     if fixture_path:
         available_configs = _fixture_repository_configs(fixture_path)
@@ -1205,6 +1295,18 @@ def _run(args: argparse.Namespace) -> int:
         registry_snapshot = _load_registry_snapshot(token)
 
         if args.repository:
+            # Targeted operator scope: provision this repository's missing
+            # canonical board first so the manual onboarding path works.
+            board_provisioning = _provision_bootstrap_boards(
+                registry_snapshot,
+                dry_run=bool(args.dry_run),
+                scope=(args.repository,),
+            )
+            if board_provisioning and not args.dry_run:
+                # Same-tick reload: the freshly created board is visible to
+                # the next snapshot, so the first task can be created in this
+                # tick instead of waiting for the next five-minute wake.
+                registry_snapshot = _load_registry_snapshot(token)
             available_configs, registry_unready = _repository_configs_from_registry(
                 registry_snapshot,
                 args.repository,
@@ -1216,11 +1318,28 @@ def _run(args: argparse.Namespace) -> int:
             wake_scope_mode = "manual"
             wake_scope_repositories = (args.repository,)
         else:
+            wake_scope = _claim_wake_scope()
+            # Board provisioning is scope-limited to the same repositories the
+            # tick will process: the woken set in event mode, every
+            # bootstrap-intent entry in a full fallback sweep.
+            provision_scope: tuple[str, ...] | None = None
+            if wake_scope is not None and wake_scope.mode == "event":
+                provision_scope = wake_scope.repositories
+            _provision_result = _provision_bootstrap_boards(
+                registry_snapshot,
+                dry_run=bool(args.dry_run),
+                scope=provision_scope,
+            )
+            board_provisioning = _provision_result
+            if board_provisioning and not args.dry_run:
+                # Same-tick reload: a freshly created canonical board is
+                # resolved via the empty-canonical-board rule, so the first
+                # agent-ready Issue can be imported in this tick.
+                registry_snapshot = _load_registry_snapshot(token)
             available_configs, registry_unready = _repository_configs_from_registry(
                 registry_snapshot,
                 None,
             )
-            wake_scope = _claim_wake_scope()
             if wake_scope is not None and wake_scope.mode == "event":
                 wake_scope_mode = "event"
                 wake_scope_repositories = wake_scope.repositories
@@ -1363,6 +1482,7 @@ def _run(args: argparse.Namespace) -> int:
         "closed_issue_cleanup_count": len(cleanup_results),
         "repositories": [config.name for config in selected_configs],
         "registry_unready": registry_unready,
+        "board_provisioning": board_provisioning,
         "wake_scope": {
             "mode": wake_scope_mode,
             "repositories": list(wake_scope_repositories),

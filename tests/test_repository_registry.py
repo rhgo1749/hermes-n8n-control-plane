@@ -350,6 +350,111 @@ def test_live_registry_snapshot_composes_existing_authorities() -> None:
         assert entry["contract_paths"] == ["AGENTS.md"]
         assert entry["ready"] is True
 
+
+def test_verified_checkout_missing_board_declares_bootstrap_intent() -> None:
+    """A verified checkout with no provenance and no canonical board gets an
+    explicit read-only bootstrap intent (the missing-board signal)."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "hermes-n8n-control-plane").mkdir()
+        entry = registry.build_entry(
+            _repo("rhgo1749/hermes-n8n-control-plane", 77),
+            root,
+            board=None,
+            board_status="not_found_task_provenance",
+            origin_reader=lambda _: "https://github.com/rhgo1749/hermes-n8n-control-plane.git",
+        )
+        assert entry.ready is False
+        assert entry.board is None
+        assert entry.board_status == "not_found_task_provenance"
+        assert entry.bootstrap == {
+            "board": "hermes-n8n-control-plane",
+            "checkout": str(root / "hermes-n8n-control-plane"),
+        }
+
+
+def test_provenance_resolved_board_has_no_bootstrap_intent() -> None:
+    """Once task provenance resolves a board, bootstrap intent must be None so
+    the intake never re-provisions an already-associated board."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "ctrl-hangul").mkdir()
+        entry = registry.build_entry(
+            _repo("rhgo1749/ctrl-hangul", 1),
+            root,
+            board="ctrlhangul",
+            board_status="resolved_task_provenance",
+            origin_reader=lambda _: "https://github.com/rhgo1749/ctrl-hangul.git",
+        )
+        assert entry.ready is True
+        assert entry.bootstrap is None
+
+
+def test_conflict_and_ambiguous_states_keep_no_bootstrap_intent() -> None:
+    """Fail-closed board states (conflict / ambiguous) must never carry a
+    bootstrap intent — provisioning on top of a conflict is forbidden."""
+    for status in ("canonical_board_conflict", "ambiguous_task_provenance", "ambiguous_multiple_boards"):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "proj-x").mkdir()
+            entry = registry.build_entry(
+                _repo("rhgo1749/proj-x", 1),
+                root,
+                board=None,
+                board_status=status,
+                origin_reader=lambda _: "https://github.com/rhgo1749/proj-x.git",
+            )
+            assert entry.bootstrap is None, f"{status} must not bootstrap"
+
+
+def test_unverified_checkout_has_no_bootstrap_intent() -> None:
+    """Bootstrap intent requires a verified checkout; a missing checkout or a
+    remote mismatch must not provision a board."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        entry = registry.build_entry(
+            _repo("rhgo1749/brand-new", 9),
+            root,
+            board=None,
+            board_status="not_found_task_provenance",
+        )
+        assert entry.checkout_status == "missing"
+        assert entry.bootstrap is None
+
+        (root / "brand-new").mkdir()
+        entry2 = registry.build_entry(
+            _repo("rhgo1749/brand-new", 9),
+            root,
+            board=None,
+            board_status="not_found_task_provenance",
+            origin_reader=lambda _: "https://github.com/rhgo1749/not-brand-new.git",
+        )
+        assert entry2.checkout_status == "remote_mismatch"
+        assert entry2.bootstrap is None
+
+
+def test_snapshot_surfaces_bootstrap_intent_field() -> None:
+    """The registry snapshot must expose the bootstrap intent per entry so the
+    intake (the mutation owner) can consume it."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "brand-new").mkdir()
+        snapshot = registry.registry_snapshot(
+            [_repo("rhgo1749/brand-new", 9)],
+            root,
+            contract_reader=lambda repository, branch: ("AGENTS.md",),
+            board_resolver=lambda repository: (None, "not_found_task_provenance"),
+            origin_reader=lambda _: "https://github.com/rhgo1749/brand-new.git",
+        )
+        entry = snapshot["repositories"][0]
+        assert entry["ready"] is False
+        assert entry["board"] is None
+        assert entry["bootstrap"] == {
+            "board": "brand-new",
+            "checkout": str(root / "brand-new"),
+        }
+
+
 def main() -> int:
     tests = [
         value
