@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,8 +103,9 @@ def test_lead_contract_drift_fails_closed() -> None:
     fake = ModuleType("fake_intake_lead")
     fake._task_body = lambda *args, **kwargs: mod._OLD_COMPLETION_CONTRACT
     mod._install_completion_contract_overlay(fake)
+    config = SimpleNamespace(default_branch="main")
     try:
-        fake._task_body()
+        fake._task_body(config)
     except RuntimeError as exc:
         assert "Kanban lead contract drifted" in str(exc)
     else:
