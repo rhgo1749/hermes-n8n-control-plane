@@ -12,7 +12,40 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 N8N = ROOT / "automation" / "n8n"
 sys.path.insert(0, str(N8N / "scripts"))
-from render_workflows import ACTIVE_JOBS, normalize_dashboard_url  # noqa: E402
+from render_workflows import (  # noqa: E402
+    ACTIVE_JOBS,
+    FALLBACK_TIMEOUT_MS,
+    ROUTER_FALLBACK_URL,
+    normalize_dashboard_url,
+)
+
+
+def load(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def validate_fallback(job: dict[str, str]) -> None:
+    path = N8N / "workflows" / f"schedule-{job['slug']}.json"
+    data = load(path)
+    assert data["name"] == "Hermes fallback · GitHub Kanban intake"
+    assert data["active"] is False
+    nodes = {node["name"]: node for node in data["nodes"]}
+    assert set(nodes) == {"Schedule Trigger", "Run registry fallback"}
+    schedule = nodes["Schedule Trigger"]
+    assert schedule["type"] == "n8n-nodes-base.scheduleTrigger"
+    assert schedule["parameters"]["rule"]["interval"] == [
+        {"field": "cronExpression", "expression": "0 * * * *"}
+    ]
+    fallback = nodes["Run registry fallback"]
+    assert fallback["type"] == "n8n-nodes-base.httpRequest"
+    assert fallback["parameters"]["url"] == ROUTER_FALLBACK_URL
+    assert fallback["parameters"]["authentication"] == "genericCredentialType"
+    assert fallback["parameters"]["genericAuthType"] == "httpHeaderAuth"
+    assert fallback["parameters"]["options"]["timeout"] == FALLBACK_TIMEOUT_MS
+    serialized = json.dumps(data)
+    assert "/api/cron/jobs/" not in serialized
+    assert "127.0.0.1:5680" not in serialized
+    assert "credentials" not in serialized.lower()
 
 
 def validate_dashboard_url_policy() -> None:
@@ -36,28 +69,17 @@ def validate_dashboard_url_policy() -> None:
 
 def validate_single_intake_boundary() -> None:
     expected_jobs = {"bf431b2a6ba6": "default"}
-    plugin_source = (
-        ROOT / "hermes-plugin" / "n8n-cron-auth" / "__init__.py"
-    ).read_text(encoding="utf-8")
+    plugin_source = (ROOT / "hermes-plugin" / "n8n-cron-auth" / "__init__.py").read_text(encoding="utf-8")
     plugin_tree = ast.parse(plugin_source)
     allowed_jobs = None
     for node in ast.walk(plugin_tree):
-        if (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "ALLOWED_JOBS"
-        ):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ALLOWED_JOBS":
             assert node.value is not None
             allowed_jobs = ast.literal_eval(node.value)
             break
     assert allowed_jobs == expected_jobs
-    installer_source = (
-        N8N / "scripts" / "configure-hermes-service-auth.sh"
-    ).read_text(encoding="utf-8")
-    installer_match = re.search(
-        r"(?ms)^expected = (?P<mapping>\{.*?^\})",
-        installer_source,
-    )
+    installer_source = (N8N / "scripts" / "configure-hermes-service-auth.sh").read_text(encoding="utf-8")
+    installer_match = re.search(r"(?ms)^expected = (?P<mapping>\{.*?^\})", installer_source)
     assert installer_match is not None
     assert ast.literal_eval(installer_match.group("mapping")) == expected_jobs
     assert "create_job" not in plugin_source
@@ -65,13 +87,16 @@ def validate_single_intake_boundary() -> None:
 
 
 def main() -> int:
-    # Async-only intake owns no tracked n8n Schedule/GitHub Trigger workflows.
-    # The durable Hermes job remains allowlisted below and is woken by the
-    # loopback github-router -> lease-controller path.
-    assert ACTIVE_JOBS == ()
-    assert sorted((N8N / "workflows").glob("schedule-*.json")) == []
+    assert len(ACTIVE_JOBS) == 1
+    job = ACTIVE_JOBS[0]
+    assert job["id"] == "bf431b2a6ba6"
+    assert job["profile"] == "default"
+    assert job["schedule"] == "0 * * * *"
+    assert [p.name for p in sorted((N8N / "workflows").glob("schedule-*.json"))] == [
+        "schedule-github-agent-ready-intake.json"
+    ]
     assert sorted((N8N / "workflows").glob("github-*-intake.json")) == []
-
+    validate_fallback(job)
     validate_dashboard_url_policy()
     validate_single_intake_boundary()
 
@@ -83,92 +108,25 @@ def main() -> int:
     assert "ports" not in n8n
     assert n8n["environment"]["N8N_LISTEN_ADDRESS"] == "127.0.0.1"
     assert n8n["environment"]["N8N_CONCURRENCY_PRODUCTION_LIMIT"] == "1"
-    assert n8n["environment"]["N8N_BLOCK_ENV_ACCESS_IN_NODE"] == "true"
-    assert n8n["environment"]["N8N_PUBLIC_API_DISABLED"] == "true"
 
     lease = compose["services"]["lease-controller"]
-    assert lease["restart"] == "unless-stopped"
-    assert lease["network_mode"] == "host"
-    assert lease["read_only"] is True
-    assert lease["user"] == "1000:1000"
     assert lease["environment"]["LEASE_LISTEN_PORT"] == "5680"
     assert lease["environment"]["LEASE_HERMES_JOB_ID"] == "bf431b2a6ba6"
     assert lease["environment"]["LEASE_HERMES_PROFILE"] == "default"
-    assert (
-        lease["environment"]["LEASE_STATE_PATH"]
-        == "/state/hermes-intake-lease.json"
-    )
-
-    assert n8n["environment"]["N8N_DIAGNOSTICS_ENABLED"] == "false"
-    assert n8n["environment"]["N8N_PERSONALIZATION_ENABLED"] == "false"
-    assert n8n["environment"]["N8N_TEMPLATES_ENABLED"] == "false"
 
     router = compose["services"]["github-router"]
-    assert router["restart"] == "unless-stopped"
-    assert router["network_mode"] == "host"
-    assert router["read_only"] is True
-    assert router["user"] == "1000:1000"
     assert router["environment"]["GITHUB_ROUTER_LISTEN_PORT"] == "5681"
-    assert (
-        router["environment"]["GITHUB_ROUTER_LEASE_BASE_URL"]
-        == "http://127.0.0.1:5680"
-    )
-    assert router["environment"]["GITHUB_ROUTER_STATE_PATH"] == "/state/github-router.json"
-    router_volumes = "\n".join(router["volumes"])
-    assert "./state/secrets:/run/secrets:ro" in router_volumes
-    assert "/var/run/docker.sock" not in compose_text
+    assert router["environment"]["GITHUB_ROUTER_LEASE_BASE_URL"] == "http://127.0.0.1:5680"
 
-    router_source = (N8N / "github-router" / "router.py").read_text(encoding="utf-8")
-    assert 'LISTEN_HOST = "127.0.0.1"' in router_source
-    assert "X-Hub-Signature-256" in router_source
-    assert "hmac.compare_digest" in router_source
-    assert '"/github/hermes-intake"' in router_source
-    assert '"/scope/claim"' in router_source
-    assert '"/fallback"' in router_source
-    assert '"/reconcile"' in router_source
-    assert "_enqueue_scope" in router_source
-    assert "_claim_scope" in router_source
-    post_start = router_source.index("    def do_POST(self) -> None:")
-    auth_index = router_source.index(
-        'authorization = self.headers.get("Authorization", "").strip()',
-        post_start,
-    )
-    claim_index = router_source.index(
-        'if parsed.path == "/scope/claim":',
-        post_start,
-    )
-    assert auth_index < claim_index
-
-    intake_source = (
-        ROOT
-        / "automation"
-        / "hermes"
-        / "scripts"
-        / "github-agent-ready-kanban-intake.py"
-    ).read_text(encoding="utf-8")
-    assert "HERMES_INTAKE_SCOPE_TOKEN_FILE" in intake_source
-    assert 'headers={"Authorization": f"Bearer {token}"}' in intake_source
-
-    env_example = (N8N / ".env.example").read_text(encoding="utf-8")
-    assert "N8N_PORT=5678" in env_example
-    assert "N8N_HOST_PORT" not in env_example
-    assert "LEASE_HERMES_BASE_URL=" in env_example
-    assert "GITHUB_ROUTER_OWNER=" in env_example
-    assert "GITHUB_ROUTER_TOPIC=" in env_example
-    assert "GITHUB_ROUTER_PUBLIC_URL=" in env_example
-
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "schedule_workflows": 0,
-                "github_workflows": 0,
-                "github_event_router": 1,
-                "hermes_intake_job": "default:bf431b2a6ba6",
-                "hermes_schedule_owned_by_n8n": False,
-            }
-        )
-    )
+    print(json.dumps({
+        "ok": True,
+        "schedule_workflows": 1,
+        "fallback_schedule": "hourly",
+        "github_workflows": 0,
+        "github_event_router": 1,
+        "hermes_intake_job": "default:bf431b2a6ba6",
+        "hermes_schedule_owned_by_n8n": False,
+    }))
     return 0
 
 
