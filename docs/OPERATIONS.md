@@ -204,7 +204,7 @@ python3 tests/test_github_event_concurrency_contract.py
 python3 tests/test_github_router.py
 python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
-python3 tests/test_hermes_cron_trigger_pause.py
+/ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py
 python3 tests/test_repo_scoped_intake.py
 python3 tests/test_repository_registry.py
 python3 tests/test_repository_registry_board_workdir.py
