@@ -5,7 +5,8 @@
 Issue-driven implementation must use the repository-owned request contract at `.agent/REQ_REQUEST_TEMPLATE.md`.
 
 - Start from the current GitHub Issue and latest fetched `origin/main`.
-- Read `README.md`, then the canonical document for the actual change surface, then target source/tests.
+- Read `README.md`, then `docs/README.md` and select the smallest canonical document for the actual change surface before reading target source/tests.
+- Do not preload every document under `docs/`; expand beyond the selected route only when repository evidence shows an adjacent contract is affected.
 - Create a **task-specific, shortened request** at `.agent/pr-requests/REQ-NNN-<slug>.md`; do not copy the full template verbatim.
 - `REQ-NNN` uses the Source GitHub Issue number. It is not the GitHub Pull Request number.
 - Refer to actual GitHub Pull Requests as `PR #<github-pr-number>` and refer to work primarily by `Issue #<issue-number>`.
