@@ -228,7 +228,9 @@ automation/n8n/scripts/reconcile-github-router.sh
 
 Run reconciliation when adding/removing the `hermes-agent` topic or repairing
 webhook configuration. This operation changes GitHub webhook registration only;
-it does not alter the Hermes job or Kanban state.
+it does not alter the Hermes job or Kanban state. Delivery replay
+deduplication (bounded `X-GitHub-Delivery` TTL store) is part of the router
+ingress, not the registry.
 
 The authenticated `/fallback` endpoint remains an intentional operator recovery
 path for a full-registry sweep. It is not scheduled automatically.

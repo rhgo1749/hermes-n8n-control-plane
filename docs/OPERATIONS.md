@@ -98,6 +98,29 @@ publish ports `5678`, `5680`, or `5681` directly.
 
 Restart the control-plane services after configuration changes.
 
+### Delivery replay deduplication
+
+The router deduplicates redelivered GitHub webhooks by `X-GitHub-Delivery` ID
+before any downstream wake. Two knobs control the bounded store:
+
+```dotenv
+GITHUB_ROUTER_DELIVERY_TTL_SECONDS=3600
+GITHUB_ROUTER_DELIVERY_MAX_ENTRIES=4096
+```
+
+- Duplicate validly-signed deliveries inside the TTL answer `202` with
+  `duplicate=true` and `reason=duplicate_delivery` and wake nothing.
+- Missing or invalid `X-GitHub-Delivery` is rejected fail-closed (`400
+  invalid_delivery_id`) before any dispatch; invalid or missing signatures are
+  rejected before deduplication and never recorded.
+- A delivery that fails dispatch (`502`) releases its record so the GitHub 5xx
+  retry or an operator resend can dispatch again.
+- The store persists in the router state file and survives restarts; entries
+  expire by TTL and the map is capped at `GITHUB_ROUTER_DELIVERY_MAX_ENTRIES`
+  with oldest-entry eviction, so it cannot grow unbounded.
+- Operator canary events must use a fresh `X-GitHub-Delivery` UUID per test
+  event; see `docs/GITHUB_EVENT_CONCURRENCY.md` for the full contract.
+
 ## 6. Webhook registry reconciliation
 
 Repository membership is discovered from GitHub topic `hermes-agent`.
@@ -162,6 +185,9 @@ intended paused-between-events state.
 A successful event canary must establish all of these facts:
 
 - router accepted a valid `X-Hub-Signature-256` event for a managed repository;
+- the canary event carries a **fresh** `X-GitHub-Delivery` UUID; within the
+  dedupe TTL the router rejects the same delivery ID as a `202` duplicate
+  no-op (contract behavior, not a failure);
 - exactly one repository scope was queued;
 - lease-controller returned a lease and called the preserved Hermes job;
 - Hermes `last_run_at` advanced and `last_status=ok` for `bf431b2a6ba6`;

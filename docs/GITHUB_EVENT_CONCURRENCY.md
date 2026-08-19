@@ -11,6 +11,7 @@ GitHub repository webhook
   -> HTTPS ingress
   -> github-router :5681
        -> HMAC verification
+       -> X-GitHub-Delivery replay dedupe
        -> durable FIFO wake-scope queue
        -> lease-controller :5680
             -> existing Hermes job default:bf431b2a6ba6 trigger
@@ -28,6 +29,42 @@ intake invocation claims exactly one queued scope. Expired unclaimed scopes are
 pruned. The persisted lease-controller is the stale delayed-pause correctness
 guard; `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a load limiter for the
 retained n8n service and is not the intake correctness mechanism.
+
+## Delivery replay deduplication
+
+GitHub may redeliver the same webhook delivery (GitHub-side retry, operator
+resend, network retransmit). A validly signed replay must not trigger the
+Hermes job twice, so the router verifies the `X-GitHub-Delivery` header on
+every signed intake event:
+
+- Missing or invalid `X-GitHub-Delivery` is rejected fail-closed with `400
+  invalid_delivery_id` before any downstream dispatch. Valid delivery IDs are
+  trimmed and must match `[A-Za-z0-9._:-]{1,128}`.
+- A first-time delivery inside its TTL is recorded in the persistent router
+  state file (`delivery_dedupe` map, one `created_at`/`expires_at` entry per
+  delivery ID) before the event is processed, then enqueued and dispatched as
+  usual.
+- A redelivered (duplicate) delivery ID inside its TTL is a `202` no-op with
+  `duplicate=true` and `reason=duplicate_delivery`; it enqueues no scope and
+  calls no `_wake()`, and its TTL is not refreshed.
+- Different delivery IDs are independent events even when the payload body is
+  identical.
+- Invalid or missing signatures are rejected before deduplication and never
+  recorded, so a forged replay cannot poison the store and a later valid
+  delivery of the same ID still processes.
+- A delivery that fails dispatch (HTTP 502 from the lease controller) has its
+  record released so the GitHub 5xx retry or an operator resend can dispatch
+  again.
+- The store is bounded on both dimensions: entries expire after
+  `GITHUB_ROUTER_DELIVERY_TTL_SECONDS` (default `3600`) and the map is capped
+  at `GITHUB_ROUTER_DELIVERY_MAX_ENTRIES` (default `4096`) with oldest-entry
+  eviction. It persists in the router state file, so restarts keep deduplicating
+  within the TTL window.
+- The dedupe store is the only new state in the router state file; the scope
+  queue, managed-repository registry, stale-pause lease, and reconciliation
+  behavior are unchanged. Operator-sent canary events must therefore use a
+  fresh `X-GitHub-Delivery` UUID each time; reusing one within the TTL is a
+  valid duplicate no-op by contract.
 
 ## Registry reconciliation and fallback
 
