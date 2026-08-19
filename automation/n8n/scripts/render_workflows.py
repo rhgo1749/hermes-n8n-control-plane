@@ -2,7 +2,7 @@
 """Compatibility renderer for tracked n8n workflow templates.
 
 The GitHub intake is event-driven through ``github-router`` and no longer owns
-an n8n Schedule Trigger workflow.  The renderer remains so older host tooling
+an n8n Schedule Trigger workflow. The renderer remains so older host tooling
 can safely report an empty template set without recreating the retired five-
 minute polling workflow.
 """
@@ -19,7 +19,13 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / "workflows"
 
-# Intentionally empty.  The durable Hermes cron job still exists and stays
+# Retained compatibility constants for older validation/tooling imports. They
+# describe the explicit operator fallback endpoint only; no generated workflow
+# consumes them.
+ROUTER_FALLBACK_URL = "http://127.0.0.1:5681/fallback"
+FALLBACK_TIMEOUT_MS = 120_000
+
+# Intentionally empty. The durable Hermes cron job still exists and stays
 # paused between event-driven trigger/pause leases; n8n does not schedule it.
 ACTIVE_JOBS: tuple[dict[str, str], ...] = ()
 
@@ -87,7 +93,7 @@ def render_templates(
     output_dir: Path,
     dashboard_url: str,
 ) -> list[Path]:
-    # Compatibility surface only.  Current GitHub intake routing is handled by
+    # Compatibility surface only. Current GitHub intake routing is handled by
     # github-router and has no n8n workflow template to render.
     normalize_dashboard_url(dashboard_url)
     output_dir.mkdir(parents=True, exist_ok=True)
