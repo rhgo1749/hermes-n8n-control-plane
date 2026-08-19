@@ -50,7 +50,10 @@ n8n/event migration.
 - `lease-controller` is bound to `default:bf431b2a6ba6` and prevents stale
   delayed pauses from overtaking a newer trigger.
 - `github-agent-ready-kanban-intake.py` remains authoritative for repository
-  filtering, idempotency, Kanban projection, and reconciliation.
+  filtering, idempotency, Kanban projection, and reconciliation. The deployed
+  historical live name is a small completion-contract entrypoint backed by the
+  canonical implementation installed beside it as
+  `github-agent-ready-kanban-intake-core.py`.
 - `edge/kanban-github-sync.py` remains authoritative for GitHub ↔ Kanban edge
   lifecycle reconciliation.
 - n8n CE remains a private, persistent control-plane service, but **there is no
@@ -112,13 +115,15 @@ reviewed decision.
 | `automation/n8n/scripts/repository_registry.py` | `hermes-agent` repository discovery and board/checkout authority |
 | `automation/n8n/scripts/reconcile-github-router.sh` | Explicit webhook-registry reconciliation |
 | `automation/n8n/scripts/import-workflows.sh` | Compatibility no-op/status path; never recreates the retired schedule |
-| `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Authoritative GitHub intake + reconciliation tick |
+| `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Canonical GitHub intake + reconciliation tick |
+| `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
 | `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
 | `hermes-plugin/n8n-cron-auth/` | Exact route allowlist for the preserved Hermes intake job |
 | `hermes-plugin/h4v3-overview/` | Read-only multi-board dashboard plugin |
 | `docs/OPERATIONS.md` | Host rollout and async-only operating contract |
 | `docs/GITHUB_EVENT_CONCURRENCY.md` | Event/lease concurrency contract |
+| `docs/GITHUB_COMPLETION_LIFECYCLE.md` | Worker terminal action vs GitHub review/done projection contract |
 | `docs/REPOSITORY_REGISTRY.md` | Repository discovery/authority contract |
 
 ## Host setup
@@ -174,6 +179,7 @@ python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
 /ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py
 python3 tests/test_repo_scoped_intake.py
+python3 tests/test_intake_completion_contract_entrypoint.py
 python3 tests/test_repository_registry.py
 python3 tests/test_h4v3_overview.py
 python3 tests/test_h4v3_notification_policy.py
