@@ -10,8 +10,9 @@ the historical live name ``github-agent-ready-kanban-intake.py``.
 This small overlay keeps Hermes core lifecycle semantics intact. GitHub-backed
 workers finish their implementation run with core ``kanban_complete``; the
 edge reconciler remains the only owner of GitHub ``done`` <-> ``review``
-projection. This avoids spawning a second worker from a core ``review`` handoff
-while the linked PR is merely waiting for a human merge.
+projection. The overlay also makes the lead/specialist stop boundary explicit:
+Kanban dependencies are the waiting mechanism, and no worker remains alive
+solely to poll future CI, human review, merge, or comments.
 """
 from __future__ import annotations
 
@@ -35,11 +36,36 @@ _NEW_COMPLETION_CONTRACT = """## GitHub completion contract (authoritative)
 
 - Worker implementation completion must finish the worker run with core `kanban_complete`. That core `done` transition is provisional for a GitHub-backed card and is not merge evidence.
 - Do not call `kanban_request_review` on this GitHub-backed intake card. Review waiting is projected by the edge reconciler, not by spawning a second core review worker.
+- No implementation, review, or lead worker may remain RUNNING solely to wait for future GitHub Actions/checks, human review, merge, or comments. Record the current PR/head and any pending external/manual gate once, then hand off.
+- Main/lead waiting for specialist work must use real Kanban dependencies; never use `sleep` or repeated polling to keep an active worker slot occupied.
 - If any required PR is OPEN or CLOSED with `merged=false`, the edge reconciler projects the card to parked `review`, clears worker ownership/claim metadata, and leaves it non-runnable. Only an explicit trusted rework signal may return it to work.
 - Authoritative `done` requires a fresh GitHub API read proving every PR linked to this Issue is merged into the target branch.
 - An OPEN PR, CI success, pushed commit, PR creation, worker completion, or `Closes #N` text is not merge evidence.
 - GitHub API failure is fail-closed: preserve the current Kanban status and do not infer completion from local metadata or worker output.
 - Linked PR discovery uses GitHub Issue links plus handoff references; all discovered required PRs must be merged."""
+
+_OLD_LEAD_CONTRACT_TEMPLATE = """## Luna lead execution contract
+
+1. Read the complete GitHub Issue thread (body and comments) from the canonical URL before making implementation decisions.
+2. Read the repository's `AGENTS.md`, the applicable router (`AGENTS_PROJECT.md` / `Docs/AGENTS.md` where present), canonical docs, and every repository contract path listed in Provenance from the current `origin/{default_branch}`.
+3. Inspect the current fetched `origin/{default_branch}`, relevant source/tests, and open or overlapping PRs. Do not modify the shared checkout directly; use the Kanban worktree/branch contract.
+4. Instantiate the repository-specific request using the naming/path contract defined by `AGENTS.md` and the detected repository template; do not invent a request identifier or path.
+5. Implement only the Issue's PR-sized scope. Delegate only bounded research, implementation, or test work to Luna workers when useful; delegation does not transfer lead ownership.
+6. Independently review every delegated diff/evidence, run applicable deterministic repository gates, and keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED / BLOCKED states honest.
+7. Create a GitHub PR only after the gates pass. Never merge or enable auto-merge."""
+
+_NEW_LEAD_CONTRACT = """## Kanban lead orchestration contract
+
+1. Read the complete GitHub Issue thread (body and comments) from the canonical URL before routing work.
+2. Read the repository's `AGENTS.md`, applicable router (`AGENTS_PROJECT.md` / `Docs/AGENTS.md` where present), canonical docs, and every repository contract path listed in Provenance from the current default branch recorded above.
+3. Inspect only enough current default-branch source/tests and overlapping PR state to recover scope and route safely. Do not modify the shared checkout directly.
+4. Instantiate the repository-specific request using the naming/path contract defined by `AGENTS.md`; preserve the source Issue identity.
+5. Build the smallest correct specialist graph. Main is the planner/router/judge, not the default implementer. Route repository changes to a verified `kanban-developer`; use `kanban-reviewer` for independent technical review; use `kanban-designer` only when a material product/UX decision or design review is actually required.
+6. Encode real dependencies before downstream work runs. While a dependency is running, step back: do not `sleep`, poll worker status, duplicate specialist validation, or consume an active worker slot merely to observe progress. Resume from durable Kanban dependency transitions.
+7. Developer delivery is implementation + required repository-local deterministic validation + PR create/update + exact evidence. Pending future CI/checks, human review, merge, or comments are recorded as external/manual gates and are not reasons to keep that developer RUNNING.
+8. Reviewer verifies the current PR/head/diff/evidence and returns PASS or REWORK. Reviewer does not become a future-state monitor. Correctable defects produce bounded rework, not a human blocker.
+9. When all required internal specialist dependencies are satisfied, inspect their durable handoffs and finish the GitHub-backed root run with core `kanban_complete`. Never merge or enable auto-merge. Future PR lifecycle belongs to GitHub + edge reconciliation.
+10. Deterministic Controller/edge logic owns event intake, READY/resource/lease/stale recovery, dependency readiness, and external GitHub projection. Do not recreate controller behavior through agent reasoning loops."""
 
 
 def _core_path() -> Path:
@@ -69,9 +95,28 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
                 "GitHub completion contract drifted; refusing to emit an "
                 "unverified worker lifecycle contract"
             )
-        return rendered.replace(
+        config = args[0] if args else kwargs.get("config")
+        default_branch = str(getattr(config, "default_branch", "")).strip()
+        if not default_branch:
+            raise RuntimeError(
+                "Kanban lead contract cannot resolve the repository default branch"
+            )
+        old_lead_contract = _OLD_LEAD_CONTRACT_TEMPLATE.format(
+            default_branch=default_branch
+        )
+        if old_lead_contract not in rendered:
+            raise RuntimeError(
+                "Kanban lead contract drifted; refusing to emit an unverified "
+                "orchestration lifecycle contract"
+            )
+        rendered = rendered.replace(
             _OLD_COMPLETION_CONTRACT,
             _NEW_COMPLETION_CONTRACT,
+            1,
+        )
+        return rendered.replace(
+            old_lead_contract,
+            _NEW_LEAD_CONTRACT,
             1,
         )
 
