@@ -32,6 +32,12 @@ HERMES_PROFILE = os.environ.get(
     "LEASE_HERMES_PROFILE",
     "default",
 )
+HERMES_TRIGGER_TIMEOUT_SECONDS = float(
+    os.environ.get("LEASE_HERMES_TRIGGER_TIMEOUT_SECONDS", "900")
+)
+HERMES_PAUSE_TIMEOUT_SECONDS = float(
+    os.environ.get("LEASE_HERMES_PAUSE_TIMEOUT_SECONDS", "60")
+)
 
 STATE_PATH = Path(
     os.environ.get(
@@ -41,6 +47,7 @@ STATE_PATH = Path(
 )
 
 _REQUEST_LOCK = threading.Lock()
+_TRIGGER_LOCK = threading.Lock()
 
 
 def _json_bytes(value: object) -> bytes:
@@ -107,9 +114,14 @@ def _call_hermes(action: str, authorization: str) -> tuple[int, bytes]:
         },
         data=b"",
     )
+    timeout = (
+        HERMES_TRIGGER_TIMEOUT_SECONDS
+        if action == "trigger"
+        else HERMES_PAUSE_TIMEOUT_SECONDS
+    )
 
     try:
-        with urlopen(request, timeout=60) as response:
+        with urlopen(request, timeout=timeout) as response:
             return response.status, response.read()
     except HTTPError as exc:
         return exc.code, exc.read()
@@ -117,8 +129,106 @@ def _call_hermes(action: str, authorization: str) -> tuple[int, bytes]:
         raise RuntimeError(f"Hermes {action} request failed: {exc}") from exc
 
 
+def _trigger_hermes_in_background(
+    lease: str,
+    authorization: str,
+) -> None:
+    """Run Hermes' synchronous dashboard trigger without blocking the caller.
+
+    Hermes' dashboard ``/trigger`` executes a cron job end-to-end and may take
+    minutes. The lease-controller therefore acknowledges the wake immediately
+    and waits for Hermes in a daemon thread. A dedicated trigger lock preserves
+    the previous controller behavior of serializing upstream trigger calls.
+    """
+
+    try:
+        with _TRIGGER_LOCK:
+            status, _body = _call_hermes("trigger", authorization)
+    except RuntimeError as exc:
+        # A timeout is ambiguous: Hermes may have accepted the trigger and kept
+        # running after this client disconnected. Keep the current lease pending
+        # rather than falsely declaring the wake failed or resurrecting an older
+        # lease.
+        with _REQUEST_LOCK:
+            state = _load_state()
+            if str(state.get("lease", "")) == lease:
+                state["trigger_error"] = str(exc)
+                _write_state(state)
+        print(
+            "lease-controller Hermes trigger outcome is ambiguous "
+            f"lease={lease}: {exc}",
+            flush=True,
+        )
+        return
+
+    with _REQUEST_LOCK:
+        state = _load_state()
+        if str(state.get("lease", "")) != lease:
+            return
+
+        if not 200 <= status < 300:
+            _write_state(
+                {
+                    "lease": lease,
+                    "status": "failed",
+                    "upstream_status": status,
+                }
+            )
+            print(
+                "lease-controller Hermes trigger rejected "
+                f"lease={lease} status={status}",
+                flush=True,
+            )
+            return
+
+        if state.get("pause_requested"):
+            try:
+                pause_status, _body = _call_hermes("pause", authorization)
+            except RuntimeError as exc:
+                _write_state(
+                    {
+                        "lease": lease,
+                        "status": "active",
+                        "pause_error": str(exc),
+                    }
+                )
+                print(
+                    "lease-controller queued pause failed "
+                    f"lease={lease}: {exc}",
+                    flush=True,
+                )
+                return
+
+            if 200 <= pause_status < 300:
+                _write_state(
+                    {
+                        "lease": lease,
+                        "status": "paused",
+                        "upstream_status": pause_status,
+                    }
+                )
+            else:
+                _write_state(
+                    {
+                        "lease": lease,
+                        "status": "active",
+                        "pause_error": "hermes_pause_rejected",
+                        "upstream_status": pause_status,
+                    }
+                )
+            return
+
+        _write_state(
+            {
+                "lease": lease,
+                "status": "active",
+                "upstream_status": status,
+            }
+        )
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesIntakeLeaseController/1"
+    server_version = "HermesIntakeLeaseController/2"
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(
@@ -197,52 +307,34 @@ class Handler(BaseHTTPRequestHandler):
 
         with _REQUEST_LOCK:
             # Validate any persisted state before replacing it. Once the new
-            # lease is persisted, never resurrect an older lease: an upstream
-            # timeout/error can be ambiguous after Hermes accepted the trigger.
+            # lease is persisted, never resurrect an older lease.
             _load_state()
 
-            # Persist first so a newly accepted wake immediately supersedes
-            # every older delayed pause, even across controller restarts.
-            pending = {
-                "lease": lease,
-                "status": "pending",
-            }
-            _write_state(pending)
-
-            try:
-                status, _body = _call_hermes("trigger", authorization)
-            except RuntimeError as exc:
-                self._send_json(
-                    HTTPStatus.BAD_GATEWAY,
-                    {"ok": False, "error": str(exc)},
-                )
-                return
-
-            if not 200 <= status < 300:
-                self._send_json(
-                    status,
-                    {
-                        "ok": False,
-                        "error": "hermes_trigger_rejected",
-                        "upstream_status": status,
-                    },
-                )
-                return
-
+            # Persist first so the accepted wake immediately supersedes every
+            # older delayed pause, even across controller restarts.
             _write_state(
                 {
                     "lease": lease,
-                    "status": "active",
+                    "status": "pending",
                 }
             )
 
+        threading.Thread(
+            target=_trigger_hermes_in_background,
+            args=(lease, authorization),
+            daemon=True,
+            name=f"hermes-intake-trigger-{lease[:8]}",
+        ).start()
+
+        # Hermes' dashboard trigger is synchronous and executes the cron job
+        # end-to-end. Acknowledge only admission here; completion is reflected
+        # later through the persisted lease state.
         self._send_json(
-            HTTPStatus.OK,
+            HTTPStatus.ACCEPTED,
             {
                 "ok": True,
-                "triggered": True,
+                "accepted": True,
                 "lease": lease,
-                "upstream_status": status,
             },
         )
 
@@ -270,6 +362,19 @@ class Handler(BaseHTTPRequestHandler):
                         "ok": True,
                         "paused": True,
                         "reason": "already_paused",
+                    },
+                )
+                return
+
+            if current_status == "pending":
+                state["pause_requested"] = True
+                _write_state(state)
+                self._send_json(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "ok": True,
+                        "paused": False,
+                        "reason": "pause_queued",
                     },
                 )
                 return
