@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Pause the legacy Hermes intake schedule only after n8n has been proven to
-# call the same existing Hermes cron path. `rollback` stops n8n before resuming
-# Hermes.
+# Historical one-job cutover/rollback utility. It pauses the preserved Hermes
+# intake job only after the event-driven router path has been independently
+# verified. It never creates or activates an n8n Schedule Trigger workflow.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -29,16 +29,19 @@ Usage:
   cutover.sh --confirm-n8n-verified [--hermes-home PATH] [--hermes-bin PATH] [--n8n-port PORT]
   cutover.sh rollback --confirm-n8n-workflows-deactivated [--hermes-home PATH] [--hermes-bin PATH] [--n8n-port PORT]
 
-Cutover requires an explicit confirmation that the sole Schedule Trigger
-workflow has already been manually run at a non-scheduled time, the GitHub
-agent-ready intake reached last_status=ok, the workflow paused it again, and
-the test job was then resumed. This script does not activate n8n workflows for
-you: activate the Schedule Trigger workflow only after this command has paused
-the legacy intake schedule.
+`--confirm-n8n-verified` is a legacy compatibility flag. In the current
+async-only topology it means the signed GitHub event path has already been
+verified end-to-end: github-router -> lease-controller -> existing Hermes job
+`default:bf431b2a6ba6`, the intake reached last_status=ok, and the latest lease
+returned that same job to paused state.
 
-Before rollback, deactivate every retained n8n intake workflow in the n8n UI
-and verify that state is persisted. Rollback then stops n8n (without removing
-data or volumes) and restores the captured pre-cutover states.
+This script never creates or activates an n8n Schedule Trigger. If an old
+persisted n8n intake Schedule workflow exists, keep it inactive (or delete that
+n8n workflow record) before cutover and rollback.
+
+Before rollback, verify every legacy persisted n8n intake workflow is inactive.
+Rollback then stops n8n (without removing data or volumes) and restores the
+captured pre-cutover Hermes job state.
 EOF
 }
 
@@ -189,7 +192,7 @@ for row in rows:
         raise SystemExit("snapshot row is missing profile or job id")
     actual.append(f"{profile}:{job['id']}")
 if actual != expected:
-    raise SystemExit("cutover snapshot rows do not match the current migration target")
+    raise SystemExit("snapshot rows do not match the current migration target")
 print(f"validated {len(actual)} current migration snapshot target(s)")
 PY
 }
@@ -322,7 +325,7 @@ PY
 
 if [[ "$ACTION" == "rollback" ]]; then
   [[ "$N8N_WORKFLOWS_DEACTIVATED" == 1 ]] || {
-    echo "Refusing rollback until all retained n8n intake workflows are persistently deactivated in n8n." >&2
+    echo "Refusing rollback until legacy persisted n8n intake workflows are verified inactive." >&2
     echo "After verifying that in the n8n UI, re-run with --confirm-n8n-workflows-deactivated." >&2
     exit 2
   }
@@ -352,7 +355,7 @@ for target in "${TARGETS[@]}"; do
   if ! hermes_cron "$profile" pause "$job_id"; then
     echo "Pause failed or had an unknown outcome; restoring the complete pre-cutover snapshot." >&2
     if ! restore_snapshot "$backup"; then
-      echo "Automatic restore failed; keep n8n Schedule workflows inactive and recover from: $backup" >&2
+      echo "Automatic restore failed; keep legacy n8n intake workflows inactive and recover from: $backup" >&2
     fi
     exit 1
   fi
@@ -360,7 +363,7 @@ done
 if ! verify_jobs paused; then
   echo "Post-pause verification failed; restoring the complete pre-cutover snapshot." >&2
   if ! restore_snapshot "$backup"; then
-    echo "Automatic restore failed; keep n8n Schedule workflows inactive and recover from: $backup" >&2
+    echo "Automatic restore failed; keep legacy n8n intake workflows inactive and recover from: $backup" >&2
   fi
   exit 1
 fi
@@ -368,7 +371,7 @@ printf '{"cutover_at":"%s","backup":"%s","targets":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backup" "$(printf '%s\n' "${TARGETS[@]}" | python3 -c 'import json,sys; print(json.dumps([x.strip() for x in sys.stdin if x.strip()]))')" \
   > "$STATE_DIR/latest.json"
 chmod 600 "$STATE_DIR/latest.json"
-echo "Legacy schedules are paused, preserved, and recoverable."
-echo "Now activate the verified n8n Schedule Trigger workflow; do not activate it before this point."
-echo "Before rollback, deactivate all retained n8n intake workflows and verify their persisted inactive state."
+echo "Existing Hermes intake job is paused, preserved, and recoverable."
+echo "Async-only cutover complete: do not activate or recreate an n8n intake Schedule Trigger."
+echo "Before rollback, verify any legacy persisted n8n intake workflow remains inactive."
 echo "Rollback command: $0 rollback --confirm-n8n-workflows-deactivated --hermes-home '$HERMES_HOME' --n8n-port '$N8N_PORT'"
