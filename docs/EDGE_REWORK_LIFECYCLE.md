@@ -72,14 +72,14 @@ Rules:
 | Transition | Trigger | Effect |
 |---|---|---|
 | `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; claim released + request label kept if the patch fails |
-| `agent-working` maintained | running task with live claim/run | per-tick label projection (idempotent) |
+| `agent-working` maintained | running task with live claim/run | per-pass label projection (idempotent) |
 | `agent-working` → `agent-review-ready` | delivery evidence complete (marker + head + validation) | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `agent-working` → `agent-rework` (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | task requeued `→ ready`, `github_pr_rework_retry` event, failure counted against `kanban.failure_limit` (circuit breaker preserved) |
 | `agent-rework` restored (BLOCKED hold) → new round | explicit trusted `AGENT_REWORK_RETRY` comment after the last attention, Issue open + `agent-ready`, comment id never consumed | `apply_rework` BLOCKED → READY + one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`), delivery contract comment bound to the retry comment id; label kept until the dispatch claim (see “Explicit maintainer retry”) |
 | `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | labels restored, idempotent `HERMES_KANBAN_REWORK_ATTENTION` comment on the PR + Kanban `github_pr_rework_attention` event (per task + reason); the PR comment body carries the exact regeneration/`AGENT_REWORK_RETRY` instructions and — for `completion_marker_malformed` — the missing fields |
-| labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same tick |
+| labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same pass |
 
 ## Ordering / race safety
 
@@ -93,8 +93,18 @@ Rules:
    historical `apply_rework` path; a label **newer than the governing event**
    always flows through the classic `DONE → REVIEW → READY` path.
 6. Delivery events are written once per head (`_latest_delivery_head`), so
-   repeated 5-minute ticks are no-ops after the transition.
-7. All GitHub label mutations are a single atomic PATCH with read-back
+   repeated reconciliation passes are no-ops after the transition.
+7. `_current_round_delivery` consumes only durable `github_pr_rework_delivery`
+   events that were emitted after `_rework_delivery_evidence` accepted the
+   worker run + trusted completion marker + live-head evidence.  It never turns
+   an unvalidated raw PR comment into delivery evidence; the durable event is
+   the already-validated boundary used by the active core-review fast path.
+8. When a fresh `agent-rework` request arrives while stale
+   `agent-review-ready` is still present, normalization removes the stale
+   review-ready label, refetches the live labels, and continues the new round's
+   REVIEW → READY evaluation in the **same reconciliation pass**.  If that
+   refetch fails, reconciliation stops fail-closed until the next wake.
+9. All GitHub label mutations are a single atomic PATCH with read-back
    verification; failures fail closed (task state preserved).
 
 ## Machine-readable completion handoff
@@ -209,16 +219,25 @@ explicit trusted retry comment (AGENT_REWORK_RETRY + task=..., after attention)
 
 ## Deployment (host)
 
-The live cron path is `~/.hermes/scripts/kanban-github-sync.py` driven by the
-5-minute intake job (`bf431b2a6ba6`).  Deploy this tracked copy with the
-candidate-copy protocol: backup → copy candidate → full regression suite →
-cron-equivalent dry-run → atomic `mv` → post-replace verification.  This PR
-does **not** auto-deploy and does **not** merge itself.
+The authoritative intake job remains Hermes job `default:bf431b2a6ba6`, but
+after PR #35 it is kept paused between **event-driven / async-only** wakes;
+n8n no longer owns a five-minute polling schedule for GitHub intake.  The
+canonical reconciliation source remains `edge/kanban-github-sync.py`.
+
+Deploy through `automation/hermes/scripts/deploy-intake-edge.sh`.  The deploy
+script installs the canonical reconciliation source as
+`$HERMES_HOME/scripts/kanban-github-sync-core.py`; the historical live path
+`$HERMES_HOME/scripts/kanban-github-sync.py` is the resource-admission
+entrypoint and delegates to that core when no configured worker-resource
+policy changes admission.  Deployment uses candidate validation, dependency /
+core replacement before the entrypoint switch, timestamped backups, and
+byte-for-byte post-install verification.  It never edits the preserved Hermes
+job definition, schedule, or enabled state.  This PR does **not** auto-deploy.
 
 ## Verification
 
 `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py`
-covers the lifecycle matrix (554 checks): claim transition, claim failure,
+covers the lifecycle matrix: claim transition, claim failure,
 duplicate-spawn guards (label + same-PR owner), working-label maintenance,
 local-commit-only, head mismatch, validation incomplete, handoff failure,
 full delivery, worker crash requeue, label conflict skip, merged cleanup,
@@ -228,14 +247,14 @@ tests 80–82), and the explicit maintainer retry (AGENT_REWORK_RETRY) ingress
 (tests 83–97; renumbered after PR #27 occupied 80–82), and the PR attention
 feedback comment + malformed-marker diagnostic (tests 102–105: malformed
 marker → `completion_marker_malformed` + one idempotent PR feedback comment,
-repeated-tick idempotency, valid marker → no attention comment, no-marker →
+repeated-pass idempotency, valid marker → no attention comment, no-marker →
 generic feedback without missing-fields detail).  Tests 63–70
 pin the DONE + OPEN PR invariants: reviewer completion repair (63), rework
 completion → REVIEW on the same PR (64), delivered + merged → DONE (65),
 DONE + OPEN PR + stale `agent-working` self-heal (66, acceptance fixture
 t_560e6a71 / PR #9), live-worker non-transition + post-delivery label
 stability (67), generic READY + OPEN PR keeps the core `active_pr` guard
-(68), repeated-tick idempotency (69), and dry-run repair prediction without
+(68), repeated-pass idempotency (69), and dry-run repair prediction without
 mutation (70).  Tests 80–82 pin the consumed-rework provenance fail-closed
 guard: wrong-task completion marker stays blocked (80), unresolved
 consumed-round `pr_number` stays blocked with attention (81), mismatched/
@@ -243,13 +262,22 @@ recreated PR stays blocked (82).  Tests 83–97 pin the explicit retry
 contract: BLOCKED attention hold without auto READY (83), pre-attention
 retry ignored (84), untrusted actor ignored (85), malformed/ambiguous retry
 ignored (86), trusted retry → exactly one fresh `github_pr_rework` event +
-READY + next-tick idempotency (87), dispatch claim → agent-working/RUNNING
+READY + next-pass idempotency (87), dispatch claim → agent-working/RUNNING
 (88), claim failure keeps the request (89), stale completion marker never a
 delivery for the retry round (90), complete retry-round delivery → REVIEW
 (91), blocked outcome + complete delivery → REVIEW (92), merged → DONE (93),
 generic BLOCKED unaffected (94), dry-run prediction without mutation (95),
 consumed retry comment permanently ineligible (96), and Issue open +
 `agent-ready` requirement (97).
+
+Tests 106–115 pin the hardened follow-up seams: genuine no-op same-head remains
+rejected (106), trusted maintainer verification-only same-head delivery is
+accepted (107), stale historical markers cannot close a newer round (108),
+`review_requested` becomes a human hold without auto-requeue (109), ordinary
+crashes still requeue (110), retry comments stay one-shot (111), malformed
+markers fail closed (112), claim failure remains recoverable (113), and stale
+review-ready normalization continues the new round in the same pass while
+remaining idempotent across subsequent passes (114–115).
 
 Hermes core (`kanban_db.py`, tools, CLI) is untouched; all mutations are edge
 direct-DB writes inside the operator-approved reconciliation scope.
