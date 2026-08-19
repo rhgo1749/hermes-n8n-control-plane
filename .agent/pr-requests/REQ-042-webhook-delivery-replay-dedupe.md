@@ -309,7 +309,10 @@ key start empty and safe). Canary events must use fresh delivery UUIDs.
 ### Git / PR
 - Base SHA: `ff1c4daf3bce3aa3d05458a59fb64476994bd8c6` (origin/main at work start)
 - Branch: Kanban worktree branch for task `t_830599ce`
-- Commits: see git log below
-- PR number/title/URL: filled at PR creation
-- Working tree: clean at commit time (verified `git status`)
+- Commits: implementation commit + this REQ backfill commit (see git log)
+- PR number/title/URL: PR #43 — `feat(router): X-GitHub-Delivery 기반 webhook
+  replay deduplication (Issue #42)` —
+  `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/43` (OPEN,
+  base `main`, state recorded at creation; head SHA moves with doc backfill)
+- Working tree: clean at each commit time (verified `git status`)
 - Merge performed: NO
