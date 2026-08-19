@@ -9,12 +9,17 @@ source-code repository list.
 
 `repository_registry.py` is **read-only**. It does not create/delete webhooks,
 change n8n workflows, modify Hermes cron state, create Kanban boards, spawn
-workers, or write to GitHub.
+workers, or write to GitHub. For a verified new repository whose canonical board
+does not exist yet, the registry only *declares* a missing-board bootstrap
+intent; it never provisions the board itself.
 
-The production intake consumes only registry entries with `ready=true`.
-Event routing is repository-scoped through `github-router`; there is no
-five-minute polling workflow. A full-registry intake remains available only as
-an explicit operator `/fallback` action.
+The production intake is the **only mutation owner** for board provisioning. It
+consumes registry entries with `ready=true` for task creation and, for the
+first-intake path, idempotently provisions a missing canonical board through
+the existing `hermes kanban boards create` surface before the first task is
+written. Event routing is repository-scoped through `github-router`; there is
+no five-minute polling workflow. A full-registry intake remains available only
+as an explicit operator `/fallback` action.
 
 ## Derived fields and authority
 
@@ -28,6 +33,9 @@ For every discovered repository the registry records:
 - repository contract files present on the GitHub default branch;
 - existing Kanban board association derived from durable task provenance or the
   bounded first-intake canonical-board bootstrap;
+- a missing-board bootstrap intent (canonical board identity + verified
+  checkout path) declared read-only for the intake, when no provenance and no
+  canonical board exist;
 - readiness/fail-closed reason.
 
 The authority boundary is:
@@ -129,6 +137,43 @@ chooses a merely similar board name.
 Once the first GitHub-backed task is created, its durable idempotency key takes
 over on the next registry snapshot.
 
+## Missing-board bootstrap intent
+
+For a verified checkout with no durable task provenance and no canonical board
+(`not_found_task_provenance`), the registry entry carries an explicit,
+read-only bootstrap intent:
+
+```text
+bootstrap: {"board": "<canonical-slug>", "checkout": "<verified-checkout-path>"}
+```
+
+The intent is set only when the checkout `origin` is verified against the
+discovered GitHub repository identity. All fail-closed board states
+(`canonical_board_conflict`, `ambiguous_task_provenance`,
+`ambiguous_multiple_boards`, `ambiguous_canonical_boards`) and every
+provenance-resolved board keep `bootstrap: null`; a missing or mismatched
+checkout also carries no intent.
+
+The production intake is the only mutation owner. On a tick whose scope covers
+the repository, it:
+
+1. checks the live board list; if the canonical board already exists it does
+   nothing (idempotent);
+2. otherwise provisions it exactly once through the existing
+   `hermes kanban boards create <canonical-slug> --default-workdir
+   <verified-checkout>` surface and verifies the board actually landed
+   (fail-closed otherwise);
+3. reloads the registry snapshot so the freshly created empty canonical board
+   resolves through the empty-canonical-board rule in the same tick, letting
+   the first `agent-ready` task be created immediately.
+
+After the first GitHub-backed task is created, its durable
+`tasks.idempotency_key` provenance becomes the long-term association authority;
+the bootstrap intent disappears and the empty-board exception is never used
+again for that repository. Board creation never duplicates task lifecycle
+authority: the registry keeps reading provenance only, and the intake creates
+tasks through the existing `hermes kanban create` surface.
+
 ## Authentication requirement
 
 The `hermes-agent` topic is opt-in policy, not an authorization grant. The
@@ -194,7 +239,9 @@ Before expecting event-driven intake for a new repository:
 
 1. add `hermes-agent` only to a repository intended for Hermes management;
 2. ensure the registry credential can discover it;
-3. ensure its canonical/existing Kanban board can resolve safely;
+3. ensure its canonical/existing Kanban board resolves safely — a verified
+   new repository with no canonical board is provisioned automatically by the
+   first intake tick (see Missing-board bootstrap intent);
 4. ensure the expected checkout exists and its origin matches;
 5. ensure contract detection on the GitHub default branch is correct;
 6. run `automation/n8n/scripts/reconcile-github-router.sh`;
@@ -202,7 +249,10 @@ Before expecting event-driven intake for a new repository:
 8. send/observe a real GitHub event and confirm one scoped intake wake.
 
 Treat ambiguous provenance, malformed board metadata, checkout remote mismatch,
-missing boards, or missing contract visibility as not ready. Do not guess.
+or missing contract visibility as not ready. Do not guess. A missing canonical
+board on a verified checkout is no longer a permanent not-ready condition: the
+intake provisions it idempotently, and a conflicting/ambiguous canonical board
+still fails closed.
 
 ## Historical associations
 
@@ -224,8 +274,6 @@ discovered from the GitHub topic.
 
 Potential separately scoped work includes:
 
-- operator-owned board provisioning for opted-in repositories whose canonical
-  board does not exist;
 - lower-frequency automatic webhook reconciliation if its ownership and failure
   policy are explicitly approved;
 - echo-event filtering without losing blocked-resume/rework/completion signals;

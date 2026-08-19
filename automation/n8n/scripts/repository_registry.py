@@ -56,6 +56,14 @@ class RegistryEntry:
     contract_paths: tuple[str, ...]
     ready: bool
     reason: str | None
+    # First-intake provisioning intent: set ONLY for a verified checkout whose
+    # canonical board does not exist yet (board_status ==
+    # "not_found_task_provenance"). The registry stays read-only — it declares
+    # the intent; the production intake owns the single idempotent
+    # ``hermes kanban boards create <canonical_slug>`` provision. All
+    # fail-closed board_status values (canonical_board_conflict,
+    # ambiguous_*) keep bootstrap=None.
+    bootstrap: dict[str, str] | None
 
 
 def _github_token() -> str:
@@ -381,6 +389,20 @@ def build_entry(
             ready = True
             reason = None
 
+    # Provisioning intent for the first-intake path: a verified checkout whose
+    # canonical board does not exist yet. The registry stays read-only — it
+    # only declares the intent; the production intake owns the single
+    # idempotent ``hermes kanban boards create <canonical_slug>`` provision.
+    # Fail-closed states (canonical_board_conflict, ambiguous_*) and
+    # provenance-resolved boards keep bootstrap=None.
+    bootstrap: dict[str, str] | None = None
+    if (
+        checkout_status == "verified"
+        and board is None
+        and board_status == "not_found_task_provenance"
+    ):
+        bootstrap = {"board": slug, "checkout": str(checkout)}
+
     return RegistryEntry(
         repository=full_name,
         repository_id=repository_id,
@@ -394,6 +416,7 @@ def build_entry(
         contract_paths=contracts,
         ready=ready,
         reason=reason,
+        bootstrap=bootstrap,
     )
 
 
