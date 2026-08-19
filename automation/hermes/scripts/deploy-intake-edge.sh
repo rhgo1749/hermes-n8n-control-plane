@@ -25,9 +25,10 @@
 # The canonical edge reconciliation source remains edge/kanban-github-sync.py.
 # Deployment installs it as kanban-github-sync-core.py and installs the small
 # resource-admission entrypoint under the historical live name
-# kanban-github-sync.py. The entrypoint installs the resource-admission and
-# head-binding-feedback overlays onto that canonical core. With no configured
-# worker_resources, resource scheduling behavior is unchanged.
+# kanban-github-sync.py. The entrypoint installs the resource-admission,
+# head-binding-feedback, and retry-signal-guard overlays onto that canonical
+# core. With no configured worker_resources, resource scheduling behavior is
+# unchanged.
 #
 # Safety guarantees:
 #   * candidate copy + validation (py_compile, --help smoke) before any write
@@ -45,6 +46,7 @@ EDGE_ENTRY_SOURCE="$ROOT/edge/kanban-github-sync-entrypoint.py"
 EDGE_CORE_SOURCE="$ROOT/edge/kanban-github-sync.py"
 EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
 EDGE_HEAD_BINDING_SOURCE="$ROOT/edge/kanban_head_binding_feedback.py"
+EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 DRY_RUN=0
@@ -66,11 +68,12 @@ projection from fresh GitHub state.
 
 The live kanban-github-sync.py is a small overlay entrypoint. The canonical
 reconciliation implementation is deployed beside it as kanban-github-sync-core.py,
-plus kanban_resource_admission.py and kanban_head_binding_feedback.py. If no
-kanban.worker_resources are configured, scheduling behavior is unchanged.
-All wrapper dependencies are replaced before the corresponding live entrypoint,
-so a cron invocation during deploy sees either the old standalone script or a
-fully backed new wrapper — never a wrapper whose imports have not been installed.
+plus kanban_resource_admission.py, kanban_head_binding_feedback.py, and
+kanban_retry_signal_guard.py. If no kanban.worker_resources are configured,
+scheduling behavior is unchanged. All wrapper dependencies are replaced before
+the corresponding live entrypoint, so a cron invocation during deploy sees either
+the old standalone script or a fully backed new wrapper — never a wrapper whose
+imports have not been installed.
 
 Run this where the supplied --hermes-home path is the active Hermes runtime.
 For the current containerized deployment:
@@ -96,6 +99,7 @@ for source in \
   "$EDGE_CORE_SOURCE" \
   "$EDGE_ADMISSION_SOURCE" \
   "$EDGE_HEAD_BINDING_SOURCE" \
+  "$EDGE_RETRY_GUARD_SOURCE" \
   "$REGISTRY_SOURCE"
 do
   [[ -f "$source" ]] || {
@@ -117,6 +121,7 @@ cp -p "$EDGE_ENTRY_SOURCE" "$CANDIDATE/kanban-github-sync.py"
 cp -p "$EDGE_CORE_SOURCE" "$CANDIDATE/kanban-github-sync-core.py"
 cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
 cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
+cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 
 # 2) validation: compile + argparse smoke (--help exits 0)
@@ -127,6 +132,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban-github-sync-core.py" \
   "$CANDIDATE/kanban_resource_admission.py" \
   "$CANDIDATE/kanban_head_binding_feedback.py" \
+  "$CANDIDATE/kanban_retry_signal_guard.py" \
   "$CANDIDATE/repository_registry.py" || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (py_compile)" >&2; exit 1;
 }
@@ -152,6 +158,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban-github-sync-core.py"
   echo "dry-run:   $TARGET_DIR/kanban_resource_admission.py"
   echo "dry-run:   $TARGET_DIR/kanban_head_binding_feedback.py"
+  echo "dry-run:   $TARGET_DIR/kanban_retry_signal_guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake-core.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
@@ -169,6 +176,7 @@ for name in \
   kanban-github-sync-core.py \
   kanban_resource_admission.py \
   kanban_head_binding_feedback.py \
+  kanban_retry_signal_guard.py \
   repository_registry.py \
   github-agent-ready-kanban-intake-core.py \
   github-agent-ready-kanban-intake.py \
@@ -203,6 +211,9 @@ source_path_for() {
     kanban_head_binding_feedback.py)
       printf '%s\n' "$ROOT/edge/kanban_head_binding_feedback.py"
       ;;
+    kanban_retry_signal_guard.py)
+      printf '%s\n' "$ROOT/edge/kanban_retry_signal_guard.py"
+      ;;
     repository_registry.py)
       printf '%s\n' "$ROOT/automation/n8n/scripts/repository_registry.py"
       ;;
@@ -220,6 +231,7 @@ for name in \
   kanban-github-sync-core.py \
   kanban_resource_admission.py \
   kanban_head_binding_feedback.py \
+  kanban_retry_signal_guard.py \
   repository_registry.py
 do
   source_path="$(source_path_for "$name")"
