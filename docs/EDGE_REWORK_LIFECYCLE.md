@@ -54,7 +54,8 @@ Rules:
 - `agent-review-ready` requires ALL of: finished worker run, PR head equals
   the completion-marker head, `validation=passed`, trusted
   `AGENT_REWORK_COMPLETE` comment on the PR (machine-readable provenance),
-  and the marker head is not the pre-rework requested head.
+  and — unless the round is a **verification-only maintainer retry** (see
+  below) — the marker head is not the pre-rework requested head.
 - `agent-review-ready` is **not** Kanban DONE.  DONE only follows a fresh
   GitHub read proving the PR merged into the target branch.
 - Worker completion is never a DONE ground for an OPEN PR.  The core review

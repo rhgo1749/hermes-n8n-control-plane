@@ -2236,6 +2236,41 @@ def _malformed_completion_marker(
     return None
 
 
+def _rework_round_is_maintainer_retry(
+    payload: Mapping[str, Any],
+) -> bool:
+    """True when the current round is an explicit trusted-maintainer retry.
+
+    ``apply_rework`` writes ``trigger: "maintainer_retry"`` plus a
+    ``retry_comment_id`` onto the ``github_pr_rework`` event that opens such
+    a round.  That round was opened by a trusted, one-shot
+    ``AGENT_REWORK_RETRY`` signal (``_consume_explicit_rework_retry``), which
+    is the authoritative proof that a previous delivery was rejected for a
+    protocol/handoff reason and a human re-opened it to verify or re-post the
+    handoff rather than to change code.
+    """
+    return (
+        str(payload.get("trigger") or "") == "maintainer_retry"
+        and payload.get("retry_comment_id") is not None
+    )
+
+
+def _rework_run_is_review_requested(run: Optional[sqlite3.Row]) -> bool:
+    """True when the active/latest run ended with a review-requested outcome.
+
+    A terminal ``review_requested`` outcome is the worker's explicit statement
+    that human review is needed (distinct from an ordinary crash/error, which
+    carries a ``crashed``/error outcome).  It is only consulted in the
+    not-delivered branch — i.e. no valid completion marker was accepted for
+    the round — so it never reinterprets a run whose delivery already landed.
+    """
+    return (
+        run is not None
+        and "outcome" in run.keys()
+        and str(run["outcome"] or "") == "review_requested"
+    )
+
+
 def _rework_delivery_evidence(
     conn: sqlite3.Connection,
     client: Any,
@@ -2290,6 +2325,48 @@ def _rework_delivery_evidence(
         }
     requested_head = str(payload.get("head_sha") or "").casefold()
     if requested_head and requested_head == marker["head"]:
+        # The marker claims the very head this round started from.  That is a
+        # genuine no-op (a worker asked to change something produced no
+        # relevant change) and MUST stay rejected — UNLESS the round is an
+        # explicit trusted-maintainer retry opened to verify or re-post the
+        # handoff after a protocol-only rejection.
+        #
+        # Verification-only acceptance is deliberately conservative: it is
+        # allowed only when ALL of the following already hold (checked above)
+        # and are re-stated here:
+        #   * the round is a maintainer retry (trigger + retry_comment_id) —
+        #     i.e. a trusted, one-shot AGENT_REWORK_RETRY re-opened it;
+        #   * the completion marker bound to this task, with validation=passed,
+        #     whose head equals the LIVE PR head exactly (a stale historical
+        #     marker cannot close the round: it either predates the round's
+        #     governing event or fails the run-head binding);
+        #   * the active/latest run for the round carried that same head, so
+        #     the round's worker provably observed and attested the current
+        #     head (the requested rework is already present there).
+        # Anything ambiguous — no trusted retry, a run that did not reach the
+        # live head, or a marker not bound to the live head — fails closed to
+        # the no-op rejection.
+        # run_heads (computed above) already guarantees marker["head"] is in
+        # run_heads whenever run_heads is non-empty (otherwise the earlier
+        # run_head_mismatch check returned).  So a run that attested the live
+        # head — required for a verification-only acceptance — is exactly the
+        # case where run_heads is non-empty.  An empty run_heads (the round's
+        # worker attested no head) fails closed.
+        if (
+            _rework_round_is_maintainer_retry(payload)
+            and bool(run_heads)
+        ):
+            evidence = {
+                "run_id": run["id"],
+                "run_outcome": run["outcome"],
+                "request_comment_id": payload.get("request_comment_id"),
+                "head": marker["head"],
+                "validation": marker["validation"],
+                "completion_comment_id": marker.get("comment_id"),
+                "verification_only": True,
+                "retry_comment_id": payload.get("retry_comment_id"),
+            }
+            return True, "delivery_complete_verification_only", evidence
         return False, "rework_head_unchanged", {
             "requested_head": requested_head, "head": marker["head"],
         }
@@ -2361,6 +2438,15 @@ def _rework_human_attention(reason: str, run: Optional[sqlite3.Row]) -> bool:
         for column in ("summary", "error")
         if run is not None and column in run.keys()
     ).casefold()
+    if _rework_run_is_review_requested(run):
+        # A terminal review_requested outcome is itself a strong human-attention
+        # signal: the worker explicitly requested human review and no valid
+        # completion marker was accepted for this round.  Do not fall through
+        # to an automatic requeue just because the summary text happened not
+        # to contain one of the keyword markers.  Ordinary crashes carry a
+        # 'crashed'/error outcome (never 'review_requested'), so they remain
+        # recoverable and requeued.
+        return True
     return any(marker in text for marker in (
         "review-required", "needs_input", "needs maintainer",
         "human review", "host_validation_required", "human_validation_required",
@@ -2859,10 +2945,14 @@ def _current_round_delivery(
     - when both the round event and the delivery carry a request-comment
       identity, the identities match;
     - its head differs from the head the current round started from (a
-      current-round delivery can never equal the requested head — the
-      delivery validator rejects ``rework_head_unchanged`` — so a
-      recorded head equal to the round's requested head is a PAST round's
-      delivery).
+      *fresh* round's worker has not yet pushed, so a recorded head equal
+      to the requested head is a PAST round's delivery).  Verification-only
+      / handoff-repair rounds (trusted ``AGENT_REWORK_RETRY``,
+      ``trigger == "maintainer_retry"``) are exempt from this same-head
+      rule because their requested rework is already present at the live
+      head and a same-head completion is the expected current-round
+      delivery — the identity and time bounds above still exclude a
+      genuinely past-round delivery.
 
     Past-round deliveries (e.g. the round N-1 head still equal to the
     live PR head while the round-N worker has not yet pushed) never
@@ -2896,6 +2986,19 @@ def _current_round_delivery(
     round_requested_head = str(payload.get("head_sha") or "").casefold()
     delivery_head = str(delivery_payload.get("head") or "").casefold()
     if round_requested_head and delivery_head == round_requested_head:
+        # The recorded delivery head equals the head this round started
+        # from.  For a *fresh* rework round that means the round's worker
+        # has not yet pushed a new head, so the recorded same-head delivery
+        # is the previous round's delivery.  For a verification-only /
+        # handoff-repair round (trusted maintainer retry) the requested
+        # rework is already present at the live head, so a same-head
+        # completion is the *expected* current-round delivery, not a stale
+        # one.  The identity bound (request_comment_id match) and the time
+        # bound (delivery at/after this round's event) still exclude a
+        # genuinely past-round delivery, so exempting same-head for
+        # maintainer-retry rounds is safe.
+        if payload.get("trigger") == "maintainer_retry":
+            return delivery_payload
         # The recorded delivery head equals the head this round started
         # from: it is the previous round's delivery, not current-round
         # evidence.
@@ -3331,7 +3434,35 @@ def _reconcile_rework_lifecycle(
                 "error": str(exc),
             }
         if normalized is not None:
-            return normalized
+            if dry_run:
+                # Nothing was mutated in a dry run; keep the original stop
+                # behavior (the predicted entry already records the intent).
+                return normalized
+            # Non-dry-run: normalization removed the stale agent-review-ready.
+            # The ``labels`` snapshot captured at the top of this function is
+            # now stale on GitHub.  Refetch the live label set so the rest of
+            # this SAME reconciliation pass evaluates against fresh state
+            # instead of deferring to the next cron tick (the observed
+            # 5-10 minute normalization latency).  Task state (``status``),
+            # the PR decision, and the governing rework event are all
+            # untouched by a label-only removal, so only ``labels`` is stale.
+            #
+            # This is idempotent: a re-run of the same pass sees
+            # agent-review-ready already absent, so _normalize_stale_review_
+            # ready returns None and the pass proceeds to the same transition.
+            # If the refetch fails we cannot trust a label snapshot, so we
+            # fall back to the original stop behavior (next tick re-evaluates
+            # with a fresh snapshot) rather than act on a stale one.
+            try:
+                labels = _pr_labels(
+                    client, ref.repository, int(context["pr_number"]),
+                )
+            except GithubCompletionError:
+                return normalized
+            # Fall through to the remainder of this function with the fresh
+            # labels instead of returning the normalized entry; a ``return
+            # None`` here hands the task to the classic intake / dispatch
+            # lane in the same tick.
 
     if len(labels & lifecycle) > 1:
         print(
