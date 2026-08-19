@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Compatibility renderer for tracked n8n workflow templates.
+"""Generate the tracked hourly n8n fallback workflow for GitHub intake.
 
-The GitHub intake is event-driven through ``github-router`` and no longer owns
-an n8n Schedule Trigger workflow. The renderer remains so older host tooling
-can safely report an empty template set without recreating the retired five-
-minute polling workflow.
+GitHub webhooks remain the primary event path. The tracked Schedule Trigger is a
+low-frequency recovery/full-registry fallback only; it does not replace or own
+the preserved Hermes intake job.
 """
 from __future__ import annotations
 
@@ -12,29 +11,106 @@ import argparse
 import ipaddress
 import json
 import sys
+import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / "workflows"
-
-# Retained compatibility constants for older validation/tooling imports. They
-# describe the explicit operator fallback endpoint only; no generated workflow
-# consumes them.
 ROUTER_FALLBACK_URL = "http://127.0.0.1:5681/fallback"
 FALLBACK_TIMEOUT_MS = 120_000
-
-# Intentionally empty. The durable Hermes cron job still exists and stays
-# paused between event-driven trigger/pause leases; n8n does not schedule it.
-ACTIVE_JOBS: tuple[dict[str, str], ...] = ()
-
+_NAMESPACE = uuid.UUID("4d3669cd-39ce-4c84-a10d-762278d838c6")
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+ACTIVE_JOBS: tuple[dict[str, str], ...] = (
+    {
+        "slug": "github-agent-ready-intake",
+        "profile": "default",
+        "id": "bf431b2a6ba6",
+        "name": "GitHub Kanban intake",
+        "schedule": "0 * * * *",
+    },
+)
+
+
+def _uuid(key: str) -> str:
+    return str(uuid.uuid5(_NAMESPACE, key))
+
+
+def schedule_workflow(job: dict[str, str]) -> dict[str, Any]:
+    schedule_name = "Schedule Trigger"
+    fallback_name = "Run registry fallback"
+    return {
+        "name": f"Hermes fallback · {job['name']}",
+        "nodes": [
+            {
+                "parameters": {
+                    "rule": {
+                        "interval": [
+                            {"field": "cronExpression", "expression": job["schedule"]}
+                        ]
+                    }
+                },
+                "id": _uuid(f"{job['id']}:schedule"),
+                "name": schedule_name,
+                "type": "n8n-nodes-base.scheduleTrigger",
+                "typeVersion": 1.2,
+                "position": [180, 300],
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": ROUTER_FALLBACK_URL,
+                    "authentication": "genericCredentialType",
+                    "genericAuthType": "httpHeaderAuth",
+                    "options": {
+                        "timeout": FALLBACK_TIMEOUT_MS,
+                        "response": {
+                            "response": {
+                                "neverError": False,
+                                "responseFormat": "json",
+                                "fullResponse": True,
+                            }
+                        },
+                    },
+                },
+                "id": _uuid(f"{job['id']}:registry-fallback"),
+                "name": fallback_name,
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [440, 300],
+            },
+        ],
+        "pinData": {},
+        "connections": {
+            schedule_name: {
+                "main": [[{"node": fallback_name, "type": "main", "index": 0}]]
+            }
+        },
+        "active": False,
+        "settings": {"executionOrder": "v1"},
+        "meta": {"templateCredsSetupCompleted": False},
+        "tags": [],
+    }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def write_templates(directory: Path) -> list[Path]:
-    directory.mkdir(parents=True, exist_ok=True)
-    return []
+    written: list[Path] = []
+    for job in ACTIVE_JOBS:
+        path = directory / f"schedule-{job['slug']}.json"
+        _write_json(path, schedule_workflow(job))
+        written.append(path)
+    return written
 
 
 def _is_private_http_target(host: str) -> bool:
@@ -44,47 +120,28 @@ def _is_private_http_target(host: str) -> bool:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return (
-        address.is_loopback
-        or address.is_private
-        or address in _TAILSCALE_CGNAT
-    )
+    return address.is_loopback or address.is_private or address in _TAILSCALE_CGNAT
 
 
 def normalize_dashboard_url(raw: str) -> str:
-    """Validate the legacy renderer URL argument without weakening old policy."""
     value = raw.strip().rstrip("/")
     parsed = urlparse(value)
-
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("dashboard URL must be an absolute http(s) URL")
-
     if parsed.username or parsed.password:
         raise ValueError("dashboard URL must not contain credentials")
-
     if not parsed.hostname:
         raise ValueError("dashboard URL must contain a host")
-
     try:
         _ = parsed.port
     except ValueError as exc:
         raise ValueError("dashboard URL must contain a valid port") from exc
-
-    if (
-        parsed.path not in {"", "/"}
-        or parsed.params
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(
-            "dashboard URL must not contain a path, query, or fragment"
-        )
-
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("dashboard URL must not contain a path, query, or fragment")
     if parsed.scheme == "http" and not _is_private_http_target(parsed.hostname):
         raise ValueError(
             "http dashboard URL must use a loopback, private, or Tailnet IP address"
         )
-
     return value
 
 
@@ -93,20 +150,13 @@ def render_templates(
     output_dir: Path,
     dashboard_url: str,
 ) -> list[Path]:
-    # Compatibility surface only. Current GitHub intake routing is handled by
-    # github-router and has no n8n workflow template to render.
     normalize_dashboard_url(dashboard_url)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    templates = sorted(template_dir.glob("*.json"))
     rendered: list[Path] = []
-    for template in templates:
+    for template in sorted(template_dir.glob("*.json")):
         data = json.loads(template.read_text(encoding="utf-8"))
         path = output_dir / template.name
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
-            encoding="utf-8",
-        )
+        _write_json(path, data)
         rendered.append(path)
     return rendered
 
@@ -114,24 +164,10 @@ def render_templates(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--write-templates",
-        action="store_true",
-        help="report the current tracked workflow template set",
-    )
-    mode.add_argument(
-        "--dashboard-url",
-        help="render importable workflows",
-    )
-    parser.add_argument(
-        "--template-dir",
-        type=Path,
-        default=WORKFLOWS,
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-    )
+    mode.add_argument("--write-templates", action="store_true")
+    mode.add_argument("--dashboard-url")
+    parser.add_argument("--template-dir", type=Path, default=WORKFLOWS)
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
 
     try:
@@ -140,11 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             paths = write_templates(output)
         else:
             output = args.output_dir or ROOT / "state" / "rendered-workflows"
-            paths = render_templates(
-                args.template_dir,
-                output,
-                args.dashboard_url,
-            )
+            paths = render_templates(args.template_dir, output, args.dashboard_url)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"workflow-render: ERROR: {exc}", file=sys.stderr)
         return 1
