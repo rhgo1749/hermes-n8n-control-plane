@@ -1,114 +1,184 @@
-# Hermes → n8n GitHub agent-ready intake control plane
+# Hermes → GitHub event control plane
 
-External H4V3 Hermes control plane for automation, edge reconciliation,
-operator notifications, and an operator-facing read-only Overview — without
-modifying Hermes core.
+External H4V3 Hermes control plane for GitHub event intake, edge reconciliation,
+operator notifications, and the read-only H4V3 Overview — without modifying
+Hermes core.
 
-This repository contains the **scope-limited** migration of one existing
-Hermes job — GitHub agent-ready Issue intake — to a self-hosted n8n Community
-Edition instance, plus the edge reconciliation that keeps GitHub-backed Kanban
-cards in sync and the operator surfaces (Telegram policy + H4V3 Overview) that
-make the boards actionable.
+The GitHub agent-ready intake is now **event-driven**. The existing Hermes cron
+job remains the durable execution primitive; n8n no longer owns a five-minute
+Schedule Trigger for it.
 
 ```text
-Schedule / GitHub event
+GitHub repository event
           │
           ▼
-        n8n
-          │  existing Hermes dashboard cron route
+   github-router :5681
+     HMAC verify
+     enqueue repo scope
+          │
           ▼
-Hermes cron trigger → existing ticker → existing script / Kanban / worker path
-          │                              │
-          ▼                              ▼
-  n8n pauses the legacy schedule   edge reconciliation (GitHub ↔ Kanban)
-  after a bounded cleanup delay          │
-  (host canaries verify)                 ├── Telegram (human-attention only)
-                                         └── H4V3 Overview (dashboard, read-only)
+ lease-controller :5680
+          │
+          ▼
+existing Hermes cron trigger
+ default:bf431b2a6ba6
+          │
+          ▼
+existing ticker → existing intake script → Kanban / workers / edge
+          │
+          └─ latest lease pauses the same Hermes job again
 ```
+
+## Durable ownership boundary
+
+The migration does **not** recreate or replace the Hermes job.
+
+`default:bf431b2a6ba6` remains the authoritative GitHub intake job. Its stored
+job ID, name, script, schedule expression, profile, and Hermes ownership stay
+intact. In normal event-driven operation the job is kept **paused between
+external wakes**. `lease-controller` calls the existing dashboard
+`trigger`/`pause` routes for that exact job.
+
+Do not delete, recreate, rename, or edit the stored Hermes job as part of the
+n8n/event migration.
+
+## Current runtime topology
+
+- `github-router` discovers repositories carrying the `hermes-agent` topic,
+  validates signed GitHub webhook events, enqueues repository-scoped wake
+  records, and asks `lease-controller` to wake Hermes.
+- `lease-controller` is bound to `default:bf431b2a6ba6` and prevents stale
+  delayed pauses from overtaking a newer trigger.
+- `github-agent-ready-kanban-intake.py` remains authoritative for repository
+  filtering, idempotency, Kanban projection, and reconciliation.
+- `edge/kanban-github-sync.py` remains authoritative for GitHub ↔ Kanban edge
+  lifecycle reconciliation.
+- n8n CE remains a private, persistent control-plane service, but **there is no
+  tracked n8n GitHub intake Schedule workflow and no tracked per-repository
+  GitHub Trigger workflow**.
+- `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` is only a retained load limit; intake
+  correctness comes from the router scope queue and persisted lease guard.
+
+## Webhook reconciliation
+
+Webhook registration is topic-driven but no longer piggybacks on a five-minute
+polling fallback. Reconcile intentionally when onboarding/removing a
+`hermes-agent` repository or after webhook configuration changes:
+
+```bash
+automation/n8n/scripts/reconcile-github-router.sh
+```
+
+The router's authenticated `/fallback` endpoint remains available for deliberate
+operator recovery/full-registry intake. Nothing in the tracked n8n workflow set
+calls it periodically.
 
 ## Scope
 
-- n8n Community Edition runs persistently on the Ubuntu host through Docker Compose.
-- Only `bf431b2a6ba6` (GitHub agent-ready Issue intake) is represented by an inactive, tracked n8n Schedule Trigger export. Optional GitHub Trigger exports only wake that same intake job.
-- n8n reuses the existing Hermes dashboard cron **trigger** and **pause** routes for that one job; it does not spawn processes or implement workers. The installer fail-closes if the allowlisted job ID is not unique to `default`.
-- The existing GitHub intake script remains authoritative for filtering, idempotency, Kanban projection, and reconciliation. Optional n8n GitHub Trigger workflows only wake that same script.
-- The five GitHub event workflows and the temporary polling fallback are production-serialized with `N8N_CONCURRENCY_PRODUCTION_LIMIT=1`. This prevents an older delayed pause from overtaking a newer trigger for the same Hermes intake job. See [GitHub event concurrency](docs/GITHUB_EVENT_CONCURRENCY.md).
-- The intake's legacy Hermes schedule is paused only after its n8n canary passes. It is preserved for rollback.
-- `168bd63461e7`, `e432a90c1361`, `df360bfa297d`, and `27f6725028ff` remain Hermes-owned. In particular, H4V3 Broadcast Health Monitor has no n8n-native redesign in this scope.
-- **Operator notifications**: the intake formats and sends Telegram alerts through the existing Hermes messaging path (`hermes send`). Only human-attention incidents are sent; routine lifecycle transitions are suppressed. See [docs/H4V3_OVERVIEW.md](docs/H4V3_OVERVIEW.md).
-- **H4V3 Overview**: a read-only multi-board Hermes dashboard plugin (`hermes-plugin/h4v3-overview/`) that projects every Kanban board onto one screen (Need You / Blocked / Review / Running / Ready, rework counts, provenance). See [docs/H4V3_OVERVIEW.md](docs/H4V3_OVERVIEW.md).
+- n8n Community Edition runs persistently on the Ubuntu host through Docker
+  Compose and stays loopback-only.
+- `lease-controller` and `github-router` run as hardened, read-only companion
+  services on host networking.
+- `hermes-plugin/n8n-cron-auth/` authorizes only trigger/pause for
+  `default:bf431b2a6ba6`; it cannot list/create/edit/delete jobs or trigger any
+  other cron job.
+- Repository membership is discovered from the GitHub topic `hermes-agent`.
+- Operator notifications use the existing Hermes messaging path (`hermes send`)
+  and only surface human-attention incidents.
+- H4V3 Overview is a read-only multi-board dashboard projection.
+
+The following Hermes jobs remain outside this migration and retain their
+existing ownership/state: `168bd63461e7`, `e432a90c1361`, `df360bfa297d`,
+`27f6725028ff`, and any other non-intake jobs.
 
 ## Explicit non-goals
 
-This change does **not** modify Hermes core, redesign Kanban state, create a new dispatch/completion API, add a separate idempotency database, move H4V3 Broadcast Health Monitor to n8n, or recreate worker/worktree/spawn behavior in n8n. The single production slot is an n8n edge-safety guard for the shared intake job, not a new Hermes concurrency system. The H4V3 Overview is a read-only projection: no task editing, worker control, analytics, Issue/PR creation, new auth, or public exposure.
+This repository does **not** modify Hermes core, redesign Kanban state, create a
+new dispatch/completion API, add a separate idempotency database, recreate
+worker/worktree/spawn behavior in n8n, or migrate H4V3 Broadcast Health Monitor
+to n8n.
 
-See [operations](docs/OPERATIONS.md) for the controlled host rollout, [GitHub event concurrency](docs/GITHUB_EVENT_CONCURRENCY.md) for the event activation gate, and [future improvements](docs/FUTURE_IMPROVEMENTS.md) for intentionally deferred ideas.
+It also does not automatically create a polling schedule as a fallback. A
+future periodic fallback/reconciliation policy requires an explicit separately
+reviewed decision.
 
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
-| `automation/n8n/compose.yaml` | Private, persistent n8n CE host deployment |
-| `automation/n8n/workflows/*.json` | Inactive, credential-free n8n workflow templates tracked in Git |
-| `automation/n8n/scripts/` | Host install, service-auth deployment, render/import/export, cutover/rollback, static validation |
-| `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Authoritative GitHub intake + reconciliation tick and Telegram notification policy |
-| `automation/hermes/scripts/install-h4v3-overview.sh` | Optional standalone Overview dashboard plugin installer (candidate copy, validation, atomic replace, rollback) |
-| `automation/hermes/scripts/deploy-intake-edge.sh` | Safe host deploy of intake/edge runtime copies (candidate copy, validation, atomic replace, rollback; never touches cron) |
-| `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation (completion, rework lifecycle, human-attention evidence) |
-| `hermes-plugin/n8n-cron-auth/` | User plugin that token-authenticates only exact existing cron trigger/pause routes |
-| `hermes-plugin/h4v3-overview/` | Read-only H4V3 Overview dashboard plugin (multi-board projection) |
-| `docs/H4V3_OVERVIEW.md` | Overview responsibilities, Need You rules, Telegram suppress/send matrix, install/rollback |
-| `tests/test_n8n_cron_auth_plugin.py` | Runtime test for the route allowlist and secret-file fail-closed behavior |
-| `tests/test_github_event_concurrency_contract.py` | Regression contract for the five GitHub event workflows and their single production execution slot |
-| `tests/test_h4v3_overview.py`, `tests/test_h4v3_notification_policy.py` | Overview projection + notification policy regression tests |
+| `automation/n8n/compose.yaml` | Private n8n + router + lease-controller deployment |
+| `automation/n8n/github-router/router.py` | Signed GitHub event ingress + scope queue + webhook reconciliation |
+| `automation/n8n/lease-controller/controller.py` | Existing Hermes job trigger/pause lease guard |
+| `automation/n8n/scripts/repository_registry.py` | `hermes-agent` repository discovery and board/checkout authority |
+| `automation/n8n/scripts/reconcile-github-router.sh` | Explicit webhook-registry reconciliation |
+| `automation/n8n/scripts/import-workflows.sh` | Compatibility no-op/status path; never recreates the retired schedule |
+| `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Authoritative GitHub intake + reconciliation tick |
+| `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
+| `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
+| `hermes-plugin/n8n-cron-auth/` | Exact route allowlist for the preserved Hermes intake job |
+| `hermes-plugin/h4v3-overview/` | Read-only multi-board dashboard plugin |
+| `docs/OPERATIONS.md` | Host rollout and async-only operating contract |
+| `docs/GITHUB_EVENT_CONCURRENCY.md` | Event/lease concurrency contract |
+| `docs/REPOSITORY_REGISTRY.md` | Repository discovery/authority contract |
 
-## Fast host path
+## Host setup
 
-> Run these from a checkout on the **Ubuntu host**, not from the Hermes container. The current agent container has no Docker socket, sudo, systemd, or host SSH authority.
+Run host operations from the Ubuntu host, not from the Hermes worker container.
+The worker container has no Docker socket, sudo, systemd, or host SSH authority.
 
 ```bash
-# 1. Docker Engine + Compose v2 must already be installed.
-#    This enables Docker boot recovery only when explicitly requested.
+# 1. Install/start the private control-plane stack.
 automation/n8n/scripts/host-install.sh --enable-docker-service
 
-# 2. Deploy the least-privilege Hermes service token plugin.
-#    Restart the existing Hermes dashboard using its current supervisor afterward.
-automation/n8n/scripts/configure-hermes-service-auth.sh --hermes-home "$HOME/.hermes"
-
-# 2b. Optional: install the read-only H4V3 Overview dashboard plugin
-#     (independent of service-auth; restart the dashboard afterward).
-automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
-
-# 2c. Optional: deploy the intake/edge runtime scripts (see docs/H4V3_OVERVIEW.md —
-#     the live cron executes deployed copies under $HERMES_HOME/scripts, not this checkout).
-automation/hermes/scripts/deploy-intake-edge.sh --hermes-home "$HOME/.hermes"
-
-# 3. Render/import inactive workflows for the current dashboard bind address.
-automation/n8n/scripts/import-workflows.sh \
-  --dashboard-url http://100.107.12.90:9119
-
-# 4. Follow the manual credential + canary gates in docs/OPERATIONS.md.
-# 5. After the sole intake Schedule Trigger workflow has passed its canary and
-#    been restored, pause only the legacy intake schedule. Activate that
-#    workflow only after this command succeeds (see docs/OPERATIONS.md).
-automation/n8n/scripts/cutover.sh --confirm-n8n-verified \
+# 2. Install the least-privilege Hermes service-token plugin.
+automation/n8n/scripts/configure-hermes-service-auth.sh \
   --hermes-home "$HOME/.hermes"
+
+# Restart the existing Hermes dashboard through its current supervisor.
+
+# 3. Copy GitHub/Hermes secrets for the router.
+automation/n8n/scripts/configure-github-router-secrets.sh \
+  --hermes-home "$HOME/.hermes"
+
+# 4. Configure the reviewed public HTTPS router URL in .env, restart services,
+#    then reconcile topic-managed repository webhooks.
+automation/n8n/scripts/reconcile-github-router.sh
 ```
 
-Do not copy the generated token into this repository, n8n workflow JSON, shell history, or chat. n8n stores the Header Auth credential encrypted with the host-specific `N8N_ENCRYPTION_KEY`.
+If an older persisted n8n workflow named
+`Hermes schedule · GitHub agent-ready Issue intake` exists in the n8n database,
+leave it inactive or delete that n8n workflow record. Do **not** activate it.
+The tracked repository no longer contains that Schedule Trigger template.
 
-The 75-second pause is intentionally a bounded compensating cleanup, not a completion acknowledgement. A trigger or pause error means the canary is not approved: leave the workflow inactive, restore the legacy job, and follow the recovery gate in `docs/OPERATIONS.md`.
+## Runtime validation
 
-## Local static verification
+For the live host, verify all of the following:
+
+- `docker compose ps` reports the n8n, lease-controller, and github-router
+  services healthy;
+- `http://127.0.0.1:5680/healthz` and `http://127.0.0.1:5681/healthz` succeed;
+- webhook reconciliation reports the intended `hermes-agent` repositories;
+- a signed GitHub test event reaches the router and produces one scoped intake
+  wake;
+- `default:bf431b2a6ba6` gets a fresh successful run and returns to paused state
+  after the current lease cleanup;
+- no n8n Schedule Trigger is active for GitHub intake.
+
+## Local deterministic verification
 
 ```bash
 python3 automation/n8n/scripts/validate.py
 python3 tests/test_github_event_concurrency_contract.py
+python3 tests/test_github_router.py
+python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
+python3 tests/test_hermes_cron_trigger_pause.py
 python3 tests/test_repo_scoped_intake.py
+python3 tests/test_repository_registry.py
 python3 tests/test_h4v3_overview.py
 python3 tests/test_h4v3_notification_policy.py
 /ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py
 ```
 
-The workflows are intentionally **inactive** and contain the literal `__HERMES_DASHBOARD_URL__` placeholder. `import-workflows.sh` renders host-specific copies into ignored `automation/n8n/state/` before import.
+GitHub Actions are intentionally not the required validation surface for this
+repository; see `AGENTS.md`.

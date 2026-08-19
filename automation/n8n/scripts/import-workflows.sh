@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Render non-secret templates, then import them into a running local n8n stack.
+# Async-only intake owns no n8n workflow templates.  Keep this command as a
+# compatibility/status surface for older host runbooks without recreating the
+# retired five-minute Schedule Trigger workflow.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -23,34 +25,29 @@ done
 
 RENDERED_DIR="$N8N_DIR/state/rendered-workflows"
 mkdir -p "$RENDERED_DIR"
-# Do not re-import stale Schedule templates after the scope reduction. This
-# affects only ignored generated copies; existing n8n workflow records must be
-# deactivated or deleted deliberately in the n8n UI.
-rm -f "$RENDERED_DIR"/schedule-*.json
+rm -f "$RENDERED_DIR"/schedule-*.json "$RENDERED_DIR"/github-*-intake.json
 
+# Retain the strict legacy dashboard URL validation, but the expected rendered
+# workflow set is now empty.
 python3 "$N8N_DIR/scripts/render_workflows.py" \
   --dashboard-url "$DASHBOARD_URL" \
   --output-dir "$RENDERED_DIR"
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps n8n
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T n8n \
-  n8n import:workflow \
-    --separate \
-    --input=/files/rendered-workflows
 
 cat <<'EOF'
-Imported inactive workflows. Before activating any Schedule Trigger workflow:
-1. Attach the protected `Hermes n8n cron` HTTP Header Auth credential to both
-   HTTP Request nodes in every workflow.
-2. In the n8n UI, deactivate or delete any previously imported Schedule
-   workflows other than `Hermes schedule · GitHub agent-ready Issue intake`.
-3. Manually run that intake workflow at a non-scheduled time. Verify the source
-   Hermes intake reports `last_status=ok` and is paused by the workflow, then
-   restore it with the documented canary restore command.
-4. Run the documented cutover command first. It pauses the legacy intake
-   schedule while the imported Schedule Trigger workflow remains inactive.
-5. Only after that command succeeds, activate the Schedule Trigger workflow.
+No n8n intake workflows were imported.
 
-GitHub Trigger workflows remain inactive until a reviewed public HTTPS ingress
-sets N8N_WEBHOOK_URL. Their activation creates signed GitHub webhooks.
+The GitHub intake is event-driven:
+  GitHub webhook -> github-router -> lease-controller -> existing Hermes job
+  default:bf431b2a6ba6
+
+The Hermes job itself must be preserved and normally remain paused between
+external trigger/pause leases. Do not delete, recreate, rename, or edit its
+stored schedule as part of this migration.
+
+If an older persisted n8n workflow named
+`Hermes schedule · GitHub agent-ready Issue intake` still exists, keep it
+inactive or delete that n8n workflow record in the n8n UI so it cannot recreate
+five-minute polling.
 EOF

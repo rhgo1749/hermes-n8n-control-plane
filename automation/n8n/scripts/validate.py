@@ -12,39 +12,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 N8N = ROOT / "automation" / "n8n"
 sys.path.insert(0, str(N8N / "scripts"))
-from render_workflows import (  # noqa: E402
-    ACTIVE_JOBS,
-    FALLBACK_TIMEOUT_MS,
-    ROUTER_FALLBACK_URL,
-    normalize_dashboard_url,
-)
-
-
-def load(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def validate_schedule(job: dict[str, str]) -> None:
-    path = N8N / "workflows" / f"schedule-{job['slug']}.json"
-    data = load(path)
-    assert data["active"] is False
-    nodes = {node["name"]: node for node in data["nodes"]}
-    assert set(nodes) == {"Schedule Trigger", "Run registry fallback"}
-    schedule = nodes["Schedule Trigger"]
-    assert schedule["type"] == "n8n-nodes-base.scheduleTrigger"
-    assert schedule["parameters"]["rule"]["interval"] == [
-        {"field": "cronExpression", "expression": job["schedule"]}
-    ]
-    fallback = nodes["Run registry fallback"]
-    assert fallback["type"] == "n8n-nodes-base.httpRequest"
-    assert fallback["parameters"]["url"] == ROUTER_FALLBACK_URL
-    assert fallback["parameters"]["authentication"] == "genericCredentialType"
-    assert fallback["parameters"]["genericAuthType"] == "httpHeaderAuth"
-    assert fallback["parameters"]["options"]["timeout"] == FALLBACK_TIMEOUT_MS
-    serialized = json.dumps(data)
-    assert "/api/cron/jobs/" not in serialized
-    assert "127.0.0.1:5680" not in serialized
-    assert "credentials" not in serialized.lower()
+from render_workflows import ACTIVE_JOBS, normalize_dashboard_url  # noqa: E402
 
 
 def validate_dashboard_url_policy() -> None:
@@ -97,18 +65,13 @@ def validate_single_intake_boundary() -> None:
 
 
 def main() -> int:
-    assert {job["id"] for job in ACTIVE_JOBS} == {"bf431b2a6ba6"}
-    expected_schedule_files = {
-        f"schedule-{job['slug']}.json" for job in ACTIVE_JOBS
-    }
-    actual_schedule_files = {
-        path.name for path in (N8N / "workflows").glob("schedule-*.json")
-    }
-    assert actual_schedule_files == expected_schedule_files
-    github_workflows = sorted((N8N / "workflows").glob("github-*-intake.json"))
-    assert github_workflows == []
-    for job in ACTIVE_JOBS:
-        validate_schedule(job)
+    # Async-only intake owns no tracked n8n Schedule/GitHub Trigger workflows.
+    # The durable Hermes job remains allowlisted below and is woken by the
+    # loopback github-router -> lease-controller path.
+    assert ACTIVE_JOBS == ()
+    assert sorted((N8N / "workflows").glob("schedule-*.json")) == []
+    assert sorted((N8N / "workflows").glob("github-*-intake.json")) == []
+
     validate_dashboard_url_policy()
     validate_single_intake_boundary()
 
@@ -198,9 +161,11 @@ def main() -> int:
         json.dumps(
             {
                 "ok": True,
-                "schedule_workflows": len(ACTIVE_JOBS),
+                "schedule_workflows": 0,
                 "github_workflows": 0,
                 "github_event_router": 1,
+                "hermes_intake_job": "default:bf431b2a6ba6",
+                "hermes_schedule_owned_by_n8n": False,
             }
         )
     )
