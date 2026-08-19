@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Async-only intake owns no n8n workflow templates.  Keep this command as a
-# compatibility/status surface for older host runbooks without recreating the
-# retired five-minute Schedule Trigger workflow.
+# Render and import the single hourly GitHub intake fallback workflow.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -27,27 +25,32 @@ RENDERED_DIR="$N8N_DIR/state/rendered-workflows"
 mkdir -p "$RENDERED_DIR"
 rm -f "$RENDERED_DIR"/schedule-*.json "$RENDERED_DIR"/github-*-intake.json
 
-# Retain the strict legacy dashboard URL validation, but the expected rendered
-# workflow set is now empty.
 python3 "$N8N_DIR/scripts/render_workflows.py" \
   --dashboard-url "$DASHBOARD_URL" \
   --output-dir "$RENDERED_DIR"
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps n8n
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T n8n \
+  n8n import:workflow \
+    --separate \
+    --input=/files/rendered-workflows
 
 cat <<'EOF'
-No n8n intake workflows were imported.
+Imported the inactive hourly fallback workflow:
+  Hermes fallback · GitHub Kanban intake
 
-The GitHub intake is event-driven:
+Primary path remains event-driven:
   GitHub webhook -> github-router -> lease-controller -> existing Hermes job
   default:bf431b2a6ba6
 
-The Hermes job itself must be preserved and normally remain paused between
-external trigger/pause leases. Do not delete, recreate, rename, or edit its
-stored schedule as part of this migration.
+Fallback path runs once per hour and calls github-router /fallback. It performs
+webhook reconciliation plus a full-registry intake wake so missed GitHub events
+or transient delivery failures are eventually recovered.
 
-If an older persisted n8n workflow named
-`Hermes schedule · GitHub agent-ready Issue intake` still exists, keep it
-inactive or delete that n8n workflow record in the n8n UI so it cannot recreate
-five-minute polling.
+Attach the protected Hermes n8n cron HTTP Header Auth credential to the
+"Run registry fallback" node, verify one manual execution, then activate only
+this hourly fallback workflow.
+
+The Hermes job itself remains preserved and should normally stay paused between
+external trigger/pause leases. Do not delete or recreate default:bf431b2a6ba6.
 EOF
