@@ -1929,20 +1929,27 @@ def test_71_stale_review_ready_normalized_then_rework_round():
     )
     fake.pr_timeline[PR_N] = labeled_timeline(future_label_ts)
     fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
-    results2 = run_sync(fake)  # tick: stale agent-review-ready normalized
-    normalized = [r for r in results2
-                  if r.get("reason") == "stale_review_ready_normalized"]
-    check("stale review-ready normalized", len(normalized) == 1, str(results2))
-    check("card stays review during normalization",
-          task_row(tid)["status"] == "review", str(task_row(tid)))
+    # Section D: the stale agent-review-ready is normalized AND the new
+    # round's REVIEW -> READY intake completes in the SAME tick (no second
+    # cron tick).  The label-only removal does not invalidate the task state,
+    # PR decision, or governing event, so the same reconciliation pass falls
+    # through to the classic intake with a freshly refetched label set.
+    results2 = run_sync(fake)  # tick: normalize + REVIEW -> READY same tick
+    ready = [r for r in results2
+             if r.get("reason") == "agent_rework" and r.get("changed")]
+    check("review -> ready round 2 (same tick as normalization)",
+          len(ready) == 1, str(results2))
+    check("card ready after one tick",
+          task_row(tid)["status"] == "ready", str(task_row(tid)))
     check("agent-rework kept, review-ready removed",
           fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
-    # Next tick: classic REVIEW -> READY intake of the new round.
-    results3 = run_sync(fake)
-    ready = [r for r in results3
-             if r.get("reason") == "agent_rework" and r.get("changed")]
-    check("review -> ready round 2", len(ready) == 1, str(results3))
-    check("card ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
+    # The single transition is deterministic: no duplicate agent_rework entry
+    # and no stale-normalization-only entry is emitted for this tick.
+    check("single transition entry in same tick",
+          sum(1 for r in results2 if r.get("reason") == "agent_rework") == 1
+          and not [r for r in results2
+                   if r.get("reason") == "stale_review_ready_normalized"],
+          str(results2))
     rework_events = [e for e in task_events(tid)
                      if e["kind"] == "github_pr_rework"]
     check("two rework events", len(rework_events) == 2, str(rework_events))
@@ -3724,6 +3731,376 @@ def test_105_no_marker_attention_feedback_generic():
         "Missing/invalid fields" not in posted[0]), posted[0] if posted else "(none)")
 
 
+# ---------------------------------------------------------------------------
+# Rework verification-only retry + human-attention hardening (sections B/C/D)
+# ---------------------------------------------------------------------------
+
+def test_106_genuine_noop_same_head_rejected():
+    print("106. genuine no-op same-head (classic round, no maintainer retry) -> "
+          "rework_head_unchanged, stays BLOCKED, no delivery")
+    fake = fresh_env()
+    head = "0123456789abcdef0123456789abcdef00000106"
+    fake.prs[PR_N] = make_pr(PR_N, state="open", head_sha=head,
+                             title="no-op round", body="body")
+    fake.pr_labels[PR_N] = ["agent-rework"]
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD)
+    fake.reviews[PR_N] = [review("rhgo1749", "CHANGES_REQUESTED",
+                                 "fix it", "2026-08-10T00:00:10Z")]
+    tid = new_task("review")
+    run_sync(fake)  # classic label round (trigger NOT maintainer_retry)
+    payload = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"][-1]["payload"]
+    check("round head == live head", payload.get("head_sha") == head, str(payload))
+    check("round is NOT a maintainer retry", payload.get("trigger") != "maintainer_retry",
+          str(payload))
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "claim failed"
+        conn.commit()
+    _close_rework_run(tid, head=head, outcome="completed", summary="no change made")
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                     "completed_at=NULL WHERE id=?", (tid,))
+        conn.commit()
+    _post_completion_marker(fake, tid, head, request_comment=payload["request_comment_id"])
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("attention hold", any(r.get("reason") == "rework_human_attention"
+                                for r in entries), str(entries))
+    check("diagnostic rework_head_unchanged", any(
+        r.get("diagnostic") == "rework_head_unchanged" for r in entries), str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check("no delivery event", not [e for e in task_events(tid)
+                                     if e["kind"] == "github_pr_rework_delivery"],
+          str(task_events(tid)))
+
+
+def test_107_maintainer_retry_verification_only_same_head_accepted():
+    print("107. verification-only maintainer-retry same-head completion -> "
+          "ACCEPTED (delivery_complete_verification_only) -> REVIEW")
+    fake, tid = _attention_blocked_retry_hold()
+    head = fake.prs[PR_N]["head"]["sha"]  # head the round-1 worker produced
+    rcid = _post_retry_comment(fake, tid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("retry consumed", any(r.get("reason") == "maintainer_retry_consumed"
+                                for r in entries), str(entries))
+    payload = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"][-1]["payload"]
+    check("round2 is maintainer_retry", payload.get("trigger") == "maintainer_retry"
+          and payload.get("retry_comment_id") == rcid, str(payload))
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "claim failed"
+        conn.commit()
+    # Round-2 verification run attests the SAME live head (no new code push).
+    _close_rework_run(tid, head=head, outcome="completed",
+                      summary="verification: requested fixes already at head")
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                     "completed_at=NULL WHERE id=?", (tid,))
+        conn.commit()
+    _post_completion_marker(fake, tid, head, request_comment=rcid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    ready = [r for r in entries if r.get("reason") == "agent_review_ready"]
+    check("delivery accepted (same head, verification-only)", len(ready) == 1, str(entries))
+    ev = (ready[0].get("evidence") or {}) if ready else {}
+    check("evidence flags verification_only", ev.get("verification_only") is True
+          and ev.get("head") == head and ev.get("validation") == "passed", str(ev))
+    check("task -> review", task_row(tid)["status"] == "review", str(task_row(tid)))
+    check("label agent-review-ready",
+          "agent-review-ready" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    check("delivery event recorded", len([e for e in task_events(tid)
+                                          if e["kind"] == "github_pr_rework_delivery"]) == 1,
+          str(task_events(tid)))
+
+
+def test_108_stale_historical_marker_cannot_close_newer_round():
+    print("108. round-1 completion marker (posted before round-2's rework event) "
+          "cannot close round 2 -> no second delivery, no review-ready")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000108"
+    fake.prs[PR_N]["head"]["sha"] = head
+    _close_rework_run(tid, head=head, outcome="completed", summary="round1 delivered")
+    _post_completion_marker(fake, tid, head)  # round-1 marker (created_at = T1)
+    results = run_sync(fake)  # round-1 delivery -> review
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("round-1 delivery accepted", any(
+        r.get("reason") == "agent_review_ready" for r in entries), str(entries))
+    check("exactly one delivery (round 1)", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_delivery"]) == 1,
+        str(task_events(tid)))
+    # Open round 2: a newer agent-rework label after the delivery normalizes the
+    # stale review-ready and performs REVIEW -> READY round 2 (event T2 > T1).
+    _future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+    fake.pr_timeline[PR_N] = labeled_timeline(_future)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    run_sync(fake)  # normalize + REVIEW -> READY round 2 (same tick)
+    check("round 2 exists (rework_round=2)", [
+        e["payload"].get("rework_round") for e in task_events(tid)
+        if e["kind"] == "github_pr_rework"][-1:] == [2], str(task_events(tid)))
+    # Claim round 2 and let its run finish at the SAME live head without posting
+    # a NEW marker. The only completion marker on the PR is round 1's, which
+    # predates round 2's governing event and therefore must NOT close round 2.
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "claim failed"
+        conn.commit()
+    _close_rework_run(tid, head=head, outcome="completed",
+                      summary="round2 verification; no new marker")
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("round-1 marker did NOT close round 2 (no review-ready)", not any(
+        r.get("reason") == "agent_review_ready" for r in entries), str(entries))
+    check("still exactly one delivery event (round 1 only)", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework_delivery"]) == 1,
+        str(task_events(tid)))
+    check("no verification_only delivery from the stale marker", not any(
+        e["payload"].get("verification_only") for e in task_events(tid)
+        if e["kind"] == "github_pr_rework_delivery"), str(task_events(tid)))
+
+
+def test_109_review_requested_stops_auto_requeue():
+    print("109. same-head marker (rework_head_unchanged) + run outcome=review_requested "
+          "+ keyword-free summary -> human attention hold (NOT the reason-set keyword path), "
+          "NO requeue/respawn, stable across ticks")
+    fake = fresh_env()
+    head = "0123456789abcdef0123456789abcdef00000109"
+    fake.prs[PR_N] = make_pr(PR_N, state="open", head_sha=head,
+                             title="round", body="body")
+    fake.pr_labels[PR_N] = ["agent-rework"]
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD)
+    fake.reviews[PR_N] = [review("rhgo1749", "CHANGES_REQUESTED",
+                                 "fix it", "2026-08-10T00:00:10Z")]
+    tid = new_task("review")
+    run_sync(fake)  # classic label round (head == live head)
+    payload = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"][-1]["payload"]
+    check("round head == live head", payload.get("head_sha") == head, str(payload))
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "claim failed"
+        conn.commit()
+    # Round worker ends terminally with outcome=review_requested, no marker yet,
+    # summary WITHOUT any human-attention keyword.  The completion marker then
+    # arrives at the SAME head (a verification/handoff repair, not new code),
+    # so the delivery guard is rework_head_unchanged — a reason NOT in the
+    # legacy attention reason set.  Only the outcome-based branch (fix C) turns
+    # this into a human-hold instead of an automatic READY requeue.
+    now = int(time.time())
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='running', worker_pid=NULL, "
+                     "claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,))
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, "
+            "ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-main', 'done', ?, ?, 'review_requested', "
+            "'awaiting sign off', ?)",
+            (tid, now, now + 600,
+             json.dumps({"head_sha": head, "pull_request": {"head_sha": head}})),
+        )
+        conn.commit()
+    _post_completion_marker(fake, tid, head,
+                            request_comment=payload.get("request_comment_id"))
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("attention hold (outcome-based)", any(
+        r.get("reason") == "rework_human_attention" for r in entries), str(entries))
+    check("diagnostic rework_head_unchanged (not in the legacy reason set)",
+          any(r.get("diagnostic") == "rework_head_unchanged" for r in entries),
+          str(entries))
+    check("NO auto requeue to ready", not any(
+        r.get("reason") == "rework_retry_scheduled" for r in entries), str(entries))
+    check("task NOT ready (human hold)", task_row(tid)["status"] != "ready",
+          str(task_row(tid)))
+    check("agent-rework restored", "agent-rework" in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+    # Second immediate dispatcher reconciliation: still no requeue, no respawn.
+    stub = StubSpawn()
+    results2 = _run_sync_with_dispatch(fake, stub)
+    entries2 = [r for r in results2 if r.get("task_id") == tid]
+    check("second tick no auto READY", not any(
+        r.get("status") == "ready" and r.get("changed") for r in entries2),
+        str(entries2))
+    check("second tick no requeue", not any(
+        r.get("reason") == "rework_retry_scheduled" for r in entries2), str(entries2))
+    check("second tick no respawn", stub.calls == [], str(stub.calls))
+
+
+def test_110_ordinary_crash_still_requeues():
+    print("110. crashed worker (outcome=crashed, no marker) -> safe requeue to "
+          "READY + agent-rework (ordinary crash is NOT review_requested)")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None, "claim failed"
+        conn.commit()
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='running', worker_pid=NULL, "
+                     "claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,))
+        conn.execute("UPDATE task_runs SET ended_at=?, outcome='crashed', "
+                     "status='crashed', error='pid N not alive' "
+                     "WHERE id=? AND ended_at IS NULL",
+                     (int(time.time()), claimed.current_run_id))
+        conn.commit()
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("requeue scheduled (crash is recoverable)", any(
+        r.get("reason") == "rework_retry_scheduled" for r in entries), str(entries))
+    check("back to ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
+    check("agent-rework restored", "agent-rework" in fake.pr_labels.get(PR_N, []),
+          str(fake.pr_labels))
+    check("no review-ready", not any(r.get("reason") == "agent_review_ready"
+                                     for r in entries), str(entries))
+
+
+def test_111_retry_signal_one_shot_no_reconsume():
+    print("111. trusted retry comment consumed once; replayed/same comment is never "
+          "re-consumed (one-shot, consumed id durable)")
+    fake, tid = _attention_blocked_retry_hold()
+    rcid = _post_retry_comment(fake, tid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("consumed once", sum(
+        1 for r in entries if r.get("reason") == "maintainer_retry_consumed") == 1,
+        str(entries))
+    check("task -> ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
+    # The same retry comment is now in the consumed set: a replay (second tick)
+    # must not consume it again.
+    results2 = run_sync(fake)
+    entries2 = [r for r in results2 if r.get("task_id") == tid]
+    check("no second consumption on replay", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries2),
+        str(entries2))
+    check("still exactly one rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"]) == 2,
+        str(task_events(tid)))
+
+
+def test_112_malformed_marker_still_fail_closed():
+    print("112. malformed AGENT_REWORK_COMPLETE (prose, no fields) -> "
+          "completion_marker_malformed, attention hold, PR feedback, stays BLOCKED")
+    fake, tid = _blocked_invalid_delivery_case(marker="none")
+    head = fake.prs[PR_N]["head"]["sha"]
+    _malformed_marker_like_round12(fake, head)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("attention hold", any(r.get("reason") == "rework_human_attention"
+                                for r in entries), str(entries))
+    check("diagnostic completion_marker_malformed", any(
+        r.get("diagnostic") == "completion_marker_malformed" for r in entries),
+        str(entries))
+    check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
+    check("no delivery event", not [e for e in task_events(tid)
+                                     if e["kind"] == "github_pr_rework_delivery"],
+          str(task_events(tid)))
+    check("PR feedback comment posted", len(
+        _pr_attention_comments(fake, tid, "completion_marker_malformed")) == 1,
+        str(_all_pr_comment_bodies(fake)))
+
+
+def test_113_claim_failure_label_recoverable():
+    print("113. claim failure -> task stays READY, agent-rework label retained, "
+          "no spawn (recoverable on next tick)")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws113-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    orig_cfg = mod._kanban_config
+    original_spawn = kanban_db._default_spawn
+    mod._kanban_config = lambda: {  # type: ignore[assignment]
+        "max_in_progress": 1, "default_assignee": "kanban-main", "failure_limit": 5,
+    }
+    kanban_db._default_spawn = stub
+    orig_claim = kanban_db.claim_task
+    kanban_db.claim_task = lambda *args, **kwargs: None  # type: ignore[assignment]
+    os.environ[mod.REWORK_DISPATCH_ENV] = "1"
+    try:
+        run_sync(fake)
+    finally:
+        mod._kanban_config = orig_cfg  # type: ignore[assignment]
+        kanban_db._default_spawn = original_spawn
+        kanban_db.claim_task = orig_claim  # type: ignore[assignment]
+        os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
+    check("no spawn on claim failure", stub.calls == [], str(stub.calls))
+    check("task stays ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
+    check("agent-rework retained (recoverable)",
+          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+
+
+def test_114_normalization_and_rework_same_tick():
+    print("114. stale agent-review-ready + agent-rework -> normalization AND "
+          "REVIEW -> READY in one tick; no duplicate transition/event/spawn")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000114"
+    fake.prs[PR_N]["head"]["sha"] = head
+    _close_rework_run(tid, head=head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, head)
+    run_sync(fake)  # delivery -> review + agent-review-ready
+    check("delivery -> review", task_row(tid)["status"] == "review", str(task_row(tid)))
+    check("agent-review-ready projected",
+          "agent-review-ready" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    _future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+    fake.pr_timeline[PR_N] = labeled_timeline(_future)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    results = run_sync(fake)  # one tick: normalize + REVIEW -> READY
+    ready = [r for r in results if r.get("reason") == "agent_rework"
+             and r.get("changed")]
+    check("REVIEW -> READY in same tick as normalization", len(ready) == 1,
+          str(results))
+    check("card ready after one tick", task_row(tid)["status"] == "ready",
+          str(task_row(tid)))
+    check("exactly one agent_rework entry", sum(
+        1 for r in results if r.get("reason") == "agent_rework") == 1, str(results))
+    check("exactly two rework events", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"]) == 2,
+        str(task_events(tid)))
+
+
+def test_115_normalization_idempotent_across_ticks():
+    print("115. repeating the same reconciliation is idempotent: no duplicate "
+          "transition/event/label mutation/spawn")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000115"
+    fake.prs[PR_N]["head"]["sha"] = head
+    _close_rework_run(tid, head=head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, head)
+    run_sync(fake)  # delivery -> review
+    _future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+    fake.pr_timeline[PR_N] = labeled_timeline(_future)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    run_sync(fake)  # tick A: normalize + REVIEW -> READY
+    check("ready after tick A", task_row(tid)["status"] == "ready",
+          str(task_row(tid)))
+    labels_after_a = list(fake.pr_labels.get(PR_N, []))
+    events_after_a = len(task_events(tid))
+    rework_events_a = len([e for e in task_events(tid)
+                           if e["kind"] == "github_pr_rework"])
+    # Tick B (and C): the card is now READY + consumed round.  No duplicate
+    # transition, event, or label churn; the dispatch lane is disabled here so
+    # no spawn either.
+    for i in (2, 3):
+        results = run_sync(fake)
+        entries = [r for r in results if r.get("task_id") == tid]
+        check(f"tick {i} stays ready", task_row(tid)["status"] == "ready",
+              str(task_row(tid)))
+        check(f"tick {i} no duplicate transition", not any(
+            r.get("reason") == "agent_rework" and r.get("changed")
+            for r in entries), str(entries))
+        check(f"tick {i} no new events", len(task_events(tid)) == events_after_a,
+              str(task_events(tid)))
+        check(f"tick {i} rework event count stable", len([
+            e for e in task_events(tid) if e["kind"] == "github_pr_rework"]) == rework_events_a,
+            str(task_events(tid)))
+        check(f"tick {i} labels stable", list(fake.pr_labels.get(PR_N, [])) == labels_after_a,
+              str(fake.pr_labels))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -3814,6 +4191,16 @@ def main() -> int:
         test_103_attention_pr_feedback_idempotent_across_ticks,
         test_104_valid_marker_no_attention_feedback,
         test_105_no_marker_attention_feedback_generic,
+        test_106_genuine_noop_same_head_rejected,
+        test_107_maintainer_retry_verification_only_same_head_accepted,
+        test_108_stale_historical_marker_cannot_close_newer_round,
+        test_109_review_requested_stops_auto_requeue,
+        test_110_ordinary_crash_still_requeues,
+        test_111_retry_signal_one_shot_no_reconsume,
+        test_112_malformed_marker_still_fail_closed,
+        test_113_claim_failure_label_recoverable,
+        test_114_normalization_and_rework_same_tick,
+        test_115_normalization_idempotent_across_ticks,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
