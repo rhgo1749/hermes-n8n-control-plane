@@ -19,7 +19,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any
 
 
 _OLD_COMPLETION_CONTRACT = """## GitHub completion contract (authoritative)
