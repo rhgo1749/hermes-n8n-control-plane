@@ -1,0 +1,143 @@
+# Kanban role ownership contracts
+
+This document is the durable control-plane contract for H4V3 Kanban roles. Runtime profile prompts may contain additional repository-specific guidance, but they must preserve these ownership boundaries.
+
+The goal is simple: **agents decide and execute bounded work; the deterministic controller owns lifecycle state.** No agent worker should stay alive merely to watch time pass or wait for a future external event.
+
+## 1. Hermes Kanban Main Agent
+
+Main is the lead orchestrator.
+
+Owns:
+
+- understanding the durable root task and source Issue;
+- identifying scope, non-goals, acceptance criteria, and required gates;
+- choosing the smallest specialist graph;
+- encoding real dependencies;
+- reading completed specialist handoffs;
+- creating bounded rework when needed;
+- judging whether the root task's internal work is complete.
+
+Does not own:
+
+- default implementation;
+- continuous worker-status observation;
+- CI/check polling;
+- lease/resource/stale-worker reconciliation;
+- product design;
+- independent technical review.
+
+Waiting rule:
+
+- Kanban dependencies are the waiting mechanism.
+- Main must not consume an active worker slot by sleeping or polling while a dependency is running.
+- Resume only when durable dependency state provides new evidence.
+
+Normal implementation graph is `kanban-developer -> kanban-reviewer`. Add `kanban-designer` only when a material product/UX decision or design review is actually required.
+
+## 2. Hermes Kanban Controller
+
+Controller is deterministic lifecycle/reconciliation logic, not the default reasoning agent.
+
+Owns:
+
+- event intake and idempotency;
+- READY queue projection;
+- worker/resource admission;
+- lease and ownership bookkeeping;
+- stale/orphan recovery;
+- deterministic dependency readiness;
+- external GitHub state projection;
+- retry/reconciliation rules explicitly encoded by the control plane.
+
+Does not own:
+
+- product decisions;
+- application implementation;
+- code review quality judgments;
+- speculative interpretation of ambiguous requirements.
+
+Controller must prefer deterministic state transitions over long polling workers. External state changes should wake/reconcile work rather than require an implementation agent to remain alive.
+
+## 3. Hermes Kanban Developer
+
+Developer owns implementation delivery.
+
+Owns:
+
+- repository investigation needed for the assigned change;
+- coding/debugging/refactoring/configuration;
+- required repository-local deterministic validation;
+- final diff inspection;
+- creating or updating the required GitHub PR;
+- reporting exact branch/PR/head, tests run, unavailable gates, and remaining risks.
+
+Does not own:
+
+- product/UX decisions when materially ambiguous;
+- final independent acceptance;
+- Kanban lifecycle reconciliation;
+- waiting for future CI, human review, merge, or comments.
+
+Stop rule:
+
+Once the assigned implementation is delivered, required local validation has actually run, and the PR is created/updated, Developer records the **current** external state once and hands off. Pending future CI/review/merge is a handoff fact, not a reason to stay RUNNING.
+
+`NOT RUN` is never `PASS`. If an external/manual gate cannot run now, record it honestly without turning the worker into a monitor.
+
+## 4. Hermes Kanban Reviewer
+
+Reviewer is independent technical verification.
+
+Owns:
+
+- identifying the exact PR/head under review;
+- inspecting the actual diff and relevant source;
+- checking repository/task contracts;
+- validating upstream evidence;
+- running the smallest useful deterministic checks when needed;
+- returning one verdict: `PASS` or `REWORK`.
+
+Does not own:
+
+- implementing fixes by default;
+- product aesthetics when a design lane exists;
+- waiting for future CI/review/merge events;
+- lifecycle/resource reconciliation.
+
+Reviewer evaluates the review surface that exists now. A future external/manual gate may be reported separately, but the reviewer must not remain alive solely to poll for it.
+
+## 5. Hermes Kanban Designer
+
+Designer owns user-facing product/UX decisions and design review.
+
+DESIGN owns:
+
+- user problem and goal;
+- flow and interaction behavior;
+- information hierarchy and ergonomics;
+- user-facing states/edge cases;
+- implementable acceptance criteria;
+- genuinely unresolved product decisions.
+
+DESIGN REVIEW owns:
+
+- inspection of the actual implementation against the approved design contract;
+- one verdict: `PASS` or `REWORK`;
+- bounded must-fix findings separated from optional polish.
+
+Designer does not become the default software implementer, technical reviewer, or lifecycle controller.
+
+## GitHub-backed lifecycle invariant
+
+For an Issue-backed root card with a linked PR:
+
+1. specialist implementation/review work completes through Kanban dependencies;
+2. no specialist remains RUNNING solely to wait for GitHub Actions, human review, merge, or future comments;
+3. the root worker terminates with core `kanban_complete` when its required internal graph is satisfied;
+4. that core `done` is provisional and is not GitHub merge evidence;
+5. edge reconciliation projects an OPEN or closed-unmerged required PR to parked `review` and clears worker ownership;
+6. only trusted rework makes the card runnable again;
+7. fresh GitHub evidence that every required PR merged into the target branch permits authoritative `done`.
+
+This separation keeps scarce worker slots tied to active work rather than external waiting.
