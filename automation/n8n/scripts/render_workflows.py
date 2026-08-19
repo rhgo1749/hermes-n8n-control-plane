@@ -19,10 +19,8 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / "workflows"
-
 ROUTER_FALLBACK_URL = "http://127.0.0.1:5681/fallback"
 FALLBACK_TIMEOUT_MS = 120_000
-
 _NAMESPACE = uuid.UUID("4d3669cd-39ce-4c84-a10d-762278d838c6")
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
@@ -41,12 +39,56 @@ def _uuid(key: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, key))
 
 
-def _base_workflow(name: str, nodes: list[dict[str, Any]], connections: dict[str, Any]) -> dict[str, Any]:
+def schedule_workflow(job: dict[str, str]) -> dict[str, Any]:
+    schedule_name = "Schedule Trigger"
+    fallback_name = "Run registry fallback"
     return {
-        "name": name,
-        "nodes": nodes,
+        "name": f"Hermes fallback · {job['name']}",
+        "nodes": [
+            {
+                "parameters": {
+                    "rule": {
+                        "interval": [
+                            {"field": "cronExpression", "expression": job["schedule"]}
+                        ]
+                    }
+                },
+                "id": _uuid(f"{job['id']}:schedule"),
+                "name": schedule_name,
+                "type": "n8n-nodes-base.scheduleTrigger",
+                "typeVersion": 1.2,
+                "position": [180, 300],
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": ROUTER_FALLBACK_URL,
+                    "authentication": "genericCredentialType",
+                    "genericAuthType": "httpHeaderAuth",
+                    "options": {
+                        "timeout": FALLBACK_TIMEOUT_MS,
+                        "response": {
+                            "response": {
+                                "neverError": False,
+                                "responseFormat": "json",
+                                "fullResponse": True,
+                            }
+                        },
+                    },
+                },
+                "id": _uuid(f"{job['id']}:registry-fallback"),
+                "name": fallback_name,
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [440, 300],
+            },
+        ],
         "pinData": {},
-        "connections": connections,
+        "connections": {
+            schedule_name: {
+                "main": [[{"node": fallback_name, "type": "main", "index": 0}]]
+            }
+        },
         "active": False,
         "settings": {"executionOrder": "v1"},
         "meta": {"templateCredsSetupCompleted": False},
@@ -54,71 +96,10 @@ def _base_workflow(name: str, nodes: list[dict[str, Any]], connections: dict[str
     }
 
 
-def schedule_workflow(job: dict[str, str]) -> dict[str, Any]:
-    schedule_name = "Schedule Trigger"
-    fallback_name = "Run registry fallback"
-    schedule = {
-        "parameters": {
-            "rule": {
-                "interval": [
-                    {"field": "cronExpression", "expression": job["schedule"]}
-                ]
-            }
-        },
-        "id": _uuid(f"{job['id']}:schedule"),
-        "name": schedule_name,
-        "type": "n8n-nodes-base.scheduleTrigger",
-        "typeVersion": 1.2,
-        "position": [180, 300],
-    }
-    fallback = {
-        "parameters": {
-            "method": "POST",
-            "url": ROUTER_FALLBACK_URL,
-            "authentication": "genericCredentialType",
-            "genericAuthType": "httpHeaderAuth",
-            "options": {
-                "timeout": FALLBACK_TIMEOUT_MS,
-                "response": {
-                    "response": {
-                        "neverError": False,
-                        "responseFormat": "json",
-                        "fullResponse": True,
-                    }
-                },
-            },
-        },
-        "id": _uuid(f"{job['id']}:registry-fallback"),
-        "name": fallback_name,
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4.2,
-        "position": [440, 300],
-    }
-    return _base_workflow(
-        f"Hermes fallback · {job['name']}",
-        [schedule, fallback],
-        {
-            schedule_name: {
-                "main": [[["node", fallback_name]]]
-            }
-        },
-    )
-
-
-def _normalize_connections(data: dict[str, Any]) -> dict[str, Any]:
-    # Keep the builder readable while emitting n8n's exact connection shape.
-    for node_name, value in list(data.get("connections", {}).items()):
-        if value == {"main": [[["node", "Run registry fallback"]]]}:
-            data["connections"][node_name] = {
-                "main": [[{"node": "Run registry fallback", "type": "main", "index": 0}]]
-            }
-    return data
-
-
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(_normalize_connections(payload), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
         encoding="utf-8",
     )
 
@@ -158,11 +139,17 @@ def normalize_dashboard_url(raw: str) -> str:
     if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
         raise ValueError("dashboard URL must not contain a path, query, or fragment")
     if parsed.scheme == "http" and not _is_private_http_target(parsed.hostname):
-        raise ValueError("http dashboard URL must use a loopback, private, or Tailnet IP address")
+        raise ValueError(
+            "http dashboard URL must use a loopback, private, or Tailnet IP address"
+        )
     return value
 
 
-def render_templates(template_dir: Path, output_dir: Path, dashboard_url: str) -> list[Path]:
+def render_templates(
+    template_dir: Path,
+    output_dir: Path,
+    dashboard_url: str,
+) -> list[Path]:
     normalize_dashboard_url(dashboard_url)
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
@@ -182,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--template-dir", type=Path, default=WORKFLOWS)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
+
     try:
         if args.write_templates:
             output = args.output_dir or WORKFLOWS
@@ -192,7 +180,17 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"workflow-render: ERROR: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"count": len(paths), "output_dir": str(output), "files": [p.name for p in paths]}, ensure_ascii=False))
+
+    print(
+        json.dumps(
+            {
+                "count": len(paths),
+                "output_dir": str(output),
+                "files": [path.name for path in paths],
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
