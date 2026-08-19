@@ -12,16 +12,22 @@ ROUTER_URL="${GITHUB_ROUTER_URL:-http://127.0.0.1:5681}"
   exit 2
 }
 
-TOKEN="$(<"$TOKEN_FILE")"
-[[ -n "$TOKEN" ]] || { echo "Router service token is empty" >&2; exit 2; }
-
-python3 - "$ROUTER_URL" "$TOKEN" <<'PY'
+python3 - "$ROUTER_URL" "$TOKEN_FILE" <<'PY'
 import json
 import sys
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-base, token = sys.argv[1].rstrip("/"), sys.argv[2]
+base = sys.argv[1].rstrip("/")
+token_file = Path(sys.argv[2])
+try:
+    token = token_file.read_text(encoding="utf-8").strip()
+except OSError as exc:
+    raise SystemExit("router service token is unavailable") from exc
+if not token:
+    raise SystemExit("router service token is empty")
+
 request = Request(
     f"{base}/reconcile",
     data=b"",
@@ -41,5 +47,3 @@ except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
     raise SystemExit(f"router reconcile failed: {type(exc).__name__}") from exc
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PY
-
-unset TOKEN
