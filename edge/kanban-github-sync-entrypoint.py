@@ -8,8 +8,9 @@ installed under the historical live name ``kanban-github-sync.py``.
 
 Small, independently reviewable overlays are installed here so the canonical
 state machine can stay unchanged: resource admission controls worker capacity,
-and head-binding feedback adds observational PR guidance without changing
-rework transitions.
+head-binding feedback adds observational PR guidance without changing rework
+transitions, and the retry-signal guard prevents edge-owned help text from being
+consumed as a fresh maintainer retry.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from types import ModuleType
 
 from kanban_head_binding_feedback import install_head_binding_feedback
 from kanban_resource_admission import install_resource_admission
+from kanban_retry_signal_guard import install_retry_signal_guard
 
 
 def _core_path() -> Path:
@@ -47,6 +49,7 @@ def _load_core() -> ModuleType:
     spec.loader.exec_module(module)
     install_resource_admission(module)
     install_head_binding_feedback(module)
+    install_retry_signal_guard(module)
     return module
 
 
