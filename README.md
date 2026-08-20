@@ -83,7 +83,7 @@ calls it periodically.
   Compose and stays loopback-only.
 - `lease-controller` and `github-router` run as hardened, read-only companion
   services on host networking.
-- `hermes-plugin/n8n-cron-auth/` authorizes only trigger/pause for
+- legacy n8n cron authentication plugin (removed after direct actuator migration) authorizes only trigger/pause for
   `default:bf431b2a6ba6`; it cannot list/create/edit/delete jobs or trigger any
   other cron job.
 - Repository membership is discovered from the GitHub topic `hermes-agent`.
@@ -120,7 +120,7 @@ reviewed decision.
 | `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
 | `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
-| `hermes-plugin/n8n-cron-auth/` | Legacy Hermes service authentication plugin for token-protected routes |
+| legacy n8n cron authentication plugin (removed after direct actuator migration) | Legacy Hermes service authentication plugin for token-protected routes |
 | `hermes-plugin/h4v3-overview/` | Read-only multi-board dashboard plugin |
 | `docs/OPERATIONS.md` | Host rollout and async-only operating contract |
 | `docs/GITHUB_EVENT_CONCURRENCY.md` | Event/lease concurrency contract |
