@@ -8,8 +8,10 @@ writer that may move GitHub-backed cards between ``review`` and ``done``
 based on a fresh GitHub re-query.
 
 State contract (per operator decision):
-  * DONE  + any required PR OPEN (or closed-not-merged)  -> REVIEW
-  * REVIEW + every required PR MERGED into target branch  -> DONE
+  * DONE  + any effective required PR OPEN (or unresolved closed-not-merged) -> REVIEW
+  * REVIEW + every effective required PR MERGED into target branch -> DONE
+    (a closed Issue may ignore an older closed-unmerged PR only when a newer
+    linked PR with the same head ref merged into target and no PR remains open)
   * REVIEW + one-shot agent-rework request (single open PR carrying a
     trusted ``agent-rework`` label, source Issue open + ``agent-ready``)
     -> READY: the sync context block is refreshed into the task body and
@@ -467,11 +469,59 @@ def _parse_pull_request(number: int, payload: Any, ref: GithubTaskRef) -> Github
     )
 
 
+def _is_merged_into_target(
+    ref: GithubTaskRef,
+    pr: GithubPullRequest,
+) -> bool:
+    return (
+        pr.is_merged_into_target
+        and pr.base_branch == ref.target_branch
+    )
+
+
+def _superseded_closed_pr_numbers(
+    ref: GithubTaskRef,
+    pull_requests: Iterable[GithubPullRequest],
+) -> frozenset[int]:
+    """Return closed historical PRs proven superseded by a newer same-head merge.
+
+    A historical PR is ignored only when:
+      * it is closed but is not itself merged into the target branch;
+      * its head ref is non-empty; and
+      * a numerically newer linked PR with exactly the same head ref is
+        merged into the target branch.
+
+    This deliberately does not infer supersession across unrelated branches.
+    """
+    prs = tuple(pull_requests)
+    merged_target_prs = tuple(
+        pr for pr in prs
+        if _is_merged_into_target(ref, pr)
+    )
+
+    return frozenset(
+        pr.number
+        for pr in prs
+        if (
+            pr.state == "closed"
+            and not _is_merged_into_target(ref, pr)
+            and bool(pr.head_ref)
+            and any(
+                replacement.number > pr.number
+                and bool(replacement.head_ref)
+                and replacement.head_ref == pr.head_ref
+                for replacement in merged_target_prs
+            )
+        )
+    )
+
+
 def evaluate_completion(
     ref: GithubTaskRef,
     pull_requests: Iterable[GithubPullRequest],
     *,
     linked_pr_numbers: Optional[Iterable[int]] = None,
+    issue_state: Optional[str] = None,
 ) -> GithubCompletionDecision:
     prs = tuple(sorted(pull_requests, key=lambda item: item.number))
     numbers = tuple(
@@ -480,6 +530,7 @@ def evaluate_completion(
             | {pr.number for pr in prs}
         )
     )
+
     if not prs:
         return GithubCompletionDecision(
             desired_status="review",
@@ -487,26 +538,66 @@ def evaluate_completion(
             linked_pr_numbers=numbers,
             pull_requests=prs,
         )
-    if all(
-        pr.is_merged_into_target and pr.base_branch == ref.target_branch
-        for pr in prs
-    ):
+
+    if all(_is_merged_into_target(ref, pr) for pr in prs):
         return GithubCompletionDecision(
             desired_status="done",
             reason="all_linked_prs_merged",
             linked_pr_numbers=numbers,
             pull_requests=prs,
         )
-    if any(pr.state == "open" for pr in prs):
+
+    has_open_pr = any(pr.state == "open" for pr in prs)
+
+    # A closed Issue may have historical PRs that were intentionally replaced
+    # after main advanced. Do not let those stale PRs revive an already
+    # completed card forever, but only accept supersession when the lineage is
+    # unambiguous: no open linked PR remains, and every closed-unmerged PR has
+    # a newer linked merge from exactly the same head branch.
+    if str(issue_state or "").casefold() == "closed" and not has_open_pr:
+        unresolved_closed = tuple(
+            pr for pr in prs
+            if (
+                pr.state == "closed"
+                and not _is_merged_into_target(ref, pr)
+            )
+        )
+        superseded = _superseded_closed_pr_numbers(ref, prs)
+
+        if (
+            unresolved_closed
+            and superseded
+            and superseded == {pr.number for pr in unresolved_closed}
+        ):
+            effective_prs = tuple(
+                pr for pr in prs
+                if pr.number not in superseded
+            )
+            if (
+                effective_prs
+                and all(
+                    _is_merged_into_target(ref, pr)
+                    for pr in effective_prs
+                )
+            ):
+                return GithubCompletionDecision(
+                    desired_status="done",
+                    reason="superseded_pr_merged",
+                    linked_pr_numbers=numbers,
+                    pull_requests=prs,
+                )
+
+    if has_open_pr:
         reason = "linked_pr_open"
     elif any(
         pr.state == "closed"
-        and (not pr.merged or pr.base_branch != ref.target_branch)
+        and not _is_merged_into_target(ref, pr)
         for pr in prs
     ):
         reason = "linked_pr_closed_not_merged"
     else:
         reason = "linked_pr_not_merged"
+
     return GithubCompletionDecision(
         desired_status="review",
         reason=reason,
@@ -520,7 +611,12 @@ def verify_completion(
     ref: GithubTaskRef,
     text_sources: Iterable[str] = (),
 ) -> GithubCompletionDecision:
-    """Re-query the Issue links and each linked PR; fail closed on errors."""
+    """Re-query linked PRs and use source-Issue state only for supersession.
+
+    Ordinary completion checks keep the existing GitHub request shape.  The
+    source Issue is fetched only when the PR set is a fully-provable
+    same-head supersession candidate.
+    """
     try:
         numbers = discover_linked_pr_numbers(client, ref, text_sources)
         pull_requests = tuple(
@@ -531,7 +627,53 @@ def verify_completion(
             )
             for number in numbers
         )
-        return evaluate_completion(ref, pull_requests, linked_pr_numbers=numbers)
+
+        provisional = evaluate_completion(
+            ref,
+            pull_requests,
+            linked_pr_numbers=numbers,
+        )
+
+        if provisional.reason != "linked_pr_closed_not_merged":
+            return provisional
+
+        unresolved_closed = {
+            pr.number
+            for pr in pull_requests
+            if (
+                pr.state == "closed"
+                and not _is_merged_into_target(ref, pr)
+            )
+        }
+        superseded = _superseded_closed_pr_numbers(ref, pull_requests)
+
+        # Avoid adding one Issue API call to every normal completion tick.
+        # Query it only when every unresolved historical PR already has an
+        # unambiguous newer same-head merged replacement.
+        if not unresolved_closed or superseded != unresolved_closed:
+            return provisional
+
+        issue_payload, _ = client.get(
+            f"/repos/{ref.repository}/issues/{ref.issue_number}"
+        )
+        if not isinstance(issue_payload, dict):
+            raise GithubCompletionError(
+                f"GitHub returned an invalid Issue response for #{ref.issue_number}"
+            )
+
+        issue_state = str(issue_payload.get("state", "")).casefold()
+        if issue_state not in {"open", "closed"}:
+            raise GithubCompletionError(
+                f"GitHub returned incomplete Issue data for #{ref.issue_number}"
+            )
+
+        return evaluate_completion(
+            ref,
+            pull_requests,
+            linked_pr_numbers=numbers,
+            issue_state=issue_state,
+        )
+
     except GithubCompletionError as exc:
         return GithubCompletionDecision(
             desired_status=None,

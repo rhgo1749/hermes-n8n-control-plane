@@ -24,7 +24,7 @@ The intake wrapper therefore emits this contract for new GitHub-backed cards:
 8. let `kanban-github-sync` re-query GitHub and project `DONE + required PR OPEN/closed-unmerged -> REVIEW`;
 9. the existing `DONE -> REVIEW` edge transition clears `assignee`, claim/worker metadata, blocker metadata, and `completed_at`, leaving a parked review card;
 10. only a trusted rework signal may return that parked card to runnable work;
-11. only a fresh GitHub read proving every linked required PR merged into the target branch may project `REVIEW -> DONE` authoritatively.
+11. only fresh GitHub evidence may project `REVIEW -> DONE` authoritatively. Normally every effective linked required PR must be merged into the target branch. A historical `closed + unmerged` PR may be excluded only when the source Issue is closed, no linked PR remains open, and a newer linked PR with the exact same non-empty head ref is merged into the target branch. Different-head, ambiguous, or still-open lineages remain `review`.
 
 A one-time snapshot of current CI/check state may be recorded in a handoff when relevant. Future external state is not a reason to keep a scarce worker process alive. `NOT RUN` remains distinct from `PASS`; an unavailable required external/manual gate must be reported honestly rather than waited on by polling.
 
