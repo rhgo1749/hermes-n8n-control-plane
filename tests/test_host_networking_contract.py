@@ -78,9 +78,25 @@ def main() -> int:
         values = read_fixture_env(n8n / ".env")
         assert values["N8N_PORT"] == "5678"
         assert values["N8N_EDITOR_BASE_URL"] == "http://127.0.0.1:5678"
-        assert values["LEASE_HERMES_BASE_URL"] == "http://100.107.12.90:9119"
+        assert "LEASE_HERMES_BASE_URL" not in values
+        assert "--hermes-base-url is deprecated and ignored" in installed.stderr
         assert "N8N_HOST_PORT" not in values
         assert calls.exists() and "docker compose" in calls.read_text(encoding="utf-8")
+
+        # A main-era runtime .env may still contain the retired dashboard key.
+        # A successful new installer run accepts it as input state but removes
+        # it from the rewritten runtime environment.
+        with (n8n / ".env").open("a", encoding="utf-8") as stream:
+            stream.write("LEASE_HERMES_BASE_URL=legacy-dashboard-value\n")
+
+        migrated = run_installer(
+            scripts / "host-install.sh",
+            root,
+            environment,
+        )
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        migrated_values = read_fixture_env(n8n / ".env")
+        assert "LEASE_HERMES_BASE_URL" not in migrated_values
 
         calls.unlink()
         (n8n / ".env").write_text(

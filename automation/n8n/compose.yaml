@@ -51,9 +51,8 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
       LEASE_LISTEN_PORT: "5680"
-      LEASE_HERMES_BASE_URL: ${LEASE_HERMES_BASE_URL:?set LEASE_HERMES_BASE_URL in .env}
-      LEASE_HERMES_JOB_ID: "bf431b2a6ba6"
-      LEASE_HERMES_PROFILE: "default"
+      LEASE_ACTUATOR_BASE_URL: http://127.0.0.1:5682
+      LEASE_TOKEN_FILE: /state/secrets/hermes-intake-control-token
       LEASE_STATE_PATH: /state/hermes-intake-lease.json
     command:
       - python3
@@ -101,7 +100,7 @@ services:
       GITHUB_ROUTER_REGISTRY_SCRIPT: /app/repository_registry.py
       GITHUB_ROUTER_GITHUB_TOKEN_FILE: /run/secrets/github-token
       GITHUB_ROUTER_WEBHOOK_SECRET_FILE: /run/secrets/github-webhook-secret
-      GITHUB_ROUTER_HERMES_TOKEN_FILE: /run/secrets/hermes-cron-token
+      GITHUB_ROUTER_INTAKE_TOKEN_FILE: /run/secrets/hermes-intake-control-token
     command:
       - python3
       - /app/router.py

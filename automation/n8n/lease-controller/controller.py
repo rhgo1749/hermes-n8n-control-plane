@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
@@ -13,30 +14,23 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
-# This edge controller is intentionally loopback-only. Do not make the
-# listen address runtime-configurable: n8n reaches it through host networking.
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("LEASE_LISTEN_PORT", "5680"))
 
-# Host-specific Hermes addresses belong in deployment configuration, never
-# in the tracked controller source.
-HERMES_BASE_URL = os.environ.get(
-    "LEASE_HERMES_BASE_URL",
-    "",
+ACTUATOR_BASE_URL = os.environ.get(
+    "LEASE_ACTUATOR_BASE_URL",
+    "http://127.0.0.1:5682",
 ).strip().rstrip("/")
-HERMES_JOB_ID = os.environ.get(
-    "LEASE_HERMES_JOB_ID",
-    "bf431b2a6ba6",
+
+ACTUATOR_TIMEOUT_SECONDS = float(
+    os.environ.get("LEASE_ACTUATOR_TIMEOUT_SECONDS", "920")
 )
-HERMES_PROFILE = os.environ.get(
-    "LEASE_HERMES_PROFILE",
-    "default",
-)
-HERMES_TRIGGER_TIMEOUT_SECONDS = float(
-    os.environ.get("LEASE_HERMES_TRIGGER_TIMEOUT_SECONDS", "900")
-)
-HERMES_PAUSE_TIMEOUT_SECONDS = float(
-    os.environ.get("LEASE_HERMES_PAUSE_TIMEOUT_SECONDS", "60")
+
+TOKEN_FILE = Path(
+    os.environ.get(
+        "LEASE_TOKEN_FILE",
+        "/state/secrets/hermes-intake-control-token",
+    )
 )
 
 STATE_PATH = Path(
@@ -82,11 +76,10 @@ def _write_state(value: dict[str, object]) -> None:
     tmp = STATE_PATH.with_name(
         f".{STATE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
-    data = _json_bytes(value) + b"\n"
 
     try:
         with tmp.open("wb") as fh:
-            fh.write(data)
+            fh.write(_json_bytes(value) + b"\n")
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, STATE_PATH)
@@ -97,16 +90,34 @@ def _write_state(value: dict[str, object]) -> None:
             pass
 
 
-def _upstream_url(action: str) -> str:
-    return (
-        f"{HERMES_BASE_URL}/api/cron/jobs/"
-        f"{HERMES_JOB_ID}/{action}?profile={HERMES_PROFILE}"
-    )
+def _read_token() -> str:
+    try:
+        value = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError("intake control token unavailable") from exc
+
+    if not value:
+        raise RuntimeError("intake control token empty")
+    return value
 
 
-def _call_hermes(action: str, authorization: str) -> tuple[int, bytes]:
+def _authorized(header: str) -> bool:
+    if not header.startswith("Bearer "):
+        return False
+
+    supplied = header[7:].strip()
+
+    try:
+        expected = _read_token()
+    except RuntimeError:
+        return False
+
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def _call_actuator(authorization: str) -> tuple[int, bytes]:
     request = Request(
-        _upstream_url(action),
+        f"{ACTUATOR_BASE_URL}/v1/intake",
         method="POST",
         headers={
             "Authorization": authorization,
@@ -114,48 +125,37 @@ def _call_hermes(action: str, authorization: str) -> tuple[int, bytes]:
         },
         data=b"",
     )
-    timeout = (
-        HERMES_TRIGGER_TIMEOUT_SECONDS
-        if action == "trigger"
-        else HERMES_PAUSE_TIMEOUT_SECONDS
-    )
 
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with urlopen(
+            request,
+            timeout=ACTUATOR_TIMEOUT_SECONDS,
+        ) as response:
             return response.status, response.read()
     except HTTPError as exc:
         return exc.code, exc.read()
     except (URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"Hermes {action} request failed: {exc}") from exc
+        raise RuntimeError(
+            f"intake actuator request failed: {exc}"
+        ) from exc
 
 
-def _trigger_hermes_in_background(
+def _trigger_intake_in_background(
     lease: str,
     authorization: str,
 ) -> None:
-    """Run Hermes' synchronous dashboard trigger without blocking the caller.
-
-    Hermes' dashboard ``/trigger`` executes a cron job end-to-end and may take
-    minutes. The lease-controller therefore acknowledges the wake immediately
-    and waits for Hermes in a daemon thread. A dedicated trigger lock preserves
-    the previous controller behavior of serializing upstream trigger calls.
-    """
-
     try:
         with _TRIGGER_LOCK:
-            status, _body = _call_hermes("trigger", authorization)
+            status, _body = _call_actuator(authorization)
     except RuntimeError as exc:
-        # A timeout is ambiguous: Hermes may have accepted the trigger and kept
-        # running after this client disconnected. Keep the current lease pending
-        # rather than falsely declaring the wake failed or resurrecting an older
-        # lease.
         with _REQUEST_LOCK:
             state = _load_state()
             if str(state.get("lease", "")) == lease:
                 state["trigger_error"] = str(exc)
                 _write_state(state)
+
         print(
-            "lease-controller Hermes trigger outcome is ambiguous "
+            "lease-controller actuator outcome is ambiguous "
             f"lease={lease}: {exc}",
             flush=True,
         )
@@ -163,6 +163,7 @@ def _trigger_hermes_in_background(
 
     with _REQUEST_LOCK:
         state = _load_state()
+
         if str(state.get("lease", "")) != lease:
             return
 
@@ -174,48 +175,16 @@ def _trigger_hermes_in_background(
                     "upstream_status": status,
                 }
             )
-            print(
-                "lease-controller Hermes trigger rejected "
-                f"lease={lease} status={status}",
-                flush=True,
-            )
             return
 
         if state.get("pause_requested"):
-            try:
-                pause_status, _body = _call_hermes("pause", authorization)
-            except RuntimeError as exc:
-                _write_state(
-                    {
-                        "lease": lease,
-                        "status": "active",
-                        "pause_error": str(exc),
-                    }
-                )
-                print(
-                    "lease-controller queued pause failed "
-                    f"lease={lease}: {exc}",
-                    flush=True,
-                )
-                return
-
-            if 200 <= pause_status < 300:
-                _write_state(
-                    {
-                        "lease": lease,
-                        "status": "paused",
-                        "upstream_status": pause_status,
-                    }
-                )
-            else:
-                _write_state(
-                    {
-                        "lease": lease,
-                        "status": "active",
-                        "pause_error": "hermes_pause_rejected",
-                        "upstream_status": pause_status,
-                    }
-                )
+            _write_state(
+                {
+                    "lease": lease,
+                    "status": "paused",
+                    "upstream_status": status,
+                }
+            )
             return
 
         _write_state(
@@ -228,7 +197,7 @@ def _trigger_hermes_in_background(
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesIntakeLeaseController/2"
+    server_version = "HermesIntakeLeaseController/3"
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(
@@ -241,7 +210,10 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, value: object) -> None:
         body = _json_bytes(value)
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -273,9 +245,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        authorization = self.headers.get(
+            "Authorization",
+            "",
+        ).strip()
 
-        authorization = self.headers.get("Authorization", "").strip()
-        if not authorization:
+        if not _authorized(authorization):
             self._send_json(
                 HTTPStatus.UNAUTHORIZED,
                 {"ok": False, "error": "authorization_required"},
@@ -287,14 +262,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/pause":
-            lease = parse_qs(parsed.query).get("lease", [""])[0].strip()
+            lease = parse_qs(parsed.query).get(
+                "lease",
+                [""],
+            )[0].strip()
+
             if not lease:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"ok": False, "error": "lease_required"},
                 )
                 return
-            self._pause(authorization, lease)
+
+            self._pause(lease)
             return
 
         self._send_json(
@@ -306,12 +286,7 @@ class Handler(BaseHTTPRequestHandler):
         lease = str(uuid.uuid4())
 
         with _REQUEST_LOCK:
-            # Validate any persisted state before replacing it. Once the new
-            # lease is persisted, never resurrect an older lease.
             _load_state()
-
-            # Persist first so the accepted wake immediately supersedes every
-            # older delayed pause, even across controller restarts.
             _write_state(
                 {
                     "lease": lease,
@@ -320,15 +295,12 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         threading.Thread(
-            target=_trigger_hermes_in_background,
+            target=_trigger_intake_in_background,
             args=(lease, authorization),
             daemon=True,
             name=f"hermes-intake-trigger-{lease[:8]}",
         ).start()
 
-        # Hermes' dashboard trigger is synchronous and executes the cron job
-        # end-to-end. Acknowledge only admission here; completion is reflected
-        # later through the persisted lease state.
         self._send_json(
             HTTPStatus.ACCEPTED,
             {
@@ -338,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
-    def _pause(self, authorization: str, lease: str) -> None:
+    def _pause(self, lease: str) -> None:
         with _REQUEST_LOCK:
             state = _load_state()
             current = str(state.get("lease", ""))
@@ -369,6 +341,7 @@ class Handler(BaseHTTPRequestHandler):
             if current_status == "pending":
                 state["pause_requested"] = True
                 _write_state(state)
+
                 self._send_json(
                     HTTPStatus.ACCEPTED,
                     {
@@ -390,27 +363,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            try:
-                status, _body = _call_hermes("pause", authorization)
-            except RuntimeError as exc:
-                self._send_json(
-                    HTTPStatus.BAD_GATEWAY,
-                    {"ok": False, "error": str(exc)},
-                )
-                return
-
-            if not 200 <= status < 300:
-                self._send_json(
-                    status,
-                    {
-                        "ok": False,
-                        "paused": False,
-                        "error": "hermes_pause_rejected",
-                        "upstream_status": status,
-                    },
-                )
-                return
-
+            # Direct actuator has no persistent schedule to pause. The delayed
+            # router cleanup now closes only this lease locally.
             _write_state(
                 {
                     "lease": lease,
@@ -423,24 +377,29 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "paused": True,
-                "upstream_status": status,
             },
         )
 
 
 def main() -> int:
-    if not HERMES_BASE_URL:
-        raise SystemExit("LEASE_HERMES_BASE_URL is required")
+    if not ACTUATOR_BASE_URL:
+        raise SystemExit("LEASE_ACTUATOR_BASE_URL is required")
+
+    # Fail closed before listening if the shared service credential is absent.
+    _read_token()
 
     server = ThreadingHTTPServer(
         (LISTEN_HOST, LISTEN_PORT),
         Handler,
     )
+
     print(
         f"lease-controller listening on "
-        f"http://{LISTEN_HOST}:{LISTEN_PORT}",
+        f"http://{LISTEN_HOST}:{LISTEN_PORT}; "
+        f"actuator={ACTUATOR_BASE_URL}",
         flush=True,
     )
+
     server.serve_forever()
     return 0
 

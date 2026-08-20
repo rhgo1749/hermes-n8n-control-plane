@@ -58,14 +58,14 @@ WEBHOOK_SECRET_FILE = Path(
         "/run/secrets/github-webhook-secret",
     )
 )
-HERMES_TOKEN_FILE = Path(
+INTAKE_TOKEN_FILE = Path(
     os.environ.get(
-        "GITHUB_ROUTER_HERMES_TOKEN_FILE",
-        "/run/secrets/hermes-cron-token",
+        "GITHUB_ROUTER_INTAKE_TOKEN_FILE",
+        "/run/secrets/hermes-intake-control-token",
     )
 )
 MAX_BODY_BYTES = 1024 * 1024
-SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request"}
+SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request", "pull_request_review"}
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _STATE_LOCK = threading.Lock()
@@ -346,7 +346,7 @@ def _release_delivery(
 
 def _service_authorized(header: str) -> bool:
     try:
-        token = _read_secret(HERMES_TOKEN_FILE, "Hermes cron token")
+        token = _read_secret(INTAKE_TOKEN_FILE, "intake control token")
     except RouterError:
         return False
     expected = f"Bearer {token}"
@@ -468,7 +468,7 @@ def _ensure_webhook(
     ]
     payload = {
         "active": True,
-        "events": ["issues", "issue_comment", "pull_request"],
+        "events": ["issues", "issue_comment", "pull_request", "pull_request_review"],
         "config": {
             "url": public_url,
             "content_type": "json",
@@ -622,7 +622,7 @@ def _delayed_pause(lease: str, token: str) -> None:
 
 
 def _wake() -> dict[str, Any]:
-    token = _read_secret(HERMES_TOKEN_FILE, "Hermes cron token")
+    token = _read_secret(INTAKE_TOKEN_FILE, "intake control token")
     status, payload = _lease_request("/trigger", token)
     if not 200 <= status < 300:
         raise RouterError(
@@ -693,7 +693,7 @@ class Handler(BaseHTTPRequestHandler):
                 "public_url_configured": bool(PUBLIC_URL),
                 "github_token_configured": GITHUB_TOKEN_FILE.is_file(),
                 "webhook_secret_configured": WEBHOOK_SECRET_FILE.is_file(),
-                "hermes_token_configured": HERMES_TOKEN_FILE.is_file(),
+                "hermes_token_configured": INTAKE_TOKEN_FILE.is_file(),
             },
         )
 

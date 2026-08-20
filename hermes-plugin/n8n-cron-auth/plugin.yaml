@@ -1,5 +1,0 @@
-name: hermes-n8n-cron-auth
-version: "1.0.0"
-description: "Least-privilege bearer auth for selected existing Hermes cron trigger/pause routes."
-author: "Hermes n8n Control Plane"
-kind: backend
