@@ -24,36 +24,36 @@ FALLBACK_TIMEOUT_MS = 120_000
 _NAMESPACE = uuid.UUID("4d3669cd-39ce-4c84-a10d-762278d838c6")
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
-ACTIVE_JOBS: tuple[dict[str, str], ...] = (
+FALLBACK_WORKFLOWS: tuple[dict[str, str], ...] = (
     {
         "slug": "github-agent-ready-intake",
-        "profile": "default",
-        "id": "bf431b2a6ba6",
         "name": "GitHub Kanban intake",
         "schedule": "0 * * * *",
     },
 )
 
+# Compatibility export for existing validation imports.
+ACTIVE_JOBS = FALLBACK_WORKFLOWS
 
 def _uuid(key: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, key))
 
 
-def schedule_workflow(job: dict[str, str]) -> dict[str, Any]:
+def schedule_workflow(fallback: dict[str, str]) -> dict[str, Any]:
     schedule_name = "Schedule Trigger"
     fallback_name = "Run registry fallback"
     return {
-        "name": f"Hermes fallback · {job['name']}",
+        "name": f"Hermes fallback · {fallback['name']}",
         "nodes": [
             {
                 "parameters": {
                     "rule": {
                         "interval": [
-                            {"field": "cronExpression", "expression": job["schedule"]}
+                            {"field": "cronExpression", "expression": fallback["schedule"]}
                         ]
                     }
                 },
-                "id": _uuid(f"{job['id']}:schedule"),
+                "id": _uuid(f"{fallback['slug']}:schedule"),
                 "name": schedule_name,
                 "type": "n8n-nodes-base.scheduleTrigger",
                 "typeVersion": 1.2,
@@ -76,7 +76,7 @@ def schedule_workflow(job: dict[str, str]) -> dict[str, Any]:
                         },
                     },
                 },
-                "id": _uuid(f"{job['id']}:registry-fallback"),
+                "id": _uuid(f"{fallback['slug']}:registry-fallback"),
                 "name": fallback_name,
                 "type": "n8n-nodes-base.httpRequest",
                 "typeVersion": 4.2,
@@ -106,9 +106,9 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def write_templates(directory: Path) -> list[Path]:
     written: list[Path] = []
-    for job in ACTIVE_JOBS:
-        path = directory / f"schedule-{job['slug']}.json"
-        _write_json(path, schedule_workflow(job))
+    for fallback in FALLBACK_WORKFLOWS:
+        path = directory / f"schedule-{fallback['slug']}.json"
+        _write_json(path, schedule_workflow(fallback))
         written.append(path)
     return written
 
