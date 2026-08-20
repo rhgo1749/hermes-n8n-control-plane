@@ -763,6 +763,85 @@ def test_delivery_store_is_bounded_and_pruned() -> None:
             _restore(original)
 
 
+
+def test_pull_request_review_event_enqueues_repo_scope() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        try:
+            router._write_state_unlocked(
+                {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
+            )
+            router._wake = lambda: {
+                "lease": "lease-pr-review",
+                "upstream_status": 200,
+            }
+
+            body = _event_body()
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request_review",
+                        delivery="delivery-pr-review",
+                    ),
+                )
+
+            claim = router._claim_scope()
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["event"] == "pull_request_review"
+            assert payload["repository"] == "rhgo1749/ctrl-hangul"
+            assert claim["mode"] == "event"
+            assert claim["repositories"] == ["rhgo1749/ctrl-hangul"]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_webhook_subscription_includes_pull_request_review() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_list_hooks = router._list_hooks
+        original_request = router._github_request
+        captured = {}
+
+        try:
+            router._list_hooks = lambda repository, token: []
+
+            def fake_request(method, path, token, payload=None):
+                if method == "POST" and path.endswith("/hooks"):
+                    captured["payload"] = payload
+                    return {"id": 10}
+                raise AssertionError(
+                    f"unexpected GitHub request: {method} {path}"
+                )
+
+            router._github_request = fake_request
+
+            action, duplicates_removed = router._ensure_webhook(
+                "rhgo1749/ctrl-hangul",
+                "github-token",
+                router.PUBLIC_URL,
+                "webhook-secret",
+            )
+
+            assert action == "created"
+            assert duplicates_removed == 0
+            assert captured["payload"]["events"] == [
+                "issues",
+                "issue_comment",
+                "pull_request",
+                "pull_request_review",
+            ]
+        finally:
+            router._list_hooks = original_list_hooks
+            router._github_request = original_request
+            _restore(original)
+
 def main() -> int:
     tests = [
         value

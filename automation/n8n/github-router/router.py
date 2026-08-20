@@ -65,7 +65,7 @@ INTAKE_TOKEN_FILE = Path(
     )
 )
 MAX_BODY_BYTES = 1024 * 1024
-SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request"}
+SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request", "pull_request_review"}
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _STATE_LOCK = threading.Lock()
@@ -468,7 +468,7 @@ def _ensure_webhook(
     ]
     payload = {
         "active": True,
-        "events": ["issues", "issue_comment", "pull_request"],
+        "events": ["issues", "issue_comment", "pull_request", "pull_request_review"],
         "config": {
             "url": public_url,
             "content_type": "json",
