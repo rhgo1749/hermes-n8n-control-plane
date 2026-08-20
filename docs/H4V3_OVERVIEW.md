@@ -159,7 +159,7 @@ automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
 ```
 
 Independent from the n8n service-auth installer: `configure-hermes-service-auth.sh`
-never installs the Overview, so an Overview failure cannot block service-auth
+never installs the Overview, so an Overview failure cannot block legacy service-auth
 provisioning. The installer validates the backend (`py_compile`), installs the
 plugin into `$HERMES_HOME/plugins/h4v3-overview/` atomically (previous version
 kept as `h4v3-overview.bak-<ts>`), and runs

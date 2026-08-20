@@ -120,7 +120,7 @@ reviewed decision.
 | `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
 | `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
-| `hermes-plugin/n8n-cron-auth/` | Exact route allowlist for the preserved Hermes intake job |
+| `hermes-plugin/n8n-cron-auth/` | Legacy Hermes service authentication plugin for token-protected routes |
 | `hermes-plugin/h4v3-overview/` | Read-only multi-board dashboard plugin |
 | `docs/OPERATIONS.md` | Host rollout and async-only operating contract |
 | `docs/GITHUB_EVENT_CONCURRENCY.md` | Event/lease concurrency contract |
