@@ -73,7 +73,7 @@ def _install_temp_paths(root: Path):
         "STATE_PATH": router.STATE_PATH,
         "GITHUB_TOKEN_FILE": router.GITHUB_TOKEN_FILE,
         "WEBHOOK_SECRET_FILE": router.WEBHOOK_SECRET_FILE,
-        "HERMES_TOKEN_FILE": router.HERMES_TOKEN_FILE,
+        "HERMES_TOKEN_FILE": router.INTAKE_TOKEN_FILE,
         "PUBLIC_URL": router.PUBLIC_URL,
         "DELIVERY_TTL_SECONDS": router.DELIVERY_TTL_SECONDS,
         "DELIVERY_MAX_ENTRIES": router.DELIVERY_MAX_ENTRIES,
@@ -83,11 +83,11 @@ def _install_temp_paths(root: Path):
     router.STATE_PATH = root / "state.json"
     router.GITHUB_TOKEN_FILE = secret_dir / "github-token"
     router.WEBHOOK_SECRET_FILE = secret_dir / "github-webhook-secret"
-    router.HERMES_TOKEN_FILE = secret_dir / "hermes-cron-token"
+    router.INTAKE_TOKEN_FILE = secret_dir / "hermes-intake-control-token"
     router.PUBLIC_URL = "https://example.test/github/hermes-intake"
     router.GITHUB_TOKEN_FILE.write_text("github-token", encoding="utf-8")
     router.WEBHOOK_SECRET_FILE.write_text("webhook-secret", encoding="utf-8")
-    router.HERMES_TOKEN_FILE.write_text("hermes-token", encoding="utf-8")
+    router.INTAKE_TOKEN_FILE.write_text("hermes-token", encoding="utf-8")
     return original
 
 

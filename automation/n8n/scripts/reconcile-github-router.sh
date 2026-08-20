@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-TOKEN_FILE="$ROOT/automation/n8n/state/secrets/hermes-cron-token"
+TOKEN_FILE="$ROOT/automation/n8n/state/secrets/hermes-intake-control-token"
 ROUTER_URL="${GITHUB_ROUTER_URL:-http://127.0.0.1:5681}"
 
 [[ -f "$TOKEN_FILE" ]] || {

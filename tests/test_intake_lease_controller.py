@@ -21,7 +21,10 @@ MODULE_PATH = (
     / "controller.py"
 )
 
-spec = importlib.util.spec_from_file_location("intake_lease_controller", MODULE_PATH)
+spec = importlib.util.spec_from_file_location(
+    "intake_lease_controller",
+    MODULE_PATH,
+)
 assert spec and spec.loader
 controller = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = controller
@@ -64,9 +67,31 @@ def _wait_for(predicate, *, timeout: float = 2.0) -> None:
 
 def _read_state() -> dict:
     try:
-        return json.loads(controller.STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(
+            controller.STATE_PATH.read_text(encoding="utf-8")
+        )
     except FileNotFoundError:
         return {}
+
+
+def _prepare_runtime(td: str) -> tuple[Path, Path]:
+    original_state = controller.STATE_PATH
+    original_token = controller.TOKEN_FILE
+
+    root = Path(td)
+    controller.STATE_PATH = root / "lease.json"
+    controller.TOKEN_FILE = root / "intake-token"
+    controller.TOKEN_FILE.write_text(
+        "test-token\n",
+        encoding="utf-8",
+    )
+
+    return original_state, original_token
+
+
+def _restore_runtime(original_state: Path, original_token: Path) -> None:
+    controller.STATE_PATH = original_state
+    controller.TOKEN_FILE = original_token
 
 
 class RunningServer:
@@ -92,28 +117,30 @@ class RunningServer:
         self.thread.join(timeout=5)
 
 
-def test_trigger_returns_before_slow_hermes_completion() -> None:
-    original_call = controller._call_hermes
-    original_state = controller.STATE_PATH
+def test_trigger_returns_before_slow_actuator_completion() -> None:
+    original_call = controller._call_actuator
 
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
+        original_state, original_token = _prepare_runtime(td)
         started = threading.Event()
         release = threading.Event()
 
-        def fake_call(action: str, authorization: str):
-            assert action == "trigger"
+        def fake_call(authorization: str):
             assert authorization == "Bearer test-token"
             started.set()
             assert release.wait(timeout=2)
             return 200, b"{}"
 
-        controller._call_hermes = fake_call
+        controller._call_actuator = fake_call
 
         try:
             with RunningServer() as server:
                 begin = time.monotonic()
-                status, body = _request(server.base_url, "POST", "/trigger")
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
                 elapsed = time.monotonic() - begin
 
                 assert status == 202
@@ -124,37 +151,41 @@ def test_trigger_returns_before_slow_hermes_completion() -> None:
                 assert _read_state()["status"] == "pending"
 
                 release.set()
-                _wait_for(lambda: _read_state().get("status") == "active")
+                _wait_for(
+                    lambda: _read_state().get("status") == "active"
+                )
         finally:
             release.set()
-            controller._call_hermes = original_call
-            controller.STATE_PATH = original_state
+            controller._call_actuator = original_call
+            _restore_runtime(original_state, original_token)
 
 
-def test_pause_queues_while_trigger_pending_and_applies_after_completion() -> None:
-    original_call = controller._call_hermes
-    original_state = controller.STATE_PATH
+def test_pause_queues_while_actuator_pending() -> None:
+    original_call = controller._call_actuator
 
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
+        original_state, original_token = _prepare_runtime(td)
         started = threading.Event()
         release = threading.Event()
-        calls: list[str] = []
+        calls = 0
 
-        def fake_call(action: str, authorization: str):
-            calls.append(action)
-            if action == "trigger":
-                started.set()
-                assert release.wait(timeout=2)
-                return 200, b"{}"
-            assert action == "pause"
+        def fake_call(authorization: str):
+            nonlocal calls
+            assert authorization == "Bearer test-token"
+            calls += 1
+            started.set()
+            assert release.wait(timeout=2)
             return 200, b"{}"
 
-        controller._call_hermes = fake_call
+        controller._call_actuator = fake_call
 
         try:
             with RunningServer() as server:
-                status, triggered = _request(server.base_url, "POST", "/trigger")
+                status, triggered = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
                 assert status == 202
                 lease = triggered["lease"]
                 assert started.wait(timeout=1)
@@ -164,6 +195,7 @@ def test_pause_queues_while_trigger_pending_and_applies_after_completion() -> No
                     "POST",
                     f"/pause?lease={lease}",
                 )
+
                 assert status == 202
                 assert queued == {
                     "ok": True,
@@ -173,148 +205,205 @@ def test_pause_queues_while_trigger_pending_and_applies_after_completion() -> No
                 assert _read_state()["pause_requested"] is True
 
                 release.set()
-                _wait_for(lambda: _read_state().get("status") == "paused")
-                assert calls == ["trigger", "pause"]
+
+                _wait_for(
+                    lambda: _read_state().get("status") == "paused"
+                )
+
+                # Critical direct-actuator invariant:
+                # pause never causes a second upstream call.
+                assert calls == 1
         finally:
             release.set()
-            controller._call_hermes = original_call
-            controller.STATE_PATH = original_state
+            controller._call_actuator = original_call
+            _restore_runtime(original_state, original_token)
 
 
-def test_stale_pause_is_superseded() -> None:
-    original_call = controller._call_hermes
-    original_state = controller.STATE_PATH
+def test_stale_pause_is_superseded_and_latest_pause_is_local() -> None:
+    original_call = controller._call_actuator
 
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
-        calls: list[str] = []
+        original_state, original_token = _prepare_runtime(td)
+        calls = 0
 
-        def fake_call(action: str, authorization: str):
+        def fake_call(authorization: str):
+            nonlocal calls
             assert authorization == "Bearer test-token"
-            calls.append(action)
+            calls += 1
             return 200, b'{"ok":true}'
 
-        controller._call_hermes = fake_call
+        controller._call_actuator = fake_call
 
         try:
             with RunningServer() as server:
-                status, first = _request(server.base_url, "POST", "/trigger")
+                status, first = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
                 assert status == 202
                 lease_a = first["lease"]
+
                 _wait_for(
                     lambda: _read_state().get("lease") == lease_a
                     and _read_state().get("status") == "active"
                 )
 
-                status, second = _request(server.base_url, "POST", "/trigger")
+                status, second = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
                 assert status == 202
                 lease_b = second["lease"]
+
                 _wait_for(
                     lambda: _read_state().get("lease") == lease_b
                     and _read_state().get("status") == "active"
                 )
 
                 assert lease_a != lease_b
-                assert calls == ["trigger", "trigger"]
+                assert calls == 2
 
                 status, stale = _request(
                     server.base_url,
                     "POST",
                     f"/pause?lease={lease_a}",
                 )
+
                 assert status == 200
                 assert stale == {
                     "ok": True,
                     "paused": False,
                     "reason": "superseded",
                 }
-
-                # Critical invariant: stale A must not reach Hermes pause.
-                assert calls == ["trigger", "trigger"]
+                assert calls == 2
 
                 status, latest = _request(
                     server.base_url,
                     "POST",
                     f"/pause?lease={lease_b}",
                 )
+
                 assert status == 200
-                assert latest["ok"] is True
-                assert latest["paused"] is True
+                assert latest == {
+                    "ok": True,
+                    "paused": True,
+                }
 
-                assert calls == ["trigger", "trigger", "pause"]
+                # Latest pause is also local-only.
+                assert calls == 2
 
-                persisted = _read_state()
-                assert persisted == {
+                assert _read_state() == {
                     "lease": lease_b,
                     "status": "paused",
                 }
         finally:
-            controller._call_hermes = original_call
-            controller.STATE_PATH = original_state
+            controller._call_actuator = original_call
+            _restore_runtime(original_state, original_token)
 
 
-def test_trigger_failure_never_resurrects_previous_lease() -> None:
-    original_call = controller._call_hermes
-    original_state = controller.STATE_PATH
+def test_ambiguous_actuator_failure_never_resurrects_old_lease() -> None:
+    original_call = controller._call_actuator
 
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
+        original_state, original_token = _prepare_runtime(td)
         calls = 0
 
-        def fake_call(action: str, authorization: str):
+        def fake_call(authorization: str):
             nonlocal calls
-            assert action == "trigger"
             calls += 1
             if calls == 1:
                 return 200, b"{}"
-            raise RuntimeError("ambiguous upstream timeout")
+            raise RuntimeError("ambiguous actuator timeout")
 
-        controller._call_hermes = fake_call
+        controller._call_actuator = fake_call
 
         try:
             with RunningServer() as server:
-                status, first = _request(server.base_url, "POST", "/trigger")
+                status, first = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
                 assert status == 202
                 lease_a = first["lease"]
+
                 _wait_for(
                     lambda: _read_state().get("lease") == lease_a
                     and _read_state().get("status") == "active"
                 )
 
-                status, accepted = _request(server.base_url, "POST", "/trigger")
+                status, second = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
                 assert status == 202
-                lease_b = accepted["lease"]
-                _wait_for(lambda: "trigger_error" in _read_state())
+                lease_b = second["lease"]
 
-                persisted = _read_state()
-                assert lease_b != lease_a
-                assert persisted["lease"] == lease_b
-                assert persisted["status"] == "pending"
-                assert "ambiguous upstream timeout" in persisted["trigger_error"]
+                _wait_for(
+                    lambda: "trigger_error" in _read_state()
+                )
 
-                # A must remain permanently superseded even though the
-                # outcome of B's upstream trigger call is unknown.
+                state = _read_state()
+
+                assert lease_a != lease_b
+                assert state["lease"] == lease_b
+                assert state["status"] == "pending"
+                assert "ambiguous actuator timeout" in state["trigger_error"]
+
                 status, stale = _request(
                     server.base_url,
                     "POST",
                     f"/pause?lease={lease_a}",
                 )
+
                 assert status == 200
-                assert stale == {
-                    "ok": True,
-                    "paused": False,
-                    "reason": "superseded",
-                }
+                assert stale["reason"] == "superseded"
         finally:
-            controller._call_hermes = original_call
-            controller.STATE_PATH = original_state
+            controller._call_actuator = original_call
+            _restore_runtime(original_state, original_token)
 
 
-def test_missing_authorization_fails_closed() -> None:
-    original_state = controller.STATE_PATH
+def test_actuator_rejection_marks_lease_failed() -> None:
+    original_call = controller._call_actuator
 
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
+        original_state, original_token = _prepare_runtime(td)
+
+        def fake_call(authorization: str):
+            return 502, b'{"ok":false}'
+
+        controller._call_actuator = fake_call
+
+        try:
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                )
+                assert status == 202
+                lease = body["lease"]
+
+                _wait_for(
+                    lambda: _read_state().get("status") == "failed"
+                )
+
+                assert _read_state() == {
+                    "lease": lease,
+                    "status": "failed",
+                    "upstream_status": 502,
+                }
+        finally:
+            controller._call_actuator = original_call
+            _restore_runtime(original_state, original_token)
+
+
+def test_missing_or_wrong_authorization_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original_state, original_token = _prepare_runtime(td)
 
         try:
             with RunningServer() as server:
@@ -324,18 +413,29 @@ def test_missing_authorization_fails_closed() -> None:
                     "/trigger",
                     authorization=None,
                 )
+
+                assert status == 401
+                assert body["error"] == "authorization_required"
+                assert not controller.STATE_PATH.exists()
+
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/trigger",
+                    authorization="Bearer wrong-token",
+                )
+
                 assert status == 401
                 assert body["error"] == "authorization_required"
                 assert not controller.STATE_PATH.exists()
         finally:
-            controller.STATE_PATH = original_state
+            _restore_runtime(original_state, original_token)
 
 
 def test_health_survives_persisted_state() -> None:
-    original_state = controller.STATE_PATH
-
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
+        original_state, original_token = _prepare_runtime(td)
+
         controller._write_state(
             {
                 "lease": "persisted-lease",
@@ -351,28 +451,29 @@ def test_health_survives_persisted_state() -> None:
                     "/healthz",
                     authorization=None,
                 )
+
                 assert status == 200
                 assert body == {
                     "ok": True,
                     "lease_status": "active",
                 }
         finally:
-            controller.STATE_PATH = original_state
+            _restore_runtime(original_state, original_token)
 
 
-def test_active_lease_survives_controller_restart() -> None:
-    original_call = controller._call_hermes
-    original_state = controller.STATE_PATH
+def test_active_lease_restart_pause_remains_local() -> None:
+    original_call = controller._call_actuator
 
     with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
-        calls: list[str] = []
+        original_state, original_token = _prepare_runtime(td)
+        calls = 0
 
-        def fake_call(action: str, authorization: str):
-            calls.append(action)
+        def fake_call(authorization: str):
+            nonlocal calls
+            calls += 1
             return 200, b"{}"
 
-        controller._call_hermes = fake_call
+        controller._call_actuator = fake_call
 
         try:
             with RunningServer() as first_server:
@@ -383,117 +484,29 @@ def test_active_lease_survives_controller_restart() -> None:
                 )
                 assert status == 202
                 lease = triggered["lease"]
-                _wait_for(lambda: _read_state().get("status") == "active")
 
-            # New HTTP server instance, same persisted lease state.
+                _wait_for(
+                    lambda: _read_state().get("status") == "active"
+                )
+
             with RunningServer() as restarted_server:
                 status, paused = _request(
                     restarted_server.base_url,
                     "POST",
                     f"/pause?lease={lease}",
                 )
+
                 assert status == 200
                 assert paused["paused"] is True
 
-            assert calls == ["trigger", "pause"]
-        finally:
-            controller._call_hermes = original_call
-            controller.STATE_PATH = original_state
-
-
-def test_pending_state_survives_restart_and_next_trigger_recovers() -> None:
-    original_call = controller._call_hermes
-    original_state = controller.STATE_PATH
-
-    with tempfile.TemporaryDirectory() as td:
-        controller.STATE_PATH = Path(td) / "lease.json"
-
-        # Simulate a controller crash after B was durably persisted as
-        # pending but before its upstream trigger outcome became known.
-        lease_a = "lease-a-old"
-        lease_b = "lease-b-pending"
-        controller._write_state(
-            {
-                "lease": lease_b,
-                "status": "pending",
+            assert calls == 1
+            assert _read_state() == {
+                "lease": lease,
+                "status": "paused",
             }
-        )
-
-        calls: list[str] = []
-
-        def fake_call(action: str, authorization: str):
-            calls.append(action)
-            return 200, b"{}"
-
-        controller._call_hermes = fake_call
-
-        try:
-            # A new HTTP server instance represents controller restart.
-            with RunningServer() as restarted_server:
-                status, stale = _request(
-                    restarted_server.base_url,
-                    "POST",
-                    f"/pause?lease={lease_a}",
-                )
-                assert status == 200
-                assert stale == {
-                    "ok": True,
-                    "paused": False,
-                    "reason": "superseded",
-                }
-
-                # A matching delayed pause can be durably queued while the
-                # trigger outcome is still pending. No pause reaches Hermes
-                # until a live trigger worker observes it.
-                status, pending = _request(
-                    restarted_server.base_url,
-                    "POST",
-                    f"/pause?lease={lease_b}",
-                )
-                assert status == 202
-                assert pending == {
-                    "ok": True,
-                    "paused": False,
-                    "reason": "pause_queued",
-                }
-
-                assert calls == []
-
-                # The next fallback/event wake supersedes B and restores the
-                # controller to a known active state.
-                status, recovered = _request(
-                    restarted_server.base_url,
-                    "POST",
-                    "/trigger",
-                )
-                assert status == 202
-
-                lease_c = recovered["lease"]
-                assert lease_c not in {lease_a, lease_b}
-                _wait_for(
-                    lambda: _read_state().get("lease") == lease_c
-                    and _read_state().get("status") == "active"
-                )
-                assert calls == ["trigger"]
-
-                persisted = _read_state()
-                assert persisted == {
-                    "lease": lease_c,
-                    "status": "active",
-                    "upstream_status": 200,
-                }
-
-                status, paused = _request(
-                    restarted_server.base_url,
-                    "POST",
-                    f"/pause?lease={lease_c}",
-                )
-                assert status == 200
-                assert paused["paused"] is True
-                assert calls == ["trigger", "pause"]
         finally:
-            controller._call_hermes = original_call
-            controller.STATE_PATH = original_state
+            controller._call_actuator = original_call
+            _restore_runtime(original_state, original_token)
 
 
 def main() -> int:

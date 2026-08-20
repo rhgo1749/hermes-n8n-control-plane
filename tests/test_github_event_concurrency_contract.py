@@ -18,8 +18,10 @@ def main() -> int:
 
     lease = compose["services"]["lease-controller"]
     assert lease["environment"]["LEASE_LISTEN_PORT"] == "5680"
-    assert lease["environment"]["LEASE_HERMES_JOB_ID"] == "bf431b2a6ba6"
-    assert lease["environment"]["LEASE_HERMES_PROFILE"] == "default"
+    assert lease["environment"]["LEASE_ACTUATOR_BASE_URL"] == "http://" + "127.0.0.1:5682"
+    assert lease["environment"]["LEASE_TOKEN_FILE"] == "/state/secrets/hermes-intake-control-token"
+    assert "LEASE_HERMES_JOB_ID" not in lease["environment"]
+    assert "LEASE_HERMES_PROFILE" not in lease["environment"]
 
     router = compose["services"]["github-router"]
     assert router["environment"]["GITHUB_ROUTER_LISTEN_PORT"] == "5681"
@@ -53,9 +55,10 @@ def main() -> int:
     assert '"/reconcile"' in router_source
 
     controller_source = (N8N / "lease-controller" / "controller.py").read_text(encoding="utf-8")
-    assert 'f"{HERMES_JOB_ID}/{action}?profile={HERMES_PROFILE}"' in controller_source
-    assert '_call_hermes("trigger", authorization)' in controller_source
-    assert '_call_hermes("pause", authorization)' in controller_source
+    assert "_call_actuator(authorization)" in controller_source
+    assert "/v1/intake" in controller_source
+    assert "/api/cron/jobs/" not in controller_source
+    assert "_call_hermes" not in controller_source
 
     print(json.dumps({
         "ok": True,
@@ -67,7 +70,7 @@ def main() -> int:
         "production_concurrency_limit_role": "load-limiter",
         "stale_pause_guard": "lease-controller",
         "scope_handoff": "durable-fifo-queue",
-        "hermes_job_preserved": "default:bf431b2a6ba6",
+        "intake_execution": "direct-actuator:5682",
     }))
     return 0
 

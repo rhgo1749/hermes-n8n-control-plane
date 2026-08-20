@@ -3,26 +3,28 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SECRET_DIR="$ROOT/automation/n8n/state/secrets"
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 
 usage() {
   cat <<'EOF'
-Usage: configure-github-router-secrets.sh [--hermes-home PATH]
+Usage: configure-github-router-secrets.sh
 
-Copies the current `gh auth token` and the existing Hermes n8n cron token into
-the protected control-plane secret directory and creates a stable GitHub
-webhook secret if one does not already exist.
+Stores:
+  - GitHub API token
+  - stable GitHub webhook HMAC secret
+  - stable Hermes intake-control token
 
-Use --hermes-home when the live Hermes home is not ~/.hermes.
 No secret value is printed.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    # Backward-compatible no-op while older operator notes disappear.
     --hermes-home)
-      [[ $# -ge 2 ]] || { echo "--hermes-home requires a path" >&2; exit 2; }
-      HERMES_HOME="$2"
+      [[ $# -ge 2 ]] || {
+        echo "--hermes-home requires a path" >&2
+        exit 2
+      }
       shift 2
       ;;
     -h|--help)
@@ -42,13 +44,6 @@ command -v gh >/dev/null || {
   exit 2
 }
 
-CRON_TOKEN="$HERMES_HOME/plugins/hermes-n8n-cron-auth/.n8n-cron-token"
-[[ -f "$CRON_TOKEN" ]] || {
-  echo "Hermes cron token missing: $CRON_TOKEN" >&2
-  echo "Pass the live path with --hermes-home PATH." >&2
-  exit 2
-}
-
 GITHUB_TOKEN="$(gh auth token 2>/dev/null)"
 [[ -n "$GITHUB_TOKEN" ]] || {
   echo "gh auth token is unavailable" >&2
@@ -58,11 +53,12 @@ GITHUB_TOKEN="$(gh auth token 2>/dev/null)"
 install -d -m 700 "$SECRET_DIR"
 umask 077
 
-printf '%s\n' "$GITHUB_TOKEN" > "$SECRET_DIR/.github-token.tmp"
+printf '%s\n' "$GITHUB_TOKEN" \
+  > "$SECRET_DIR/.github-token.tmp"
 chmod 600 "$SECRET_DIR/.github-token.tmp"
-mv -f "$SECRET_DIR/.github-token.tmp" "$SECRET_DIR/github-token"
-
-install -m 600 "$CRON_TOKEN" "$SECRET_DIR/hermes-cron-token"
+mv -f \
+  "$SECRET_DIR/.github-token.tmp" \
+  "$SECRET_DIR/github-token"
 
 if [[ ! -f "$SECRET_DIR/github-webhook-secret" ]]; then
   python3 -c 'import secrets; print(secrets.token_hex(32))' \
@@ -73,13 +69,31 @@ if [[ ! -f "$SECRET_DIR/github-webhook-secret" ]]; then
     "$SECRET_DIR/github-webhook-secret"
 fi
 
+if [[ ! -f "$SECRET_DIR/hermes-intake-control-token" ]]; then
+  # One-time migration: preserve the existing credential value so persisted
+  # n8n HTTP Header Auth credentials and operator clients do not break merely
+  # because the token's role/name changes from cron-specific to intake-control.
+  if [[ -f "$SECRET_DIR/hermes-cron-token" ]]; then
+    install -m 600 \
+      "$SECRET_DIR/hermes-cron-token" \
+      "$SECRET_DIR/hermes-intake-control-token"
+    echo "Migrated existing service credential to intake-control token."
+  else
+    python3 -c 'import secrets; print(secrets.token_hex(32))' \
+      > "$SECRET_DIR/.hermes-intake-control-token.tmp"
+    chmod 600 "$SECRET_DIR/.hermes-intake-control-token.tmp"
+    mv -f \
+      "$SECRET_DIR/.hermes-intake-control-token.tmp" \
+      "$SECRET_DIR/hermes-intake-control-token"
+  fi
+fi
+
 chmod 600 \
   "$SECRET_DIR/github-token" \
-  "$SECRET_DIR/hermes-cron-token" \
-  "$SECRET_DIR/github-webhook-secret"
+  "$SECRET_DIR/github-webhook-secret" \
+  "$SECRET_DIR/hermes-intake-control-token"
 
 unset GITHUB_TOKEN
 
-echo "GitHub router secrets configured under: $SECRET_DIR"
-echo "Hermes home: $HERMES_HOME"
+echo "GitHub router/intake secrets configured under: $SECRET_DIR"
 echo "Secret values were not printed."

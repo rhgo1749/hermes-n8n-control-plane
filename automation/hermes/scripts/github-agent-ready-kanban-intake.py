@@ -103,8 +103,8 @@ def _claim_wake_scope() -> WakeScope | None:
         os.environ.get(
             "HERMES_INTAKE_SCOPE_TOKEN_FILE",
             (
-                f"{DEFAULT_HERMES_HOME}/plugins/"
-                "hermes-n8n-cron-auth/.n8n-cron-token"
+                f"{DEFAULT_HERMES_HOME}/.control-plane/"
+                "github-intake-control-token"
             ),
         )
     )
