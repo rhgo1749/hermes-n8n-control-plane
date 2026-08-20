@@ -8,9 +8,10 @@ installed under the historical live name ``kanban-github-sync.py``.
 
 Small, independently reviewable overlays are installed here so the canonical
 state machine can stay unchanged: resource admission controls worker capacity,
-head-binding feedback adds observational PR guidance without changing rework
-transitions, and the retry-signal guard prevents edge-owned help text from being
-consumed as a fresh maintainer retry.
+dynamic backend resolution (when installed) makes that admission follow each
+profile's current provider/endpoint, head-binding feedback adds observational
+PR guidance without changing rework transitions, and the retry-signal guard
+prevents edge-owned help text from being consumed as a fresh maintainer retry.
 """
 from __future__ import annotations
 
@@ -19,9 +20,14 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import kanban_resource_admission as resource_admission
 from kanban_head_binding_feedback import install_head_binding_feedback
-from kanban_resource_admission import install_resource_admission
 from kanban_retry_signal_guard import install_retry_signal_guard
+
+try:
+    from kanban_dynamic_resource import install_everywhere
+except ImportError:  # backwards-compatible deploy before scheduler install
+    install_everywhere = None  # type: ignore[assignment]
 
 
 def _core_path() -> Path:
@@ -47,7 +53,15 @@ def _load_core() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    install_resource_admission(module)
+
+    # Patch policy parsing and cross-board helpers before the legacy edge
+    # admission wrapper captures them. Core READY/REVIEW claim admission is
+    # installed separately by the h4v3-resource-scheduler user plugin in the
+    # long-lived gateway process. If an older deployment has not installed
+    # the dynamic module yet, preserve the previous assignee-only behavior.
+    if install_everywhere is not None:
+        install_everywhere(resource_admission)
+    resource_admission.install_resource_admission(module)
     install_head_binding_feedback(module)
     install_retry_signal_guard(module)
     return module

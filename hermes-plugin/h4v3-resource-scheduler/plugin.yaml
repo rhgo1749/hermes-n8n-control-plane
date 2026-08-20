@@ -1,0 +1,5 @@
+name: h4v3-resource-scheduler
+version: "0.1.0"
+description: "Backend-aware cross-board Kanban worker resource admission."
+author: "Hermes n8n Control Plane"
+kind: standalone
