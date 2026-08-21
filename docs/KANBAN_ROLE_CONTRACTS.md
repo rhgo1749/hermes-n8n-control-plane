@@ -143,7 +143,7 @@ When a reviewer reports `REWORK`:
    ```
 4. **No non-terminal parent dependencies**: Never set a blocked, review-waiting, or non-terminal reviewer task as the blocking parent (`parents=[t_reviewer]`) of the developer rework task. Doing so causes an immediate `parents_not_done` deadlock where the developer task cannot start because the reviewer task is not terminal, yet the reviewer cannot finish without developer changes.
 5. **Attach review context by reference**: "Attach review dependency" means referencing the reviewer task ID and findings in the developer task body, comments, and metadata—not creating a blocking dependency link from a non-terminal task.
-6. **No forced promotion loops**: Never use repeated `promote --force` to bypass `parents_not_done`. Fix the task link topology in the database instead.
+6. **No forced promotion loops**: Never use repeated `promote --force` to bypass `parents_not_done`. Repair the task dependency topology using canonical Kanban/control-plane dependency operations (e.g. `unlink`/`link`/`reassign`), and reserve direct database interventions exclusively for explicit manual operator recovery.
 
 ## GitHub-backed lifecycle invariant
 
