@@ -1,6 +1,6 @@
 # REQ-058: n8n Webhook 기반 GitHub PR Edge Sync 및 완료 계약
 
-- Status: Draft
+- Status: Ready for review
 - Project: `hermes-n8n-control-plane`
 - Product type: `CONTROL_PLANE_AUTOMATION` / `EDGE_RECONCILIATION` / `N8N_WORKFLOW`
 - Validation profiles: `STATIC_UNIT`, `N8N_VALIDATE`, `EDGE_REWORK`
