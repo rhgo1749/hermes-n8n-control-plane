@@ -165,8 +165,7 @@ commands. Host deploy/live GitHub canary validation is not part of this task.
 - PR: PR #59 — `fix(edge): Issue #57 operator recovery 후 재작업 retry admission 수정`
   — `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/59` — OPEN.
 - PR base/head: `main` / `fix/issue-57-operator-recovery-retry`.
-- PR head SHA: update after this final request-evidence commit, then verify
-  through the live PR API.
+- PR head SHA: `2e9dbc599e1e234eae196235f393ed795956d0b4`, verified through the live PR API.
 - GitHub checks: none reported; hosted Actions remain disabled by repository
   policy.
 - Merge performed: `NO`.
