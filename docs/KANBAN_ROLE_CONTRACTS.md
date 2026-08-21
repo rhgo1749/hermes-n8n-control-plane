@@ -101,11 +101,12 @@ Owns:
 Does not own:
 
 - implementing fixes by default;
+- creating downstream rework tasks or manipulating task dependencies;
 - product aesthetics when a design lane exists;
 - waiting for future CI/review/merge events;
 - lifecycle/resource reconciliation.
 
-Reviewer evaluates the review surface that exists now. A future external/manual gate may be reported separately, but the reviewer must not remain alive solely to poll for it.
+Reviewer evaluates the review surface that exists now. When returning a `REWORK` verdict, Reviewer provides a structured handoff (exact evidence, findings, inspected head, and required validation) and finishes its run. Reviewer must not create child rework tasks. A future external/manual gate may be reported separately, but the reviewer must not remain alive solely to poll for it.
 
 ## 5. Hermes Kanban Designer
 
@@ -128,6 +129,22 @@ DESIGN REVIEW owns:
 
 Designer does not become the default software implementer, technical reviewer, or lifecycle controller.
 
+## Rework graph invariant
+
+When a reviewer reports `REWORK`:
+
+1. **Structured handoff only**: The reviewer returns a structured report containing verdict=`REWORK`, exact path:line findings, inspected PR head SHA, and required validation commands. The reviewer terminates its run without creating child tasks.
+2. **Main Agent owns graph recreation**: Only the Main Agent creates the bounded developer rework task and attaches downstream review.
+3. **Valid rework graph topology**:
+   ```text
+   prior implementation / source task (done)
+     └── bounded developer rework (todo -> ready)
+           └── fresh reviewer (todo)
+   ```
+4. **No non-terminal parent dependencies**: Never set a blocked, review-waiting, or non-terminal reviewer task as the blocking parent (`parents=[t_reviewer]`) of the developer rework task. Doing so causes an immediate `parents_not_done` deadlock where the developer task cannot start because the reviewer task is not terminal, yet the reviewer cannot finish without developer changes.
+5. **Attach review context by reference**: "Attach review dependency" means referencing the reviewer task ID and findings in the developer task body, comments, and metadata—not creating a blocking dependency link from a non-terminal task.
+6. **No forced promotion loops**: Never use repeated `promote --force` to bypass `parents_not_done`. Repair the task dependency topology using canonical Kanban/control-plane dependency operations (e.g. `unlink`/`link`/`reassign`), and reserve direct database interventions exclusively for explicit manual operator recovery.
+
 ## GitHub-backed lifecycle invariant
 
 For an Issue-backed root card with a linked PR:
@@ -135,7 +152,7 @@ For an Issue-backed root card with a linked PR:
 1. specialist implementation/review work completes through Kanban dependencies;
 2. no specialist remains RUNNING solely to wait for GitHub Actions, human review, merge, or future comments;
 3. the root worker terminates with core `kanban_complete` when its required internal graph is satisfied;
-4. that core `done` is provisional and is not GitHub merge evidence;
+4. that core `done` is provisional and is not GitHub merge evidence. Main Agent must not declare work "merged" or "delivered" based on internal graph completion;
 5. edge reconciliation projects an OPEN or closed-unmerged required PR to parked `review` and clears worker ownership;
 6. only trusted rework makes the card runnable again;
 7. fresh GitHub evidence that every required PR merged into the target branch permits authoritative `done`.
