@@ -1,6 +1,6 @@
 # REQ-057: operator recovery 후 `REVIEW` rework retry admission
 
-- Status: Implementation in progress
+- Status: Implementation complete / review pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`
@@ -147,8 +147,21 @@ commands. Host deploy/live GitHub canary validation is not part of this task.
   `edge/test-kanban-github-sync-rework.py`, `docs/EDGE_REWORK_LIFECYCLE.md`,
   this request file.
 - Baseline Edge harness before implementation: `647 passed, 0 failed`.
-- Post-change Edge harness: fill from the exact final-head command output.
-- Static/compile/diff results: fill from exact final-head command output.
+- Pre-fix sabotage run: the new recovered-`REVIEW` regressions produced
+  `44 passed, 14 failed`, demonstrating that the old BLOCKED-only admission
+  does not satisfy the new contract.
+- Post-change Edge harness: `706 passed, 0 failed` from the exact canonical
+  command above.
+- Focused Issue #57 scenarios: `59 passed, 0 failed` (tests 116–120).
+- Retry-signal guard: `5 passed`.
+- Python compile: `PASS` for the changed edge/test Python files.
+- Shell syntax: `PASS` for `automation/hermes/scripts/deploy-intake-edge.sh`.
+- `git diff --check`: `PASS`.
+- LSP: changed production edge files report `0 errors, 0 warnings, 0
+  informations`; the full legacy harness retains five pre-existing
+  diagnostics at unchanged lines 533, 541, 1241, 1275, and 1283, with no
+  diagnostics on the added test functions.
+- Implementation commit: `5538e92` (full SHA recorded in the PR handoff).
 - PR number/title/URL/head SHA: fill after remote verification.
 - Merge performed: `NO`.
 - Host deploy/live canary: `NOT RUN` (no host side effect requested).
