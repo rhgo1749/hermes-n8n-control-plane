@@ -30,6 +30,14 @@ LEASE_BASE_URL = os.environ.get(
     "GITHUB_ROUTER_LEASE_BASE_URL",
     "http://127.0.0.1:5680",
 ).rstrip("/")
+N8N_EDGE_SYNC_URL = os.environ.get(
+    "GITHUB_ROUTER_N8N_EDGE_SYNC_URL",
+    "http://127.0.0.1:5678/webhook/hermes-github-edge-sync",
+).strip().rstrip("/")
+N8N_EDGE_SYNC_TIMEOUT_SECONDS = float(
+    os.environ.get("GITHUB_ROUTER_N8N_EDGE_SYNC_TIMEOUT_SECONDS", "130")
+)
+N8N_EDGE_SYNC_MAX_RESPONSE_BYTES = 64 * 1024
 WAIT_SECONDS = int(os.environ.get("GITHUB_ROUTER_WAIT_SECONDS", "75"))
 SCOPE_TTL_SECONDS = int(
     os.environ.get(
@@ -68,6 +76,8 @@ MAX_BODY_BYTES = 1024 * 1024
 SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request", "pull_request_review"}
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_ACTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_N8N_EDGE_SYNC_PATH = "/webhook/hermes-github-edge-sync"
 _STATE_LOCK = threading.Lock()
 
 
@@ -600,6 +610,103 @@ def _lease_request(path: str, token: str) -> tuple[int, dict[str, Any]]:
         ) from exc
 
 
+def _validated_n8n_edge_sync_url() -> str:
+    value = N8N_EDGE_SYNC_URL
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "http"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != _N8N_EDGE_SYNC_PATH
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+    ):
+        raise RouterError("n8n edge-sync URL must be a loopback Webhook URL")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RouterError("n8n edge-sync URL has an invalid port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise RouterError("n8n edge-sync URL has an invalid port")
+    return value
+
+
+def _normalise_pull_request_event(
+    payload: dict[str, Any],
+    repository: str,
+    delivery_id: str,
+) -> dict[str, Any]:
+    pull_request = payload.get("pull_request")
+    if not isinstance(pull_request, dict):
+        raise RouterError("pull_request_missing")
+
+    raw_action = payload.get("action")
+    action = raw_action.strip() if isinstance(raw_action, str) else ""
+    if not _ACTION_RE.fullmatch(action):
+        raise RouterError("pull_request_action_invalid")
+
+    merged = pull_request.get("merged")
+    if not isinstance(merged, bool):
+        raise RouterError("pull_request_merged_invalid")
+
+    label = payload.get("label")
+    label_name = ""
+    if label is not None:
+        if not isinstance(label, dict) or not isinstance(label.get("name"), str):
+            raise RouterError("pull_request_label_invalid")
+        label_name = label["name"].strip()
+        if len(label_name) > 128:
+            raise RouterError("pull_request_label_invalid")
+
+    return {
+        "repository": repository,
+        "event": "pull_request",
+        "action": action,
+        "merged": merged,
+        "label": label_name,
+        "delivery": delivery_id,
+    }
+
+
+def _n8n_edge_sync(event: dict[str, Any]) -> dict[str, Any]:
+    """Forward one bounded event to the private, authenticated n8n hop."""
+    url = _validated_n8n_edge_sync_url()
+    token = _read_secret(INTAKE_TOKEN_FILE, "intake control token")
+    request = Request(
+        url,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-Hermes-Event-Source": "github-router",
+        },
+        data=_json_bytes(event),
+    )
+    try:
+        with urlopen(request, timeout=N8N_EDGE_SYNC_TIMEOUT_SECONDS) as response:
+            raw = response.read(N8N_EDGE_SYNC_MAX_RESPONSE_BYTES + 1)
+            if len(raw) > N8N_EDGE_SYNC_MAX_RESPONSE_BYTES:
+                raise RouterError("n8n edge-sync response is too large")
+            if not raw:
+                raise RouterError("n8n edge-sync response is empty")
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RouterError("n8n edge-sync response is invalid JSON") from exc
+            if not isinstance(body, dict):
+                raise RouterError("n8n edge-sync response is not an object")
+            return {"status": int(response.status), "body": body}
+    except HTTPError as exc:
+        raise RouterError(f"n8n edge-sync returned HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RouterError(
+            f"n8n edge-sync request failed: {type(exc).__name__}"
+        ) from exc
+
+
 def _delayed_pause(lease: str, token: str) -> None:
     time.sleep(WAIT_SECONDS)
     try:
@@ -805,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         try:
-            decision, is_duplicate = _claim_delivery(delivery_id)
+            _decision, is_duplicate = _claim_delivery(delivery_id)
         except RouterError as exc:
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -874,6 +981,42 @@ class Handler(BaseHTTPRequestHandler):
                         "reason": "repository_not_managed",
                         "repository": repository,
                         "delivery": delivery_id,
+                    },
+                )
+                return
+            if event == "pull_request":
+                try:
+                    normalized = _normalise_pull_request_event(
+                        payload,
+                        repository,
+                        delivery_id,
+                    )
+                except RouterError as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                try:
+                    edge_sync = _n8n_edge_sync(normalized)
+                except RouterError as exc:
+                    # A failed n8n/actuator hop must remain retryable. The
+                    # delivery claim is released so GitHub can redeliver it.
+                    _release_delivery(delivery_id)
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "ok": True,
+                        "edge_sync": True,
+                        "repository": repository,
+                        "event": event,
+                        "delivery": delivery_id,
+                        "upstream_status": edge_sync["status"],
                     },
                 )
                 return

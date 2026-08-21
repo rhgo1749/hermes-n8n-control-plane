@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the tracked hourly n8n fallback workflow for GitHub intake.
+"""Generate the tracked n8n Webhook workflow for GitHub edge reconciliation.
 
-GitHub webhooks remain the primary event path. The tracked Schedule Trigger is a
-low-frequency recovery/full-registry fallback only; it does not replace or own
-the preserved Hermes intake job.
+The external GitHub webhook remains owned by ``github-router``.  n8n receives
+only a bounded, authenticated loopback hop and is responsible for filtering
+the two PR lifecycle events that may invoke the fixed edge-sync actuator.
 """
 from __future__ import annotations
 
@@ -16,78 +16,205 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / "workflows"
-ROUTER_FALLBACK_URL = "http://127.0.0.1:5681/fallback"
-FALLBACK_TIMEOUT_MS = 120_000
+EDGE_SYNC_WEBHOOK_PATH = "hermes-github-edge-sync"
+EDGE_SYNC_ACTUATOR_URL = "http://127.0.0.1:5682/v1/edge-sync"
+EDGE_SYNC_TIMEOUT_MS = 120_000
 _NAMESPACE = uuid.UUID("4d3669cd-39ce-4c84-a10d-762278d838c6")
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
-FALLBACK_WORKFLOWS: tuple[dict[str, str], ...] = (
+EDGE_SYNC_WORKFLOWS: tuple[dict[str, str], ...] = (
     {
-        "slug": "github-agent-ready-intake",
-        "name": "GitHub Kanban intake",
-        "schedule": "0 * * * *",
+        "slug": "github-pr-edge-sync",
+        "name": "GitHub PR edge sync",
     },
 )
-
-# Compatibility export for existing validation imports.
-ACTIVE_JOBS = FALLBACK_WORKFLOWS
 
 def _uuid(key: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, key))
 
 
-def schedule_workflow(fallback: dict[str, str]) -> dict[str, Any]:
-    schedule_name = "Schedule Trigger"
-    fallback_name = "Run registry fallback"
+def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
+    webhook_name = "GitHub edge sync webhook"
+    normalize_name = "Normalize bounded event"
+    gate_name = "Allowed edge event?"
+    sync_name = "Run edge sync actuator"
+    ignore_name = "Ignore unsupported event"
     return {
-        "name": f"Hermes fallback · {fallback['name']}",
+        "name": f"Hermes Webhook · {workflow['name']}",
         "nodes": [
             {
                 "parameters": {
-                    "rule": {
-                        "interval": [
-                            {"field": "cronExpression", "expression": fallback["schedule"]}
-                        ]
+                    "httpMethod": "POST",
+                    "path": EDGE_SYNC_WEBHOOK_PATH,
+                    "authentication": "headerAuth",
+                    "responseMode": "lastNode",
+                    "options": {},
+                },
+                "id": _uuid(f"{workflow['slug']}:webhook"),
+                "name": webhook_name,
+                "type": "n8n-nodes-base.webhook",
+                "typeVersion": 2.1,
+                "position": [180, 300],
+                "credentials": {
+                    "httpHeaderAuth": {
+                        "id": "REPLACE_AFTER_IMPORT",
+                        "name": "Hermes router control token",
                     }
                 },
-                "id": _uuid(f"{fallback['slug']}:schedule"),
-                "name": schedule_name,
-                "type": "n8n-nodes-base.scheduleTrigger",
-                "typeVersion": 1.2,
-                "position": [180, 300],
+            },
+            {
+                "parameters": {
+                    "assignments": {
+                        "assignments": [
+                            {
+                                "id": _uuid(f"{workflow['slug']}:repository"),
+                                "name": "repository",
+                                "value": "={{ $json.body.repository }}",
+                                "type": "string",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:event"),
+                                "name": "event",
+                                "value": "={{ $json.body.event }}",
+                                "type": "string",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:action"),
+                                "name": "action",
+                                "value": "={{ $json.body.action }}",
+                                "type": "string",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:merged"),
+                                "name": "merged",
+                                "value": "={{ $json.body.merged }}",
+                                "type": "boolean",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:label"),
+                                "name": "label",
+                                "value": "={{ $json.body.label }}",
+                                "type": "string",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:delivery"),
+                                "name": "delivery",
+                                "value": "={{ $json.body.delivery }}",
+                                "type": "string",
+                            },
+                        ]
+                    },
+                    "includeOtherFields": False,
+                    "options": {},
+                },
+                "id": _uuid(f"{workflow['slug']}:normalize"),
+                "name": normalize_name,
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.4,
+                "position": [420, 300],
+            },
+            {
+                "parameters": {
+                    "conditions": {
+                        "options": {
+                            "caseSensitive": True,
+                            "leftValue": "",
+                            "typeValidation": "strict",
+                            "version": 2.3,
+                        },
+                        "conditions": [
+                            {
+                                "id": _uuid(f"{workflow['slug']}:allow"),
+                                "leftValue": "={{ $json.event === 'pull_request' && (($json.action === 'closed' && $json.merged === true) || ($json.action === 'labeled' && $json.label === 'agent-rework')) }}",
+                                "rightValue": True,
+                                "operator": {
+                                    "type": "boolean",
+                                    "operation": "equals",
+                                },
+                            }
+                        ],
+                        "combinator": "and",
+                    },
+                },
+                "id": _uuid(f"{workflow['slug']}:gate"),
+                "name": gate_name,
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2.3,
+                "position": [660, 300],
             },
             {
                 "parameters": {
                     "method": "POST",
-                    "url": ROUTER_FALLBACK_URL,
+                    "url": EDGE_SYNC_ACTUATOR_URL,
                     "authentication": "genericCredentialType",
                     "genericAuthType": "httpHeaderAuth",
-                    "options": {
-                        "timeout": FALLBACK_TIMEOUT_MS,
-                        "response": {
-                            "response": {
-                                "neverError": False,
-                                "responseFormat": "json",
-                                "fullResponse": True,
-                            }
-                        },
-                    },
+                    "sendBody": True,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify($json) }}",
+                    "options": {"timeout": EDGE_SYNC_TIMEOUT_MS},
                 },
-                "id": _uuid(f"{fallback['slug']}:registry-fallback"),
-                "name": fallback_name,
+                "id": _uuid(f"{workflow['slug']}:actuator"),
+                "name": sync_name,
                 "type": "n8n-nodes-base.httpRequest",
-                "typeVersion": 4.2,
-                "position": [440, 300],
+                "typeVersion": 4.5,
+                "position": [920, 220],
+                "credentials": {
+                    "httpHeaderAuth": {
+                        "id": "REPLACE_AFTER_IMPORT",
+                        "name": "Hermes edge sync actuator token",
+                    }
+                },
+            },
+            {
+                "parameters": {
+                    "assignments": {
+                        "assignments": [
+                            {
+                                "id": _uuid(f"{workflow['slug']}:ignored"),
+                                "name": "ok",
+                                "value": "true",
+                                "type": "boolean",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:ignored-flag"),
+                                "name": "ignored",
+                                "value": "true",
+                                "type": "boolean",
+                            },
+                            {
+                                "id": _uuid(f"{workflow['slug']}:ignored-reason"),
+                                "name": "reason",
+                                "value": "unsupported_pull_request_action",
+                                "type": "string",
+                            },
+                        ]
+                    },
+                    "includeOtherFields": False,
+                    "options": {},
+                },
+                "id": _uuid(f"{workflow['slug']}:ignore"),
+                "name": ignore_name,
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.4,
+                "position": [920, 380],
             },
         ],
         "pinData": {},
         "connections": {
-            schedule_name: {
-                "main": [[{"node": fallback_name, "type": "main", "index": 0}]]
-            }
+            webhook_name: {
+                "main": [[{"node": normalize_name, "type": "main", "index": 0}]]
+            },
+            normalize_name: {
+                "main": [[{"node": gate_name, "type": "main", "index": 0}]]
+            },
+            gate_name: {
+                "main": [
+                    [{"node": sync_name, "type": "main", "index": 0}],
+                    [{"node": ignore_name, "type": "main", "index": 0}],
+                ]
+            },
         },
         "active": False,
         "settings": {"executionOrder": "v1"},
@@ -106,9 +233,9 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def write_templates(directory: Path) -> list[Path]:
     written: list[Path] = []
-    for fallback in FALLBACK_WORKFLOWS:
-        path = directory / f"schedule-{fallback['slug']}.json"
-        _write_json(path, schedule_workflow(fallback))
+    for workflow in EDGE_SYNC_WORKFLOWS:
+        path = directory / f"{workflow['slug']}.json"
+        _write_json(path, edge_sync_workflow(workflow))
         written.append(path)
     return written
 
@@ -148,12 +275,19 @@ def normalize_dashboard_url(raw: str) -> str:
 def render_templates(
     template_dir: Path,
     output_dir: Path,
-    dashboard_url: str,
+    dashboard_url: str | None = None,
 ) -> list[Path]:
-    normalize_dashboard_url(dashboard_url)
+    if dashboard_url:
+        # Retain the old private-dashboard validation for callers that still
+        # pass the compatibility option; no rendered workflow uses it.
+        normalize_dashboard_url(dashboard_url)
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
     for template in sorted(template_dir.glob("*.json")):
+        if template.name.startswith("schedule-"):
+            raise ValueError(
+                "scheduled n8n workflows are retired; use the Webhook template"
+            )
         data = json.loads(template.read_text(encoding="utf-8"))
         path = output_dir / template.name
         _write_json(path, data)
@@ -163,9 +297,12 @@ def render_templates(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--write-templates", action="store_true")
-    mode.add_argument("--dashboard-url")
+    parser.add_argument(
+        "--dashboard-url",
+        help="Deprecated compatibility argument; no workflow uses this URL",
+    )
     parser.add_argument("--template-dir", type=Path, default=WORKFLOWS)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)

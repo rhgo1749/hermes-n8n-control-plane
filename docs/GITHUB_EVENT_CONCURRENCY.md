@@ -2,9 +2,11 @@
 
 ## Final event topology
 
-Repository-specific n8n GitHub Trigger workflows and the five-minute n8n
-Schedule fallback are retired. Production intake is event-driven through one
-loopback GitHub router and the existing Hermes cron primitive.
+Repository-specific n8n GitHub Trigger workflows and the n8n Schedule fallback
+are retired. Production intake is event-driven through one loopback GitHub
+router. Issue/intake events continue to use the existing Hermes cron primitive;
+PR completion/rework events use one private n8n Webhook hop and the existing
+edge reconciliation script.
 
 ```text
 GitHub repository webhook
@@ -12,11 +14,14 @@ GitHub repository webhook
   -> github-router :5681
        -> HMAC verification
        -> X-GitHub-Delivery replay dedupe
-       -> durable FIFO wake-scope queue
-       -> lease-controller :5680
-            -> existing Hermes job default:bf431b2a6ba6 trigger
-            -> Hermes ticker executes the existing intake script
-            -> lease-controller pauses the same job after the bounded delay
+       -> managed repository admission
+       -> pull_request event: private n8n Webhook :5678
+            -> allowlisted filter/normalization
+            -> fixed actuator :5682
+                 -> kanban-github-sync.py --board <slug> --json
+       -> other intake event: durable FIFO wake-scope queue
+            -> lease-controller :5680
+                 -> existing Hermes job default:bf431b2a6ba6 trigger
 ```
 
 The Hermes job itself is preserved. Its stored job ID, name, script, schedule,
@@ -24,11 +29,22 @@ and ownership are not migrated into n8n. Between event-driven invocations the
 job normally remains paused; an accepted lease temporarily triggers that same
 job and the latest lease alone may pause it again.
 
-Each GitHub event enqueues its repository scope before triggering Hermes. Each
-intake invocation claims exactly one queued scope. Expired unclaimed scopes are
-pruned. The persisted lease-controller is the stale delayed-pause correctness
-guard; `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a load limiter for the
-retained n8n service and is not the intake correctness mechanism.
+Each non-PR intake event enqueues its repository scope before triggering Hermes.
+Each intake invocation claims exactly one queued scope. Expired unclaimed
+scopes are pruned. A PR event is sent only as bounded normalized data to the
+private n8n Webhook; n8n never receives the external signature boundary or a
+caller-controlled command. The persisted lease-controller remains the stale
+delayed-pause correctness guard for the Hermes path; n8n's
+`N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a load limiter.
+
+The n8n edge workflow accepts only:
+
+- `pull_request` + `action=closed` + `merged=true`;
+- `pull_request` + `action=labeled` + `label=agent-rework`.
+
+All other PR actions finish as an explicit no-op. The actuator repeats the
+allowlist, resolves repository → board through the existing registry/task
+provenance, and runs exactly `kanban-github-sync.py --board <slug> --json`.
 
 ## Delivery replay deduplication
 
@@ -81,5 +97,7 @@ automation/n8n/scripts/reconcile-github-router.sh
 ```
 
 The authenticated `/fallback` endpoint remains available for deliberate
-operator recovery/full-registry intake, but no tracked n8n Schedule Trigger
-calls it automatically.
+operator recovery/full-registry intake, but no tracked n8n workflow calls it
+automatically. The tracked workflow is
+`automation/n8n/workflows/github-pr-edge-sync.json`; it is inactive until its
+loopback Header Auth credentials are bound and a host canary passes.

@@ -4,9 +4,10 @@ External H4V3 Hermes control plane for GitHub event intake, edge reconciliation,
 operator notifications, and the read-only H4V3 Overview — without modifying
 Hermes core.
 
-The GitHub agent-ready intake is now **event-driven**. The existing Hermes cron
-job remains the durable execution primitive; n8n no longer owns a five-minute
-Schedule Trigger for it.
+The GitHub control plane is **event-driven**. The existing Hermes cron job
+remains the durable execution primitive for Issue intake, while PR completion
+and trusted rework signals use one private n8n Webhook hop to the edge sync
+actuator. n8n owns no polling Schedule Trigger.
 
 ```text
 GitHub repository event
@@ -15,19 +16,13 @@ GitHub repository event
    github-router :5681
      HMAC verify
      delivery dedupe (X-GitHub-Delivery)
-     enqueue repo scope
-          │
-          ▼
- lease-controller :5680
-          │
-          ▼
-existing Hermes cron trigger
- default:bf431b2a6ba6
-          │
-          ▼
-existing ticker → existing intake script → Kanban / workers / edge
-          │
-          └─ latest lease pauses the same Hermes job again
+     managed-repository admission
+         ├─ PR close/rework → n8n Webhook :5678
+         │                    → fixed edge actuator :5682
+         │                    → kanban-github-sync.py --board <slug> --json
+         └─ Issue/intake event → lease-controller :5680
+                                  → existing Hermes job
+                                     default:bf431b2a6ba6
 ```
 
 ## Durable ownership boundary
@@ -46,10 +41,20 @@ n8n/event migration.
 ## Current runtime topology
 
 - `github-router` discovers repositories carrying the `hermes-agent` topic,
-  validates signed GitHub webhook events, enqueues repository-scoped wake
-  records, and asks `lease-controller` to wake Hermes.
+  validates signed GitHub webhook events, deduplicates deliveries, and keeps
+  repository admission authoritative. PR lifecycle events are reduced to a
+  bounded loopback payload for the private n8n Webhook; Issue/intake events
+  continue through the repository-scoped wake queue.
 - `lease-controller` is bound to `default:bf431b2a6ba6` and prevents stale
-  delayed pauses from overtaking a newer trigger.
+  delayed pauses from overtaking a newer trigger for the existing Issue intake
+  path.
+- The tracked n8n Webhook workflow filters only merged PR close and trusted
+  `agent-rework` label events, then calls the fixed loopback actuator. It is
+  inactive after import until the operator binds the protected control-token
+  credentials and activates it.
+- The loopback actuator resolves repository → board through the existing
+  repository registry/task provenance and executes the edge script with fixed
+  argv. It is not a generic command or completion API.
 - `github-agent-ready-kanban-intake.py` remains authoritative for repository
   filtering, idempotency, Kanban projection, and reconciliation. The deployed
   historical live name is a small completion-contract entrypoint backed by the
@@ -57,9 +62,9 @@ n8n/event migration.
   `github-agent-ready-kanban-intake-core.py`.
 - `edge/kanban-github-sync.py` remains authoritative for GitHub ↔ Kanban edge
   lifecycle reconciliation.
-- n8n CE remains a private, persistent control-plane service, but **there is no
-  tracked n8n GitHub intake Schedule workflow and no tracked per-repository
-  GitHub Trigger workflow**.
+- n8n CE remains a private, persistent control-plane service with one tracked
+  on-demand PR edge-sync Webhook workflow. There is no tracked n8n Schedule
+  workflow and no direct GitHub webhook registration to n8n.
 - `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` is only a retained load limit; intake
   correctness comes from the router scope queue and persisted lease guard.
 
@@ -113,9 +118,10 @@ reviewed decision.
 | `automation/n8n/compose.yaml` | Private n8n + router + lease-controller deployment |
 | `automation/n8n/github-router/router.py` | Signed GitHub event ingress + scope queue + webhook reconciliation |
 | `automation/n8n/lease-controller/controller.py` | Existing Hermes job trigger/pause lease guard |
+| `automation/n8n/workflows/github-pr-edge-sync.json` | Private PR lifecycle Webhook → filter → fixed edge actuator |
 | `automation/n8n/scripts/repository_registry.py` | `hermes-agent` repository discovery and board/checkout authority |
 | `automation/n8n/scripts/reconcile-github-router.sh` | Explicit webhook-registry reconciliation |
-| `automation/n8n/scripts/import-workflows.sh` | Compatibility no-op/status path; never recreates the retired schedule |
+| `automation/n8n/scripts/import-workflows.sh` | Render/import the inactive on-demand edge-sync workflow |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Canonical GitHub intake + reconciliation tick |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
@@ -149,6 +155,10 @@ automation/n8n/scripts/configure-github-router-secrets.sh \
 # 4. Configure the reviewed public HTTPS router URL in .env, restart services,
 #    then reconcile topic-managed repository webhooks.
 automation/n8n/scripts/reconcile-github-router.sh
+
+# 5. Import the inactive private PR edge-sync workflow, bind the protected
+#    router/actuator control-token credential, and activate it after canary.
+automation/n8n/scripts/import-workflows.sh
 ```
 
 If an older persisted n8n workflow named
@@ -164,8 +174,10 @@ For the live host, verify all of the following:
   services healthy;
 - `http://127.0.0.1:5680/healthz` and `http://127.0.0.1:5681/healthz` succeed;
 - webhook reconciliation reports the intended `hermes-agent` repositories;
-- a signed GitHub test event reaches the router and produces one scoped intake
-  wake;
+- a signed GitHub Issue/intake test event reaches the router and produces one
+  scoped Hermes wake;
+- a signed PR close/rework test event reaches the private n8n Webhook and
+  produces one fixed edge-sync actuator call;
 - `default:bf431b2a6ba6` gets a fresh successful run and returns to paused state
   after the current lease cleanup;
 - no n8n Schedule Trigger is active for GitHub intake.
@@ -176,6 +188,8 @@ For the live host, verify all of the following:
 python3 automation/n8n/scripts/validate.py
 python3 tests/test_github_event_concurrency_contract.py
 python3 tests/test_github_router.py
+python3 tests/test_github_intake_actuator.py
+python3 tests/test_intake_completion_contract_entrypoint.py
 python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
 /ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py

@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import hmac
+import importlib.util
 import json
 import os
 import re
 import stat
 import subprocess
+import sys
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-
 
 HOST = "127.0.0.1"
 PORT = 5682
@@ -29,9 +30,29 @@ PYTHON_BIN = Path("/opt/venv/bin/python3")
 INTAKE_SCRIPT = Path(
     "/home/hermes/.hermes/scripts/github-agent-ready-kanban-intake.py"
 )
+EDGE_SYNC_SCRIPT = Path(
+    "/home/hermes/.hermes/scripts/kanban-github-sync.py"
+)
+REGISTRY_SCRIPT = Path(
+    "/home/hermes/.hermes/scripts/repository_registry.py"
+)
+KANBAN_BOARDS_ROOT = Path(
+    os.environ.get(
+        "HERMES_KANBAN_BOARDS_ROOT",
+        "/home/hermes/.hermes/kanban/boards",
+    )
+)
 TIMEOUT_SECONDS = float(
     os.environ.get("HERMES_INTAKE_ACTUATOR_TIMEOUT_SECONDS", "900")
 )
+EDGE_SYNC_TIMEOUT_SECONDS = float(
+    os.environ.get("HERMES_EDGE_SYNC_TIMEOUT_SECONDS", "120")
+)
+MAX_EDGE_SYNC_BODY_BYTES = 16 * 1024
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+ACTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+DELIVERY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+BOARD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # Compatibility:
 # - legacy main: secrets.token_urlsafe(32) -> 43 URL-safe characters
@@ -87,6 +108,81 @@ def _runtime_ready() -> bool:
     )
 
 
+def _edge_runtime_ready() -> bool:
+    return (
+        PYTHON_BIN.is_file()
+        and os.access(PYTHON_BIN, os.X_OK)
+        and EDGE_SYNC_SCRIPT.is_file()
+        and REGISTRY_SCRIPT.is_file()
+    )
+
+
+def _env_file_value(path: Path, key: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{key}="
+    for line in lines:
+        value = line.strip()
+        if not value or value.startswith("#") or not value.startswith(prefix):
+            continue
+        value = value[len(prefix) :].strip().split("#", 1)[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
+def _github_token() -> str:
+    for key in ("GITHUB_TOKEN", "GH_TOKEN", "HERMES_GITHUB_TOKEN"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    hermes_home = Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"))
+    for path in (hermes_home / ".env", Path("/home/hermes/.hermes/.env")):
+        value = _env_file_value(path, "GITHUB_TOKEN")
+        if value:
+            return value
+    raise RuntimeError("github_token_unavailable")
+
+
+def _load_registry_module():
+    if not REGISTRY_SCRIPT.is_file():
+        raise RuntimeError("repository_registry_unavailable")
+    spec = importlib.util.spec_from_file_location(
+        "hermes_github_intake_actuator_registry",
+        REGISTRY_SCRIPT,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("repository_registry_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _resolve_board(repository: str) -> str:
+    if not REPOSITORY_RE.fullmatch(repository):
+        raise ValueError("repository_invalid")
+    try:
+        registry = _load_registry_module()
+        evidence = registry._kanban_board_repository_evidence(KANBAN_BOARDS_ROOT)
+        board, _status = registry._resolve_board(repository, evidence)
+    except Exception as exc:
+        raise RuntimeError("board_resolution_failed") from exc
+    if not board or not BOARD_RE.fullmatch(str(board)):
+        raise ValueError("board_unresolved")
+    try:
+        root = KANBAN_BOARDS_ROOT.resolve(strict=False)
+        board_dir = (KANBAN_BOARDS_ROOT / str(board)).resolve(strict=False)
+    except OSError as exc:
+        raise RuntimeError("board_resolution_failed") from exc
+    if board_dir.parent != root or not (board_dir / "kanban.db").is_file():
+        raise ValueError("board_unresolved")
+    return str(board)
+
+
 def _run_intake() -> int:
     if not _runtime_ready():
         raise RuntimeError("intake_runtime_unavailable")
@@ -109,8 +205,7 @@ def _run_intake() -> int:
     completed = subprocess.run(
         [str(PYTHON_BIN), str(INTAKE_SCRIPT)],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         timeout=TIMEOUT_SECONDS,
         check=False,
@@ -118,6 +213,51 @@ def _run_intake() -> int:
         env=env,
     )
     return int(completed.returncode)
+
+
+def _run_edge_sync(board: str) -> list[dict[str, Any]]:
+    if not _edge_runtime_ready():
+        raise RuntimeError("edge_sync_runtime_unavailable")
+
+    env = {
+        **os.environ,
+        "HOME": "/home/hermes",
+        "HERMES_HOME": "/home/hermes/.hermes",
+        "PATH": (
+            "/opt/venv/bin:"
+            "/home/hermes/.local/bin:"
+            "/usr/local/bin:/usr/bin:/bin"
+        ),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GITHUB_TOKEN": _github_token(),
+    }
+    completed = subprocess.run(
+        [
+            str(PYTHON_BIN),
+            str(EDGE_SYNC_SCRIPT),
+            "--board",
+            board,
+            "--json",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=EDGE_SYNC_TIMEOUT_SECONDS,
+        check=False,
+        shell=False,
+        env=env,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("edge_sync_command_failed")
+    try:
+        payload = json.loads(completed.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("edge_sync_output_invalid") from exc
+    if not isinstance(payload, list) or not all(
+        isinstance(item, dict) for item in payload
+    ):
+        raise RuntimeError("edge_sync_output_invalid")
+    return payload
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -162,31 +302,34 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "hermes-github-intake-actuator",
                 "token_ready": token_ready,
                 "runtime_ready": _runtime_ready(),
+                "edge_sync_runtime_ready": _edge_runtime_ready(),
                 "busy": _RUN_LOCK.locked(),
             },
         )
 
     def do_POST(self) -> None:
-        if self.path != "/v1/intake":
+        if self.path not in {"/v1/intake", "/v1/edge-sync"}:
             self._send_json(
                 HTTPStatus.NOT_FOUND,
                 {"ok": False, "error": "not_found"},
             )
             return
 
-        if not _authorized(
-            self.headers.get("Authorization", "").strip()
-        ):
+        if not _authorized(self.headers.get("Authorization", "").strip()):
             self._send_json(
                 HTTPStatus.UNAUTHORIZED,
                 {"ok": False, "error": "unauthorized"},
             )
             return
 
+        if self.path == "/v1/intake":
+            self._handle_intake()
+            return
+        self._handle_edge_sync()
+
+    def _handle_intake(self) -> None:
         try:
-            content_length = int(
-                self.headers.get("Content-Length", "0")
-            )
+            content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             content_length = -1
 
@@ -232,9 +375,136 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        self._send_json(HTTPStatus.OK, {"ok": True, "returncode": 0})
+
+    def _handle_edge_sync(self) -> None:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length <= 0 or content_length > MAX_EDGE_SYNC_BODY_BYTES:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_request_body"},
+            )
+            return
+
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_json"},
+            )
+            return
+        if not isinstance(payload, dict):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "request_must_be_object"},
+            )
+            return
+
+        expected_keys = {
+            "repository",
+            "event",
+            "action",
+            "merged",
+            "label",
+            "delivery",
+        }
+        if set(payload) != expected_keys:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "request_schema_invalid"},
+            )
+            return
+
+        repository = payload["repository"]
+        event = payload["event"]
+        action = payload["action"]
+        label = payload["label"]
+        delivery = payload["delivery"]
+        merged = payload["merged"]
+        if (
+            not isinstance(repository, str)
+            or not REPOSITORY_RE.fullmatch(repository)
+            or event != "pull_request"
+            or not isinstance(action, str)
+            or not ACTION_RE.fullmatch(action)
+            or not isinstance(merged, bool)
+            or not isinstance(label, str)
+            or len(label) > 128
+            or not isinstance(delivery, str)
+            or not DELIVERY_RE.fullmatch(delivery)
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "request_schema_invalid"},
+            )
+            return
+
+        allowed = (
+            action == "closed" and merged is True
+        ) or (
+            action == "labeled" and label == "agent-rework"
+        )
+        if not allowed:
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {
+                    "ok": True,
+                    "ignored": True,
+                    "reason": "unsupported_pull_request_action",
+                },
+            )
+            return
+
+        try:
+            board = _resolve_board(repository)
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": str(exc)},
+            )
+            return
+        except RuntimeError:
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"ok": False, "error": "board_resolution_failed"},
+            )
+            return
+
+        if not _RUN_LOCK.acquire(blocking=False):
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "edge_sync_busy"},
+            )
+            return
+        try:
+            results = _run_edge_sync(board)
+        except subprocess.TimeoutExpired:
+            self._send_json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {"ok": False, "error": "edge_sync_timeout"},
+            )
+            return
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"ok": False, "error": "edge_sync_execution_failed"},
+            )
+            return
+        finally:
+            _RUN_LOCK.release()
+
         self._send_json(
             HTTPStatus.OK,
-            {"ok": True, "returncode": 0},
+            {
+                "ok": True,
+                "board": board,
+                "returncode": 0,
+                "results": results,
+            },
         )
 
 

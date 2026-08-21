@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
-import stat
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -12,7 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
@@ -331,6 +329,267 @@ def test_token_permissions_fail_closed() -> None:
             ) is False
         finally:
             _restore_runtime(originals)
+
+
+def _edge_payload(
+    *,
+    action: str = "closed",
+    merged: bool = True,
+    label: str = "",
+) -> bytes:
+    return json.dumps(
+        {
+            "repository": "rhgo1749/ctrl-hangul",
+            "event": "pull_request",
+            "action": action,
+            "merged": merged,
+            "label": label,
+            "delivery": "delivery-actuator-test",
+        }
+    ).encode()
+
+
+def test_edge_sync_rejects_unknown_fields_without_execution() -> None:
+    original_resolve = actuator._resolve_board
+    original_run = actuator._run_edge_sync
+    calls = 0
+
+    def unexpected(board):
+        nonlocal calls
+        calls += 1
+        raise AssertionError(board)
+
+    actuator.__dict__["_resolve_board"] = lambda repository: "ctrlhangul"
+    actuator.__dict__["_run_edge_sync"] = unexpected
+    with tempfile.TemporaryDirectory() as td:
+        originals = _configure_runtime(td)
+        try:
+            payload = json.loads(_edge_payload())
+            payload["unexpected"] = "reject-me"
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/v1/edge-sync",
+                    authorization=f"Bearer {TEST_TOKEN}",
+                    data=json.dumps(payload).encode(),
+                )
+            assert status == 400
+            assert body["error"] == "request_schema_invalid"
+            assert calls == 0
+        finally:
+            actuator.__dict__["_resolve_board"] = original_resolve
+            actuator.__dict__["_run_edge_sync"] = original_run
+            _restore_runtime(originals)
+
+
+def test_edge_sync_unsupported_action_is_explicit_noop() -> None:
+    original_resolve = actuator._resolve_board
+    original_run = actuator._run_edge_sync
+    actuator.__dict__["_resolve_board"] = lambda repository: (
+        (_ for _ in ()).throw(AssertionError("unsupported action resolved board"))
+    )
+    actuator.__dict__["_run_edge_sync"] = lambda board: (
+        (_ for _ in ()).throw(AssertionError("unsupported action executed"))
+    )
+    with tempfile.TemporaryDirectory() as td:
+        originals = _configure_runtime(td)
+        try:
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/v1/edge-sync",
+                    authorization=f"Bearer {TEST_TOKEN}",
+                    data=_edge_payload(action="opened", merged=False),
+                )
+            assert status == 202
+            assert body == {
+                "ok": True,
+                "ignored": True,
+                "reason": "unsupported_pull_request_action",
+            }
+        finally:
+            actuator.__dict__["_resolve_board"] = original_resolve
+            actuator.__dict__["_run_edge_sync"] = original_run
+            _restore_runtime(originals)
+
+
+def test_edge_sync_resolves_board_and_reads_back_results() -> None:
+    original_resolve = actuator._resolve_board
+    original_run = actuator._run_edge_sync
+    calls: list[str] = []
+    actuator.__dict__["_resolve_board"] = lambda repository: (
+        calls.append(repository),
+        "ctrlhangul",
+    )[1]
+    actuator.__dict__["_run_edge_sync"] = lambda board: [
+        {"task_id": "task-1", "status": "done", "changed": True}
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        originals = _configure_runtime(td)
+        try:
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/v1/edge-sync",
+                    authorization=f"Bearer {TEST_TOKEN}",
+                    data=_edge_payload(),
+                )
+            assert status == 200
+            assert body == {
+                "ok": True,
+                "board": "ctrlhangul",
+                "returncode": 0,
+                "results": [
+                    {"task_id": "task-1", "status": "done", "changed": True}
+                ],
+            }
+            assert calls == ["rhgo1749/ctrl-hangul"]
+        finally:
+            actuator.__dict__["_resolve_board"] = original_resolve
+            actuator.__dict__["_run_edge_sync"] = original_run
+            _restore_runtime(originals)
+
+
+def test_edge_sync_command_failure_is_not_reported_as_success() -> None:
+    original_resolve = actuator._resolve_board
+    original_run = actuator._run_edge_sync
+    actuator.__dict__["_resolve_board"] = lambda repository: "ctrlhangul"
+    actuator.__dict__["_run_edge_sync"] = lambda board: (
+        (_ for _ in ()).throw(RuntimeError("edge_sync_command_failed"))
+    )
+    with tempfile.TemporaryDirectory() as td:
+        originals = _configure_runtime(td)
+        try:
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/v1/edge-sync",
+                    authorization=f"Bearer {TEST_TOKEN}",
+                    data=_edge_payload(),
+                )
+            assert status == 502
+            assert body == {
+                "ok": False,
+                "error": "edge_sync_execution_failed",
+            }
+        finally:
+            actuator.__dict__["_resolve_board"] = original_resolve
+            actuator.__dict__["_run_edge_sync"] = original_run
+            _restore_runtime(originals)
+
+
+def test_edge_sync_busy_fails_closed() -> None:
+    original_resolve = actuator._resolve_board
+    original_run = actuator._run_edge_sync
+    actuator.__dict__["_resolve_board"] = lambda repository: "ctrlhangul"
+    actuator.__dict__["_run_edge_sync"] = lambda board: (
+        (_ for _ in ()).throw(AssertionError("busy actuator executed"))
+    )
+    actuator._RUN_LOCK.acquire()
+    with tempfile.TemporaryDirectory() as td:
+        originals = _configure_runtime(td)
+        try:
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/v1/edge-sync",
+                    authorization=f"Bearer {TEST_TOKEN}",
+                    data=_edge_payload(),
+                )
+            assert status == 409
+            assert body["error"] == "edge_sync_busy"
+        finally:
+            actuator._RUN_LOCK.release()
+            actuator.__dict__["_resolve_board"] = original_resolve
+            actuator.__dict__["_run_edge_sync"] = original_run
+            _restore_runtime(originals)
+
+
+def test_board_resolution_uses_authoritative_task_provenance() -> None:
+    original_registry = actuator.REGISTRY_SCRIPT
+    original_boards_root = actuator.KANBAN_BOARDS_ROOT
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        boards_root = root / "boards"
+        board_dir = boards_root / "ctrlhangul"
+        board_dir.mkdir(parents=True)
+        db = board_dir / "kanban.db"
+        with sqlite3.connect(db) as connection:
+            connection.execute(
+                "CREATE TABLE tasks (idempotency_key TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO tasks (idempotency_key) VALUES (?)",
+                ("github:rhgo1749/ctrl-hangul:issue:58",),
+            )
+            connection.commit()
+        actuator.__dict__["REGISTRY_SCRIPT"] = (
+            ROOT / "automation" / "n8n" / "scripts" / "repository_registry.py"
+        )
+        actuator.__dict__["KANBAN_BOARDS_ROOT"] = boards_root
+        try:
+            assert actuator._resolve_board("rhgo1749/ctrl-hangul") == "ctrlhangul"
+            try:
+                actuator._resolve_board("rhgo1749/unknown")
+            except ValueError as exc:
+                assert str(exc) == "board_unresolved"
+            else:
+                raise AssertionError("unknown repository must fail closed")
+        finally:
+            actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["KANBAN_BOARDS_ROOT"] = original_boards_root
+
+
+def test_edge_sync_fixed_command_is_bounded_and_shell_free() -> None:
+    original_edge = actuator.EDGE_SYNC_SCRIPT
+    original_registry = actuator.REGISTRY_SCRIPT
+    original_github_token = actuator._github_token
+    original_run = actuator.subprocess.run
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        edge = root / "kanban-github-sync.py"
+        registry = root / "repository_registry.py"
+        edge.write_text("# edge\n", encoding="utf-8")
+        registry.write_text("# registry\n", encoding="utf-8")
+        actuator.__dict__["EDGE_SYNC_SCRIPT"] = edge
+        actuator.__dict__["REGISTRY_SCRIPT"] = registry
+        actuator.__dict__["_github_token"] = lambda: TEST_TOKEN
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured.update(kwargs)
+            return SimpleNamespace(
+                returncode=0,
+                stdout='[{"task_id":"task-1"}]',
+                stderr="",
+            )
+
+        actuator.subprocess.run = fake_run
+        try:
+            assert actuator._run_edge_sync("ctrlhangul") == [
+                {"task_id": "task-1"}
+            ]
+            assert captured["argv"] == [
+                str(actuator.PYTHON_BIN),
+                str(edge),
+                "--board",
+                "ctrlhangul",
+                "--json",
+            ]
+            assert captured["shell"] is False
+            assert captured["check"] is False
+            assert captured["env"]["GITHUB_TOKEN"] == TEST_TOKEN
+        finally:
+            actuator.subprocess.run = original_run
+            actuator.__dict__["EDGE_SYNC_SCRIPT"] = original_edge
+            actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["_github_token"] = original_github_token
 
 
 def main() -> int:

@@ -8,6 +8,13 @@ GitHub-backed Issue intake cards use deliberately separate lifecycle authorities
 
 The durable role boundaries are defined in `docs/KANBAN_ROLE_CONTRACTS.md`.
 
+The external event path is `github-router` (HMAC, delivery dedupe, and managed
+repository admission) → private n8n Webhook (bounded PR-event filter) → the
+loopback actuator → `kanban-github-sync.py --board <slug> --json`. The actuator
+reuses repository-registry/task-provenance board authority and the existing
+edge state machine; n8n does not write Kanban state directly. The tracked
+workflow has no Schedule Trigger or polling fallback.
+
 ## Why worker `kanban_request_review` is forbidden here
 
 A GitHub-backed worker already has an external review surface: its linked GitHub pull request. Calling core `kanban_request_review` creates a second internal review lane. With the same/default Kanban profile, that review card can be claimed again by the implementation worker, producing a `review -> running -> review` self-review loop while the PR is simply waiting for a human merge.

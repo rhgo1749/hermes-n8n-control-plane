@@ -23,16 +23,21 @@ GitHub signed webhook
   -> public HTTPS ingress
   -> github-router 127.0.0.1:5681
        -> repository/topic check
-       -> durable FIFO scope queue
-       -> lease-controller 127.0.0.1:5680
-            -> POST existing Hermes trigger route for default:bf431b2a6ba6
-            -> existing Hermes ticker executes the existing intake script
-            -> latest lease performs the bounded pause cleanup
+       -> HMAC + delivery dedupe
+       -> pull_request close/rework -> n8n Webhook 127.0.0.1:5678
+            -> allowlisted normalized event
+            -> fixed edge actuator 127.0.0.1:5682
+                 -> kanban-github-sync.py --board <slug> --json
+       -> other intake event -> durable FIFO scope queue
+            -> lease-controller 127.0.0.1:5680
+                 -> existing Hermes trigger route for default:bf431b2a6ba6
 ```
 
-There is no tracked n8n Schedule Trigger and no tracked per-repository n8n
-GitHub Trigger workflow. n8n remains a private persistent service, but GitHub
-intake execution does not depend on an n8n polling workflow.
+The tracked workflow is `automation/n8n/workflows/github-pr-edge-sync.json`.
+It is inactive after import until the operator binds the protected Header Auth
+credential on both the Webhook and actuator nodes, then activates it after a
+signed host canary. There is no tracked n8n Schedule Trigger and no direct
+GitHub webhook registration to n8n.
 
 The authenticated router `/fallback` endpoint remains available for deliberate
 operator recovery/full-registry intake. It is not called periodically.
@@ -138,13 +143,14 @@ cron state.
 
 There is intentionally no five-minute reconciliation scheduler in this scope.
 
-## 7. Retiring the old n8n polling workflow
+## 7. Importing the on-demand edge-sync workflow
 
-The repository no longer tracks
-`automation/n8n/workflows/schedule-github-agent-ready-intake.json`.
-`render_workflows.py` reports an empty tracked workflow set, and
-`import-workflows.sh` is a compatibility/status command that never imports a
-replacement Schedule Trigger.
+The repository tracks exactly one inactive edge-sync workflow:
+`automation/n8n/workflows/github-pr-edge-sync.json`.
+`render_workflows.py` generates that Webhook graph and never generates a
+Schedule Trigger. `import-workflows.sh` clears only its own rendered
+`github-*.json`/legacy `schedule-*.json` files, renders the current workflow,
+and imports it through the local n8n CLI.
 
 If an older persisted n8n database still contains:
 
@@ -153,10 +159,17 @@ Hermes schedule · GitHub agent-ready Issue intake
 ```
 
 keep that workflow inactive or delete the persisted n8n workflow record. Do not
-activate it.
+activate it. The old persisted record is separate from the new edge-sync
+workflow and from Hermes job `bf431b2a6ba6`.
 
 This persisted n8n cleanup is separate from the Hermes job. Never delete the
 Hermes `bf431b2a6ba6` job while removing the old n8n Schedule workflow.
+
+After importing, bind Header Auth credentials with header name `Authorization`
+and value `Bearer <the protected loopback control token>` on the Webhook and
+actuator nodes. The same token is sent by `github-router` to the n8n Webhook and
+by n8n to the actuator. Do not put the token in tracked workflow JSON,
+`.env.example`, GitHub payloads, or logs.
 
 ## 8. One-time transition from active polling to async-only
 
@@ -193,6 +206,8 @@ A successful event canary must establish all of these facts:
 - Hermes `last_run_at` advanced and `last_status=ok` for `bf431b2a6ba6`;
 - after bounded cleanup, the same job is `enabled=false` / `state=paused`;
 - no n8n Schedule Trigger fired the intake.
+- the active n8n workflow has one Webhook execution for the canary and one
+  actuator call for a supported PR event; unsupported PR actions are no-ops.
 
 A build/static check is not runtime evidence.
 
@@ -228,6 +243,8 @@ Local deterministic validation:
 python3 automation/n8n/scripts/validate.py
 python3 tests/test_github_event_concurrency_contract.py
 python3 tests/test_github_router.py
+python3 tests/test_github_intake_actuator.py
+python3 tests/test_intake_completion_contract_entrypoint.py
 python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
 /ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py

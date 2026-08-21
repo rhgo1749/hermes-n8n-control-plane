@@ -198,3 +198,4 @@ PYHEALTH
 echo "Installed: $UNIT_NAME"
 echo "Token:     $TOKEN_HOST (not printed)"
 echo "Endpoint:  http://127.0.0.1:5682/v1/intake"
+echo "Edge sync: http://127.0.0.1:5682/v1/edge-sync (fixed board argv)"

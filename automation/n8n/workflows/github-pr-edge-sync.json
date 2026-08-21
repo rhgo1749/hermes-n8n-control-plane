@@ -1,0 +1,229 @@
+{
+  "name": "Hermes Webhook · GitHub PR edge sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hermes-github-edge-sync",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "9f26c863-a9a5-5ec1-bf6b-5136b5b790d9",
+      "name": "GitHub edge sync webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        180,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_AFTER_IMPORT",
+          "name": "Hermes router control token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b05a47ff-ab33-5431-9ec4-dba080c71763",
+              "name": "repository",
+              "value": "={{ $json.body.repository }}",
+              "type": "string"
+            },
+            {
+              "id": "4d22b52f-52b5-5a18-b63d-72d845fb8899",
+              "name": "event",
+              "value": "={{ $json.body.event }}",
+              "type": "string"
+            },
+            {
+              "id": "11da08a3-d4ce-5563-b277-dc3bb4c1cf9b",
+              "name": "action",
+              "value": "={{ $json.body.action }}",
+              "type": "string"
+            },
+            {
+              "id": "c59e94db-255f-56c7-b7de-75f9a96b3030",
+              "name": "merged",
+              "value": "={{ $json.body.merged }}",
+              "type": "boolean"
+            },
+            {
+              "id": "ddef94f5-e4e2-53ac-afaf-37543a2ed5d8",
+              "name": "label",
+              "value": "={{ $json.body.label }}",
+              "type": "string"
+            },
+            {
+              "id": "01cc95a6-5db4-5be4-8ca5-dfd0e579f253",
+              "name": "delivery",
+              "value": "={{ $json.body.delivery }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "b1056126-2085-5b86-9189-2d1015405346",
+      "name": "Normalize bounded event",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2.3
+          },
+          "conditions": [
+            {
+              "id": "71cac1c2-50f0-583e-8ce3-f7c3a0962df4",
+              "leftValue": "={{ $json.event === 'pull_request' && (($json.action === 'closed' && $json.merged === true) || ($json.action === 'labeled' && $json.label === 'agent-rework')) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "a8dde862-6839-5b8d-9b6e-76a432e2d228",
+      "name": "Allowed edge event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:5682/v1/edge-sync",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "3add3d8a-5ad0-59db-92f2-cdd684e3ca01",
+      "name": "Run edge sync actuator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        920,
+        220
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_AFTER_IMPORT",
+          "name": "Hermes edge sync actuator token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "73d61280-794f-5a1b-b8a3-83b1093b9175",
+              "name": "ok",
+              "value": "true",
+              "type": "boolean"
+            },
+            {
+              "id": "dbc40841-9d1b-5e2e-8dc6-0bb5b9dd3712",
+              "name": "ignored",
+              "value": "true",
+              "type": "boolean"
+            },
+            {
+              "id": "0191a40f-5848-5bee-a20d-76b01ff5c0fc",
+              "name": "reason",
+              "value": "unsupported_pull_request_action",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "385da606-0fcc-5582-9d87-14340bd30406",
+      "name": "Ignore unsupported event",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        920,
+        380
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "GitHub edge sync webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize bounded event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize bounded event": {
+      "main": [
+        [
+          {
+            "node": "Allowed edge event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed edge event?": {
+      "main": [
+        [
+          {
+            "node": "Run edge sync actuator",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignore unsupported event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
