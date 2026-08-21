@@ -75,6 +75,9 @@ def test_main_and_controller_ownership_are_separated() -> None:
     assert "## Kanban lead orchestration contract" in body
     assert "Main is the planner/router/judge, not the default implementer" in body
     assert "Encode real dependencies before downstream work runs" in body
+    assert "Reviewer does not create child rework tasks or manipulate dependencies" in body
+    assert "without parent-linking to non-terminal reviewer cards" in body
+    assert "That core done is provisional; authoritative done is owned by the edge" in body
     assert "Deterministic Controller/edge logic owns event intake" in body
     assert "Do not recreate controller behavior through agent reasoning loops" in body
     assert "## Luna lead execution contract" not in body
