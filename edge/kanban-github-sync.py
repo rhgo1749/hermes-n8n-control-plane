@@ -19,6 +19,11 @@ State contract (per operator decision):
     until the edge dispatcher successfully claims the Kanban task; only
     then is it atomically replaced by ``agent-working``.  A claim or label
     mutation failure therefore leaves the request intake-visible.
+  * REVIEW + current-round ``rework_human_attention`` hold recovered by an
+    operator (stale ``agent-rework`` label) + exact trusted
+    ``AGENT_REWORK_RETRY`` comment -> READY through the same transaction and
+    dispatch lane; without that comment the card stays REVIEW and no round
+    is opened.
   * GitHub lookup failure / ambiguous decision            -> keep state
   * blocked/triage/todo/scheduled/running/archived/ready  -> never
     overwritten (REVIEW->READY is the only sync write into ``ready``;
@@ -105,9 +110,10 @@ REWORK_ATTENTION_MARKER = "HERMES_KANBAN_REWORK_ATTENTION"
 # Machine-readable explicit maintainer retry: a TRUSTED_GITHUB_ACTORS
 # comment on the current PR containing exactly ``AGENT_REWORK_RETRY`` plus a
 # ``task=<task_id>`` line, posted AFTER the last rework attention record.
-# It is the ONLY human signal that may start a new rework round from the
-# BLOCKED + rework_human_attention hold (label presence alone is never
-# retry evidence — the edge restores ``agent-rework`` during self-heal).
+# It is the ONLY human signal that may start a new rework round from a
+# BLOCKED or operator-recovered REVIEW + rework_human_attention hold (label
+# presence alone is never retry evidence — the edge restores ``agent-rework``
+# during self-heal).
 REWORK_RETRY_MARKER = "AGENT_REWORK_RETRY"
 
 # Sync-owned body region.  Between these markers the whole block is
@@ -3289,6 +3295,39 @@ def _last_rework_attention_at(
     return int(value) if value is not None else None
 
 
+def _current_rework_attention_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event: tuple[dict[str, Any], int, str],
+) -> Optional[int]:
+    """Return the current round's attention timestamp, if one exists."""
+    event_payload, event_at, _ = event
+    round_number = event_payload.get("rework_round")
+    pr_number = event_payload.get("pr_number")
+    rows = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework_attention' "
+        "ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        created_at = int(row["created_at"] or 0)
+        if created_at < int(event_at):
+            continue
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if round_number is not None and payload.get("rework_round") != round_number:
+            continue
+        if pr_number is not None and payload.get("pr_number") != pr_number:
+            continue
+        return created_at
+    return None
+
+
 def _consumed_retry_comment_ids(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3353,15 +3392,8 @@ def _find_rework_retry_signal(
         if not isinstance(comment_id, int) or comment_id in consumed_ids:
             continue
         body = str(comment.get("body") or "")
-        lines = body.splitlines()
-        marker_present = any(
-            line.strip() == REWORK_RETRY_MARKER for line in lines
-        )
-        task_bound = any(
-            line.startswith("task=") and line.split("=", 1)[1].strip() == task_id
-            for line in lines
-        )
-        if not marker_present or not task_bound:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        if lines != [REWORK_RETRY_MARKER, f"task={task_id}"]:
             continue
         return {
             "comment_id": comment_id,
@@ -3618,6 +3650,34 @@ def _reconcile_rework_lifecycle(
             "reason": "lifecycle_label_conflict",
             "lifecycle": {"labels": sorted(labels)},
         }
+
+    # Operator recovery can move a consumed attention hold back to REVIEW.
+    # Only the current round's attention evidence plus the stale rework label
+    # authorizes this narrow retry ingress.  Normal review-ready cards and
+    # ordinary REVIEW label intake never enter this branch; a lifecycle-label
+    # conflict has already failed closed above.
+    if (
+        status == "review"
+        and context["pr"].state == "open"
+        and REWORK_LABEL in labels
+    ):
+        attention_at = _current_rework_attention_at(conn, task_id, context["event"])
+        if attention_at is not None:
+            retry_result = _consume_explicit_rework_retry(
+                conn, client, ref, decision, task_id, context,
+                dry_run=dry_run,
+            )
+            if retry_result is not None:
+                return retry_result
+            return {
+                "task_id": task_id,
+                "status": status,
+                "changed": False,
+                "reason": "rework_retry_pending",
+                "retry_required": True,
+                "attention_at": attention_at,
+                "lifecycle": {"labels": sorted(labels)},
+            }
 
     # A freshly (re-)requested rework round stays owned by the classic intake
     # transitions (REVIEW/BLOCKED -> READY) and by the dispatch lane.  A
