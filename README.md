@@ -23,7 +23,20 @@ GitHub repository event
          └─ Issue/intake event → lease-controller :5680
                                   → existing Hermes job
                                      default:bf431b2a6ba6
+
+GitHub-backed worker completion
+       └─ core kanban_complete (committed provisional DONE)
+          → kanban_task_completed observer
+          → fixed live edge command: --board <validated-slug> --json
+          → existing DONE/REVIEW projection owner
 ```
+
+The completion observer is a trigger only: it reads the committed task row,
+filters out ordinary/non-GitHub tasks, and invokes the already-deployed edge
+reconciler once. It does not write Kanban state, replace the edge state machine,
+or turn n8n into a completion owner. Invalid runtime/board evidence fails
+closed; a wake failure leaves provisional `DONE` as an observable diagnostic,
+not as merge evidence.
 
 ## Durable ownership boundary
 
@@ -125,6 +138,8 @@ reviewed decision.
 | `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Canonical GitHub intake + reconciliation tick |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
+| `hermes-plugin/github-completion-edge-wake/` | Post-commit worker observer that wakes the deployed edge once for GitHub-backed completion |
+| `automation/hermes/scripts/install-github-completion-edge-wake.sh` | Candidate/atomic/rollback-safe host installation and plugin activation |
 | `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
 | legacy n8n cron authentication plugin (removed after direct actuator migration) | Legacy Hermes service authentication plugin for token-protected routes |
 | `hermes-plugin/h4v3-overview/` | Read-only multi-board dashboard plugin |

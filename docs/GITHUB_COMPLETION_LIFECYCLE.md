@@ -15,6 +15,36 @@ reuses repository-registry/task-provenance board authority and the existing
 edge state machine; n8n does not write Kanban state directly. The tracked
 workflow has no Schedule Trigger or polling fallback.
 
+## Completion-side wake
+
+Root worker completion deliberately remains a two-step projection:
+
+```text
+worker core kanban_complete
+  -> committed provisional DONE + completion cleanup
+  -> kanban_task_completed plugin observer (worker process)
+  -> committed-row/board/runtime validation
+  -> $HERMES_HOME/scripts/kanban-github-sync.py \
+       --board <validated-slug> --json (exactly once)
+  -> existing edge DONE -> REVIEW / REVIEW -> DONE decision
+```
+
+`hermes-plugin/github-completion-edge-wake/` is an observer/trigger only. It
+reads the already-committed task row and wakes the deployed canonical/live edge
+path only when the importer-owned provenance contains both
+`source: github-issue` and `completion contract: github-pr`. Ordinary tasks,
+missing or ambiguous board/runtime evidence, and non-`DONE` rows do not wake
+the edge. The observer never calls a Kanban mutator, parses the untrusted Issue
+body as instructions, or duplicates the edge transition logic.
+
+The callback uses a fixed argument vector with `shell=False`, a bounded
+timeout/output budget, and stable diagnostics that do not include task body,
+summary, command output, or credentials. A failed wake is observable and
+fail-closed: the core completion remains provisional `DONE` for a later
+operator/event reconciliation and is never treated as merge evidence. If the
+edge already moved the card, a repeated observation is an idempotent no-op
+through the existing optimistic edge transition.
+
 ## Why worker `kanban_request_review` is forbidden here
 
 A GitHub-backed worker already has an external review surface: its linked GitHub pull request. Calling core `kanban_request_review` creates a second internal review lane. With the same/default Kanban profile, that review card can be claimed again by the implementation worker, producing a `review -> running -> review` self-review loop while the PR is simply waiting for a human merge.
@@ -46,3 +76,21 @@ GitHub lookup failures remain fail-closed. Hermes core is not modified.
 - the existing edge wrapper/core/overlays and repository registry.
 
 The canonical intake source remains `automation/hermes/scripts/github-agent-ready-kanban-intake.py`. The live wrapper fail-closed overlays two rendered blocks: the GitHub completion contract and the Kanban lead orchestration contract. If either canonical source block drifts unexpectedly, the wrapper refuses to emit an unverified lifecycle contract.
+
+Install the completion observer separately on the Hermes runtime that starts
+workers; this is a manual host activation gate, not an automatic repository
+deployment step:
+
+```bash
+automation/hermes/scripts/install-github-completion-edge-wake.sh \
+  --hermes-home "$HOME/.hermes"
+```
+
+The installer validates the candidate, atomically replaces the user plugin,
+keeps a timestamped backup, enables only
+`github-completion-edge-wake`, and prints an exact rollback command. Deploy the
+edge runtime first with `deploy-intake-edge.sh`, then restart the existing
+Hermes worker/dashboard supervisor so the plugin is loaded in worker
+processes. Host installation, plugin activation/restart, and a signed live
+canary remain separate `HOST_VALIDATION_REQUIRED` gates; repository tests do
+not claim those operations were performed.

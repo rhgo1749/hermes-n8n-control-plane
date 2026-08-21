@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 sys.path.insert(0, "/ws/hermes-agent")
 
@@ -38,6 +38,20 @@ assert spec is not None and spec.loader is not None
 mod = importlib.util.module_from_spec(spec)
 sys.modules["kanban_github_sync"] = mod
 spec.loader.exec_module(mod)
+
+WAKE_PLUGIN = (
+    Path(__file__).resolve().parents[1]
+    / "hermes-plugin"
+    / "github-completion-edge-wake"
+    / "__init__.py"
+)
+wake_spec = importlib.util.spec_from_file_location(
+    "github_completion_edge_wake", WAKE_PLUGIN
+)
+assert wake_spec is not None and wake_spec.loader is not None
+wake_plugin: Any = importlib.util.module_from_spec(wake_spec)
+sys.modules[wake_spec.name] = wake_plugin
+wake_spec.loader.exec_module(wake_plugin)
 
 from hermes_cli import kanban_db  # type: ignore  # noqa: E402
 from hermes_cli.kanban_db import connect_closing, init_db  # type: ignore  # noqa: E402
@@ -393,6 +407,43 @@ def fresh_env() -> FakeGitHub:
     _prepare_isolated_environment()
     init_db()
     return FakeGitHub()
+
+
+def _install_completion_wake_plugin(runner):
+    """Register the repository plugin in the real Hermes hook manager."""
+    from hermes_cli.plugins import (  # type: ignore
+        PluginContext,
+        PluginManifest,
+        get_plugin_manager,
+    )
+
+    home = Path(os.environ["HERMES_HOME"])
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "kanban-github-sync.py").write_text(
+        "#!/usr/bin/env python3\n", encoding="utf-8"
+    )
+
+    manager = get_plugin_manager()
+    manifest = PluginManifest(
+        name="github-completion-edge-wake",
+        key="github-completion-edge-wake",
+        source="user",
+    )
+    original_runner = wake_plugin._run_edge
+    wake_plugin._run_edge = runner
+    wake_plugin.register(PluginContext(manifest, manager))
+    return manager, original_runner
+
+
+def _finish_claimed_task(task_id: str, run_id: int) -> bool:
+    with connect_closing() as conn:
+        return kanban_db.complete_task(
+            conn,
+            task_id,
+            summary="completion fixture",
+            expected_run_id=run_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4101,6 +4152,125 @@ def test_115_normalization_idempotent_across_ticks():
               str(fake.pr_labels))
 
 
+def test_116_completion_side_wake_open_pr():
+    print("116. real core completion hook + one-shot edge reconciliation: "
+          "DONE -> REVIEW for an open PR")
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="open", merged=False)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("ready")
+    wake_calls: list[tuple[str, str]] = []
+
+    def runner(edge_path, board):
+        wake_calls.append((str(edge_path), board))
+        results = run_sync(fake)
+        check(
+            "completion wake runs the real edge reconciliation",
+            any(item.get("task_id") == tid and item.get("status") == "review"
+                for item in results),
+            str(results),
+        )
+        return wake_plugin.WakeResult(
+            returncode=0,
+            output_bytes=0,
+        )
+
+    manager, original_runner = _install_completion_wake_plugin(runner)
+    try:
+        with connect_closing() as conn:
+            claimed = kanban_db.claim_task(conn, tid)
+            assert claimed is not None, "claim failed"
+            conn.commit()
+        check(
+            "root completion commits through core path",
+            _finish_claimed_task(tid, claimed.current_run_id),
+        )
+    finally:
+        manager.unload("github-completion-edge-wake")
+        wake_plugin._run_edge = original_runner
+
+    row = task_row(tid)
+    check("completion wake invoked exactly once", len(wake_calls) == 1, str(wake_calls))
+    check("open PR is parked immediately in review", row["status"] == "review", str(row))
+    check(
+        "DONE metadata is cleared by the existing edge owner",
+        row["completed_at"] is None
+        and row["assignee"] is None
+        and row["claim_lock"] is None
+        and row["claim_expires"] is None
+        and row["worker_pid"] is None
+        and row["block_kind"] is None
+        and row["block_recurrences"] == 0,
+        str(row),
+    )
+
+
+def test_117_completion_side_wake_ordinary_task_noop():
+    print("117. ordinary completion does not invoke the GitHub edge wake")
+    fresh_env()
+    wake_calls: list[tuple[str, str]] = []
+
+    def runner(edge_path, board):
+        wake_calls.append((str(edge_path), board))
+        return wake_plugin.WakeResult(returncode=0, output_bytes=0)
+
+    manager, original_runner = _install_completion_wake_plugin(runner)
+    try:
+        with connect_closing() as conn:
+            tid = kanban_db.create_task(
+                conn,
+                title="ordinary task",
+                body="not a GitHub-backed intake card",
+                assignee="worker",
+            )
+            conn.commit()
+        with connect_closing() as conn:
+            claimed = kanban_db.claim_task(conn, tid)
+            assert claimed is not None, "claim failed"
+            conn.commit()
+        check("ordinary completion succeeds", _finish_claimed_task(tid, claimed.current_run_id))
+    finally:
+        manager.unload("github-completion-edge-wake")
+        wake_plugin._run_edge = original_runner
+    check("ordinary task remains done", task_row(tid)["status"] == "done")
+    check("ordinary task never wakes edge", wake_calls == [], str(wake_calls))
+
+
+def test_118_completion_side_wake_fail_closed():
+    print("118. invalid board and wake failure fail closed without breaking completion")
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="open", merged=False)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    wake_calls: list[tuple[str, str]] = []
+
+    def failing_runner(edge_path, board):
+        wake_calls.append((str(edge_path), board))
+        raise OSError("fixture failure")
+
+    manager, original_runner = _install_completion_wake_plugin(failing_runner)
+    try:
+        wake_plugin._on_task_completed(
+            task_id="t_invalid", board="../not-a-board"
+        )
+        tid = new_task("ready")
+        with connect_closing() as conn:
+            claimed = kanban_db.claim_task(conn, tid)
+            assert claimed is not None, "claim failed"
+            conn.commit()
+        check(
+            "completion remains successful when edge wake fails",
+            _finish_claimed_task(tid, claimed.current_run_id),
+        )
+    finally:
+        manager.unload("github-completion-edge-wake")
+        wake_plugin._run_edge = original_runner
+    check("invalid board does not spawn edge", len(wake_calls) == 1, str(wake_calls))
+    check("wake failure leaves provisional DONE for later reconciliation",
+          task_row(tid)["status"] == "done", str(task_row(tid)))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -4201,6 +4371,9 @@ def main() -> int:
         test_113_claim_failure_label_recoverable,
         test_114_normalization_and_rework_same_tick,
         test_115_normalization_idempotent_across_ticks,
+        test_116_completion_side_wake_open_pr,
+        test_117_completion_side_wake_ordinary_task_noop,
+        test_118_completion_side_wake_fail_closed,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

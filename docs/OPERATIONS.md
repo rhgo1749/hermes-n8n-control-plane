@@ -82,6 +82,43 @@ The plugin token can authorize only:
 
 It cannot list, create, edit, delete, or trigger another job.
 
+## 4a. Completion-side edge wake
+
+GitHub-backed worker completion uses the supported Hermes lifecycle observer
+boundary rather than polling:
+
+```text
+core kanban_complete (commit provisional DONE)
+  -> kanban_task_completed observer
+  -> fixed live edge: kanban-github-sync.py --board <slug> --json
+  -> existing edge projection (DONE -> REVIEW for an open/unmerged PR)
+```
+
+Install and activate the repository-owned observer manually in the Hermes
+runtime namespace (the edge runtime deployment is a separate step):
+
+```bash
+automation/hermes/scripts/deploy-intake-edge.sh \
+  --hermes-home "$HOME/.hermes"
+automation/hermes/scripts/install-github-completion-edge-wake.sh \
+  --hermes-home "$HOME/.hermes"
+```
+
+`install-github-completion-edge-wake.sh` validates a candidate copy before an
+atomic plugin-directory switch, retains a timestamped backup, enables only the
+named plugin, and prints rollback commands. Restart the existing Hermes worker
+supervisor after activation; a plugin installed on disk but not loaded by the
+worker is not runtime evidence.
+
+The observer is not a completion/state owner. It reads the committed task row,
+skips ordinary tasks, validates the authoritative board/runtime paths, and
+uses one fixed `shell=False` command with bounded timeout/output. Invalid input
+or a wake failure logs a bounded diagnostic and leaves provisional `DONE`; it
+does not claim a merge or mutate Kanban. The existing edge remains the sole
+`DONE`/`REVIEW` transition owner and optimistic updates make repeated
+observations idempotent. No n8n workflow, Schedule Trigger, cron edit, or
+public endpoint is added by this path.
+
 ## 5. Router credentials and public ingress
 
 Copy the current GitHub credential and Hermes service token into the protected
@@ -245,6 +282,8 @@ python3 tests/test_github_event_concurrency_contract.py
 python3 tests/test_github_router.py
 python3 tests/test_github_intake_actuator.py
 python3 tests/test_intake_completion_contract_entrypoint.py
+PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 \
+  tests/test_completion_edge_wake_plugin.py
 python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
 /ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py
@@ -252,6 +291,10 @@ python3 tests/test_repo_scoped_intake.py
 python3 tests/test_repository_registry.py
 python3 tests/test_repository_registry_board_workdir.py
 python3 tests/test_cutover_snapshot_boundary.py
+env -u HERMES_DELEGATED_CHILD_CONTEXT \
+  PYTHONDONTWRITEBYTECODE=1 \
+  /ws/hermes-agent/venv/bin/python3 \
+  edge/test-kanban-github-sync-rework.py
 ```
 
 Live-host evidence should additionally retain:
