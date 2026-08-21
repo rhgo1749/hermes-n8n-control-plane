@@ -2992,6 +2992,227 @@ def test_97_retry_requires_issue_open_agent_ready():
           str(task_row(tid2)))
 
 
+def _operator_recovered_review_retry_hold() -> tuple[FakeGitHub, str]:
+    """Recover the current attention hold into the ordinary REVIEW lane."""
+    fake, tid = _attention_blocked_retry_hold()
+    with connect_closing() as conn:
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='review', block_kind=NULL, "
+            "completed_at=NULL, assignee=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'github_pr_sync', ?, ?)",
+            (
+                tid,
+                json.dumps({
+                    "previous_status": "done",
+                    "new_status": "review",
+                    "reason": "operator_recovery",
+                    "source": "operator",
+                }),
+                now,
+            ),
+        )
+        conn.commit()
+    check("operator recovery fixture is REVIEW", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    return fake, tid
+
+
+def _assert_recovered_review_retry_rejected(
+    fake: FakeGitHub,
+    tid: str,
+    label: str,
+) -> None:
+    events_before = task_events(tid)
+    patches_before = len(fake.patch_calls)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check(f"{label}: explicit retry not consumed", not any(
+        r.get("reason") == "maintainer_retry_consumed" for r in entries),
+        str(entries))
+    check(f"{label}: retry remains fail-closed",
+          any(r.get("reason") == "rework_retry_pending" for r in entries),
+          str(entries))
+    check(f"{label}: card stays REVIEW", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    check(f"{label}: no duplicate rework event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == len([e for e in events_before if e["kind"] == "github_pr_rework"]),
+          str(task_events(tid)))
+    check(f"{label}: no label mutation", len(fake.patch_calls) == patches_before,
+          str(fake.patch_calls))
+
+
+def test_116_operator_recovered_review_retry_opens_and_dispatches_round():
+    print("116. operator-recovered REVIEW + stale label + exact retry -> one round, "
+          "review -> ready, dispatch claim/spawn and idempotency")
+    fake, tid = _operator_recovered_review_retry_hold()
+    retry_id = _post_retry_comment(fake, tid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    consumed = [r for r in entries if r.get("reason") == "maintainer_retry_consumed"]
+    check("review retry consumed once", len(consumed) == 1, str(entries))
+    check("review retry -> ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
+    events = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("review retry creates exactly one new rework event", len(events) == 2,
+          str(events))
+    if len(events) == 2:
+        payload = events[-1]["payload"]
+        check("review retry provenance",
+              payload.get("previous_status") == "review"
+              and payload.get("new_status") == "ready"
+              and payload.get("trigger") == "maintainer_retry"
+              and payload.get("retry_comment_id") == retry_id
+              and payload.get("request_comment_id") == retry_id,
+              str(payload))
+    check("stale agent-rework remains until claim",
+          fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+
+    events_before = len(task_events(tid))
+    results2 = run_sync(fake)
+    check("review retry next tick is idempotent", len(task_events(tid)) == events_before
+          and not any(r.get("reason") == "maintainer_retry_consumed" for r in results2),
+          str(results2))
+
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws116-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    dispatch_results = _run_sync_with_dispatch(fake, stub)
+    check("review retry dispatches one worker", len([
+        r for r in dispatch_results if r.get("reason") == "rework_worker_spawned"
+    ]) == 1, str(dispatch_results))
+    check("review retry claim -> RUNNING", task_row(tid)["status"] == "running",
+          str(task_row(tid)))
+    check("review retry spawn called once", len(stub.calls) == 1, str(stub.calls))
+    check("review retry label swaps on claim",
+          fake.pr_labels.get(PR_N) == ["agent-working"], str(fake.pr_labels))
+
+
+def test_117_operator_recovered_review_retry_rejections_fail_closed():
+    print("117. recovered REVIEW rejects stale/old, untrusted, malformed, wrong-task, "
+          "already-consumed and label-only retry signals")
+
+    def stale_retry(fake: FakeGitHub, tid: str) -> None:
+        _post_retry_comment(fake, tid, when="2026-08-10T00:00:30Z")
+
+    def untrusted_retry(fake: FakeGitHub, tid: str) -> None:
+        _post_retry_comment(fake, tid, author="not-a-trusted-actor")
+
+    def extra_prose_retry(fake: FakeGitHub, tid: str) -> None:
+        _MARKER_ID[0] += 1
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+        fake.issue_comments.setdefault(PR_N, []).append(comment(
+            "rhgo1749",
+            f"please retry\n{mod.REWORK_RETRY_MARKER}\ntask={tid}",
+            when,
+            n=_MARKER_ID[0],
+        ))
+
+    def wrong_task_retry(fake: FakeGitHub, tid: str) -> None:
+        _post_retry_comment(fake, tid, task="t_wrong-task")
+
+    def consumed_retry(fake: FakeGitHub, tid: str) -> None:
+        retry_id = _post_retry_comment(fake, tid)
+        with connect_closing() as conn:
+            row = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id=? "
+                "AND kind='github_pr_rework' ORDER BY created_at DESC, id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert row is not None
+            payload = json.loads(row["payload"] or "{}")
+            payload.update({"trigger": "maintainer_retry", "retry_comment_id": retry_id})
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(payload), row["id"]),
+            )
+            conn.commit()
+
+    cases = [
+        ("stale/old", stale_retry),
+        ("untrusted", untrusted_retry),
+        ("malformed/extra-prose", extra_prose_retry),
+        ("wrong-task", wrong_task_retry),
+        ("already-consumed", consumed_retry),
+        ("label-only", lambda _fake, _tid: None),
+    ]
+    for label, setup in cases:
+        fake, tid = _operator_recovered_review_retry_hold()
+        setup(fake, tid)
+        _assert_recovered_review_retry_rejected(fake, tid, label)
+
+
+def test_118_normal_review_ready_lane_ignores_retry_comment():
+    print("118. normal agent-review-ready REVIEW lane ignores retry comment and "
+          "keeps delivered round")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000118"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="review_requested",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)
+    check("normal review-ready fixture", task_row(tid)["status"] == "review"
+          and fake.pr_labels.get(PR_N) == ["agent-review-ready"],
+          str(task_row(tid)))
+    _post_retry_comment(fake, tid)
+    events_before = len(task_events(tid))
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("normal review-ready does not consume retry",
+          not any(r.get("reason") == "maintainer_retry_consumed" for r in entries),
+          str(entries))
+    check("normal review-ready remains review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    check("normal review-ready label remains authoritative",
+          fake.pr_labels.get(PR_N) == ["agent-review-ready"], str(fake.pr_labels))
+    check("normal review-ready creates no rework event", len(task_events(tid)) == events_before,
+          str(task_events(tid)))
+
+
+def test_119_recovered_review_label_conflict_blocks_retry():
+    print("119. recovered REVIEW + agent-rework/agent-working conflict -> fail closed")
+    fake, tid = _operator_recovered_review_retry_hold()
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-working"]
+    _post_retry_comment(fake, tid)
+    rework_events_before = len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ])
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("label conflict diagnostic", any(
+        r.get("reason") == "lifecycle_label_conflict" for r in entries), str(entries))
+    check("label conflict leaves REVIEW", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    check("label conflict prevents retry event", len([
+        e for e in task_events(tid) if e["kind"] == "github_pr_rework"
+    ]) == rework_events_before, str(task_events(tid)))
+
+
+def test_120_classic_review_label_readdition_unchanged():
+    print("120. normal REVIEW + fresh agent-rework label uses classic label admission")
+    fake = fresh_env()
+    rework_scenario(fake)
+    tid = new_task("review")
+    _post_retry_comment(fake, tid)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("classic review rework consumed", any(
+        r.get("reason") == "agent_rework" and r.get("changed") for r in entries),
+        str(entries))
+    check("classic review rework -> READY", task_row(tid)["status"] == "ready",
+          str(task_row(tid)))
+    rework_events = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("classic event has no maintainer retry trigger", len(rework_events) == 1
+          and "trigger" not in rework_events[0]["payload"], str(rework_events))
+
+
 
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
@@ -4374,6 +4595,11 @@ def main() -> int:
         test_116_completion_side_wake_open_pr,
         test_117_completion_side_wake_ordinary_task_noop,
         test_118_completion_side_wake_fail_closed,
+        test_116_operator_recovered_review_retry_opens_and_dispatches_round,
+        test_117_operator_recovered_review_retry_rejections_fail_closed,
+        test_118_normal_review_ready_lane_ignores_retry_comment,
+        test_119_recovered_review_label_conflict_blocks_retry,
+        test_120_classic_review_label_readdition_unchanged,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
