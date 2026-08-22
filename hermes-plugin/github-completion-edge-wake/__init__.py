@@ -9,8 +9,8 @@ projects GitHub state back into Kanban.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
-import math
 import os
 import re
 import selectors
@@ -31,13 +31,36 @@ _SOURCE_LINE = re.compile(r"^\s*-\s*source\s*:\s*github-issue\s*$", re.IGNORECAS
 _COMPLETION_LINE = re.compile(
     r"^\s*-\s*completion contract\s*:\s*github-pr\s*$", re.IGNORECASE
 )
+
+
+def _load_edge_sync_timeout_contract():
+    candidates = (
+        Path(__file__).with_name("edge_sync_timeout.py"),
+        Path(__file__).resolve().parents[2]
+        / "automation"
+        / "hermes"
+        / "edge_sync_timeout.py",
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "hermes_edge_sync_timeout_contract_plugin",
+            candidate,
+        )
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise RuntimeError("edge_sync_timeout_contract_unavailable")
+
+
+_TIMEOUT_CONTRACT = _load_edge_sync_timeout_contract()
 _EDGE_SCRIPT = Path("scripts") / "kanban-github-sync.py"
-_EDGE_SYNC_TIMEOUT_ENV = "HERMES_EDGE_SYNC_TIMEOUT_SECONDS"
-_EDGE_SYNC_TIMEOUT_SECONDS = 120.0
-_EDGE_TIMEOUT_GRACE_SECONDS = 5.0
-_EDGE_SYNC_TIMEOUT_MAX_SECONDS = 3600.0
-_EDGE_TIMEOUT_SECONDS = _EDGE_SYNC_TIMEOUT_SECONDS + _EDGE_TIMEOUT_GRACE_SECONDS
-_EDGE_OUTPUT_LIMIT_BYTES = 64 * 1024
+_EDGE_TIMEOUT_GRACE_SECONDS = _TIMEOUT_CONTRACT.EDGE_SYNC_TIMEOUT_GRACE_SECONDS
+_EDGE_OUTPUT_LIMIT_BYTES = _TIMEOUT_CONTRACT.EDGE_SYNC_OUTPUT_LIMIT_BYTES
 
 
 @dataclass(frozen=True)
@@ -92,19 +115,10 @@ def _github_token() -> str:
 
 def _edge_timeout_seconds() -> float:
     """Return a bounded outer deadline beyond the configured edge budget."""
-    raw = os.environ.get(_EDGE_SYNC_TIMEOUT_ENV, "").strip()
-    if not raw:
-        return _EDGE_TIMEOUT_SECONDS
     try:
-        configured = float(raw)
-    except (TypeError, ValueError) as exc:
-        raise _WakeFailure("edge_timeout_invalid") from exc
-    if (
-        not math.isfinite(configured)
-        or configured <= 0
-        or configured > _EDGE_SYNC_TIMEOUT_MAX_SECONDS
-    ):
-        raise _WakeFailure("edge_timeout_invalid")
+        configured = _TIMEOUT_CONTRACT.parse_edge_sync_timeout()
+    except _TIMEOUT_CONTRACT.TimeoutConfigurationError as exc:
+        raise _WakeFailure(exc.code) from exc
     return configured + _EDGE_TIMEOUT_GRACE_SECONDS
 
 

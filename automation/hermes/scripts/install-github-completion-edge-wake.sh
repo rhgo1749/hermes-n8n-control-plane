@@ -5,6 +5,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SOURCE="$ROOT/hermes-plugin/github-completion-edge-wake"
+TIMEOUT_SOURCE="$ROOT/automation/hermes/edge_sync_timeout.py"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_BIN="${HERMES_BIN:-hermes}"
 DRY_RUN=0
@@ -44,7 +45,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for source in "$SOURCE/plugin.yaml" "$SOURCE/__init__.py"; do
+for source in "$SOURCE/plugin.yaml" "$SOURCE/__init__.py" "$TIMEOUT_SOURCE"; do
   [[ -f "$source" ]] || { echo "plugin source missing: $source" >&2; exit 1; }
 done
 [[ -d "$HERMES_HOME" ]] || { echo "Hermes home not found: $HERMES_HOME" >&2; exit 2; }
@@ -93,7 +94,9 @@ trap cleanup EXIT
 install -d -m 700 "$TARGET_ROOT" "$CANDIDATE"
 install -m 644 "$SOURCE/plugin.yaml" "$CANDIDATE/plugin.yaml"
 install -m 644 "$SOURCE/__init__.py" "$CANDIDATE/__init__.py"
-PYTHONPYCACHEPREFIX="$TMP/pycache" python3 -m py_compile "$CANDIDATE/__init__.py"
+install -m 644 "$TIMEOUT_SOURCE" "$CANDIDATE/edge_sync_timeout.py"
+PYTHONPYCACHEPREFIX="$TMP/pycache" python3 -m py_compile \
+  "$CANDIDATE/__init__.py" "$CANDIDATE/edge_sync_timeout.py"
 
 if [[ -d "$TARGET" ]]; then
   mv "$TARGET" "$BACKUP"
@@ -122,6 +125,12 @@ cmp -s "$SOURCE/plugin.yaml" "$TARGET/plugin.yaml" || {
 }
 cmp -s "$SOURCE/__init__.py" "$TARGET/__init__.py" || {
   echo "installed plugin mismatch" >&2
+  restore_previous
+  exit 1
+}
+
+cmp -s "$TIMEOUT_SOURCE" "$TARGET/edge_sync_timeout.py" || {
+  echo "installed timeout contract mismatch" >&2
   restore_previous
   exit 1
 }

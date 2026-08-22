@@ -51,11 +51,18 @@ owner is introduced.
 
 The callback uses a fixed argument vector with `shell=False`, a bounded
 timeout/output budget, and stable diagnostics that do not include task body,
-summary, command output, or credentials. A failed wake is observable and
-fail-closed: the core completion remains provisional `DONE` for a later
-operator/event reconciliation and is never treated as merge evidence. If the
-edge already moved the card, a repeated observation is an idempotent no-op
-through the existing optimistic edge transition.
+summary, command output, or credentials. Both wake paths load the shared
+`automation/hermes/edge_sync_timeout.py` contract at installation time:
+`HERMES_EDGE_SYNC_TIMEOUT_SECONDS` defaults to `120` seconds and must be finite,
+positive, and no greater than `3600`; the completion observer adds its bounded
+`5`-second grace. Combined child output is capped at `64 KiB`; invalid timeout
+configuration or oversized output fails closed before any edge success is
+reported.
+
+A failed wake is observable and fail-closed: the core completion remains
+provisional `DONE` for a later operator/event reconciliation and is never treated
+as merge evidence. If the edge already moved the card, a repeated observation is
+an idempotent no-op through the existing optimistic edge transition.
 
 ## Why worker `kanban_request_review` is forbidden here
 

@@ -36,6 +36,10 @@ def main() -> int:
         installed.mkdir(parents=True)
         shutil.copy2(SOURCE, installed / "__init__.py")
         shutil.copy2(SOURCE.with_name("plugin.yaml"), installed / "plugin.yaml")
+        shutil.copy2(
+            ROOT / "automation" / "hermes" / "edge_sync_timeout.py",
+            installed / "edge_sync_timeout.py",
+        )
         (home / "config.yaml").write_text(
             "plugins:\n  enabled:\n    - github-completion-edge-wake\n",
             encoding="utf-8",
@@ -98,16 +102,19 @@ def main() -> int:
             assert result.output_limited, result
             assert result.output_bytes > mod._EDGE_OUTPUT_LIMIT_BYTES, result
 
-            slow = script(root / "slow.py", "import time; time.sleep(1)")
-            original_timeout = mod._EDGE_TIMEOUT_SECONDS
-            mod._EDGE_TIMEOUT_SECONDS = 0.05
+            slow = script(root / "slow.py", "import time; time.sleep(6)")
+            original_timeout = os.environ.get("HERMES_EDGE_SYNC_TIMEOUT_SECONDS")
+            os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = "0.05"
             try:
                 result = mod._run_edge(slow, "default")
             finally:
-                mod._EDGE_TIMEOUT_SECONDS = original_timeout
+                if original_timeout is None:
+                    os.environ.pop("HERMES_EDGE_SYNC_TIMEOUT_SECONDS", None)
+                else:
+                    os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = original_timeout
             assert result.timed_out, result
 
-            assert mod._EDGE_TIMEOUT_SECONDS > 120.0, mod._EDGE_TIMEOUT_SECONDS
+            assert mod._edge_timeout_seconds() > 120.0
             os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = "0.05"
             assert mod._edge_timeout_seconds() == 0.05 + mod._EDGE_TIMEOUT_GRACE_SECONDS
             bounded_slow = script(

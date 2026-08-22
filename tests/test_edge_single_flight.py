@@ -108,7 +108,8 @@ sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 plugin._completion_is_eligible = lambda task_id, board: True
 plugin._edge_script_path = lambda: Path(os.environ["EDGE_TARGET"])
-plugin._EDGE_TIMEOUT_SECONDS = float(os.environ.get("EDGE_PLUGIN_TIMEOUT", "5"))
+plugin._EDGE_TIMEOUT_GRACE_SECONDS = 0.0
+os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = os.environ.get("EDGE_PLUGIN_TIMEOUT", "5")
 diagnostics = []
 plugin._diagnostic = lambda task_id, board, code: diagnostics.append({
     "task_id": task_id,

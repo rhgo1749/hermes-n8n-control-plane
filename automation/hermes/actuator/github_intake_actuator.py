@@ -8,14 +8,40 @@ import importlib.util
 import json
 import os
 import re
+import selectors
 import stat
 import subprocess
 import sys
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+
+def _load_edge_sync_timeout_contract():
+    candidates = (
+        Path(__file__).with_name("edge_sync_timeout.py"),
+        Path(__file__).resolve().parents[1] / "edge_sync_timeout.py",
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "hermes_edge_sync_timeout_contract_actuator",
+            candidate,
+        )
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise RuntimeError("edge_sync_timeout_contract_unavailable")
+
+
+_TIMEOUT_CONTRACT = _load_edge_sync_timeout_contract()
 
 HOST = "127.0.0.1"
 PORT = 5682
@@ -44,9 +70,6 @@ KANBAN_BOARDS_ROOT = Path(
 )
 TIMEOUT_SECONDS = float(
     os.environ.get("HERMES_INTAKE_ACTUATOR_TIMEOUT_SECONDS", "900")
-)
-EDGE_SYNC_TIMEOUT_SECONDS = float(
-    os.environ.get("HERMES_EDGE_SYNC_TIMEOUT_SECONDS", "120")
 )
 MAX_EDGE_SYNC_BODY_BYTES = 16 * 1024
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -215,7 +238,27 @@ def _run_intake() -> int:
     return int(completed.returncode)
 
 
+def _edge_sync_timeout_seconds() -> float:
+    try:
+        return _TIMEOUT_CONTRACT.parse_edge_sync_timeout()
+    except _TIMEOUT_CONTRACT.TimeoutConfigurationError as exc:
+        raise RuntimeError(exc.code) from exc
+
+
+def _stop_edge_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_edge_sync(board: str) -> list[dict[str, Any]]:
+    timeout_seconds = _edge_sync_timeout_seconds()
     if not _edge_runtime_ready():
         raise RuntimeError("edge_sync_runtime_unavailable")
 
@@ -231,33 +274,91 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "GITHUB_TOKEN": _github_token(),
     }
-    completed = subprocess.run(
-        [
-            str(PYTHON_BIN),
-            str(EDGE_SYNC_SCRIPT),
-            "--board",
-            board,
-            "--json",
-        ],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=EDGE_SYNC_TIMEOUT_SECONDS,
-        check=False,
-        shell=False,
-        env=env,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError("edge_sync_command_failed")
+    command = [
+        str(PYTHON_BIN),
+        str(EDGE_SYNC_SCRIPT),
+        "--board",
+        board,
+        "--json",
+    ]
     try:
-        payload = json.loads(completed.stdout or "")
-    except json.JSONDecodeError as exc:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            close_fds=True,
+            env=env,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("edge_sync_spawn_failed") from exc
+
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    output: list[bytes] = []
+    output_bytes = 0
+    deadline = time.monotonic() + timeout_seconds
+    stream_closed = False
+    try:
+        while not stream_closed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_edge_process(process)
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            events = selector.select(remaining)
+            if not events:
+                _stop_edge_process(process)
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            for key, _ in events:
+                data = os.read(key.fd, 4096)
+                if not data:
+                    stream_closed = True
+                    selector.unregister(key.fileobj)
+                    break
+                if (
+                    output_bytes + len(data)
+                    > _TIMEOUT_CONTRACT.EDGE_SYNC_OUTPUT_LIMIT_BYTES
+                ):
+                    _stop_edge_process(process)
+                    raise RuntimeError("edge_sync_output_limit")
+                output.append(data)
+                output_bytes += len(data)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _stop_edge_process(process)
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        returncode = process.wait(timeout=remaining)
+    except (OSError, subprocess.TimeoutExpired):
+        _stop_edge_process(process)
+        raise
+    finally:
+        try:
+            selector.close()
+        finally:
+            process.stdout.close()
+
+    if returncode != 0:
+        raise RuntimeError("edge_sync_command_failed")
+    raw_output = b"".join(output)
+    try:
+        payload = json.loads(raw_output or b"")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise RuntimeError("edge_sync_output_invalid") from exc
     if not isinstance(payload, list) or not all(
         isinstance(item, dict) for item in payload
     ):
         raise RuntimeError("edge_sync_output_invalid")
     return payload
+
+
+def _edge_sync_error_code(exc: RuntimeError) -> str:
+    code = str(exc)
+    if code in {"edge_sync_output_limit", "edge_timeout_invalid"}:
+        return code
+    return "edge_sync_execution_failed"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -488,7 +589,13 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "edge_sync_timeout"},
             )
             return
-        except (RuntimeError, OSError, subprocess.SubprocessError):
+        except RuntimeError as exc:
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"ok": False, "error": _edge_sync_error_code(exc)},
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
             self._send_json(
                 HTTPStatus.BAD_GATEWAY,
                 {"ok": False, "error": "edge_sync_execution_failed"},

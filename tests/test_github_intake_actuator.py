@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -548,29 +550,35 @@ def test_board_resolution_uses_authoritative_task_provenance() -> None:
 def test_edge_sync_fixed_command_is_bounded_and_shell_free() -> None:
     original_edge = actuator.EDGE_SYNC_SCRIPT
     original_registry = actuator.REGISTRY_SCRIPT
+    original_python = actuator.PYTHON_BIN
     original_github_token = actuator._github_token
-    original_run = actuator.subprocess.run
+    original_popen = actuator.subprocess.Popen
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         edge = root / "kanban-github-sync.py"
         registry = root / "repository_registry.py"
-        edge.write_text("# edge\n", encoding="utf-8")
+        edge.write_text(
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "assert sys.argv[1:] == ['--board', 'ctrlhangul', '--json']\n"
+            f"assert os.environ['GITHUB_TOKEN'] == {TEST_TOKEN!r}\n"
+            "print(json.dumps([{'task_id': 'task-1'}]))\n",
+            encoding="utf-8",
+        )
         registry.write_text("# registry\n", encoding="utf-8")
+        actuator.__dict__["PYTHON_BIN"] = Path(sys.executable)
         actuator.__dict__["EDGE_SYNC_SCRIPT"] = edge
         actuator.__dict__["REGISTRY_SCRIPT"] = registry
         actuator.__dict__["_github_token"] = lambda: TEST_TOKEN
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def fake_run(argv, **kwargs):
+        def recording_popen(argv, **kwargs):
             captured["argv"] = argv
             captured.update(kwargs)
-            return SimpleNamespace(
-                returncode=0,
-                stdout='[{"task_id":"task-1"}]',
-                stderr="",
-            )
+            return original_popen(argv, **kwargs)
 
-        actuator.subprocess.run = fake_run
+        actuator.subprocess.Popen = recording_popen
         try:
             assert actuator._run_edge_sync("ctrlhangul") == [
                 {"task_id": "task-1"}
@@ -583,12 +591,156 @@ def test_edge_sync_fixed_command_is_bounded_and_shell_free() -> None:
                 "--json",
             ]
             assert captured["shell"] is False
-            assert captured["check"] is False
-            assert captured["env"]["GITHUB_TOKEN"] == TEST_TOKEN
         finally:
-            actuator.subprocess.run = original_run
+            actuator.subprocess.Popen = original_popen
+            actuator.__dict__["PYTHON_BIN"] = original_python
             actuator.__dict__["EDGE_SYNC_SCRIPT"] = original_edge
             actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["_github_token"] = original_github_token
+
+
+def test_edge_sync_oversized_output_fails_closed_and_terminates_child() -> None:
+    original_edge = actuator.EDGE_SYNC_SCRIPT
+    original_registry = actuator.REGISTRY_SCRIPT
+    original_python = actuator.PYTHON_BIN
+    original_github_token = actuator._github_token
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        marker = root / "child-marker"
+        edge = root / "kanban-github-sync.py"
+        registry = root / "repository_registry.py"
+        edge.write_text(
+            "import json\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            f"marker = Path({str(marker)!r})\n"
+            "marker.write_text('started', encoding='utf-8')\n"
+            "print(json.dumps([{'payload': 'x' * 2000001}]))\n"
+            "time.sleep(5)\n"
+            "marker.write_text('survived', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        registry.write_text("# registry\n", encoding="utf-8")
+        actuator.__dict__["PYTHON_BIN"] = Path(sys.executable)
+        actuator.__dict__["EDGE_SYNC_SCRIPT"] = edge
+        actuator.__dict__["REGISTRY_SCRIPT"] = registry
+        actuator.__dict__["_github_token"] = lambda: TEST_TOKEN
+        try:
+            try:
+                actuator._run_edge_sync("ctrlhangul")
+            except RuntimeError as exc:
+                assert str(exc) == "edge_sync_output_limit", str(exc)
+                assert actuator._edge_sync_error_code(exc) == "edge_sync_output_limit"
+            else:
+                raise AssertionError("oversized edge output must fail closed")
+            time.sleep(0.1)
+            assert marker.read_text(encoding="utf-8") == "started"
+        finally:
+            actuator.__dict__["PYTHON_BIN"] = original_python
+            actuator.__dict__["EDGE_SYNC_SCRIPT"] = original_edge
+            actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["_github_token"] = original_github_token
+
+
+def test_edge_sync_invalid_timeout_values_fail_closed_before_spawn() -> None:
+    original_edge = actuator.EDGE_SYNC_SCRIPT
+    original_registry = actuator.REGISTRY_SCRIPT
+    original_python = actuator.PYTHON_BIN
+    original_github_token = actuator._github_token
+    previous_timeout = os.environ.get("HERMES_EDGE_SYNC_TIMEOUT_SECONDS")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        marker = root / "spawned"
+        edge = root / "kanban-github-sync.py"
+        registry = root / "repository_registry.py"
+        edge.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('spawned', encoding='utf-8')\n"
+            "print('[]')\n",
+            encoding="utf-8",
+        )
+        registry.write_text("# registry\n", encoding="utf-8")
+        actuator.__dict__["PYTHON_BIN"] = Path(sys.executable)
+        actuator.__dict__["EDGE_SYNC_SCRIPT"] = edge
+        actuator.__dict__["REGISTRY_SCRIPT"] = registry
+        actuator.__dict__["_github_token"] = lambda: TEST_TOKEN
+        try:
+            for raw in ("nan", "inf", "0", "-1", "not-a-number", "3600.1"):
+                os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = raw
+                try:
+                    actuator._run_edge_sync("ctrlhangul")
+                except RuntimeError as exc:
+                    assert str(exc) == "edge_timeout_invalid", str(exc)
+                else:
+                    raise AssertionError(f"invalid timeout must fail closed: {raw!r}")
+                assert not marker.exists(), raw
+
+            os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = "0.05"
+            assert actuator._run_edge_sync("ctrlhangul") == []
+            assert marker.read_text(encoding="utf-8") == "spawned"
+        finally:
+            if previous_timeout is None:
+                os.environ.pop("HERMES_EDGE_SYNC_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = previous_timeout
+            actuator.__dict__["PYTHON_BIN"] = original_python
+            actuator.__dict__["EDGE_SYNC_SCRIPT"] = original_edge
+            actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["_github_token"] = original_github_token
+
+
+def test_edge_sync_invalid_timeout_http_response_is_stable() -> None:
+    original_edge = actuator.EDGE_SYNC_SCRIPT
+    original_registry = actuator.REGISTRY_SCRIPT
+    original_python = actuator.PYTHON_BIN
+    original_token_file = actuator.TOKEN_FILE
+    original_resolve = actuator._resolve_board
+    original_github_token = actuator._github_token
+    previous_timeout = os.environ.get("HERMES_EDGE_SYNC_TIMEOUT_SECONDS")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        marker = root / "spawned"
+        edge = root / "kanban-github-sync.py"
+        registry = root / "repository_registry.py"
+        token = root / "token"
+        token.write_text(TEST_TOKEN + "\n", encoding="utf-8")
+        token.chmod(0o600)
+        edge.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('spawned', encoding='utf-8')\n"
+            "print('[]')\n",
+            encoding="utf-8",
+        )
+        registry.write_text("# registry\n", encoding="utf-8")
+        actuator.__dict__["PYTHON_BIN"] = Path(sys.executable)
+        actuator.__dict__["TOKEN_FILE"] = token
+        actuator.__dict__["EDGE_SYNC_SCRIPT"] = edge
+        actuator.__dict__["REGISTRY_SCRIPT"] = registry
+        actuator.__dict__["_resolve_board"] = lambda repository: "ctrlhangul"
+        actuator.__dict__["_github_token"] = lambda: TEST_TOKEN
+        os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = "nan"
+        try:
+            with RunningServer() as server:
+                status, body = _request(
+                    server.base_url,
+                    "POST",
+                    "/v1/edge-sync",
+                    authorization=f"Bearer {TEST_TOKEN}",
+                    data=_edge_payload(),
+                )
+            assert status == 502
+            assert body == {"ok": False, "error": "edge_timeout_invalid"}
+            assert not marker.exists()
+        finally:
+            if previous_timeout is None:
+                os.environ.pop("HERMES_EDGE_SYNC_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = previous_timeout
+            actuator.__dict__["PYTHON_BIN"] = original_python
+            actuator.__dict__["TOKEN_FILE"] = original_token_file
+            actuator.__dict__["EDGE_SYNC_SCRIPT"] = original_edge
+            actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["_resolve_board"] = original_resolve
             actuator.__dict__["_github_token"] = original_github_token
 
 
