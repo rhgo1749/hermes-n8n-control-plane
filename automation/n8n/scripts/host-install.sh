@@ -3,10 +3,16 @@
 # Run this on the Ubuntu HOST, not inside the Hermes container.
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 N8N_DIR="$ROOT/automation/n8n"
 COMPOSE_FILE="$N8N_DIR/compose.yaml"
-ENV_FILE="$N8N_DIR/.env"
+# shellcheck source=state-root.sh
+. "$SCRIPT_DIR/state-root.sh"
+ENV_FILE="$(h4v3_n8n_env_file "$N8N_DIR")"
+export HERMES_N8N_ENV_FILE="$ENV_FILE"
+STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
+export HERMES_N8N_STATE_ROOT="$STATE_ROOT"
 TIMEZONE="Asia/Seoul"
 ENABLE_DOCKER_SERVICE=0
 TIMEZONE_EXPLICIT=0
@@ -20,6 +26,11 @@ n8n itself listens only on 127.0.0.1:5678. `--port` is
 intentionally unsupported: a mapped host port does not exist in this topology.
 The installer never exposes a public webhook endpoint, mounts the Docker socket,
 or changes Hermes.
+
+Runtime config and persistent workflow/router/lease/secrets state are stored
+outside the Git checkout. Override HERMES_N8N_ENV_FILE or
+HERMES_N8N_STATE_ROOT only with absolute host paths; the resolved paths are
+persisted into the runtime env file and reused by Compose/helpers.
 
 --enable-docker-service explicitly runs `sudo systemctl enable --now docker`
 so Docker restores the `restart: unless-stopped` n8n container after host boot.
@@ -55,8 +66,9 @@ command -v docker >/dev/null || {
   exit 2
 }
 
-install -d -m 700 "$N8N_DIR/state" "$N8N_DIR/state/rendered-workflows" \
-  "$N8N_DIR/state/exports" "$N8N_DIR/state/backups" "$N8N_DIR/state/secrets"
+install -d -m 700 "$(dirname "$ENV_FILE")"
+install -d -m 700 "$STATE_ROOT" "$STATE_ROOT/rendered-workflows" \
+  "$STATE_ROOT/exports" "$STATE_ROOT/backups" "$STATE_ROOT/secrets"
 if [[ ! -f "$ENV_FILE" ]]; then
   cp "$N8N_DIR/.env.example" "$ENV_FILE"
 fi
@@ -67,7 +79,7 @@ chmod 600 "$ENV_FILE"
 # actual n8n listener at 127.0.0.1:5678, so a former mapped host-port setting
 # must not survive into the runtime file.
 EFFECTIVE_PORT=5678
-python3 - "$ENV_FILE" "$TIMEZONE" "$TIMEZONE_EXPLICIT" <<'PY'
+python3 - "$ENV_FILE" "$TIMEZONE" "$TIMEZONE_EXPLICIT" "$STATE_ROOT" <<'PY'
 import os
 import secrets
 import stat
@@ -76,7 +88,11 @@ import tempfile
 from pathlib import Path
 
 path = Path(sys.argv[1])
-timezone, timezone_explicit = sys.argv[2:]
+timezone, timezone_explicit, state_root = sys.argv[2:]
+if not path.is_absolute():
+    raise SystemExit("HERMES_N8N_ENV_FILE must be an absolute host path")
+if not Path(state_root).is_absolute():
+    raise SystemExit("HERMES_N8N_STATE_ROOT must be an absolute host path")
 lines = path.read_text(encoding="utf-8").splitlines()
 values: dict[str, str] = {}
 order: list[str] = []
@@ -99,10 +115,14 @@ defaults = {
     "N8N_SECURE_COOKIE": "false",
     "GENERIC_TIMEZONE": timezone,
     "TZ": timezone,
+    "HERMES_N8N_ENV_FILE": str(path),
+    "HERMES_N8N_STATE_ROOT": state_root,
 }
 for key, value in defaults.items():
     if not values.get(key, "").strip():
         values[key] = value
+values["HERMES_N8N_ENV_FILE"] = str(path)
+values["HERMES_N8N_STATE_ROOT"] = state_root
 values.pop("N8N_HOST_PORT", None)
 values.pop("LEASE_HERMES_BASE_URL", None)
 order = [
@@ -118,7 +138,7 @@ if values["N8N_PORT"].strip() != "5678":
     raise SystemExit("N8N_PORT must be 5678 while Compose uses host networking")
 if not values.get("N8N_ENCRYPTION_KEY", "").strip():
     values["N8N_ENCRYPTION_KEY"] = secrets.token_urlsafe(32)
-# Keep comments in .env.example as documentation; write runtime .env as a
+# Keep comments in .env.example as documentation; write runtime env as a
 # simple, permission-protected key=value secret file.
 keys = list(dict.fromkeys([*order, *defaults.keys(), "N8N_ENCRYPTION_KEY"]))
 content = "".join(f"{key}={values.get(key, '')}\n" for key in keys)
@@ -156,6 +176,8 @@ for _ in $(seq 1 30); do
   if curl --fail --silent --show-error "http://127.0.0.1:${EFFECTIVE_PORT}/healthz" >/dev/null; then
     echo "n8n is healthy at http://127.0.0.1:${EFFECTIVE_PORT}"
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
+    echo "Runtime config:        $ENV_FILE"
+    echo "Persistent state root: $STATE_ROOT"
     echo "Next: configure router secrets, then install the direct intake actuator."
     exit 0
   fi

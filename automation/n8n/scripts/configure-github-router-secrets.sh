@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-SECRET_DIR="$ROOT/automation/n8n/state/secrets"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+N8N_DIR="$ROOT/automation/n8n"
+# shellcheck source=state-root.sh
+. "$SCRIPT_DIR/state-root.sh"
+STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
+SECRET_DIR="$STATE_ROOT/secrets"
 
 usage() {
   cat <<'EOF'

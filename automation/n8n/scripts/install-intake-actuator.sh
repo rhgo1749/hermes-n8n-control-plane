@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+N8N_DIR="$ROOT/automation/n8n"
+# shellcheck source=state-root.sh
+. "$SCRIPT_DIR/state-root.sh"
+STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
 
 CONTAINER_NAME="${HERMES_CONTAINER_NAME:-hermes-cloudcli-agent}"
 HOST_UID="${HERMES_RUNTIME_UID:-1000}"
@@ -9,7 +14,7 @@ HOST_GID="${HERMES_RUNTIME_GID:-1000}"
 
 SOURCE="$ROOT/automation/hermes/actuator/github_intake_actuator.py"
 
-SECRET_DIR="$ROOT/automation/n8n/state/secrets"
+SECRET_DIR="$STATE_ROOT/secrets"
 TOKEN_HOST="$SECRET_DIR/hermes-intake-control-token"
 
 LIBEXEC_DIR="/home/hermes/.local/libexec"

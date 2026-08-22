@@ -1,6 +1,4 @@
 # Host-specific n8n configuration and durable runtime data
-automation/n8n/.env
-automation/n8n/state/
 
 # Generated or local Python state
 __pycache__/

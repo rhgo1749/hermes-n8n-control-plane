@@ -2,10 +2,16 @@
 # Render and import the single on-demand GitHub edge-sync workflow.
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 N8N_DIR="$ROOT/automation/n8n"
 COMPOSE_FILE="$N8N_DIR/compose.yaml"
-ENV_FILE="$N8N_DIR/.env"
+# shellcheck source=state-root.sh
+. "$SCRIPT_DIR/state-root.sh"
+ENV_FILE="$(h4v3_n8n_env_file "$N8N_DIR")"
+export HERMES_N8N_ENV_FILE="$ENV_FILE"
+STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
+export HERMES_N8N_STATE_ROOT="$STATE_ROOT"
 usage() {
   echo "Usage: import-workflows.sh" >&2
 }
@@ -20,10 +26,9 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
-[[ -n "$DASHBOARD_URL" ]] || { usage; exit 2; }
 [[ -f "$ENV_FILE" ]] || { echo "Run host-install.sh first." >&2; exit 2; }
 
-RENDERED_DIR="$N8N_DIR/state/rendered-workflows"
+RENDERED_DIR="$STATE_ROOT/rendered-workflows"
 mkdir -p "$RENDERED_DIR"
 rm -f "$RENDERED_DIR"/schedule-*.json "$RENDERED_DIR"/github-*.json
 
@@ -52,6 +57,6 @@ After import, bind the protected loopback control-token Header Auth credential
 to both the Webhook trigger and "Run edge sync actuator" node. Verify one
 signed host canary, then activate only this workflow.
 
-The Hermes job itself remains preserved for non-PR intake. Do not delete or
-recreate default:bf431b2a6ba6.
+The Hermes job itself remains preserved and should normally stay paused between
+external trigger/pause leases. Do not delete or recreate default:bf431b2a6ba6.
 EOF
