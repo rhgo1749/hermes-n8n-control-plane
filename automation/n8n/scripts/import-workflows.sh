@@ -6,10 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 N8N_DIR="$ROOT/automation/n8n"
 COMPOSE_FILE="$N8N_DIR/compose.yaml"
-ENV_FILE="$N8N_DIR/.env"
 # shellcheck source=state-root.sh
 . "$SCRIPT_DIR/state-root.sh"
+ENV_FILE="$(h4v3_n8n_env_file "$N8N_DIR")"
+export HERMES_N8N_ENV_FILE="$ENV_FILE"
 STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
+export HERMES_N8N_STATE_ROOT="$STATE_ROOT"
 DASHBOARD_URL=""
 
 usage() {
