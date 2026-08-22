@@ -57,35 +57,116 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="completion-edge-wake-") as td:
         root = Path(td)
-        success = script(
-            root / "kanban-github-sync.py",
-            "import sys; assert sys.argv[1:] == ['--board', 'default', '--json']; print('ok')",
+        env_keys = (
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "HERMES_GITHUB_TOKEN",
+            "HERMES_HOME",
+            "HERMES_EDGE_SYNC_TIMEOUT_SECONDS",
+            "EDGE_TOKEN_MARKER",
         )
-        result = mod._run_edge(success, "default")
-        assert result.returncode == 0, result
-        assert result.output_bytes > 0, result
-        assert not result.timed_out and not result.output_limited, result
-
-        failure = script(root / "failure.py", "raise SystemExit(3)")
-        result = mod._run_edge(failure, "default")
-        assert result.returncode == 3, result
-
-        noisy = script(
-            root / "noisy.py",
-            "import sys; sys.stdout.write('x' * 1000000); sys.stdout.flush()",
-        )
-        result = mod._run_edge(noisy, "default")
-        assert result.output_limited, result
-        assert result.output_bytes > mod._EDGE_OUTPUT_LIMIT_BYTES, result
-
-        slow = script(root / "slow.py", "import time; time.sleep(1)")
-        original_timeout = mod._EDGE_TIMEOUT_SECONDS
-        mod._EDGE_TIMEOUT_SECONDS = 0.05
+        previous_env = {key: os.environ.get(key) for key in env_keys}
+        os.environ["GITHUB_TOKEN"] = "environment-token"
+        os.environ.pop("GH_TOKEN", None)
+        os.environ.pop("HERMES_GITHUB_TOKEN", None)
         try:
-            result = mod._run_edge(slow, "default")
+            success = script(
+                root / "kanban-github-sync.py",
+                "import sys; assert sys.argv[1:] == ['--board', 'default', '--json']; print('ok')",
+            )
+            result = mod._run_edge(success, "default")
+            assert result.returncode == 0, result
+            assert result.output_bytes > 0, result
+            assert not result.timed_out and not result.output_limited, result
+
+            precedence = script(
+                root / "precedence.py",
+                "import os; assert os.environ['GITHUB_TOKEN'] == 'environment-token'; print(os.environ['GITHUB_TOKEN'])",
+            )
+            result = mod._run_edge(precedence, "default")
+            assert result.returncode == 0, result
+
+            failure = script(root / "failure.py", "raise SystemExit(3)")
+            result = mod._run_edge(failure, "default")
+            assert result.returncode == 3, result
+
+            noisy = script(
+                root / "noisy.py",
+                "import sys; sys.stdout.write('x' * 1000000); sys.stdout.flush()",
+            )
+            result = mod._run_edge(noisy, "default")
+            assert result.output_limited, result
+            assert result.output_bytes > mod._EDGE_OUTPUT_LIMIT_BYTES, result
+
+            slow = script(root / "slow.py", "import time; time.sleep(1)")
+            original_timeout = mod._EDGE_TIMEOUT_SECONDS
+            mod._EDGE_TIMEOUT_SECONDS = 0.05
+            try:
+                result = mod._run_edge(slow, "default")
+            finally:
+                mod._EDGE_TIMEOUT_SECONDS = original_timeout
+            assert result.timed_out, result
+
+            assert mod._EDGE_TIMEOUT_SECONDS > 120.0, mod._EDGE_TIMEOUT_SECONDS
+            os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = "0.05"
+            assert mod._edge_timeout_seconds() == 0.05 + mod._EDGE_TIMEOUT_GRACE_SECONDS
+            bounded_slow = script(
+                root / "bounded-slow.py", "import time; time.sleep(0.1)"
+            )
+            result = mod._run_edge(bounded_slow, "default")
+            assert not result.timed_out, result
+
+            os.environ["HERMES_EDGE_SYNC_TIMEOUT_SECONDS"] = "inf"
+            try:
+                mod._edge_timeout_seconds()
+            except mod._WakeFailure as exc:
+                assert exc.code == "edge_timeout_invalid", exc.code
+            else:
+                raise AssertionError("non-finite edge timeout must fail closed")
+            os.environ.pop("HERMES_EDGE_SYNC_TIMEOUT_SECONDS", None)
+
+            fallback_token = "fallback-token-value"
+            fallback_home = root / "hermes-home"
+            fallback_home.mkdir()
+            (fallback_home / ".env").write_text(
+                f"GITHUB_TOKEN={fallback_token}\n", encoding="utf-8"
+            )
+            marker = root / "token-marker"
+            os.environ.pop("GITHUB_TOKEN", None)
+            os.environ["HERMES_HOME"] = str(fallback_home)
+            os.environ["EDGE_TOKEN_MARKER"] = str(marker)
+            fallback = script(
+                root / "fallback.py",
+                f"""
+import os
+from pathlib import Path
+token = os.environ.get("GITHUB_TOKEN")
+assert token == {fallback_token!r}
+Path(os.environ["EDGE_TOKEN_MARKER"]).write_text("received", encoding="utf-8")
+print(token)
+""",
+            )
+            result = mod._run_edge(fallback, "default")
+            assert result.returncode == 0, result
+            assert marker.read_text(encoding="utf-8") == "received"
+            assert fallback_token not in repr(result)
         finally:
-            mod._EDGE_TIMEOUT_SECONDS = original_timeout
-        assert result.timed_out, result
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    legacy_body = (
+        "- source: github-issue\n"
+        "- repository: rhgo1749/hermes-n8n-control-plane\n"
+        "\n## Canonical Issue body\n"
+        "- completion contract: github-pr\n"
+    )
+    assert mod._is_github_backed_body(legacy_body), legacy_body
+    assert not mod._is_github_backed_body(
+        "## Canonical Issue body\n- source: github-issue\n"
+    )
 
     try:
         mod._valid_board("../escape")

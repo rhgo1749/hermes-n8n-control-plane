@@ -4492,6 +4492,58 @@ def test_118_completion_side_wake_fail_closed():
           task_row(tid)["status"] == "done", str(task_row(tid)))
 
 
+def test_119_completion_side_wake_legacy_github_card():
+    print("119. legacy source-only provenance still receives one-shot completion wake")
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="open", merged=False)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("ready")
+    legacy_body = task_row(tid)["body"].replace(
+        "- completion contract: github-pr\n", ""
+    )
+    with connect_closing() as conn:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (legacy_body, tid))
+        conn.commit()
+    check(
+        "legacy provenance is canonical",
+        wake_plugin._is_github_backed_body(legacy_body),
+        legacy_body,
+    )
+    wake_calls: list[tuple[str, str]] = []
+
+    def runner(edge_path, board):
+        wake_calls.append((str(edge_path), board))
+        results = run_sync(fake)
+        check(
+            "legacy completion wake runs the real edge reconciliation",
+            any(item.get("task_id") == tid and item.get("status") == "review"
+                for item in results),
+            str(results),
+        )
+        return wake_plugin.WakeResult(returncode=0, output_bytes=0)
+
+    manager, original_runner = _install_completion_wake_plugin(runner)
+    try:
+        with connect_closing() as conn:
+            claimed = kanban_db.claim_task(conn, tid)
+            assert claimed is not None, "claim failed"
+            conn.commit()
+        check(
+            "legacy root completion commits through core path",
+            _finish_claimed_task(tid, claimed.current_run_id),
+        )
+    finally:
+        manager.unload("github-completion-edge-wake")
+        wake_plugin._run_edge = original_runner
+
+    row = task_row(tid)
+    check("legacy completion wake invoked exactly once", len(wake_calls) == 1,
+          str(wake_calls))
+    check("legacy open PR is parked immediately in review", row["status"] == "review",
+          str(row))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -4595,6 +4647,7 @@ def main() -> int:
         test_116_completion_side_wake_open_pr,
         test_117_completion_side_wake_ordinary_task_noop,
         test_118_completion_side_wake_fail_closed,
+        test_119_completion_side_wake_legacy_github_card,
         test_116_operator_recovered_review_retry_opens_and_dispatches_round,
         test_117_operator_recovered_review_retry_rejections_fail_closed,
         test_118_normal_review_ready_lane_ignores_retry_comment,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import os
 import re
 import selectors
@@ -31,7 +32,11 @@ _COMPLETION_LINE = re.compile(
     r"^\s*-\s*completion contract\s*:\s*github-pr\s*$", re.IGNORECASE
 )
 _EDGE_SCRIPT = Path("scripts") / "kanban-github-sync.py"
-_EDGE_TIMEOUT_SECONDS = 20.0
+_EDGE_SYNC_TIMEOUT_ENV = "HERMES_EDGE_SYNC_TIMEOUT_SECONDS"
+_EDGE_SYNC_TIMEOUT_SECONDS = 120.0
+_EDGE_TIMEOUT_GRACE_SECONDS = 5.0
+_EDGE_SYNC_TIMEOUT_MAX_SECONDS = 3600.0
+_EDGE_TIMEOUT_SECONDS = _EDGE_SYNC_TIMEOUT_SECONDS + _EDGE_TIMEOUT_GRACE_SECONDS
 _EDGE_OUTPUT_LIMIT_BYTES = 64 * 1024
 
 
@@ -51,6 +56,56 @@ class _WakeFailure(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+def _env_file_value(path: Path, key: str) -> str:
+    """Read one simple ``KEY=value`` entry without exposing its value."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{key}="
+    for line in lines:
+        value = line.strip()
+        if not value or value.startswith("#") or not value.startswith(prefix):
+            continue
+        value = value[len(prefix) :].strip().split("#", 1)[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
+def _github_token() -> str:
+    """Resolve the token with the same precedence as the live actuator."""
+    for key in ("GITHUB_TOKEN", "GH_TOKEN", "HERMES_GITHUB_TOKEN"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    hermes_home = Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"))
+    for path in (hermes_home / ".env", Path("/home/hermes/.hermes/.env")):
+        value = _env_file_value(path, "GITHUB_TOKEN")
+        if value:
+            return value
+    raise _WakeFailure("github_token_unavailable")
+
+
+def _edge_timeout_seconds() -> float:
+    """Return a bounded outer deadline beyond the configured edge budget."""
+    raw = os.environ.get(_EDGE_SYNC_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _EDGE_TIMEOUT_SECONDS
+    try:
+        configured = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise _WakeFailure("edge_timeout_invalid") from exc
+    if (
+        not math.isfinite(configured)
+        or configured <= 0
+        or configured > _EDGE_SYNC_TIMEOUT_MAX_SECONDS
+    ):
+        raise _WakeFailure("edge_timeout_invalid")
+    return configured + _EDGE_TIMEOUT_GRACE_SECONDS
 
 
 def _valid_board(board: Any) -> str:
@@ -129,7 +184,7 @@ def _is_github_backed_body(body: Any) -> bool:
     """Check only importer-owned provenance, never untrusted Issue prose."""
     provenance = str(body or "").split(_PROVENANCE_END, 1)[0]
     lines = provenance.splitlines()
-    return any(_SOURCE_LINE.fullmatch(line) for line in lines) and any(
+    return any(_SOURCE_LINE.fullmatch(line) for line in lines) or any(
         _COMPLETION_LINE.fullmatch(line) for line in lines
     )
 
@@ -170,6 +225,7 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
 def _run_edge(edge_path: Path, board: str) -> WakeResult:
     """Run one fixed edge command with timeout and combined-output bounds."""
     command = [sys.executable, str(edge_path), "--board", board, "--json"]
+    timeout_seconds = _edge_timeout_seconds()
     try:
         process = subprocess.Popen(
             command,
@@ -179,6 +235,7 @@ def _run_edge(edge_path: Path, board: str) -> WakeResult:
             stderr=subprocess.STDOUT,
             shell=False,
             close_fds=True,
+            env={**os.environ, "GITHUB_TOKEN": _github_token()},
         )
     except (OSError, ValueError) as exc:
         raise _WakeFailure("edge_spawn_failed") from exc
@@ -187,7 +244,7 @@ def _run_edge(edge_path: Path, board: str) -> WakeResult:
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     output_bytes = 0
-    deadline = time.monotonic() + _EDGE_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     stream_closed = False
     try:
         while not stream_closed:
