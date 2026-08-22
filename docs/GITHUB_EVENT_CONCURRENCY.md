@@ -46,6 +46,30 @@ All other PR actions finish as an explicit no-op. The actuator repeats the
 allowlist, resolves repository → board through the existing registry/task
 provenance, and runs exactly `kanban-github-sync.py --board <slug> --json`.
 
+## Edge reconciliation single-flight
+
+Every invocation of the deployed edge path, regardless of whether it came from
+the webhook actuator or the completion observer, enters the same process-shared
+boundary in the canonical edge implementation before any GitHub/Kanban
+reconciliation read or side effect:
+
+- Linux `fcntl.flock(LOCK_EX)` guards
+  `$HERMES_HOME/kanban/.resource-locks/github-edge-sync.lock`;
+- the runtime root, lock directory, and lock file are validated fail-closed
+  against symlink/path substitution, and the lock is outside tracked
+  repository state;
+- the actuator's process-local `_RUN_LOCK` remains a fast admission guard, but
+  the filesystem lock is the correctness boundary shared with direct plugin
+  wakes;
+- acquisition blocks in the kernel rather than polling or sleeping. The
+  existing finite actuator/plugin edge deadlines bound a waiter; a wake that
+  reaches its deadline is reported as a failed wake and is never reported as a
+  successful reconciliation. A crashed owner releases the kernel lock.
+
+This serializes the complete edge run, including GitHub reads and Kanban/GitHub
+side effects, without introducing a queue database, task store, second
+transition owner, or polling fallback.
+
 ## Delivery replay deduplication
 
 GitHub may redeliver the same webhook delivery (GitHub-side retry, operator

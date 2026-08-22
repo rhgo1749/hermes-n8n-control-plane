@@ -37,6 +37,18 @@ missing or ambiguous board/runtime evidence, and non-`DONE` rows do not wake
 the edge. The observer never calls a Kanban mutator, parses the untrusted Issue
 body as instructions, or duplicates the edge transition logic.
 
+The actuator and this direct completion wake share the same edge single-flight
+boundary. Before the canonical edge reads GitHub/Kanban state, it acquires the
+guarded runtime lock at
+`$HERMES_HOME/kanban/.resource-locks/github-edge-sync.lock` with Linux
+`fcntl.flock(LOCK_EX)`. A completion wake waits behind an in-flight webhook or
+another completion wake instead of being dropped; the finite outer edge
+deadline bounds that wait. If the deadline expires, the observer records a
+bounded failure and keeps the core completion provisional `DONE`—it never
+claims a successful reconciliation. Kernel lock ownership releases on a
+crashed process, and no queue database, polling loop, or second transition
+owner is introduced.
+
 The callback uses a fixed argument vector with `shell=False`, a bounded
 timeout/output budget, and stable diagnostics that do not include task body,
 summary, command output, or credentials. A failed wake is observable and
