@@ -26,7 +26,9 @@ services:
       EXECUTIONS_DATA_PRUNE_MAX_COUNT: "10000"
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./state:/files
+      - type: bind
+        source: ${HERMES_N8N_STATE_ROOT:?run host-install.sh first}
+        target: /files
     healthcheck:
       test:
         - CMD-SHELL
@@ -59,7 +61,9 @@ services:
       - /app/controller.py
     volumes:
       - ./lease-controller/controller.py:/app/controller.py:ro
-      - ./state:/state
+      - type: bind
+        source: ${HERMES_N8N_STATE_ROOT:?run host-install.sh first}
+        target: /state
     tmpfs:
       - /tmp:size=8m
     healthcheck:
@@ -107,8 +111,13 @@ services:
     volumes:
       - ./github-router/router.py:/app/router.py:ro
       - ./scripts/repository_registry.py:/app/repository_registry.py:ro
-      - ./state:/state
-      - ./state/secrets:/run/secrets:ro
+      - type: bind
+        source: ${HERMES_N8N_STATE_ROOT:?run host-install.sh first}
+        target: /state
+      - type: bind
+        source: ${HERMES_N8N_STATE_ROOT:?run host-install.sh first}/secrets
+        target: /run/secrets
+        read_only: true
     tmpfs:
       - /tmp:size=8m
     healthcheck:

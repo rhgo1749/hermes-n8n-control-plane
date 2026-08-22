@@ -2,8 +2,13 @@
 # Reconcile topic-managed GitHub repository webhooks without scheduling intake.
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-TOKEN_FILE="$ROOT/automation/n8n/state/secrets/hermes-intake-control-token"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+N8N_DIR="$ROOT/automation/n8n"
+# shellcheck source=state-root.sh
+. "$SCRIPT_DIR/state-root.sh"
+STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
+TOKEN_FILE="$STATE_ROOT/secrets/hermes-intake-control-token"
 ROUTER_URL="${GITHUB_ROUTER_URL:-http://127.0.0.1:5681}"
 
 [[ -f "$TOKEN_FILE" ]] || {

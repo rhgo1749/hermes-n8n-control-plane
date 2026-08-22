@@ -2,10 +2,14 @@
 # Render and import the single hourly GitHub intake fallback workflow.
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 N8N_DIR="$ROOT/automation/n8n"
 COMPOSE_FILE="$N8N_DIR/compose.yaml"
 ENV_FILE="$N8N_DIR/.env"
+# shellcheck source=state-root.sh
+. "$SCRIPT_DIR/state-root.sh"
+STATE_ROOT="$(h4v3_n8n_state_root "$N8N_DIR")"
 DASHBOARD_URL=""
 
 usage() {
@@ -21,7 +25,7 @@ done
 [[ -n "$DASHBOARD_URL" ]] || { usage; exit 2; }
 [[ -f "$ENV_FILE" ]] || { echo "Run host-install.sh first." >&2; exit 2; }
 
-RENDERED_DIR="$N8N_DIR/state/rendered-workflows"
+RENDERED_DIR="$STATE_ROOT/rendered-workflows"
 mkdir -p "$RENDERED_DIR"
 rm -f "$RENDERED_DIR"/schedule-*.json "$RENDERED_DIR"/github-*-intake.json
 
