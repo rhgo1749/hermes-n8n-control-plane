@@ -5,13 +5,14 @@ plugin then reads the committed row and, only for GitHub-backed cards, invokes
 the already-deployed edge owner. The edge remains the only component that
 projects GitHub state back into Kanban.
 
-A timed-out first invocation is retried once with a completely fresh edge
-budget. This is intentional: the first deadline covers both shared-flock wait
-and execution, so contention can consume that budget even though the wake still
-needs one post-owner reconciliation. Canonical edge callers are themselves
-bounded by the same timeout contract, therefore the fresh retry prevents a
-completion wake from being silently dropped behind an earlier edge owner while
-keeping the observer finite and non-polling.
+A timed-out first invocation cannot silently consume a still-provisional
+completion. After that timeout the observer re-reads the committed row. If an
+in-flight owner already projected the task away from DONE, no duplicate edge
+run is needed. If the GitHub-backed task is still DONE (or the post-timeout
+eligibility re-read itself cannot be trusted), the observer launches exactly
+one new fixed-argv edge child with a completely fresh budget. Canonical edge
+callers are themselves bounded by the same timeout contract, so this closes the
+contention wake-loss race without polling or creating another transition owner.
 """
 # ruff: noqa: N999
 from __future__ import annotations
@@ -69,7 +70,6 @@ _TIMEOUT_CONTRACT = _load_edge_sync_timeout_contract()
 _EDGE_SCRIPT = Path("scripts") / "kanban-github-sync.py"
 _EDGE_TIMEOUT_GRACE_SECONDS = _TIMEOUT_CONTRACT.EDGE_SYNC_TIMEOUT_GRACE_SECONDS
 _EDGE_OUTPUT_LIMIT_BYTES = _TIMEOUT_CONTRACT.EDGE_SYNC_OUTPUT_LIMIT_BYTES
-_EDGE_TIMEOUT_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -313,22 +313,32 @@ def _run_edge(edge_path: Path, board: str) -> WakeResult:
             process.stdout.close()
 
 
-def _run_edge_with_contention_retry(edge_path: Path, board: str) -> WakeResult:
-    """Guarantee one fresh post-timeout edge attempt without polling.
+def _run_edge_with_contention_retry(
+    edge_path: Path,
+    board: str,
+    task_id: str,
+) -> WakeResult:
+    """Preserve a still-provisional completion across one timed-out attempt.
 
-    The canonical edge lock is inside the child process. A first attempt may
-    spend most or all of its outer deadline waiting behind an earlier owner,
-    then be killed before it has enough execution budget to reconcile the
-    just-completed task. Do not consume that completion signal: after a timeout
-    launch exactly one new fixed-argv child with a completely fresh deadline.
-
-    Canonical actuator/completion owners are bounded by the same timeout
-    contract, so this second attempt is the deterministic post-contention run.
-    Non-timeout failures are not retried and there is no sleep/poll loop.
+    The canonical edge lock lives inside the child. The first attempt can spend
+    its deadline behind an earlier owner. After a timeout, re-read committed
+    task state: if the owner already moved the card away from DONE, suppress a
+    duplicate run. If the task is still eligible, or the re-read itself fails
+    closed, launch exactly one fresh fixed-argv child. There is no sleep/poll
+    loop and no retry for non-timeout failures.
     """
     result = _run_edge(edge_path, board)
     if not result.timed_out:
         return result
+    try:
+        if not _completion_is_eligible(task_id, board):
+            return WakeResult(
+                returncode=0,
+                output_bytes=result.output_bytes,
+            )
+    except _WakeFailure:
+        # An uncertain post-timeout read must not consume the completion wake.
+        pass
     return _run_edge(edge_path, board)
 
 
@@ -363,7 +373,7 @@ def _on_task_completed(
         if not _completion_is_eligible(task_id, safe_board):
             return
         edge_path = _edge_script_path()
-        result = _run_edge_with_contention_retry(edge_path, safe_board)
+        result = _run_edge_with_contention_retry(edge_path, safe_board, task_id)
         if result.timed_out:
             _diagnostic(safe_task_id, safe_board, "edge_retry_timeout")
         elif result.output_limited:
