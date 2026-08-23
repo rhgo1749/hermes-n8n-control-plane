@@ -27,7 +27,9 @@ worker core kanban_complete
   -> $HERMES_HOME/scripts/kanban-github-sync.py \
        --board <validated-slug> --json
        first bounded attempt
-       timeout only -> exactly one fresh-budget retry
+       timeout -> re-read committed task
+         ├─ no longer DONE -> stop; prior owner already projected it
+         └─ still DONE / uncertain read -> exactly one fresh-budget retry
   -> existing edge DONE -> REVIEW / REVIEW -> DONE decision
 ```
 
@@ -52,18 +54,23 @@ A single outer deadline is not allowed to turn lock contention into a lost
 completion signal. The first completion child uses the normal bounded edge
 budget. If that child times out—possibly because the preceding owner consumed
 most of the deadline while the child was blocked in `flock()`—the observer does
-not accept that timeout as the completion handoff. It immediately launches
-exactly one second fixed-argv child with a completely fresh deadline. Only a
-second timeout becomes the final bounded `edge_retry_timeout` diagnostic.
-Non-timeout failures are not retried. There is no sleep, retry loop, Schedule
-Trigger, or polling fallback.
+not accept that timeout as the completion handoff. It re-reads the committed
+task state. When the earlier owner already moved the card away from `DONE`, the
+observer stops without launching a duplicate edge process. When the task is
+still an eligible GitHub-backed `DONE`, or the post-timeout read itself fails
+closed, the observer launches exactly one second fixed-argv child with a
+completely fresh deadline. Only a second timeout becomes the final bounded
+`edge_retry_timeout` diagnostic. Non-timeout failures are not retried. There is
+no sleep, retry loop, Schedule Trigger, or polling fallback.
 
 The process-level contention regression models the race directly: the owner
 enters the canonical edge before the completion is committed, so its snapshot
 cannot contain the later provisional `DONE`; the first completion attempt is
 forced to expire behind that owner; the test passes only when the fresh retry
-runs after the owner and observes the post-owner completion snapshot. Merely
-recording a timeout diagnostic is explicitly not success evidence.
+runs after the owner and observes the post-owner completion snapshot. A focused
+unit contract also proves that an already-projected non-`DONE` row suppresses
+the retry and that an uncertain post-timeout re-read does not consume the wake.
+Merely recording a timeout diagnostic is explicitly not success evidence.
 
 The callback uses a fixed argument vector with `shell=False`, bounded per-attempt
 timeout/output budgets, and stable diagnostics that do not include task body,
@@ -77,10 +84,10 @@ success is reported.
 
 A final failed wake is observable and fail-closed: the core completion remains
 provisional `DONE` and is never treated as merge evidence. Under ordinary
-contention, however, the first timeout is consumed by the mandatory fresh
-retry rather than leaving the card stranded. If the edge already moved the
-card, a repeated observation is an idempotent no-op through the existing
-optimistic edge transition.
+contention, however, the first timeout is followed by committed-state
+revalidation and, when necessary, the mandatory fresh retry rather than leaving
+the card stranded. If the edge already moved the card, the observer suppresses
+the duplicate run instead of relying only on downstream idempotency.
 
 ## Why worker `kanban_request_review` is forbidden here
 
