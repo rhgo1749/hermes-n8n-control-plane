@@ -20,10 +20,12 @@
 
 Close the contention gap in the existing completion observer without changing
 Hermes core: when the first fixed edge child spends its bounded deadline waiting
-for the shared edge lock, launch exactly one fresh-budget retry so a committed
-GitHub-backed `DONE` cannot be silently stranded. The later canonical edge run
-must observe an open/unmerged PR and perform the existing `DONE -> REVIEW`
-projection.
+for the shared edge lock, re-read the committed task row. If an earlier owner
+already projected the task away from `DONE`, suppress the duplicate; if the
+GitHub-backed task remains `DONE` (or the re-read is uncertain), launch exactly
+one fresh-budget retry so the completion cannot be silently stranded. The later
+canonical edge run must observe an open/unmerged PR and perform the existing
+`DONE -> REVIEW` projection.
 
 ## Confirmed route and ownership
 
@@ -38,7 +40,8 @@ projection.
 
 ## In scope
 
-1. Preserve/fix the bounded completion wake retry after shared-lock contention.
+1. Preserve/fix the bounded completion wake retry and post-timeout committed-row
+   revalidation after shared-lock contention.
 2. Add a process/runtime regression covering owner-before-completion snapshot,
    first waiter timeout, fresh retry, and real open/unmerged `DONE -> REVIEW`.
 3. Keep canonical concurrency/completion documentation and PR evidence aligned.
@@ -67,6 +70,8 @@ host/manual gates remain `HOST_VALIDATION_REQUIRED`.
 
 - [ ] Current PR #60 branch/head/base and ancestry verified from live sources.
 - [ ] First contention timeout cannot silently drop the completion signal.
+- [ ] Post-timeout revalidation suppresses a duplicate when the task is no
+      longer `DONE`; uncertain reads fail closed into the bounded retry.
 - [ ] Fresh retry is finite, fixed-argv, bounded, non-polling, and fail-closed.
 - [ ] Regression proves canonical edge observes `DONE` after owner snapshot and
       parks the open/unmerged PR card in `REVIEW` with no uncontrolled duplicate.
