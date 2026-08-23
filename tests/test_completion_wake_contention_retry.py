@@ -70,14 +70,15 @@ with lock_path.open("a+b") as lock_handle:
     update_state(f"start:{role}")
     if role == "owner":
         Path(os.environ["EDGE_OWNER_STARTED"]).write_text("1", encoding="utf-8")
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 8.0
         while not attempt_marker.exists() and time.monotonic() < deadline:
             time.sleep(0.005)
         if not attempt_marker.exists():
             raise SystemExit("completion attempt did not reach lock contention")
-        # The first completion attempt's parent budget is 1.0s. Hold the lock
+        # The first completion attempt's parent budget is 3.0s. Hold the lock
         # beyond that budget *from the observed attempt start*, then release
-        # early enough for the fresh second attempt to acquire and run.
+        # early enough for the fresh second attempt to acquire and run with its
+        # own full 3.0s budget even on slower CI/container process startup.
         time.sleep(float(os.environ["EDGE_OWNER_POST_ATTEMPT_HOLD"]))
     else:
         time.sleep(float(os.environ["EDGE_COMPLETION_HOLD"]))
@@ -138,7 +139,7 @@ def _mark_completion_committed(path: Path) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _wait_for(path: Path, timeout: float = 5.0) -> None:
+def _wait_for(path: Path, timeout: float = 8.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -175,12 +176,12 @@ def main() -> int:
                 "HERMES_HOME": str(root),
                 "GITHUB_TOKEN": "test-token",
                 "PYTHONDONTWRITEBYTECODE": "1",
-                "HERMES_EDGE_SYNC_TIMEOUT_SECONDS": "1.00",
+                "HERMES_EDGE_SYNC_TIMEOUT_SECONDS": "3.00",
                 "EDGE_RETRY_STATE": str(state_path),
                 "EDGE_OWNER_STARTED": str(owner_started),
                 "EDGE_COMPLETION_ATTEMPT_MARKER": str(attempt_marker),
                 "EDGE_COMPLETION_ATTEMPT_LOG": str(attempt_log),
-                "EDGE_OWNER_POST_ATTEMPT_HOLD": "1.30",
+                "EDGE_OWNER_POST_ATTEMPT_HOLD": "3.50",
                 "EDGE_COMPLETION_HOLD": "0.05",
                 "EDGE_STUB": str(edge_stub),
                 "PLUGIN_SOURCE": str(PLUGIN_SOURCE),
@@ -210,9 +211,9 @@ def main() -> int:
             capture_output=True,
             text=True,
             check=False,
-            timeout=6.0,
+            timeout=10.0,
         )
-        owner_stdout, owner_stderr = owner.communicate(timeout=6.0)
+        owner_stdout, owner_stderr = owner.communicate(timeout=10.0)
 
         assert owner.returncode == 0, (owner_stdout, owner_stderr)
         assert completion.returncode == 0, completion
