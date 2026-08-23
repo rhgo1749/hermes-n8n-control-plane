@@ -97,6 +97,12 @@ _PRESERVED_STATES = frozenset(
     {"triage", "todo", "scheduled", "ready", "running", "blocked", "archived"}
 )
 
+# A GitHub-backed intake root is not eligible for external completion
+# projection while any internal parent is still in flight. ``task_links``
+# stores parent -> child edges; the gate therefore reads parents through
+# ``WHERE child_id = ?`` and treats only terminal parent rows as satisfied.
+_DEPENDENCY_TERMINAL_STATES = frozenset({"done", "archived"})
+
 # Machine-readable prefix for the DONE -> REVIEW parking marker comment.
 # ``review`` on a GitHub-backed card means "parked awaiting merge" — no human
 # or worker action is required until fresh GitHub evidence resolves it. The
@@ -1696,6 +1702,133 @@ def _append_sync_event(
     )
 
 
+def _internal_dependency_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Read the direct parent gate for a GitHub-backed intake task.
+
+    The query deliberately validates the live ``task_links`` direction and
+    does not infer dependencies from task metadata. A dangling link is a
+    lookup failure, not an implicitly satisfied dependency.
+    """
+    rows = conn.execute(
+        "SELECT l.parent_id, t.status AS parent_status "
+        "FROM task_links AS l LEFT JOIN tasks AS t ON t.id = l.parent_id "
+        "WHERE l.child_id = ? ORDER BY l.parent_id",
+        (task_id,),
+    ).fetchall()
+    parents: list[dict[str, str]] = []
+    pending: list[dict[str, str]] = []
+    for row in rows:
+        parent_id = str(row["parent_id"])
+        parent_status = row["parent_status"]
+        if parent_status is None:
+            raise SyncError(f"missing parent task for link: {parent_id}")
+        status = str(parent_status)
+        parent = {"id": parent_id, "status": status}
+        parents.append(parent)
+        if status not in _DEPENDENCY_TERMINAL_STATES:
+            pending.append(parent)
+    return {"parents": parents, "pending": pending, "all_terminal": not pending}
+
+
+def _restore_pending_dependency(
+    conn: sqlite3.Connection,
+    task_id: str,
+    gate: Mapping[str, Any],
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Keep an intake root runnable until all internal parents terminate."""
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "status": None, "changed": False, "reason": "task_missing"}
+    current_status = str(row["status"])
+    pending = list(gate.get("pending") or [])
+    evidence = {"parents": pending, "dependency_gate": "pending"}
+    if current_status not in {"review", "done"}:
+        return {
+            "task_id": task_id, "status": current_status, "changed": False,
+            "reason": "internal_dependency_pending", "evidence": evidence,
+        }
+    if dry_run:
+        return {
+            "task_id": task_id, "status": "todo", "changed": False,
+            "reason": "internal_dependency_pending_predicted", "evidence": evidence,
+        }
+    with conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'todo', completed_at = NULL, assignee = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "block_kind = NULL, block_recurrences = 0 WHERE id = ? AND status = ?",
+            (task_id, current_status),
+        )
+        if cur.rowcount != 1:
+            return {
+                "task_id": task_id, "status": current_status, "changed": False,
+                "reason": "state_changed_during_sync", "evidence": evidence,
+            }
+        _append_sync_event(
+            conn, task_id, {
+                **evidence, "source": "github",
+                "previous_status": current_status, "new_status": "todo",
+                "reason": "internal_dependency_pending",
+                "merge_authority": "human", "auto_merge": False,
+            }, kind="github_dependency_gate",
+        )
+    return {
+        "task_id": task_id, "status": "todo", "changed": True,
+        "reason": "internal_dependency_pending", "evidence": evidence,
+    }
+
+
+def _dependency_gate_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Read the live dependency gate without raising.
+
+    Returns ``(gate, None)`` on success and ``(None, error)`` when the
+    lookup itself fails (dangling link, missing table, SQL error).  The
+    caller fails closed on any error: a lookup failure is never an
+    implicitly satisfied dependency, and a single bad task must never
+    crash the whole board sync.
+    """
+    try:
+        return _internal_dependency_gate(conn, task_id), None
+    except (SyncError, sqlite3.Error) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _dependency_guard_sql() -> str:
+    """Atomic gate folded into the final ``UPDATE ... WHERE``.
+
+    Counts direct parent links whose parent is NOT terminal (see
+    ``_DEPENDENCY_TERMINAL_STATES``); a dangling link also counts (the
+    inner ``NOT EXISTS`` is true when the parent row is missing).  The
+    update therefore only fires when every direct parent is terminal and
+    present — the same condition the ``sync_board`` pre-gate checked,
+    re-evaluated in the very statement that writes.  Because the subquery
+    and the write are one statement, no writer can interleave between the
+    check and the write: a parent that flips non-terminal (or a new parent
+    link) after the pre-gate is visible to this statement and the update
+    affects zero rows.  Appends exactly one ``?`` placeholder (the child
+    task id).
+    """
+    terminal = ",".join(
+        f"'{status}'" for status in sorted(_DEPENDENCY_TERMINAL_STATES)
+    )
+    return (
+        f"AND (SELECT count(*) FROM task_links AS l "
+        f"WHERE l.child_id = ? "
+        f"AND NOT EXISTS (SELECT 1 FROM tasks AS t "
+        f"WHERE t.id = l.parent_id AND t.status IN ({terminal}))) = 0"
+    )
+
+
 def _last_resume_response_at(conn: sqlite3.Connection, task_id: str) -> str:
     """``response_at`` of the newest consumed ``github_blocked_resolved`` event.
 
@@ -1857,6 +1990,34 @@ def apply_decision(
         }
 
     now = int(time.time())
+    # Re-verify the dependency gate in the SAME transaction as the write.
+    # The pre-gate in sync_board ran before the (seconds-long) GitHub
+    # fetch; this evidence read plus the guard folded into the UPDATE
+    # below is what closes the TOCTOU window at the write itself.  A
+    # lookup failure is fail-closed: the transition is refused, never
+    # guessed through.
+    gate, gate_error = _dependency_gate_evidence(conn, task_id)
+    if gate_error is not None:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "dependency_recheck_failed",
+            "error": gate_error,
+        }
+    # Invariant: ``_dependency_gate_evidence`` returns exactly one of a
+    # gate dict or an error string, never both.  The error path returned
+    # above, so a None gate here is a programming error — fail closed
+    # rather than guess.
+    if gate is None:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "dependency_recheck_failed",
+            "error": "gate evidence unavailable",
+        }
+    guard = _dependency_guard_sql()
     if desired == "review":
         # DONE -> REVIEW (required PR open / closed-not-merged).
         new_body = row["body"]
@@ -1864,7 +2025,7 @@ def apply_decision(
             new_body = replace_sync_context(row["body"], context_block)
         parked_comment = _parking_comment_for_decision(task_id, decision)
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status = 'review',
                    completed_at = NULL,
@@ -1876,13 +2037,14 @@ def apply_decision(
                    block_recurrences = 0,
                    body = ?
              WHERE id = ? AND status = ?
+             {guard}
             """,
-            (new_body, task_id, current_status),
+            (new_body, task_id, current_status, task_id),
         )
     else:
         # REVIEW -> DONE (every required PR merged into target branch).
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status = 'done',
                    completed_at = ?,
@@ -1892,10 +2054,27 @@ def apply_decision(
                    block_kind = NULL,
                    block_recurrences = 0
              WHERE id = ? AND status = ?
+             {guard}
             """,
-            (now, task_id, current_status),
+            (now, task_id, current_status, task_id),
         )
     if cur.rowcount != 1:
+        if gate["pending"]:
+            # The pre-gate passed but a parent went non-terminal — or a
+            # new parent link appeared — between the pre-gate and this
+            # write.  Refuse the transition and leave the card untouched;
+            # the next tick repairs it through the canonical
+            # _restore_pending_dependency lane.
+            return {
+                "task_id": task_id,
+                "status": current_status,
+                "changed": False,
+                "reason": "dependency_recheck_pending",
+                "evidence": {
+                    "parents": gate["pending"],
+                    "dependency_gate": "recheck_pending",
+                },
+            }
         return {
             "task_id": task_id,
             "status": current_status,
@@ -4828,6 +5007,32 @@ def sync_board(
             ref = parse_task_ref(row["body"])
             if ref is None:
                 continue
+
+            # Internal Kanban dependencies are evaluated before any GitHub
+            # lookup. This prevents an OPEN/merged PR from projecting REVIEW
+            # or DONE while specialist work is still in flight. Lookup errors
+            # fail closed and never manufacture BLOCKED.
+            try:
+                dependency_gate = _internal_dependency_gate(conn, task_id)
+            except (sqlite3.Error, SyncError) as exc:
+                results.append(_annotate({
+                    "task_id": task_id,
+                    "status": row["status"],
+                    "changed": False,
+                    "reason": "internal_dependency_lookup_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }, row, ref))
+                continue
+            if dependency_gate["pending"]:
+                results.append(_annotate(
+                    _restore_pending_dependency(
+                        conn, task_id, dependency_gate, dry_run=dry_run,
+                    ),
+                    row,
+                    ref,
+                ))
+                continue
+
             text_sources: list[str] = [str(row["body"] or "")]
             try:
                 for comment in kanban_db.list_comments(conn, task_id):
