@@ -1428,25 +1428,22 @@ def test_55_worker_running_keeps_agent_working():
 
 
 def test_56_local_commit_only_no_review_ready():
-    print("56. done + run but no completion marker -> human attention, review-ready forbidden")
+    print("56. done + run but no completion marker -> repaired to REVIEW "
+          "(OPEN PR never stays DONE), review-ready not forged as delivery")
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     _close_rework_run(tid, head="0123456789abcdef0123456789abcdef00000001")
     results = run_sync(fake)
     entries = [r for r in results if r.get("task_id") == tid]
-    check("human attention entry",
-          any(r.get("reason") == "rework_human_attention"
-              and r.get("diagnostic") == "completion_handoff_missing" for r in entries),
-          str(entries))
-    check("not review-ready", not any(r.get("reason") == "agent_review_ready" for r in entries))
-    check("task not review", task_row(tid)["status"] == "done")
-    check("label restored to agent-rework",
-          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
-    with connect_closing() as conn:
-        comments = kanban_db.list_comments(conn, tid)
-    check("attention comment recorded",
-          any(mod.REWORK_ATTENTION_MARKER in c.body for c in comments),
-          str([c.body for c in comments]))
+    check("repair entry carries diagnostic",
+          any(r.get("diagnostic") == "completion_handoff_missing"
+              for r in entries), str(entries))
+    check("not forged review-ready", not any(
+        r.get("reason") == "agent_review_ready" for r in entries))
+    check("task repaired to review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+    check("label projected to agent-review-ready",
+          "agent-review-ready" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
 
 
 def test_57_push_head_mismatch_no_review_ready():
@@ -1469,7 +1466,8 @@ def test_57_push_head_mismatch_no_review_ready():
 
 
 def test_58_validation_not_passed_no_review_ready():
-    print("58. validation != passed -> review-ready forbidden, human attention")
+    print("58. validation != passed -> repaired to REVIEW (never stays DONE), "
+          "review-ready not forged")
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     final_head = "0123456789abcdef0123456789abcdef00000004"
@@ -1479,8 +1477,11 @@ def test_58_validation_not_passed_no_review_ready():
     results = run_sync(fake)
     entries = [r for r in results if r.get("task_id") == tid]
     check("no review-ready", not any(r.get("reason") == "agent_review_ready" for r in entries), str(entries))
-    check("human attention", any(r.get("reason") == "rework_human_attention" for r in entries), str(entries))
-    check("task stays done", task_row(tid)["status"] == "done")
+    check("repair carries malformed-marker diagnostic", any(
+        r.get("diagnostic") == "completion_marker_malformed" for r in entries),
+        str(entries))
+    check("task repaired to review", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
 
 
 def test_59_delivery_success_review_ready():
@@ -4544,6 +4545,56 @@ def test_119_completion_side_wake_legacy_github_card():
           str(row))
 
 
+def test_120_done_open_pr_incomplete_delivery_repairs_to_review():
+    """DONE card with an OPEN linked PR must be repaired back to REVIEW even
+    when the round's delivery evidence is incomplete (malformed marker).
+
+    Regression: the rework lifecycle lane used to return a
+    ``rework_human_attention`` entry for a DONE card without touching the
+    status, leaving a false-terminal DONE card while the PR awaited merge.
+    """
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000120"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="completed",
+                      summary="worker finished cleanly")
+    # Card is DONE now (provisional core completion), PR still open, and the
+    # delivery handoff is malformed (no valid marker fields).
+    _malformed_marker_like_round12(fake, final_head)
+    assert task_row(tid)["status"] == "done"
+
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    check("120: repaired to review", task_row(tid)["status"] == "review",
+          str(entries))
+    check("120: repair reason recorded", any(
+        r.get("reason") in {"linked_pr_open", "done_open_pr_repair_predicted"}
+        or (r.get("repair") or {}).get("reason") == "linked_pr_open"
+        for r in entries), str(entries))
+    check("120: no attention hold", not any(
+        r.get("reason") == "rework_human_attention" for r in entries),
+        str(entries))
+    row = task_row(tid)
+    check("120: completed_at cleared", row["completed_at"] is None, str(row))
+
+
+def test_121_done_open_pr_valid_delivery_also_review():
+    """Even a fully delivered round on an OPEN PR projects REVIEW, not DONE."""
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000121"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="completed",
+                      summary="rework delivered")
+    _post_completion_marker(fake, tid, final_head)
+    assert task_row(tid)["status"] == "done"
+
+    run_sync(fake)
+    check("121: stays review until merged", task_row(tid)["status"] == "review",
+          str(task_row(tid)))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -4653,6 +4704,8 @@ def main() -> int:
         test_118_normal_review_ready_lane_ignores_retry_comment,
         test_119_recovered_review_label_conflict_blocks_retry,
         test_120_classic_review_label_readdition_unchanged,
+        test_120_done_open_pr_incomplete_delivery_repairs_to_review,
+        test_121_done_open_pr_valid_delivery_also_review,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

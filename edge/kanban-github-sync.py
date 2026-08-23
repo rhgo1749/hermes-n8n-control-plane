@@ -4385,6 +4385,60 @@ def _reconcile_rework_lifecycle(
             return None
         run = _task_run_after_rework(conn, task_id, int(context["event_at"]))
         if _rework_human_attention(delivery_reason, run):
+            if status == "done" and decision.desired_status == "review":
+                # A human-attention hold must never leave a GitHub-backed card
+                # parked in false-terminal DONE while its linked PR is still
+                # OPEN: the core review lane may complete the root
+                # provisionally, but authoritative projection belongs to the
+                # edge. Repair DONE -> REVIEW through the canonical
+                # transition; the attention diagnostic travels in the entry.
+                # A fresh agent-rework label re-opening a new round has
+                # already returned earlier, so this never swallows a new
+                # round request.
+                if dry_run:
+                    return {
+                        "task_id": task_id,
+                        "status": "done",
+                        "changed": True,
+                        "reason": "done_open_pr_repair_predicted",
+                        "repair_predicted": "done_open_pr_repaired",
+                        "diagnostic": delivery_reason,
+                    }
+                context_block: Optional[str] = None
+                try:
+                    context_block = _build_context_block(
+                        client, ref, decision.pull_requests
+                    )
+                except GithubCompletionError:
+                    context_block = None
+                with conn:
+                    db_result = apply_decision(
+                        conn, task_id, decision, context_block=context_block,
+                    )
+                try:
+                    _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                        client, ref, int(context["pr_number"]),
+                        add=(REVIEW_READY_LABEL,),
+                        remove=(REWORK_LABEL, WORKING_LABEL),
+                    )
+                except GithubCompletionError as exc:
+                    return {
+                        "task_id": task_id,
+                        "status": str(db_result.get("status") or "review"),
+                        "changed": bool(db_result.get("changed")),
+                        "reason": "review_ready_label_projection_failed",
+                        "error": str(exc),
+                        "evidence": decision.to_dict(),
+                    }
+                return {
+                    "task_id": task_id,
+                    "status": str(db_result.get("status") or "review"),
+                    "changed": bool(db_result.get("changed")),
+                    "reason": str(db_result.get("reason") or "linked_pr_open"),
+                    "diagnostic": delivery_reason,
+                    "label_action": label_reason,
+                    "lifecycle": label_evidence,
+                }
             if dry_run:
                 return {
                     "task_id": task_id, "status": status, "changed": False,
