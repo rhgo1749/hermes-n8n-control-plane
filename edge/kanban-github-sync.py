@@ -97,6 +97,13 @@ _PRESERVED_STATES = frozenset(
     {"triage", "todo", "scheduled", "ready", "running", "blocked", "archived"}
 )
 
+# Machine-readable prefix for the DONE -> REVIEW parking marker comment.
+# ``review`` on a GitHub-backed card means "parked awaiting merge" — no human
+# or worker action is required until fresh GitHub evidence resolves it. The
+# full format is documented in docs/GITHUB_COMPLETION_LIFECYCLE.md and
+# asserted by edge/test-kanban-github-sync-completion.py.
+_PARKING_COMMENT_PREFIX = "[parked:"
+
 # ---------------------------------------------------------------------------
 # agent-rework loop (one-shot rework requests driven by PR labels)
 # ---------------------------------------------------------------------------
@@ -1711,6 +1718,73 @@ def _last_resume_response_at(conn: sqlite3.Connection, task_id: str) -> str:
     return str(payload.get("response_at") or "")
 
 
+def _parking_comment_for_decision(
+    task_id: str,
+    decision: GithubCompletionDecision,
+) -> Optional[str]:
+    """Render the one-line DONE -> REVIEW parking marker comment.
+
+    ``review`` here means "parked awaiting external GitHub resolution": the
+    card needs no human or worker action until the edge observes fresh
+    evidence (merge, PR link, closure). The first token is machine-readable;
+    the trailing sentence states explicitly that no action is required.
+    Returns None for decisions that must not park a card with a marker
+    (non-authoritative outcomes never reach this transition anyway).
+    """
+    if decision.desired_status != "review":
+        return None
+    reason = str(decision.reason or "")
+    if reason == "no_linked_pr":
+        marker = f"{_PARKING_COMMENT_PREFIX} awaiting-pr] reason=no_linked_pr"
+        next_step = (
+            "next=github-edge(PR 링크 감지 시 자동 재평가). "
+            "사람 행동 불필요."
+        )
+    else:
+        numbers = [int(n) for n in decision.linked_pr_numbers if int(n) > 0]
+        pr_token = ",".join(str(n) for n in sorted(numbers))
+        if not pr_token:
+            return None
+        if reason == "linked_pr_open":
+            marker = f"{_PARKING_COMMENT_PREFIX} awaiting-merge] reason=linked_pr_open"
+        else:
+            # closed-not-merged / linked_pr_not_merged: still waiting on
+            # GitHub merge evidence, not on any person.
+            marker = f"{_PARKING_COMMENT_PREFIX} awaiting-merge] reason={reason}"
+        marker = f"{marker} pr=#{pr_token}"
+        next_step = (
+            "next=github-edge(merge 감지 시 자동 해제). "
+            "사람 행동 불필요."
+        )
+    return f"{marker} {next_step}"
+
+
+def _append_parking_comment_if_absent(
+    conn: sqlite3.Connection,
+    task_id: str,
+    comment_body: str,
+) -> bool:
+    """Insert the parking marker comment once per exact body.
+
+    Idempotency key IS the rendered body (task+reason+pr combination):
+    repeated syncs over an unchanged situation re-append nothing, while a
+    genuinely new situation renders a different line and is recorded once.
+    """
+    existing = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    for row in existing:
+        if str(row["body"] or "").strip() == comment_body:
+            return False
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, "github-edge", comment_body, int(time.time())),
+    )
+    return True
+
+
 def apply_decision(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1788,6 +1862,7 @@ def apply_decision(
         new_body = row["body"]
         if context_block is not None:
             new_body = replace_sync_context(row["body"], context_block)
+        parked_comment = _parking_comment_for_decision(task_id, decision)
         cur = conn.execute(
             """
             UPDATE tasks
@@ -1827,6 +1902,13 @@ def apply_decision(
             "changed": False,
             "reason": "state_changed_during_sync",
         }
+
+    if desired == "review" and parked_comment is not None:
+        # Same-transaction UX marker: the parked review card states why it
+        # exists and that no human action is required. Appended once per
+        # exact (task+reason+pr) line; a later merge/done transition leaves
+        # it behind as durable provenance of why the card was parked.
+        _append_parking_comment_if_absent(conn, task_id, parked_comment)
 
     payload = dict(evidence)
     payload.update(
