@@ -822,6 +822,7 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         intake._board_slugs = fake_board_slugs
         intake._run_hermes = fake_run_hermes
         intake._issue_candidates = lambda token, fixture_path, configs: [(configs[0], issue)]
+        intake._merged_linked_pr_numbers = lambda token, repository, issue_number: ()
         intake._repo_snapshot = lambda config: intake.RepoSnapshot(
             origin_sha="abc",
             remote="https://github.com/rhgo1749/brand-new.git",

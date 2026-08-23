@@ -1175,6 +1175,59 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
         return False
 
 
+def _merged_linked_pr_numbers(token: str, repository: str, issue_number: int) -> tuple[int, ...]:
+    """Return linked PR numbers proven merged into the default branch.
+
+    Discovery uses the Issue timeline's ``cross-referenced`` events (the same
+    source the edge sync trusts) and re-queries each referenced pull request
+    from its canonical endpoint. Only PRs with ``merged == true`` count; a
+    query failure raises (fail-closed: the caller must not silently treat an
+    unverifiable Issue as complete).
+    """
+    merged: list[int] = []
+    seen: set[int] = set()
+    timeline, _ = _github_json(
+        token,
+        f"/repos/{repository}/issues/{issue_number}/timeline",
+        {"per_page": 100},
+    )
+    if not isinstance(timeline, list):
+        raise IntakeError(
+            f"invalid Issue timeline response for {repository}#{issue_number}"
+        )
+    for event in timeline:
+        if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+            continue
+        source = event.get("source")
+        if not isinstance(source, dict):
+            continue
+        source_issue = source.get("issue")
+        if not isinstance(source_issue, dict):
+            continue
+        if not isinstance(source_issue.get("pull_request"), dict):
+            continue
+        number = source_issue.get("number")
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            continue
+        if number in seen or number <= 0:
+            continue
+        pr, _ = _github_json(token, f"/repos/{repository}/pulls/{number}", {})
+        if not isinstance(pr, dict):
+            raise IntakeError(f"invalid pull request payload for {repository}#{number}")
+        seen.add(number)
+        base = pr.get("base")
+        merged_into_branch = (
+            pr.get("merged") is True
+            and isinstance(base, dict)
+            and bool(base.get("ref"))
+        )
+        if merged_into_branch:
+            merged.append(number)
+    return tuple(sorted(merged))
+
+
 def _issue_candidates(
     token: str | None,
     fixture_path: Path | None,
@@ -1419,6 +1472,36 @@ def _run(args: argparse.Namespace) -> int:
         key = _idempotency_key(config.name, issue["number"])
         if args.dry_run:
             results.append({"key": key, "board": config.board, "title": issue.get("title", "")})
+            continue
+        # Completed-work guard: an OPEN agent-ready Issue whose every linked
+        # PR is already merged has no remaining automated work. Creating a
+        # card here would only re-run the verify-only cycle (intake → edge
+        # merge proof → done). Skip the card and clear the agent-ready label
+        # (same atomic label-clear contract as closed-issue cleanup) so the
+        # re-intake loop cannot recur on the next tick.
+        try:
+            merged_prs = _merged_linked_pr_numbers(
+                token, config.name, int(issue["number"])
+            )
+        except IntakeError as exc:
+            raise IntakeError(
+                f"merged-PR lookup failed for {config.name}#{issue['number']}: {exc}"
+            ) from exc
+        if merged_prs and not args.dry_run:
+            labels = _issue_labels(issue)
+            _github_patch_json(
+                token,
+                f"/repos/{config.name}/issues/{issue['number']}",
+                {"labels": []},
+            )
+            results.append({
+                "key": key,
+                "board": config.board,
+                "title": issue.get("title", ""),
+                "skipped": "all_linked_prs_merged",
+                "merged_pr_numbers": merged_prs,
+                "labels_cleared": labels,
+            })
             continue
         created = _create_task(config, issue, snapshot, imported_at, tick_started=tick_started)
         results.append(created)
