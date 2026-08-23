@@ -66,19 +66,24 @@ reconciliation read or side effect:
 
 The completion observer must not consume a completion signal merely because
 its first child used the whole outer deadline waiting behind an earlier owner.
-Its first invocation is bounded by the shared edge timeout contract; if that
-attempt times out, the observer immediately launches exactly one new fixed-argv
-edge child with a completely fresh deadline. There is no sleep loop, Schedule
-Trigger, or polling fallback. Non-timeout failures are not retried. Only when
-that fresh retry also times out is the completion wake reported as a final
-`edge_retry_timeout` failure.
+Its first invocation is bounded by the shared edge timeout contract. If that
+attempt times out, the observer re-reads the committed task row before deciding
+whether another edge process is necessary. If the earlier owner already moved
+the task away from provisional `DONE`, the observer returns without a duplicate
+edge run. If the GitHub-backed task is still `DONE`, or that re-read cannot be
+trusted, the observer launches exactly one new fixed-argv edge child with a
+completely fresh deadline. There is no sleep loop, Schedule Trigger, or polling
+fallback. Non-timeout failures are not retried. Only when that fresh retry also
+times out is the completion wake reported as a final `edge_retry_timeout`
+failure.
 
 The process-level regression deliberately starts an owner before the simulated
 completion is committed, so the owner's snapshot cannot contain that completion.
 The first completion child is forced to expire in lock contention; the test
 passes only when a post-owner retry actually enters the canonical edge and sees
-the later committed snapshot. A timeout diagnostic by itself is therefore not
-success evidence.
+the later committed snapshot. A focused unit contract separately verifies that
+a task already projected away from `DONE` suppresses the retry. A timeout
+diagnostic by itself is therefore not success evidence.
 
 This serializes the complete edge run, including GitHub reads and Kanban/GitHub
 side effects, without introducing a queue database, task store, second
