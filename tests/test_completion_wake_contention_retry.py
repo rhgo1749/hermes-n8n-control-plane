@@ -31,6 +31,8 @@ lock_dir = hermes_home / "kanban" / ".resource-locks"
 lock_dir.mkdir(parents=True, exist_ok=True)
 lock_path = lock_dir / "github-edge-sync.lock"
 role = os.environ["EDGE_ROLE"]
+attempt_marker = Path(os.environ["EDGE_COMPLETION_ATTEMPT_MARKER"])
+attempt_log = Path(os.environ["EDGE_COMPLETION_ATTEMPT_LOG"])
 
 
 def update_state(event: str) -> None:
@@ -53,12 +55,30 @@ def update_state(event: str) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+# Record every completion child before it blocks on the canonical edge lock.
+# This makes the regression prove that a first child really existed and later
+# timed out instead of merely passing because process startup was slow.
+if role == "completion":
+    with attempt_log.open("a", encoding="utf-8") as handle:
+        handle.write("attempt\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    attempt_marker.write_text("started", encoding="utf-8")
+
 with lock_path.open("a+b") as lock_handle:
     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
     update_state(f"start:{role}")
     if role == "owner":
         Path(os.environ["EDGE_OWNER_STARTED"]).write_text("1", encoding="utf-8")
-        time.sleep(float(os.environ["EDGE_OWNER_HOLD"]))
+        deadline = time.monotonic() + 5.0
+        while not attempt_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if not attempt_marker.exists():
+            raise SystemExit("completion attempt did not reach lock contention")
+        # The first completion attempt's parent budget is 1.0s. Hold the lock
+        # beyond that budget *from the observed attempt start*, then release
+        # early enough for the fresh second attempt to acquire and run.
+        time.sleep(float(os.environ["EDGE_OWNER_POST_ATTEMPT_HOLD"]))
     else:
         time.sleep(float(os.environ["EDGE_COMPLETION_HOLD"]))
     update_state(f"end:{role}")
@@ -142,6 +162,8 @@ def main() -> int:
             encoding="utf-8",
         )
         owner_started = root / "owner-started"
+        attempt_marker = root / "completion-attempt-started"
+        attempt_log = root / "completion-attempts.log"
         edge_stub = _write_script(root / "edge-stub.py", _EDGE_STUB)
         plugin_driver = _write_script(root / "plugin-driver.py", _PLUGIN_DRIVER)
 
@@ -156,7 +178,9 @@ def main() -> int:
                 "HERMES_EDGE_SYNC_TIMEOUT_SECONDS": "1.00",
                 "EDGE_RETRY_STATE": str(state_path),
                 "EDGE_OWNER_STARTED": str(owner_started),
-                "EDGE_OWNER_HOLD": "1.50",
+                "EDGE_COMPLETION_ATTEMPT_MARKER": str(attempt_marker),
+                "EDGE_COMPLETION_ATTEMPT_LOG": str(attempt_log),
+                "EDGE_OWNER_POST_ATTEMPT_HOLD": "1.30",
                 "EDGE_COMPLETION_HOLD": "0.05",
                 "EDGE_STUB": str(edge_stub),
                 "PLUGIN_SOURCE": str(PLUGIN_SOURCE),
@@ -186,15 +210,18 @@ def main() -> int:
             capture_output=True,
             text=True,
             check=False,
-            timeout=5.0,
+            timeout=6.0,
         )
-        owner_stdout, owner_stderr = owner.communicate(timeout=5.0)
+        owner_stdout, owner_stderr = owner.communicate(timeout=6.0)
 
         assert owner.returncode == 0, (owner_stdout, owner_stderr)
         assert completion.returncode == 0, completion
         assert completion.stderr == "", completion.stderr
         result = json.loads(completion.stdout)
         assert result["diagnostics"] == [], result
+
+        attempts = attempt_log.read_text(encoding="utf-8").splitlines()
+        assert attempts == ["attempt", "attempt"], attempts
 
         state = _read_state(state_path)
         assert state["events"] == [
