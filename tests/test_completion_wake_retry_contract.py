@@ -22,14 +22,14 @@ def main() -> int:
     try:
         calls: list[str] = []
 
-        def timed_out_then_success(path: Path, board: str):
+        def timed_out_then_success(_path: Path, board: str):
             calls.append(board)
             if len(calls) == 1:
                 return mod.WakeResult(returncode=-9, output_bytes=0, timed_out=True)
             return mod.WakeResult(returncode=0, output_bytes=2)
 
         mod._run_edge = timed_out_then_success
-        mod._completion_is_eligible = lambda task_id, board: True
+        mod._completion_is_eligible = lambda _task_id, _board: True
         result = mod._run_edge_with_contention_retry(
             edge_path, "default", "t_12345678"
         )
@@ -37,7 +37,7 @@ def main() -> int:
         assert calls == ["default", "default"], calls
 
         calls.clear()
-        mod._completion_is_eligible = lambda task_id, board: False
+        mod._completion_is_eligible = lambda _task_id, _board: False
         result = mod._run_edge_with_contention_retry(
             edge_path, "default", "t_12345678"
         )
@@ -46,7 +46,7 @@ def main() -> int:
 
         calls.clear()
 
-        def uncertain_eligibility(task_id: str, board: str) -> bool:
+        def uncertain_eligibility(_task_id: str, _board: str) -> bool:
             raise mod._WakeFailure("board_read_failed")
 
         mod._completion_is_eligible = uncertain_eligibility
@@ -58,12 +58,12 @@ def main() -> int:
 
         calls.clear()
 
-        def non_timeout_failure(path: Path, board: str):
+        def non_timeout_failure(_path: Path, board: str):
             calls.append(board)
             return mod.WakeResult(returncode=3, output_bytes=0)
 
         mod._run_edge = non_timeout_failure
-        mod._completion_is_eligible = lambda task_id, board: True
+        mod._completion_is_eligible = lambda _task_id, _board: True
         result = mod._run_edge_with_contention_retry(
             edge_path, "default", "t_12345678"
         )
