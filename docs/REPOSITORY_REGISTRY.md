@@ -208,16 +208,20 @@ associations.
 ## Event-driven webhook router
 
 The production event path contains no per-repository n8n workflow and no n8n
-Schedule Trigger:
+Schedule Trigger. One tracked private Webhook workflow handles only the PR
+edge-sync signal:
 
 ```text
 GitHub webhook
   -> github-router
        -> verify X-Hub-Signature-256
        -> ensure repository is currently managed
-       -> enqueue repository scope
-       -> lease-controller
-            -> existing Hermes job default:bf431b2a6ba6
+       -> pull_request close/rework -> n8n Webhook
+            -> fixed edge-sync actuator
+                 -> repository registry/task provenance -> board slug
+                 -> kanban-github-sync.py --board <slug> --json
+       -> other intake event -> enqueue repository scope
+            -> lease-controller -> existing Hermes job default:bf431b2a6ba6
 ```
 
 The router's webhook inventory is reconciled from the registry with:
@@ -233,7 +237,8 @@ deduplication (bounded `X-GitHub-Delivery` TTL store) is part of the router
 ingress, not the registry.
 
 The authenticated `/fallback` endpoint remains an intentional operator recovery
-path for a full-registry sweep. It is not scheduled automatically.
+path for a full-registry sweep. It is not scheduled automatically and is not
+called by the tracked edge-sync Webhook.
 
 ## Onboarding gate for a new repository
 

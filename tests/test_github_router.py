@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import importlib.util
 import json
 import sys
@@ -10,7 +11,6 @@ import tempfile
 import threading
 import time
 import uuid
-import http.client
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -121,7 +121,7 @@ def test_invalid_signature_is_rejected() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (_ for _ in ()).throw(
+            router.__dict__["_wake"] = lambda: (_ for _ in ()).throw(
                 AssertionError("invalid signature reached wake")
             )
             body = json.dumps(
@@ -142,7 +142,7 @@ def test_invalid_signature_is_rejected() -> None:
             assert status == 401
             assert payload["error"] == "invalid_signature"
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -183,7 +183,7 @@ def test_valid_event_enqueues_one_repo_scope() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: {
+            router.__dict__["_wake"] = lambda: {
                 "lease": "lease-test",
                 "upstream_status": 200,
             }
@@ -210,7 +210,200 @@ def test_valid_event_enqueues_one_repo_scope() -> None:
             assert claim["mode"] == "event"
             assert claim["repositories"] == ["rhgo1749/ctrl-hangul"]
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
+            _restore(original)
+
+
+def _pull_request_body(
+    *,
+    action: str,
+    merged: bool,
+    label: str | None = None,
+) -> bytes:
+    payload = {
+        "action": action,
+        "repository": {"full_name": "rhgo1749/ctrl-hangul"},
+        "pull_request": {"merged": merged},
+    }
+    if label is not None:
+        payload["label"] = {"name": label}
+    return json.dumps(payload).encode()
+
+
+def test_merged_pull_request_routes_to_n8n_edge_sync_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_edge_sync = router._n8n_edge_sync
+        original_wake = router._wake
+        forwarded: list[dict] = []
+        try:
+            router._write_state_unlocked(
+                {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
+            )
+            router.__dict__["_n8n_edge_sync"] = lambda event: (
+                forwarded.append(event),
+                {"status": 200, "body": {"ok": True}},
+            )[1]
+            router.__dict__["_wake"] = lambda: (_ for _ in ()).throw(
+                AssertionError("PR edge sync must not wake legacy intake")
+            )
+            body = _pull_request_body(action="closed", merged=True)
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="delivery-merged",
+                    ),
+                )
+                replay_status, replay = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="delivery-merged",
+                    ),
+                )
+            assert status == 202
+            assert payload["edge_sync"] is True
+            assert replay_status == 202
+            assert replay["duplicate"] is True
+            assert forwarded == [
+                {
+                    "repository": "rhgo1749/ctrl-hangul",
+                    "event": "pull_request",
+                    "action": "closed",
+                    "merged": True,
+                    "label": "",
+                    "delivery": "delivery-merged",
+                }
+            ]
+            assert router._claim_scope()["mode"] == "none"
+        finally:
+            router.__dict__["_n8n_edge_sync"] = original_edge_sync
+            router.__dict__["_wake"] = original_wake
+            _restore(original)
+
+
+def test_agent_rework_label_routes_bounded_event_to_n8n() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_edge_sync = router._n8n_edge_sync
+        try:
+            router._write_state_unlocked(
+                {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
+            )
+            forwarded: list[dict] = []
+            router.__dict__["_n8n_edge_sync"] = lambda event: (
+                forwarded.append(event),
+                {"status": 200, "body": {"ok": True}},
+            )[1]
+            body = _pull_request_body(
+                action="labeled",
+                merged=False,
+                label="agent-rework",
+            )
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="delivery-rework",
+                    ),
+                )
+            assert status == 202
+            assert payload["edge_sync"] is True
+            assert forwarded[0]["action"] == "labeled"
+            assert forwarded[0]["label"] == "agent-rework"
+            assert set(forwarded[0]) == {
+                "repository",
+                "event",
+                "action",
+                "merged",
+                "label",
+                "delivery",
+            }
+        finally:
+            router.__dict__["_n8n_edge_sync"] = original_edge_sync
+            _restore(original)
+
+
+def test_malformed_pull_request_event_fails_closed_without_n8n() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_edge_sync = router._n8n_edge_sync
+        calls = 0
+        try:
+            router._write_state_unlocked(
+                {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
+            )
+
+            def unexpected(event):
+                nonlocal calls
+                calls += 1
+                raise AssertionError(event)
+
+            router.__dict__["_n8n_edge_sync"] = unexpected
+            body = json.dumps(
+                {
+                    "action": "closed",
+                    "repository": {"full_name": "rhgo1749/ctrl-hangul"},
+                }
+            ).encode()
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="delivery-malformed-pr",
+                    ),
+                )
+            assert status == 400
+            assert payload["error"] == "pull_request_missing"
+            assert calls == 0
+            assert router._claim_scope()["mode"] == "none"
+        finally:
+            router.__dict__["_n8n_edge_sync"] = original_edge_sync
+            _restore(original)
+
+
+def test_n8n_edge_sync_failure_releases_delivery_for_retry() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_edge_sync = router._n8n_edge_sync
+        try:
+            router._write_state_unlocked(
+                {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
+            )
+            router.__dict__["_n8n_edge_sync"] = lambda event: (_ for _ in ()).throw(
+                router.RouterError("n8n edge-sync unavailable")
+            )
+            body = _pull_request_body(action="closed", merged=True)
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="delivery-edge-retry",
+                    ),
+                )
+            assert status == 502
+            assert payload["error"] == "n8n edge-sync unavailable"
+            assert router._load_state_unlocked().get("delivery_dedupe") in (
+                None,
+                {},
+            )
+        finally:
+            router.__dict__["_n8n_edge_sync"] = original_edge_sync
             _restore(original)
 
 
@@ -246,7 +439,7 @@ def test_fallback_survives_reconcile_failure() -> None:
                     router.RouterError("reconcile unavailable")
                 )
             )
-            router._wake = lambda: {
+            router.__dict__["_wake"] = lambda: {
                 "lease": "lease-fallback",
                 "upstream_status": 200,
             }
@@ -269,7 +462,7 @@ def test_fallback_survives_reconcile_failure() -> None:
             assert claim["mode"] == "full"
         finally:
             router._reconcile_webhooks = original_reconcile
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -356,7 +549,7 @@ def test_duplicate_delivery_is_noop_single_wake() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append({"lease": "lease-dedupe"}),
                 {"lease": "lease-dedupe", "upstream_status": 200},
             )[1]
@@ -382,7 +575,7 @@ def test_duplicate_delivery_is_noop_single_wake() -> None:
                 assert "queued" not in payload2
                 assert len(wakes) == 1
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -395,7 +588,7 @@ def test_duplicate_delivery_survives_restart() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-restart", "upstream_status": 200},
             )[1]
@@ -422,7 +615,7 @@ def test_duplicate_delivery_survives_restart() -> None:
                 assert payload2["duplicate"] is True
             assert len(wakes) == 1
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -435,7 +628,7 @@ def test_delivery_ttl_expiry_allows_reprocess() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-ttl", "upstream_status": 200},
             )[1]
@@ -469,7 +662,7 @@ def test_delivery_ttl_expiry_allows_reprocess() -> None:
                 reentry = state["delivery_dedupe"]["delivery-ttl"]
                 assert reentry["expires_at"] > int(time.time())
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -482,7 +675,7 @@ def test_distinct_delivery_ids_dispatch_independently() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-distinct", "upstream_status": 200},
             )[1]
@@ -499,7 +692,7 @@ def test_distinct_delivery_ids_dispatch_independently() -> None:
                     assert payload["delivery"] == delivery_id
                 assert len(wakes) == 2
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -512,7 +705,7 @@ def test_invalid_signature_not_recorded_in_dedupe_store() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-sig", "upstream_status": 200},
             )[1]
@@ -545,7 +738,7 @@ def test_invalid_signature_not_recorded_in_dedupe_store() -> None:
                 assert payload2["queued"] is True
                 assert len(wakes) == 1
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -558,7 +751,7 @@ def test_missing_delivery_id_rejected_fail_closed() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-missing", "upstream_status": 200},
             )[1]
@@ -577,7 +770,7 @@ def test_missing_delivery_id_rejected_fail_closed() -> None:
                 assert state.get("delivery_dedupe") in (None, {})
                 assert wakes == []
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -590,7 +783,7 @@ def test_invalid_delivery_id_rejected_fail_closed() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-invalid-id", "upstream_status": 200},
             )[1]
@@ -636,7 +829,7 @@ def test_invalid_delivery_id_rejected_fail_closed() -> None:
                 assert payload["delivery"] == "delivery-padded"
                 assert wakes == ["w"]
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -657,7 +850,7 @@ def test_concurrent_duplicate_requests_dispatch_once() -> None:
                     wakes.append("w")
                 return {"lease": "lease-concurrent", "upstream_status": 200}
 
-            router._wake = counting_wake
+            router.__dict__["_wake"] = counting_wake
             body = _event_body()
             barrier = threading.Barrier(2)
 
@@ -682,7 +875,7 @@ def test_concurrent_duplicate_requests_dispatch_once() -> None:
             state = router._load_state_unlocked()
             assert list(state["delivery_dedupe"]) == ["delivery-concurrent"]
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -695,7 +888,7 @@ def test_dispatch_failure_releases_delivery_record() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = (
+            router.__dict__["_wake"] = (
                 lambda: (_ for _ in ()).throw(
                     router.RouterError("lease-controller unavailable")
                 )
@@ -713,7 +906,7 @@ def test_dispatch_failure_releases_delivery_record() -> None:
                 assert state.get("delivery_dedupe") in (None, {})
             # After the failure the same delivery can dispatch again: this is
             # the GitHub 5xx retry / operator resend recovery path.
-            router._wake = lambda: (
+            router.__dict__["_wake"] = lambda: (
                 wakes.append("w"),
                 {"lease": "lease-retry", "upstream_status": 200},
             )[1]
@@ -727,7 +920,7 @@ def test_dispatch_failure_releases_delivery_record() -> None:
                 assert payload2["queued"] is True
                 assert len(wakes) == 1
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 
@@ -772,7 +965,7 @@ def test_pull_request_review_event_enqueues_repo_scope() -> None:
             router._write_state_unlocked(
                 {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
             )
-            router._wake = lambda: {
+            router.__dict__["_wake"] = lambda: {
                 "lease": "lease-pr-review",
                 "upstream_status": 200,
             }
@@ -798,7 +991,7 @@ def test_pull_request_review_event_enqueues_repo_scope() -> None:
             assert claim["mode"] == "event"
             assert claim["repositories"] == ["rhgo1749/ctrl-hangul"]
         finally:
-            router._wake = original_wake
+            router.__dict__["_wake"] = original_wake
             _restore(original)
 
 

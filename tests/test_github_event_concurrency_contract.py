@@ -24,22 +24,34 @@ def main() -> int:
     assert "LEASE_HERMES_PROFILE" not in lease["environment"]
 
     router = compose["services"]["github-router"]
-    assert router["environment"]["GITHUB_ROUTER_LISTEN_PORT"] == "5681"
-    assert router["environment"]["GITHUB_ROUTER_LEASE_BASE_URL"] == "http://127.0.0.1:5680"
+    router_env = router["environment"]
+    assert router_env["GITHUB_ROUTER_LISTEN_PORT"] == "5681"
+    assert router_env["GITHUB_ROUTER_LEASE_BASE_URL"] == "http://127.0.0.1:5680"
+    assert (
+        router_env["GITHUB_ROUTER_N8N_EDGE_SYNC_URL"]
+        == "http://127.0.0.1:5678/webhook/hermes-github-edge-sync"
+    )
 
-    github_paths = sorted(WORKFLOWS.glob("github-*-intake.json"))
-    schedule_paths = sorted(WORKFLOWS.glob("schedule-*.json"))
-    assert github_paths == []
-    assert [path.name for path in schedule_paths] == ["schedule-github-agent-ready-intake.json"]
+    assert sorted(WORKFLOWS.glob("schedule-*.json")) == []
+    github_paths = sorted(WORKFLOWS.glob("github-*.json"))
+    assert [path.name for path in github_paths] == ["github-pr-edge-sync.json"]
 
-    workflow = json.loads(schedule_paths[0].read_text(encoding="utf-8"))
-    assert workflow["name"] == "Hermes fallback · GitHub Kanban intake"
+    workflow = json.loads(github_paths[0].read_text(encoding="utf-8"))
+    assert workflow["name"] == "Hermes Webhook · GitHub PR edge sync"
     nodes = {node["name"]: node for node in workflow["nodes"]}
-    assert nodes["Schedule Trigger"]["parameters"]["rule"]["interval"] == [
-        {"field": "cronExpression", "expression": "0 * * * *"}
-    ]
-    assert nodes["Run registry fallback"]["parameters"]["url"] == "http://127.0.0.1:5681/fallback"
+    assert nodes["GitHub edge sync webhook"]["type"] == "n8n-nodes-base.webhook"
+    assert nodes["GitHub edge sync webhook"]["parameters"]["path"] == "hermes-github-edge-sync"
+    assert nodes["Normalize bounded event"]["parameters"]["includeOtherFields"] is False
+    assert nodes["Run edge sync actuator"]["parameters"]["url"] == "http://127.0.0.1:5682/v1/edge-sync"
+    assert nodes["Run edge sync actuator"]["parameters"]["jsonBody"] == "={{ JSON.stringify($json) }}"
+    gate = nodes["Allowed edge event?"]["parameters"]["conditions"]["conditions"][0]
+    assert "action === 'closed'" in gate["leftValue"]
+    assert "merged === true" in gate["leftValue"]
+    assert "label === 'agent-rework'" in gate["leftValue"]
     serialized = json.dumps(workflow)
+    assert "scheduleTrigger" not in serialized
+    assert "Schedule Trigger" not in serialized
+    assert "/fallback" not in serialized
     assert "/api/cron/jobs/" not in serialized
     assert "127.0.0.1:5680" not in serialized
 
@@ -51,8 +63,19 @@ def main() -> int:
     assert "_claim_delivery" in router_source
     assert "delivery_dedupe" in router_source
     assert '"/github/hermes-intake"' in router_source
+    assert '"/webhook/hermes-github-edge-sync"' in router_source
+    assert "_normalise_pull_request_event" in router_source
     assert '"/fallback"' in router_source
     assert '"/reconcile"' in router_source
+
+    actuator_source = (
+        ROOT / "automation" / "hermes" / "actuator" / "github_intake_actuator.py"
+    ).read_text(encoding="utf-8")
+    assert '"/v1/edge-sync"' in actuator_source
+    assert "_resolve_board" in actuator_source
+    assert "--board" in actuator_source
+    assert "--json" in actuator_source
+    assert "shell=False" in actuator_source
 
     controller_source = (N8N / "lease-controller" / "controller.py").read_text(encoding="utf-8")
     assert "_call_actuator(authorization)" in controller_source
@@ -60,18 +83,22 @@ def main() -> int:
     assert "/api/cron/jobs/" not in controller_source
     assert "_call_hermes" not in controller_source
 
-    print(json.dumps({
-        "ok": True,
-        "github_event_workflows": 0,
-        "schedule_workflows": 1,
-        "fallback_schedule": "hourly",
-        "github_event_router": 1,
-        "production_concurrency_limit": 1,
-        "production_concurrency_limit_role": "load-limiter",
-        "stale_pause_guard": "lease-controller",
-        "scope_handoff": "durable-fifo-queue",
-        "intake_execution": "direct-actuator:5682",
-    }))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "github_event_workflows": 1,
+                "schedule_workflows": 0,
+                "edge_sync_workflow": "webhook-filter-actuator",
+                "github_event_router": 1,
+                "production_concurrency_limit": 1,
+                "production_concurrency_limit_role": "load-limiter",
+                "stale_pause_guard": "lease-controller",
+                "scope_handoff": "durable-fifo-queue-for-intake-events",
+                "edge_sync_execution": "direct-actuator:5682",
+            }
+        )
+    )
     return 0
 
 

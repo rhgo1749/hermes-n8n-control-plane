@@ -13,6 +13,7 @@ HOST_UID="${HERMES_RUNTIME_UID:-1000}"
 HOST_GID="${HERMES_RUNTIME_GID:-1000}"
 
 SOURCE="$ROOT/automation/hermes/actuator/github_intake_actuator.py"
+TIMEOUT_SOURCE="$ROOT/automation/hermes/edge_sync_timeout.py"
 
 SECRET_DIR="$STATE_ROOT/secrets"
 TOKEN_HOST="$SECRET_DIR/hermes-intake-control-token"
@@ -22,6 +23,7 @@ BIN_DIR="/home/hermes/.local/bin"
 CONTROL_DIR="/home/hermes/.hermes/.control-plane"
 
 ACTUATOR_REMOTE="$LIBEXEC_DIR/github_intake_actuator.py"
+TIMEOUT_REMOTE="$LIBEXEC_DIR/edge_sync_timeout.py"
 TOKEN_REMOTE="$CONTROL_DIR/github-intake-control-token"
 LAUNCHER_REMOTE="$BIN_DIR/hermes-github-intake-actuator"
 
@@ -42,6 +44,7 @@ done
 
 [[ "$EUID" == "0" ]] || fail "run with sudo"
 [[ -s "$SOURCE" ]] || fail "missing actuator source: $SOURCE"
+[[ -s "$TIMEOUT_SOURCE" ]] || fail "missing timeout contract: $TIMEOUT_SOURCE"
 
 docker ps --format '{{.Names}}' \
     | grep -Fxq "$CONTAINER_NAME" \
@@ -75,7 +78,7 @@ print("intake control token contract: PASS")
 PY
 
 mkdir -p "$TMP/pycache"
-PYTHONPYCACHEPREFIX="$TMP/pycache" python3 -m py_compile "$SOURCE"
+PYTHONPYCACHEPREFIX="$TMP/pycache" python3 -m py_compile "$SOURCE" "$TIMEOUT_SOURCE"
 
 hermes_exec() {
     docker exec \
@@ -122,6 +125,7 @@ hermes_exec mkdir -p \
 hermes_exec chmod 700 "$CONTROL_DIR"
 
 hermes_write "$SOURCE" "$ACTUATOR_REMOTE" 0755
+hermes_write "$TIMEOUT_SOURCE" "$TIMEOUT_REMOTE" 0644
 hermes_write "$TOKEN_HOST" "$TOKEN_REMOTE" 0600
 
 cat > "$TMP/launcher" <<'LAUNCHER'
@@ -139,6 +143,7 @@ LAUNCHER
 hermes_write "$TMP/launcher" "$LAUNCHER_REMOTE" 0755
 
 hermes_exec /opt/venv/bin/python3 -m py_compile "$ACTUATOR_REMOTE"
+hermes_exec /opt/venv/bin/python3 -m py_compile "$TIMEOUT_REMOTE"
 
 DOCKER_BIN="$(command -v docker)"
 
@@ -203,3 +208,4 @@ PYHEALTH
 echo "Installed: $UNIT_NAME"
 echo "Token:     $TOKEN_HOST (not printed)"
 echo "Endpoint:  http://127.0.0.1:5682/v1/intake"
+echo "Edge sync: http://127.0.0.1:5682/v1/edge-sync (fixed board argv)"

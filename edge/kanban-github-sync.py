@@ -65,8 +65,10 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1535,6 +1537,99 @@ def _hermes_home() -> Path:
         or os.environ.get("HERMES_HOME")
         or DEFAULT_HERMES_HOME
     )
+
+
+_EDGE_LOCK_NAME = "github-edge-sync.lock"
+
+
+def _edge_lock_path() -> Path:
+    """Return the guarded runtime lock path shared by every edge caller."""
+    raw_home = _hermes_home().expanduser()
+    if raw_home.is_symlink():
+        raise SyncError("edge_single_flight_path_invalid")
+    try:
+        home = raw_home.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SyncError("edge_single_flight_path_invalid") from exc
+    if not home.is_dir():
+        raise SyncError("edge_single_flight_path_invalid")
+
+    kanban_root = home / "kanban"
+    if kanban_root.is_symlink() or (kanban_root.exists() and not kanban_root.is_dir()):
+        raise SyncError("edge_single_flight_path_invalid")
+    try:
+        kanban_root.mkdir(mode=0o700, exist_ok=True)
+        kanban_root = kanban_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SyncError("edge_single_flight_path_invalid") from exc
+    if kanban_root.parent != home or kanban_root.is_symlink():
+        raise SyncError("edge_single_flight_path_invalid")
+
+    lock_dir = kanban_root / ".resource-locks"
+    if lock_dir.is_symlink() or (lock_dir.exists() and not lock_dir.is_dir()):
+        raise SyncError("edge_single_flight_path_invalid")
+    try:
+        lock_dir.mkdir(mode=0o700, exist_ok=True)
+        lock_dir = lock_dir.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SyncError("edge_single_flight_path_invalid") from exc
+    if lock_dir.parent != kanban_root or lock_dir.is_symlink():
+        raise SyncError("edge_single_flight_path_invalid")
+
+    lock_path = lock_dir / _EDGE_LOCK_NAME
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise SyncError("edge_single_flight_path_invalid")
+    return lock_path
+
+
+@contextmanager
+def _edge_single_flight():
+    """Serialize the complete edge run across processes with kernel locking.
+
+    Callers already impose the finite edge-sync deadline.  Waiting here is a
+    blocking ``flock`` operation rather than a polling loop; a killed owner
+    releases the kernel lock, and a caller that reaches its deadline reports a
+    failed wake instead of claiming a successful reconciliation.
+    """
+    try:
+        import fcntl  # POSIX; the deployed edge runtime is Linux.
+    except ImportError as exc:  # pragma: no cover - unsupported host
+        raise SyncError("edge_single_flight_unavailable") from exc
+
+    fd: int | None = None
+    handle: Any = None
+    try:
+        lock_path = _edge_lock_path()
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+        fd = os.open(lock_path, flags, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise OSError("edge lock permissions or type invalid")
+        handle = os.fdopen(fd, "a+b", closefd=True)
+        fd = None
+        # The kernel owns contention and releases this lock if the process
+        # crashes; do not replace it with a sleep/retry loop.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except SyncError:
+        if handle is not None:
+            handle.close()
+        elif fd is not None:
+            os.close(fd)
+        raise
+    except (OSError, ValueError) as exc:
+        if handle is not None:
+            handle.close()
+        elif fd is not None:
+            os.close(fd)
+        raise SyncError("edge_single_flight_unavailable") from exc
+
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _import_kanban_db():
@@ -5042,13 +5137,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        client = GithubApiClient.from_environment()
-        results = sync_board(
-            args.board,
-            args.task_ids or None,
-            dry_run=args.dry_run,
-            client=client,
-        )
+        with _edge_single_flight():
+            client = GithubApiClient.from_environment()
+            results = sync_board(
+                args.board,
+                args.task_ids or None,
+                dry_run=args.dry_run,
+                client=client,
+            )
     except SyncError as exc:
         print(f"kanban-github-sync: {exc}", file=sys.stderr)
         return 1

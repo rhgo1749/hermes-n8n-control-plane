@@ -1,0 +1,9 @@
+name: github-completion-edge-wake
+version: "1.0.0"
+description: "Wake the deployed GitHub/Kanban edge once after a GitHub-backed task completion."
+author: hermes-n8n-control-plane
+kind: standalone
+hooks:
+  - kanban_task_completed
+provides_hooks:
+  - kanban_task_completed

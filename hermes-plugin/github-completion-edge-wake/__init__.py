@@ -1,0 +1,394 @@
+"""Completion-side wake for the deployed GitHub/Kanban edge reconciler.
+
+This is an observer only. Hermes core commits the task completion first; this
+plugin then reads the committed row and, only for GitHub-backed cards, invokes
+the already-deployed edge owner. The edge remains the only component that
+projects GitHub state back into Kanban.
+
+A timed-out first invocation cannot silently consume a still-provisional
+completion. After that timeout the observer re-reads the committed row. If an
+in-flight owner already projected the task away from DONE, no duplicate edge
+run is needed. If the GitHub-backed task is still DONE (or the post-timeout
+eligibility re-read itself cannot be trusted), the observer launches exactly
+one new fixed-argv edge child with a completely fresh budget. Canonical edge
+callers are themselves bounded by the same timeout contract, so this closes the
+contention wake-loss race without polling or creating another transition owner.
+"""
+# ruff: noqa: N999
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import logging
+import os
+import re
+import selectors
+import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+_LOG = logging.getLogger(__name__)
+_BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_TASK_ID_RE = re.compile(r"^t_[0-9a-f]{8,64}$")
+_PROVENANCE_END = "## Canonical Issue body"
+_SOURCE_LINE = re.compile(r"^\s*-\s*source\s*:\s*github-issue\s*$", re.IGNORECASE)
+_COMPLETION_LINE = re.compile(
+    r"^\s*-\s*completion contract\s*:\s*github-pr\s*$", re.IGNORECASE
+)
+
+
+def _load_edge_sync_timeout_contract():
+    candidates = (
+        Path(__file__).with_name("edge_sync_timeout.py"),
+        Path(__file__).resolve().parents[2]
+        / "automation"
+        / "hermes"
+        / "edge_sync_timeout.py",
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "hermes_edge_sync_timeout_contract_plugin",
+            candidate,
+        )
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise RuntimeError("edge_sync_timeout_contract_unavailable")
+
+
+_TIMEOUT_CONTRACT = _load_edge_sync_timeout_contract()
+_EDGE_SCRIPT = Path("scripts") / "kanban-github-sync.py"
+_EDGE_TIMEOUT_GRACE_SECONDS = _TIMEOUT_CONTRACT.EDGE_SYNC_TIMEOUT_GRACE_SECONDS
+_EDGE_OUTPUT_LIMIT_BYTES = _TIMEOUT_CONTRACT.EDGE_SYNC_OUTPUT_LIMIT_BYTES
+
+
+@dataclass(frozen=True)
+class WakeResult:
+    """Bounded result of one edge subprocess invocation."""
+
+    returncode: int | None
+    output_bytes: int
+    timed_out: bool = False
+    output_limited: bool = False
+
+
+class _WakeFailure(RuntimeError):
+    """Internal fail-closed diagnostic with a stable, non-sensitive code."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _env_file_value(path: Path, key: str) -> str:
+    """Read one simple ``KEY=value`` entry without exposing its value."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{key}="
+    for line in lines:
+        value = line.strip()
+        if not value or value.startswith("#") or not value.startswith(prefix):
+            continue
+        value = value[len(prefix) :].strip().split("#", 1)[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
+def _github_token() -> str:
+    """Resolve the token with the same precedence as the live actuator."""
+    for key in ("GITHUB_TOKEN", "GH_TOKEN", "HERMES_GITHUB_TOKEN"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    hermes_home = Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"))
+    for path in (hermes_home / ".env", Path("/home/hermes/.hermes/.env")):
+        value = _env_file_value(path, "GITHUB_TOKEN")
+        if value:
+            return value
+    raise _WakeFailure("github_token_unavailable")
+
+
+def _edge_timeout_seconds() -> float:
+    """Return one bounded attempt deadline beyond the configured edge budget."""
+    try:
+        configured = _TIMEOUT_CONTRACT.parse_edge_sync_timeout()
+    except _TIMEOUT_CONTRACT.TimeoutConfigurationError as exc:
+        raise _WakeFailure(exc.code) from exc
+    return configured + _EDGE_TIMEOUT_GRACE_SECONDS
+
+
+def _valid_board(board: Any) -> str:
+    if not isinstance(board, str) or not _BOARD_RE.fullmatch(board):
+        raise _WakeFailure("invalid_board")
+
+    pinned_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if pinned_board and pinned_board != board:
+        raise _WakeFailure("board_pin_mismatch")
+    if os.environ.get("HERMES_KANBAN_DB", "").strip() and not pinned_board:
+        raise _WakeFailure("ambiguous_board_pin")
+    return board
+
+
+def _runtime_root() -> Path:
+    """Resolve the shared Hermes root used by the live edge deployment."""
+    try:
+        hermes_constants = importlib.import_module("hermes_constants")
+        root = hermes_constants.get_default_hermes_root()
+    except Exception as exc:  # pragma: no cover - only old runtimes
+        raw_home = os.environ.get("HERMES_HOME", "").strip()
+        if not raw_home:
+            raise _WakeFailure("runtime_home_missing") from exc
+        root = Path(raw_home).expanduser()
+
+    try:
+        resolved = root.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _WakeFailure("runtime_home_unavailable") from exc
+    if not resolved.is_dir():
+        raise _WakeFailure("runtime_home_not_directory")
+    return resolved
+
+
+def _edge_script_path() -> Path:
+    root = _runtime_root()
+    candidate = root / _EDGE_SCRIPT
+    if candidate.is_symlink():
+        raise _WakeFailure("edge_script_symlink")
+    try:
+        resolved = candidate.resolve(strict=True)
+        scripts_root = (root / "scripts").resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _WakeFailure("edge_script_missing") from exc
+    if resolved.name != "kanban-github-sync.py" or not resolved.is_file():
+        raise _WakeFailure("edge_script_invalid")
+    if resolved.parent != scripts_root:
+        raise _WakeFailure("edge_script_outside_runtime")
+    return resolved
+
+
+def _board_db_path(board: str) -> Path:
+    try:
+        kanban_db = importlib.import_module("hermes_cli.kanban_db")
+
+        if not kanban_db.board_exists(board):
+            raise _WakeFailure("board_missing")
+        path = Path(kanban_db.kanban_db_path(board=board)).expanduser()
+    except _WakeFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _WakeFailure("board_path_invalid") from exc
+
+    if path.is_symlink():
+        raise _WakeFailure("board_db_symlink")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _WakeFailure("board_db_missing") from exc
+    if not resolved.is_file():
+        raise _WakeFailure("board_db_not_file")
+    return resolved
+
+
+def _is_github_backed_body(body: Any) -> bool:
+    """Check only importer-owned provenance, never untrusted Issue prose."""
+    provenance = str(body or "").split(_PROVENANCE_END, 1)[0]
+    lines = provenance.splitlines()
+    return any(_SOURCE_LINE.fullmatch(line) for line in lines) or any(
+        _COMPLETION_LINE.fullmatch(line) for line in lines
+    )
+
+
+def _completion_is_eligible(task_id: str, board: str) -> bool:
+    """Read committed state without creating/migrating a board database."""
+    db_path = _board_db_path(board)
+    uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise _WakeFailure("board_read_failed") from exc
+
+    if row is None or str(row["status"]) != "done":
+        return False
+    return _is_github_backed_body(row["body"])
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_edge(edge_path: Path, board: str) -> WakeResult:
+    """Run one fixed edge command with one fresh timeout/output budget."""
+    command = [sys.executable, str(edge_path), "--board", board, "--json"]
+    timeout_seconds = _edge_timeout_seconds()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(edge_path.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            close_fds=True,
+            env={**os.environ, "GITHUB_TOKEN": _github_token()},
+        )
+    except (OSError, ValueError) as exc:
+        raise _WakeFailure("edge_spawn_failed") from exc
+
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    output_bytes = 0
+    deadline = time.monotonic() + timeout_seconds
+    stream_closed = False
+    try:
+        while not stream_closed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_process(process)
+                return WakeResult(
+                    returncode=process.returncode,
+                    output_bytes=output_bytes,
+                    timed_out=True,
+                )
+            events = selector.select(remaining)
+            if not events:
+                _stop_process(process)
+                return WakeResult(
+                    returncode=process.returncode,
+                    output_bytes=output_bytes,
+                    timed_out=True,
+                )
+            for key, _ in events:
+                data = os.read(key.fd, 4096)
+                if not data:
+                    stream_closed = True
+                    selector.unregister(key.fileobj)
+                    break
+                output_bytes += len(data)
+                if output_bytes > _EDGE_OUTPUT_LIMIT_BYTES:
+                    _stop_process(process)
+                    return WakeResult(
+                        returncode=process.returncode,
+                        output_bytes=output_bytes,
+                        output_limited=True,
+                    )
+        returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return WakeResult(returncode=returncode, output_bytes=output_bytes)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _stop_process(process)
+        raise _WakeFailure("edge_process_failed") from exc
+    finally:
+        try:
+            selector.close()
+        finally:
+            process.stdout.close()
+
+
+def _run_edge_with_contention_retry(
+    edge_path: Path,
+    board: str,
+    task_id: str,
+) -> WakeResult:
+    """Preserve a still-provisional completion across one timed-out attempt.
+
+    The canonical edge lock lives inside the child. The first attempt can spend
+    its deadline behind an earlier owner. After a timeout, re-read committed
+    task state: if the owner already moved the card away from DONE, suppress a
+    duplicate run. If the task is still eligible, or the re-read itself fails
+    closed, launch exactly one fresh fixed-argv child. There is no sleep/poll
+    loop and no retry for non-timeout failures.
+    """
+    result = _run_edge(edge_path, board)
+    if not result.timed_out:
+        return result
+    try:
+        if not _completion_is_eligible(task_id, board):
+            return WakeResult(
+                returncode=0,
+                output_bytes=result.output_bytes,
+            )
+    except _WakeFailure:
+        # An uncertain post-timeout read must not consume the completion wake.
+        pass
+    return _run_edge(edge_path, board)
+
+
+def _diagnostic(task_id: str, board: str | None, code: str) -> None:
+    """Emit only bounded identifiers and stable failure classes."""
+    safe_task_id = task_id if _TASK_ID_RE.fullmatch(task_id) else "<invalid>"
+    safe_board = board if isinstance(board, str) and _BOARD_RE.fullmatch(board) else "<invalid>"
+    _LOG.warning(
+        "GitHub completion edge wake skipped or failed: task=%s board=%s code=%s",
+        safe_task_id,
+        safe_board,
+        code,
+    )
+
+
+def _on_task_completed(
+    *,
+    task_id: str | None = None,
+    board: str | None = None,
+    **_: Any,
+) -> None:
+    """Wake the edge after a committed GitHub-backed completion only."""
+    safe_task_id = (
+        task_id
+        if isinstance(task_id, str) and _TASK_ID_RE.fullmatch(task_id)
+        else "<invalid>"
+    )
+    try:
+        if not isinstance(task_id, str) or not task_id:
+            raise _WakeFailure("missing_task_id")
+        safe_board = _valid_board(board)
+        if not _completion_is_eligible(task_id, safe_board):
+            return
+        edge_path = _edge_script_path()
+        result = _run_edge_with_contention_retry(edge_path, safe_board, task_id)
+        if result.timed_out:
+            _diagnostic(safe_task_id, safe_board, "edge_retry_timeout")
+        elif result.output_limited:
+            _diagnostic(safe_task_id, safe_board, "edge_output_limit")
+        elif result.returncode != 0:
+            _diagnostic(safe_task_id, safe_board, "edge_nonzero")
+    except _WakeFailure as exc:
+        _diagnostic(safe_task_id, board if isinstance(board, str) else None, exc.code)
+    except Exception as exc:  # noqa: BLE001  # observer must never affect completion
+        _diagnostic(safe_task_id, board if isinstance(board, str) else None, type(exc).__name__)
+
+
+def register(ctx: Any) -> None:
+    """Register the post-commit completion observer."""
+    ctx.register_hook("kanban_task_completed", _on_task_completed)
+
+
+__all__ = ["WakeResult", "register"]
