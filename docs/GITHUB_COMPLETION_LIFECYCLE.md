@@ -89,6 +89,45 @@ revalidation and, when necessary, the mandatory fresh retry rather than leaving
 the card stranded. If the edge already moved the card, the observer suppresses
 the duplicate run instead of relying only on downstream idempotency.
 
+## `review` means parked: the parking marker contract
+
+On a GitHub-backed card, Kanban `review` is **not** a request for internal
+review. It is a *parked* state owned by the edge: fresh GitHub evidence
+decides everything that happens next, and no person or worker needs to act.
+
+| Kanban state | Meaning | Who can move it |
+| --- | --- | --- |
+| `review` (GitHub-backed) | Parked awaiting external GitHub resolution (merge / PR link). Edge re-evaluates on each GitHub event. | Only `kanban-github-sync` with fresh GitHub evidence (`REVIEW -> DONE`) or a trusted rework signal (`REVIEW -> READY`). |
+| `review` (non-GitHub card) | Internal review handoff between specialist profiles. | The assigned reviewer profile via core review tools. |
+| `blocked` | Requires an explicit human/operator decision right now. | A human unblocks with context; the edge never guesses. |
+| `ready`/`running`/`todo` | Active dispatch/work states. | Dispatcher and workers. |
+
+To make this visible on the board itself, every authoritative edge parking of a
+done card (`DONE -> REVIEW` in `apply_decision`) appends exactly one structured
+comment to the card:
+
+```text
+[parked: awaiting-merge] reason=linked_pr_open pr=#74 next=github-edge(merge 감지 시 자동 해제). 사람 행동 불필요.
+```
+
+- `[parked: awaiting-merge]` — machine-readable first token. `awaiting-merge`
+  covers every linked-PR situation (`linked_pr_open`,
+  `linked_pr_closed_not_merged`, `linked_pr_not_merged`);
+  `awaiting-pr` is emitted for `no_linked_pr`.
+- `reason=<evaluate_completion reason>` — the exact fail-closed decision
+  reason, matching the `github_pr_sync` event payload.
+- `pr=#74[,#75…]` — the linked PR numbers known at parking time.
+- `next=github-edge(...)` — the single automatic trigger that will lift the
+  park (merge detection, or PR-link detection for `awaiting-pr`).
+- `사람 행동 불필요.` — explicit no-human-action statement.
+
+The marker is idempotent by its exact rendered body: repeated syncs over an
+unchanged situation append nothing, while a genuinely new situation (different
+reason or PR set) records one additional line as provenance. The transition,
+the comment, and the `github_pr_sync` event share one transaction. A later
+`REVIEW -> DONE` projection leaves existing markers in place as durable
+history of why the card had been parked.
+
 ## Why worker `kanban_request_review` is forbidden here
 
 A GitHub-backed worker already has an external review surface: its linked GitHub pull request. Calling core `kanban_request_review` creates a second internal review lane. With the same/default Kanban profile, that review card can be claimed again by the implementation worker, producing a `review -> running -> review` self-review loop while the PR is simply waiting for a human merge.
