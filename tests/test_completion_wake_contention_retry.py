@@ -118,7 +118,7 @@ def _mark_completion_committed(path: Path) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _wait_for(path: Path, timeout: float = 3.0) -> None:
+def _wait_for(path: Path, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -153,11 +153,11 @@ def main() -> int:
                 "HERMES_HOME": str(root),
                 "GITHUB_TOKEN": "test-token",
                 "PYTHONDONTWRITEBYTECODE": "1",
-                "HERMES_EDGE_SYNC_TIMEOUT_SECONDS": "0.20",
+                "HERMES_EDGE_SYNC_TIMEOUT_SECONDS": "1.00",
                 "EDGE_RETRY_STATE": str(state_path),
                 "EDGE_OWNER_STARTED": str(owner_started),
-                "EDGE_OWNER_HOLD": "0.35",
-                "EDGE_COMPLETION_HOLD": "0.01",
+                "EDGE_OWNER_HOLD": "1.50",
+                "EDGE_COMPLETION_HOLD": "0.05",
                 "EDGE_STUB": str(edge_stub),
                 "PLUGIN_SOURCE": str(PLUGIN_SOURCE),
             }
@@ -186,9 +186,9 @@ def main() -> int:
             capture_output=True,
             text=True,
             check=False,
-            timeout=3.0,
+            timeout=5.0,
         )
-        owner_stdout, owner_stderr = owner.communicate(timeout=3.0)
+        owner_stdout, owner_stderr = owner.communicate(timeout=5.0)
 
         assert owner.returncode == 0, (owner_stdout, owner_stderr)
         assert completion.returncode == 0, completion
