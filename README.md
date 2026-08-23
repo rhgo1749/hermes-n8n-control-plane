@@ -28,15 +28,20 @@ GitHub-backed worker completion
        └─ core kanban_complete (committed provisional DONE)
           → kanban_task_completed observer
           → fixed live edge command: --board <validated-slug> --json
+             └─ first timeout + task still provisional DONE
+                → exactly one fresh-budget retry
           → existing DONE/REVIEW projection owner
 ```
 
 The completion observer is a trigger only: it reads the committed task row,
 filters out ordinary/non-GitHub tasks, and invokes the already-deployed edge
-reconciler once. It does not write Kanban state, replace the edge state machine,
-or turn n8n into a completion owner. Invalid runtime/board evidence fails
-closed; a wake failure leaves provisional `DONE` as an observable diagnostic,
-not as merge evidence.
+reconciler. It does not write Kanban state, replace the edge state machine, or
+turn n8n into a completion owner. If the first child times out, the observer
+re-reads the committed task; when the task is already projected away from
+`DONE`, it suppresses a duplicate run, while a still-provisional/uncertain row
+gets exactly one fresh-budget retry. There is no polling or retry loop. Invalid
+runtime/board evidence and a final failed wake remain bounded diagnostics and
+are never merge evidence.
 
 ## Durable ownership boundary
 
@@ -138,7 +143,7 @@ reviewed decision.
 | `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Canonical GitHub intake + reconciliation tick |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
-| `hermes-plugin/github-completion-edge-wake/` | Post-commit worker observer that wakes the deployed edge once for GitHub-backed completion |
+| `hermes-plugin/github-completion-edge-wake/` | Post-commit worker observer with bounded post-timeout revalidation/retry for GitHub-backed completion |
 | `automation/hermes/scripts/install-github-completion-edge-wake.sh` | Candidate/atomic/rollback-safe host installation and plugin activation |
 | `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
 | legacy n8n cron authentication plugin (removed after direct actuator migration) | Legacy Hermes service authentication plugin for token-protected routes |
@@ -213,6 +218,10 @@ python3 tests/test_intake_completion_contract_entrypoint.py
 python3 tests/test_repository_registry.py
 python3 tests/test_h4v3_overview.py
 python3 tests/test_h4v3_notification_policy.py
+PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_completion_edge_wake_plugin.py
+PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_completion_wake_retry_contract.py
+PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_completion_wake_contention_retry.py
+PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_edge_single_flight.py
 /ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py
 ```
 
