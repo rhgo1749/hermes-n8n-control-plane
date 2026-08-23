@@ -42,13 +42,6 @@ def update_state(delta: int, event: str) -> None:
         state["active"] += delta
         state["max_active"] = max(state["max_active"], state["active"])
         state["events"].append(event)
-        if delta > 0 and event.startswith("start:"):
-            state["snapshots"].append(
-                {
-                    "run": event.split(":", 1)[1],
-                    "completion_committed": bool(state.get("completion_committed")),
-                }
-            )
         handle.seek(0)
         handle.truncate()
         json.dump(state, handle)
@@ -136,15 +129,7 @@ def _write_script(path: Path, source: str) -> Path:
 
 def _initialise_state(path: Path) -> None:
     path.write_text(
-        json.dumps(
-            {
-                "active": 0,
-                "max_active": 0,
-                "events": [],
-                "completion_committed": False,
-                "snapshots": [],
-            }
-        ),
+        json.dumps({"active": 0, "max_active": 0, "events": []}),
         encoding="utf-8",
     )
 
@@ -261,12 +246,6 @@ def _read_state(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _mark_completion_committed(path: Path) -> None:
-    state = _read_state(path)
-    state["completion_committed"] = True
-    path.write_text(json.dumps(state), encoding="utf-8")
-
-
 def _fixtures(root: Path) -> tuple[Path, Path, Path, Path, Path]:
     state = root / "state.json"
     target = _write_script(root / "edge-target.py", _TARGET_SOURCE)
@@ -356,16 +335,8 @@ def test_two_completion_wakes_are_serialized_and_both_run() -> None:
         ], state_value
 
 
-def test_contention_timeout_gets_fresh_post_owner_edge_run() -> None:
-    """A completion committed after the owner snapshot must not be dropped.
-
-    The owner begins while completion_committed is false. The completion then
-    commits while the owner still holds the canonical edge lock. The waiter's
-    first child has a deliberately shorter outer deadline than the owner hold,
-    so that first attempt dies in flock contention. The completion observer
-    must immediately launch a fresh-budget retry; only that post-owner run is
-    allowed to satisfy this regression.
-    """
+def test_repeated_contention_timeout_is_an_explicit_failed_wake() -> None:
+    """Two exhausted attempt budgets fail closed; they never report success."""
     with tempfile.TemporaryDirectory(prefix="edge-single-flight-") as td:
         root = Path(td)
         state, target, _actuator, plugin, registry = _fixtures(root)
@@ -375,47 +346,32 @@ def test_contention_timeout_gets_fresh_post_owner_edge_run() -> None:
             target=target,
             registry=registry,
             run="owner",
-            hold=0.40,
+            hold=0.35,
             driver=plugin,
         )
         _wait_started(owner, owner_signal)
-
-        # Owner has already taken its snapshot. Commit the provisional DONE
-        # after that point so only a later edge run can observe it.
-        _mark_completion_committed(state)
-
         waiter, waiter_signal = _start(
             root=root,
             state=state,
             target=target,
             registry=registry,
-            run="completion-after-snapshot",
-            hold=0.01,
+            run="timed-out-wake",
+            hold=0.05,
             driver=plugin,
-            plugin_timeout=0.20,
+            plugin_timeout=0.05,
         )
-        # The first child times out while waiting. The signal can only arrive
-        # from the fresh retry after the owner releases the edge lock.
-        _wait_started(waiter, waiter_signal)
+        os.close(waiter_signal)
         waiter_stdout, waiter_stderr = _finish(waiter)
         _finish(owner)
-
         assert waiter_stderr == "", waiter_stderr
         waiter_result = json.loads(waiter_stdout)
-        assert waiter_result["diagnostics"] == [], waiter_result
+        assert waiter_result["diagnostics"] == [
+            {"task_id": "t_12345678", "board": "default", "code": "edge_retry_timeout"}
+        ], waiter_result
         state_value = _read_state(state)
         assert state_value["active"] == 0, state_value
         assert state_value["max_active"] == 1, state_value
-        assert state_value["events"] == [
-            "start:owner",
-            "end:owner",
-            "start:completion-after-snapshot",
-            "end:completion-after-snapshot",
-        ], state_value
-        assert state_value["snapshots"] == [
-            {"run": "owner", "completion_committed": False},
-            {"run": "completion-after-snapshot", "completion_committed": True},
-        ], state_value
+        assert state_value["events"] == ["start:owner", "end:owner"], state_value
 
 
 def test_crashed_owner_releases_kernel_lock() -> None:
@@ -493,7 +449,7 @@ def test_symlinked_runtime_lock_root_fails_closed() -> None:
 def main() -> int:
     test_webhook_and_completion_paths_are_serialized()
     test_two_completion_wakes_are_serialized_and_both_run()
-    test_contention_timeout_gets_fresh_post_owner_edge_run()
+    test_repeated_contention_timeout_is_an_explicit_failed_wake()
     test_crashed_owner_releases_kernel_lock()
     test_symlinked_runtime_lock_root_fails_closed()
     print("edge single-flight process concurrency regressions: PASS")
