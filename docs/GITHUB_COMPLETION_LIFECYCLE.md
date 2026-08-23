@@ -25,44 +25,62 @@ worker core kanban_complete
   -> kanban_task_completed plugin observer (worker process)
   -> committed-row/board/runtime validation
   -> $HERMES_HOME/scripts/kanban-github-sync.py \
-       --board <validated-slug> --json (exactly once)
+       --board <validated-slug> --json
+       first bounded attempt
+       timeout only -> exactly one fresh-budget retry
   -> existing edge DONE -> REVIEW / REVIEW -> DONE decision
 ```
 
 `hermes-plugin/github-completion-edge-wake/` is an observer/trigger only. It
 reads the already-committed task row and wakes the deployed canonical/live edge
-path only when the importer-owned provenance contains both
-`source: github-issue` and `completion contract: github-pr`. Ordinary tasks,
-missing or ambiguous board/runtime evidence, and non-`DONE` rows do not wake
-the edge. The observer never calls a Kanban mutator, parses the untrusted Issue
-body as instructions, or duplicates the edge transition logic.
+path when the importer-owned provenance contains `source: github-issue` or
+`completion contract: github-pr` before the canonical Issue-body boundary.
+Ordinary tasks, missing or ambiguous board/runtime evidence, and non-`DONE`
+rows do not wake the edge. The observer never calls a Kanban mutator, parses the
+untrusted Issue body as instructions, or duplicates the edge transition logic.
 
 The actuator and this direct completion wake share the same edge single-flight
 boundary. Before the canonical edge reads GitHub/Kanban state, it acquires the
 guarded runtime lock at
 `$HERMES_HOME/kanban/.resource-locks/github-edge-sync.lock` with Linux
 `fcntl.flock(LOCK_EX)`. A completion wake waits behind an in-flight webhook or
-another completion wake instead of being dropped; the finite outer edge
-deadline bounds that wait. If the deadline expires, the observer records a
-bounded failure and keeps the core completion provisional `DONE`—it never
-claims a successful reconciliation. Kernel lock ownership releases on a
-crashed process, and no queue database, polling loop, or second transition
-owner is introduced.
+another completion wake rather than running concurrently. Kernel lock ownership
+releases on a crashed process, and no queue database, polling loop, or second
+transition owner is introduced.
 
-The callback uses a fixed argument vector with `shell=False`, a bounded
-timeout/output budget, and stable diagnostics that do not include task body,
+A single outer deadline is not allowed to turn lock contention into a lost
+completion signal. The first completion child uses the normal bounded edge
+budget. If that child times out—possibly because the preceding owner consumed
+most of the deadline while the child was blocked in `flock()`—the observer does
+not accept that timeout as the completion handoff. It immediately launches
+exactly one second fixed-argv child with a completely fresh deadline. Only a
+second timeout becomes the final bounded `edge_retry_timeout` diagnostic.
+Non-timeout failures are not retried. There is no sleep, retry loop, Schedule
+Trigger, or polling fallback.
+
+The process-level contention regression models the race directly: the owner
+enters the canonical edge before the completion is committed, so its snapshot
+cannot contain the later provisional `DONE`; the first completion attempt is
+forced to expire behind that owner; the test passes only when the fresh retry
+runs after the owner and observes the post-owner completion snapshot. Merely
+recording a timeout diagnostic is explicitly not success evidence.
+
+The callback uses a fixed argument vector with `shell=False`, bounded per-attempt
+timeout/output budgets, and stable diagnostics that do not include task body,
 summary, command output, or credentials. Both wake paths load the shared
 `automation/hermes/edge_sync_timeout.py` contract at installation time:
 `HERMES_EDGE_SYNC_TIMEOUT_SECONDS` defaults to `120` seconds and must be finite,
 positive, and no greater than `3600`; the completion observer adds its bounded
-`5`-second grace. Combined child output is capped at `64 KiB`; invalid timeout
-configuration or oversized output fails closed before any edge success is
-reported.
+`5`-second grace to each attempt. Combined child output is capped at `64 KiB`;
+invalid timeout configuration or oversized output fails closed before any edge
+success is reported.
 
-A failed wake is observable and fail-closed: the core completion remains
-provisional `DONE` for a later operator/event reconciliation and is never treated
-as merge evidence. If the edge already moved the card, a repeated observation is
-an idempotent no-op through the existing optimistic edge transition.
+A final failed wake is observable and fail-closed: the core completion remains
+provisional `DONE` and is never treated as merge evidence. Under ordinary
+contention, however, the first timeout is consumed by the mandatory fresh
+retry rather than leaving the card stranded. If the edge already moved the
+card, a repeated observation is an idempotent no-op through the existing
+optimistic edge transition.
 
 ## Why worker `kanban_request_review` is forbidden here
 
