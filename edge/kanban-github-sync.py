@@ -1785,6 +1785,50 @@ def _restore_pending_dependency(
     }
 
 
+def _dependency_gate_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Read the live dependency gate without raising.
+
+    Returns ``(gate, None)`` on success and ``(None, error)`` when the
+    lookup itself fails (dangling link, missing table, SQL error).  The
+    caller fails closed on any error: a lookup failure is never an
+    implicitly satisfied dependency, and a single bad task must never
+    crash the whole board sync.
+    """
+    try:
+        return _internal_dependency_gate(conn, task_id), None
+    except (SyncError, sqlite3.Error) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _dependency_guard_sql() -> str:
+    """Atomic gate folded into the final ``UPDATE ... WHERE``.
+
+    Counts direct parent links whose parent is NOT terminal (see
+    ``_DEPENDENCY_TERMINAL_STATES``); a dangling link also counts (the
+    inner ``NOT EXISTS`` is true when the parent row is missing).  The
+    update therefore only fires when every direct parent is terminal and
+    present — the same condition the ``sync_board`` pre-gate checked,
+    re-evaluated in the very statement that writes.  Because the subquery
+    and the write are one statement, no writer can interleave between the
+    check and the write: a parent that flips non-terminal (or a new parent
+    link) after the pre-gate is visible to this statement and the update
+    affects zero rows.  Appends exactly one ``?`` placeholder (the child
+    task id).
+    """
+    terminal = ",".join(
+        f"'{status}'" for status in sorted(_DEPENDENCY_TERMINAL_STATES)
+    )
+    return (
+        f"AND (SELECT count(*) FROM task_links AS l "
+        f"WHERE l.child_id = ? "
+        f"AND NOT EXISTS (SELECT 1 FROM tasks AS t "
+        f"WHERE t.id = l.parent_id AND t.status IN ({terminal}))) = 0"
+    )
+
+
 def _last_resume_response_at(conn: sqlite3.Connection, task_id: str) -> str:
     """``response_at`` of the newest consumed ``github_blocked_resolved`` event.
 
@@ -1946,6 +1990,34 @@ def apply_decision(
         }
 
     now = int(time.time())
+    # Re-verify the dependency gate in the SAME transaction as the write.
+    # The pre-gate in sync_board ran before the (seconds-long) GitHub
+    # fetch; this evidence read plus the guard folded into the UPDATE
+    # below is what closes the TOCTOU window at the write itself.  A
+    # lookup failure is fail-closed: the transition is refused, never
+    # guessed through.
+    gate, gate_error = _dependency_gate_evidence(conn, task_id)
+    if gate_error is not None:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "dependency_recheck_failed",
+            "error": gate_error,
+        }
+    # Invariant: ``_dependency_gate_evidence`` returns exactly one of a
+    # gate dict or an error string, never both.  The error path returned
+    # above, so a None gate here is a programming error — fail closed
+    # rather than guess.
+    if gate is None:
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "changed": False,
+            "reason": "dependency_recheck_failed",
+            "error": "gate evidence unavailable",
+        }
+    guard = _dependency_guard_sql()
     if desired == "review":
         # DONE -> REVIEW (required PR open / closed-not-merged).
         new_body = row["body"]
@@ -1953,7 +2025,7 @@ def apply_decision(
             new_body = replace_sync_context(row["body"], context_block)
         parked_comment = _parking_comment_for_decision(task_id, decision)
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status = 'review',
                    completed_at = NULL,
@@ -1965,13 +2037,14 @@ def apply_decision(
                    block_recurrences = 0,
                    body = ?
              WHERE id = ? AND status = ?
+             {guard}
             """,
-            (new_body, task_id, current_status),
+            (new_body, task_id, current_status, task_id),
         )
     else:
         # REVIEW -> DONE (every required PR merged into target branch).
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status = 'done',
                    completed_at = ?,
@@ -1981,10 +2054,27 @@ def apply_decision(
                    block_kind = NULL,
                    block_recurrences = 0
              WHERE id = ? AND status = ?
+             {guard}
             """,
-            (now, task_id, current_status),
+            (now, task_id, current_status, task_id),
         )
     if cur.rowcount != 1:
+        if gate["pending"]:
+            # The pre-gate passed but a parent went non-terminal — or a
+            # new parent link appeared — between the pre-gate and this
+            # write.  Refuse the transition and leave the card untouched;
+            # the next tick repairs it through the canonical
+            # _restore_pending_dependency lane.
+            return {
+                "task_id": task_id,
+                "status": current_status,
+                "changed": False,
+                "reason": "dependency_recheck_pending",
+                "evidence": {
+                    "parents": gate["pending"],
+                    "dependency_gate": "recheck_pending",
+                },
+            }
         return {
             "task_id": task_id,
             "status": current_status,
