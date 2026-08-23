@@ -8,6 +8,22 @@ GitHub-backed Issue intake cards use deliberately separate lifecycle authorities
 
 The durable role boundaries are defined in `docs/KANBAN_ROLE_CONTRACTS.md`.
 
+## Internal dependency gate
+
+Before the edge reads or applies any GitHub completion decision, it evaluates
+the live `task_links` table in its canonical parent-to-child direction
+(`task_links.child_id = intake_task.id`). Every direct parent must be
+`done` or `archived`; any `todo`, `ready`, `running`, `review`, `blocked`, or
+`scheduled` parent keeps the intake root out of the external projection lane.
+A stale `review` or `done` root is repaired to `todo` in one transaction with
+claim, assignee, worker, blocker, and completion metadata cleared, and one
+`github_dependency_gate` event is recorded. Repeated ticks are idempotent.
+Dependency lookup or GitHub API failures preserve the current state and never
+create `blocked`; `blocked` remains reserved for an explicit human/operator
+decision. Only after all parents are terminal may the existing GitHub contract
+project an OPEN/closed-unmerged PR to `review` or merged required PRs to
+`done`.
+
 The external event path is `github-router` (HMAC, delivery dedupe, and managed
 repository admission) → private n8n Webhook (bounded PR-event filter) → the
 loopback actuator → `kanban-github-sync.py --board <slug> --json`. The actuator
