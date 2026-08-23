@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import fcntl
-import importlib.util
 import json
 import os
 import subprocess
