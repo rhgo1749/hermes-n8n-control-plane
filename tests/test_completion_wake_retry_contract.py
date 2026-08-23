@@ -58,6 +58,20 @@ def main() -> int:
 
         calls.clear()
 
+        def always_times_out(_path: Path, board: str):
+            calls.append(board)
+            return mod.WakeResult(returncode=-9, output_bytes=0, timed_out=True)
+
+        mod._run_edge = always_times_out
+        mod._completion_is_eligible = lambda _task_id, _board: True
+        result = mod._run_edge_with_contention_retry(
+            edge_path, "default", "t_12345678"
+        )
+        assert result.timed_out, result
+        assert calls == ["default", "default"], calls
+
+        calls.clear()
+
         def non_timeout_failure(_path: Path, board: str):
             calls.append(board)
             return mod.WakeResult(returncode=3, output_bytes=0)
