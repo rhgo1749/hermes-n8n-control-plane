@@ -70,6 +70,17 @@ def test_external_wait_never_keeps_worker_running() -> None:
     assert "Future PR lifecycle belongs to GitHub + edge reconciliation" in body
 
 
+def test_required_acceptance_is_attempted_or_explained() -> None:
+    body = _render_body()
+    assert "must attempt every required gate that is executable" in body
+    assert "browser acceptance must be performed before delivery" in body
+    assert "`HUMAN_VALIDATION_REQUIRED` is not permission to skip an executable gate" in body
+    assert "whether the required browser/tool/runtime was available" in body
+    assert "what step was attempted" in body
+    assert "bare `human validation required`, `not run`" in body
+    assert "is REWORK" in body
+
+
 def test_main_and_controller_ownership_are_separated() -> None:
     body = _render_body()
     assert "## Kanban lead orchestration contract" in body
@@ -119,6 +130,7 @@ if __name__ == "__main__":
     tests = (
         test_worker_completion_uses_core_terminal_action,
         test_external_wait_never_keeps_worker_running,
+        test_required_acceptance_is_attempted_or_explained,
         test_main_and_controller_ownership_are_separated,
         test_legacy_review_handoff_contract_is_removed,
         test_contract_drift_fails_closed,
