@@ -138,6 +138,33 @@ GITHUB_ROUTER_PUBLIC_URL=https://<reviewed-host>/github/hermes-intake
 Expose only that reviewed HTTPS path through the reverse proxy/Funnel. Do not
 publish ports `5678`, `5680`, or `5681` directly.
 
+### Funnel path isolation (required)
+
+The Tailscale Funnel terminates TLS for the whole `*.ts.net` hostname, so a
+funnel-enabled serve rule that proxies `/` publishes every path the backend
+listens on — including the control-center dashboard and its static assets —
+to the public internet. The funnel must therefore proxy **only** the router
+intake path. Configure the host as:
+
+```bash
+tailscale serve --https=443 \
+  --set-path=/github/hermes-intake http://127.0.0.1:5681/github/hermes-intake
+```
+
+Do not add a `/` (or any non-intake) funnel rule against the control-center
+port (`8940`). The dashboard stays reachable inside the tailnet through a
+non-funnel `tailscale serve` rule or direct tailnet addressing; it must not be
+publicly routed.
+
+Verify after applying:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>/            # expect 404 (not 200)
+curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>/healthz    # expect 404 (not 200)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  https://<ts-hostname>/github/hermes-intake                              # expect 401 invalid_signature
+```
+
 Restart the control-plane services after configuration changes.
 
 ### Delivery replay deduplication
