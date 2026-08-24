@@ -776,6 +776,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _is_loopback_client(self) -> bool:
+        host = self.client_address[0] if self.client_address else ""
+        return host in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path != "/healthz":
@@ -783,6 +787,12 @@ class Handler(BaseHTTPRequestHandler):
                 HTTPStatus.NOT_FOUND,
                 {"ok": False, "error": "not_found"},
             )
+            return
+        if not self._is_loopback_client():
+            # The public funnel reaches this handler too; it must learn only
+            # that the process is alive. Queue depth, secret-file presence,
+            # and URL configuration stay loopback-only.
+            self._send_json(HTTPStatus.OK, {"ok": True})
             return
         try:
             status = _queue_status()
