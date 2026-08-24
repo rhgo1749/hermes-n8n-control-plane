@@ -167,8 +167,30 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 ```
 
 The external `/healthz` response is deliberately minimal (`{"ok": true}`);
-queue depth and secret-configuration details are served to loopback clients
-only.
+queue depth and secret-configuration details moved to the Bearer-authenticated
+`/debug/state` endpoint (see below).
+
+### Router operator diagnostics
+
+`GET /debug/state` returns the queue statistics and secret/URL configuration
+flags that `/healthz` no longer exposes. It requires the intake control
+token (the same Bearer token as `/scope/claim`; the router reads it from
+`/run/secrets/hermes-intake-control-token`, managed by
+`configure-github-router-secrets.sh`). Run from the host:
+
+```bash
+TOKEN_FILE="$HOME/.local/state/hermes-n8n-control-plane/secrets/hermes-intake-control-token"
+curl -sS -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+  http://127.0.0.1:5681/debug/state
+```
+
+- No/wrong token → `401 authorization_required`.
+- Success → `200` with `queued_scopes`, `managed_count`,
+  `public_url_configured`, `github_token_configured`,
+  `webhook_secret_configured`, and `hermes_token_configured`.
+
+Do not expose `/debug/state` through the funnel; the loopback-only binding of
+the router port keeps it off the public internet.
 
 Restart the control-plane services after configuration changes.
 
