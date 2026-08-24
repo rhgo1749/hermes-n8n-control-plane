@@ -140,30 +140,35 @@ publish ports `5678`, `5680`, or `5681` directly.
 
 ### Funnel path isolation (required)
 
-The Tailscale Funnel terminates TLS for the whole `*.ts.net` hostname, so a
-funnel-enabled serve rule that proxies `/` publishes every path the backend
-listens on — including the control-center dashboard and its static assets —
-to the public internet. The funnel must therefore proxy **only** the router
-intake path. Configure the host as:
+The Tailscale Funnel terminates TLS for the funnel-enabled port (the deployed
+host funnels `:10000`; the tailnet-only `:443` listener must stay
+non-funnel). A funnel rule that proxies `/` publishes every path the backend
+listens on to the public internet, so the funnel must proxy **only** the
+router intake path. Configure the host as:
 
 ```bash
-tailscale serve --https=443 \
+tailscale serve --https=10000 \
   --set-path=/github/hermes-intake http://127.0.0.1:5681/github/hermes-intake
 ```
 
 Do not add a `/` (or any non-intake) funnel rule against the control-center
-port (`8940`). The dashboard stays reachable inside the tailnet through a
-non-funnel `tailscale serve` rule or direct tailnet addressing; it must not be
-publicly routed.
+port (`8940`). The dashboard, `/voice`, `/avatar`, `/ramstation`, and the
+other tailnet-only listeners on `:443`/`:8443`/`:9443` stay inside the
+tailnet; they must not be publicly routed.
 
-Verify after applying:
+Verify after applying (from outside the tailnet, e.g. a non-Tailscale
+network):
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>/            # expect 404 (not 200)
-curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>/healthz    # expect 404 (not 200)
+curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>:10000/                  # expect 404 (not 200)
+curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>:10000/healthz           # expect 200 {"ok":true} only
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  https://<ts-hostname>/github/hermes-intake                              # expect 401 invalid_signature
+  https://<ts-hostname>:10000/github/hermes-intake                                     # expect 401 invalid_signature
 ```
+
+The external `/healthz` response is deliberately minimal (`{"ok": true}`);
+queue depth and secret-configuration details are served to loopback clients
+only.
 
 Restart the control-plane services after configuration changes.
 

@@ -6,6 +6,7 @@ import hmac
 import http.client
 import importlib.util
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -1050,3 +1051,70 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+def test_healthz_loopback_returns_details() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            with RunningServer() as server:
+                status, payload = _request(server.base_url, "GET", "/healthz")
+            assert status == 200
+            assert payload["ok"] is True
+            # Loopback clients (the compose healthcheck) get the full detail set.
+            assert "queued_scopes" in payload
+            assert "public_url_configured" in payload
+            assert "github_token_configured" in payload
+            assert "webhook_secret_configured" in payload
+            assert "hermes_token_configured" in payload
+        finally:
+            _restore(original)
+
+
+def test_healthz_non_loopback_is_minimal() -> None:
+    external_ip = None
+    for candidate in ("172.17.0.1", "192.168.219.109"):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect((candidate, 9))
+            local = probe.getsockname()[0]
+        except OSError:
+            local = None
+        finally:
+            probe.close()
+        if local and not local.startswith("127.") and not local.startswith("::"):
+            external_ip = local
+            break
+    if external_ip is None:
+        return  # no non-loopback egress in this environment
+
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        server = router.ThreadingHTTPServer((external_ip, 0), router.Handler)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, payload = _request(f"http://{host}:{port}", "GET", "/healthz")
+            assert status == 200
+            # Non-loopback clients learn only liveness — no queue depth, no
+            # secret-configuration details.
+            assert payload == {"ok": True}
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            _restore(original)
+
+
+def test_is_loopback_client_classification() -> None:
+    handler = object.__new__(router.Handler)
+
+    def classify(addr):
+        handler.client_address = addr
+        return router.Handler._is_loopback_client(handler)
+
+    assert classify(("127.0.0.1", 50000)) is True
+    assert classify(("::1", 50000)) is True
+    assert classify(("::ffff:127.0.0.1", 50000)) is True
+    assert classify(("100.64.168.58", 50000)) is False
+    assert classify(("203.0.113.7", 50000)) is False
+    assert classify(("", 0)) is False
