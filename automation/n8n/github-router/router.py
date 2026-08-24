@@ -776,42 +776,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _is_loopback_client(self) -> bool:
-        host = self.client_address[0] if self.client_address else ""
-        return host in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
-
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/healthz":
-            self._send_json(
-                HTTPStatus.NOT_FOUND,
-                {"ok": False, "error": "not_found"},
-            )
-            return
-        if not self._is_loopback_client():
-            # The public funnel reaches this handler too; it must learn only
-            # that the process is alive. Queue depth, secret-file presence,
-            # and URL configuration stay loopback-only.
+        if parsed.path == "/healthz":
+            # Fixed minimal liveness body. The funnel proxies public traffic
+            # to this handler from a local source address, so client-address
+            # checks cannot distinguish external callers; nothing beyond
+            # liveness may be disclosed here. Queue depth, secret-file
+            # presence, and URL configuration are served by the
+            # Bearer-authenticated /debug/state endpoint instead.
             self._send_json(HTTPStatus.OK, {"ok": True})
             return
-        try:
-            status = _queue_status()
-        except RouterError as exc:
+        if parsed.path == "/debug/state":
+            authorization = self.headers.get("Authorization", "").strip()
+            if not _service_authorized(authorization):
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "authorization_required"},
+                )
+                return
+            try:
+                status = _queue_status()
+            except RouterError as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
+                return
             self._send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"ok": False, "error": str(exc)},
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    **status,
+                    "public_url_configured": bool(PUBLIC_URL),
+                    "github_token_configured": GITHUB_TOKEN_FILE.is_file(),
+                    "webhook_secret_configured": WEBHOOK_SECRET_FILE.is_file(),
+                    "hermes_token_configured": INTAKE_TOKEN_FILE.is_file(),
+                },
             )
             return
         self._send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                **status,
-                "public_url_configured": bool(PUBLIC_URL),
-                "github_token_configured": GITHUB_TOKEN_FILE.is_file(),
-                "webhook_secret_configured": WEBHOOK_SECRET_FILE.is_file(),
-                "hermes_token_configured": INTAKE_TOKEN_FILE.is_file(),
-            },
+            HTTPStatus.NOT_FOUND,
+            {"ok": False, "error": "not_found"},
         )
 
     def do_POST(self) -> None:
