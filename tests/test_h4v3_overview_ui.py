@@ -42,7 +42,6 @@ def test_need_you_uses_existing_task_attention_and_preserves_links() -> None:
     assert "task.attention === true" in index
     assert 'if (key === "need_you") return attentionTasks(board).length;' in index
     assert 'href: linkFor(task)' in index
-    assert 'href: board.kanban_url || "/kanban"' in index
     assert 'h("span", { className: "h4v3-visually-hidden" }, " Board slug: ", slug)' in index
     assert "board.repositories" not in index
     assert "Repository:" not in index
@@ -95,6 +94,18 @@ def test_mobile_fallback_and_accessible_matrix_contract() -> None:
     assert '.h4v3-mobile-board-list { display: grid;' in style
     assert '.h4v3-page a:focus-visible, .h4v3-page button:focus-visible' in style
     assert 'overflow-x' not in style
+
+
+def test_board_name_links_to_github_open_pr_list() -> None:
+    index, style = _source()
+    assert "function openPrsUrl(board)" in index
+    assert "board.open_prs_url" in index
+    assert 'className: "h4v3-project-link h4v3-project-link--github"' in index
+    assert 'target: "_blank"' in index and 'rel: "noopener noreferrer"' in index
+    assert "GitHub에서 open PR 목록 열기" in index
+    assert ".h4v3-project-link--github" in style
+    # No label filter anywhere — the list is ALL open PRs of the repos.
+    assert "label%3Aagent-rework" not in index or "label:agent-rework" not in index
 
 
 def test_read_only_refresh_polling_and_failure_states_remain() -> None:

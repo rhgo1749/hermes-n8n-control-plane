@@ -73,6 +73,10 @@
 .h4v3-mobile-recent { display: grid; gap: 4px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border, #303743); overflow-wrap: anywhere; }
 .h4v3-mobile-field-label { color: var(--text-tertiary, #87909f); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
 .h4v3-page a:focus-visible, .h4v3-page button:focus-visible { outline: 3px solid #f5d576; outline-offset: 2px; }
+/* Board name -> GitHub agent-rework PR list (only when rework pending). */
+.h4v3-project-link--github .h4v3-board-name { text-decoration: underline; text-underline-offset: 3px; }
+.h4v3-project-link--github:hover .h4v3-board-name { color: var(--text-primary, #e8ebf0); }
+.h4v3-board-github-mark { margin-left: 6px; font-size: 12px; opacity: .75; }
 .h4v3-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .h4v3-empty, .h4v3-loading, .h4v3-error { display: grid; gap: 8px; border: 1px dashed var(--border, #3b4350); border-radius: 10px; padding: 22px; color: var(--text-secondary, #b8bec8); }
 .h4v3-error { border-color: #a85b5b; }

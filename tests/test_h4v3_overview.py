@@ -56,11 +56,15 @@ def test_projection_counts_and_need_you_are_read_only() -> None:
             [
                 ("t-ready", "Ready", "ready", "worker", None, 0, 0, None, "github:rhgo1749/a:issue:1", ""),
                 ("t-run", "Run", "running", "worker", None, 0, 0, None, None, ""),
-                ("t-review", "Review", "review", None, None, 0, 0, None, None, ""),
+                ("t-review", "Review", "review", None, None, 0, 0, None, "github:rhgo1749/H4V3-DJ:issue:88", ""),
                 ("t-blocked", "Input", "blocked", None, "needs_input", 0, 0, None, None, ""),
                 ("t-plain", "Plain", "blocked", None, None, 0, 0, None, None, ""),
             ],
-            [("t-review", "github_pr_rework", json.dumps({"reason": "agent_rework"}), 10)],
+            [("t-review", "github_pr_rework", json.dumps({
+                "reason": "agent_rework",
+                "repository": "rhgo1749/H4V3-DJ",
+                "pr_number": 144,
+            }), 10)],
         )
         metadata = {"slug": "demo", "name": "Demo", "db_path": str(path)}
         result = overview._load_board_projection(metadata)
@@ -69,10 +73,18 @@ def test_projection_counts_and_need_you_are_read_only() -> None:
         assert result["counts"]["review"] == 1
         assert result["counts"]["blocked"] == 2
         assert result["rework_count"] == 1
+        review_task = next(task for task in result["tasks"] if task["id"] == "t-review")
+        assert review_task["rework_pr_url"] == "https://github.com/rhgo1749/H4V3-DJ/pull/144"
+        assert review_task["rework_pr_number"] == 144
+        assert result["open_prs_url"] and (
+            "is%3Apr%20is%3Aopen" in result["open_prs_url"]
+            and "repo%3Arhgo1749%2FH4V3-DJ" in result["open_prs_url"]
+        )
+        assert "label%3Aagent-rework" not in result["open_prs_url"]
         assert [task["id"] for task in result["tasks"] if task["attention"]] == ["t-blocked"]
         ready_task = next(task for task in result["tasks"] if task["id"] == "t-ready")
         assert ready_task["kanban_url"] == "/kanban?board=demo&task=t-ready"
-        assert result["repositories"] == ["rhgo1749/a"]
+        assert result["repositories"] == ["rhgo1749/a", "rhgo1749/H4V3-DJ"]
         with sqlite3.connect(path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 1
 
