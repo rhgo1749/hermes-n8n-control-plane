@@ -86,11 +86,21 @@ Rules:
 2. `agent-working` present ⇒ no new rework spawn (`working_label_present`).
 3. Another **running Kanban task owning the same PR** ⇒ no spawn
    (`pr_worker_active`, plus the existing board `max_in_progress` cap).
-4. `agent-rework` + `agent-working` simultaneously ⇒ skip with a diagnostic
-   (`lifecycle_label_conflict`), never spawn.
-5. Classic intake (`REVIEW/BLOCKED` + fresh `agent-rework` label) keeps the
-   historical `apply_rework` path; a label **newer than the governing event**
-   always flows through the classic `DONE → REVIEW → READY` path.
+4. `agent-rework` + `agent-working` simultaneously:
+   - while the Kanban task has a live active worker claim, defer with
+     `lifecycle_conflict_deferred_active_worker`; keep both labels untouched so
+     the worker's ownership remains observable and the newer request is not
+     swallowed;
+   - after the worker run ends, remove stale `agent-working`, preserve the
+     newer `agent-rework`, and let the normal `REVIEW -> READY` intake consume
+     it;
+   - any other ambiguous lifecycle combination still skips with a diagnostic
+     (`lifecycle_label_conflict`) and never spawns.
+5. Classic intake (`REVIEW/BLOCKED` + fresh `agent-rework` label), plus a
+   false-terminal `DONE + OPEN PR` card with a fresh trusted
+   `AGENT_REWORK_RETRY`, flows through the bounded `DONE -> REVIEW -> READY`
+   path. A label **newer than the governing event** always flows through the
+   classic path.
 6. A consumed round with current-round `github_pr_rework_attention` that an
    operator recovers to `REVIEW` may use the explicit retry admission only
    while the stale `agent-rework` label is present. Normal `review`/

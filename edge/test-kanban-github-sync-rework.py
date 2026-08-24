@@ -4595,6 +4595,126 @@ def test_121_done_open_pr_valid_delivery_also_review():
           str(task_row(tid)))
 
 
+def test_122_done_open_pr_new_rework_label_opens_new_round():
+    """RC1+RC4 regression: a DONE card whose linked PR is OPEN must not be a
+    dead end for a fresh trusted agent-rework request.
+
+    Incident t_aff9017c / ctrl-hangul#74 round-19: the core review lane
+    completed the card DONE, then the maintainer added agent-rework with an
+    AGENT_REWORK_RETRY comment.  The old edge ignored the retry because
+    _consume_explicit_rework_retry only ran for status == "review", and the
+    classic intake only ran for review/blocked — leaving the label stranded.
+    """
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000122"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="completed",
+                      summary="round delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivery -> review
+    # Core lane completes provisionally: DONE while the PR is still open.
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    _close_reviewer_completion(tid)
+    assert task_row(tid)["status"] == "done"
+    # Fresh maintainer rework request AFTER the done completion: label + retry
+    # comment postdate every prior event for this task.
+    new_label_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 900))
+    fake.pr_timeline[PR_N] = labeled_timeline(new_label_at)
+    fake.pr_labels[PR_N] = ["agent-rework"]
+    _post_retry_comment(fake, tid, when=new_label_at)
+    results = run_sync(fake)
+    entries = [r for r in results if r.get("task_id") == tid]
+    row = task_row(tid)
+    check("122: new round opens from done", row["status"] == "ready",
+          str(entries))
+    check("122: retry consumed",
+          any(r.get("reason") in {"maintainer_retry_consumed",
+                                  "maintainer_retry_predicted"}
+              for r in entries), str(entries))
+
+
+def test_123_working_plus_fresh_rework_defers_until_worker_ends():
+    """RC3 regression: an ACTIVE worker's agent-working plus a fresh trusted
+    agent-rework must defer the conflict instead of failing closed forever.
+
+    The deferral holds only while the worker run is still open; once the run
+    ends, the stale agent-working is cleaned and the pending round proceeds.
+    """
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    # Start a live worker for the current round (claim + open run).
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    # A fresh maintainer rework request arrives mid-round.
+    mid_label_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+    fake.pr_timeline[PR_N] = labeled_timeline(mid_label_at)
+    fake.pr_labels[PR_N] = ["agent-working", "agent-rework"]
+    results = run_sync(fake)
+    check("123: deferred while worker active", any(
+        r.get("reason") == "lifecycle_conflict_deferred_active_worker"
+        for r in results), str(results))
+    check("123: no fail-closed conflict entry", not any(
+        r.get("reason") == "lifecycle_label_conflict" for r in results),
+        str(results))
+    check("123: labels untouched during deferral",
+          sorted(fake.pr_labels.get(PR_N, [])) ==
+          ["agent-rework", "agent-working"], str(fake.pr_labels))
+    check("123: card stays running", task_row(tid)["status"] == "running")
+
+    # Worker finishes WITHOUT resolving the new request: the stale
+    # agent-working must now be cleaned so the pending round can proceed.
+    final_head = "0123456789abcdef0123456789abcdef00000123"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="completed",
+                      summary="worker finished cleanly")
+    run_sync(fake)
+    labels = fake.pr_labels.get(PR_N, [])
+    row = task_row(tid)
+    check("123: stale working removed after run end",
+          "agent-working" not in labels, str(labels))
+    check("123: pending rework preserved", "agent-rework" in labels,
+          str(labels))
+    check("123: done card repaired to review while PR open",
+          row["status"] == "review" and row["completed_at"] is None,
+          str(row))
+
+
+def test_124_done_open_pr_self_heal_without_any_labels():
+    """RC1 invariant sweep: DONE + OPEN PR repairs to REVIEW even when no
+    lifecycle label is present at all (pure invariant, no delivery needed).
+    """
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000124"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, outcome="completed",
+                      summary="delivered")
+    _post_completion_marker(fake, tid, final_head)
+    run_sync(fake)  # delivered -> review
+    with connect_closing() as conn:
+        claimed = kanban_db.claim_review_task(conn, tid)
+        assert claimed is not None
+        conn.commit()
+    _close_reviewer_completion(tid)
+    assert task_row(tid)["status"] == "done"
+    fake.pr_labels[PR_N] = []  # no lifecycle labels at all
+    results = run_sync(fake)
+    row = task_row(tid)
+    check("124: repaired to review", row["status"] == "review", str(results))
+    check("124: completed_at cleared", row["completed_at"] is None, str(row))
+    check("124: no attention hold", not any(
+        r.get("reason") == "rework_human_attention" for r in results),
+        str(results))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -4706,6 +4826,9 @@ def main() -> int:
         test_120_classic_review_label_readdition_unchanged,
         test_120_done_open_pr_incomplete_delivery_repairs_to_review,
         test_121_done_open_pr_valid_delivery_also_review,
+        test_122_done_open_pr_new_rework_label_opens_new_round,
+        test_123_working_plus_fresh_rework_defers_until_worker_ends,
+        test_124_done_open_pr_self_heal_without_any_labels,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

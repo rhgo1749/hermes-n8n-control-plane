@@ -2018,6 +2018,7 @@ def apply_decision(
             "error": "gate evidence unavailable",
         }
     guard = _dependency_guard_sql()
+    parked_comment: Optional[str] = None
     if desired == "review":
         # DONE -> REVIEW (required PR open / closed-not-merged).
         new_body = row["body"]
@@ -2142,12 +2143,12 @@ def apply_rework(
     round (one-shot consumption).
     """
     row = conn.execute(
-        "SELECT status, body FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, body, completed_at FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return {"task_id": task_id, "changed": False, "reason": "task_missing"}
     current_status = str(row["status"])
-    if current_status not in {"review", "blocked"}:
+    if current_status not in {"review", "blocked", "done"}:
         return {
             "task_id": task_id,
             "status": current_status,
@@ -2192,6 +2193,7 @@ def apply_rework(
         "pr_number": rework.pr_number,
         "head_sha": rework.head_sha,
         "request_comment_id": rework.request_comment_id,
+        "label_added_at": rework.label_added_at,
         "reason": "agent_rework",
         "rework_round": rework_round,
         "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
@@ -2785,6 +2787,20 @@ def _rework_delivery_evidence(
 ) -> tuple[bool, str, dict[str, Any]]:
     """Check the complete remote-delivery contract without mutating state."""
     payload, rework_at, _ = event
+    # A pending newer rework request (a trusted agent-rework label addition
+    # postdating this round's governing event) means this round is spent:
+    # its delivery can no longer project REVIEW-READY because that would
+    # swallow the maintainer's newer request (t_aff9017c incident).  The
+    # caller repairs the card through the classic DONE -> REVIEW path and
+    # the classic intake owns the new round on a later tick.
+    if _label_is_newer_than_event(
+        client,
+        ref,
+        pr.number,
+        rework_at,
+        current_label_at=payload.get("label_added_at"),
+    ):
+        return False, "delivery_superseded_by_new_rework", {"rework_at": rework_at}
     run = _task_run_after_rework(conn, task_id, rework_at)
     if run is None or run["ended_at"] is None:
         return False, "delivery_run_missing", {"rework_at": rework_at}
@@ -3406,13 +3422,22 @@ def _label_is_newer_than_event(
     ref: GithubTaskRef,
     pr_number: int,
     event_at: int,
+    current_label_at: Optional[int] = None,
 ) -> bool:
-    """True when the newest agent-rework label addition postdates the round."""
+    """True when a newer agent-rework label addition follows this round.
+
+    The governing event is written a few seconds AFTER the label is observed,
+    so comparing only against ``event_at`` falsely classifies the current
+    round's own label as a newer request.  Persisted ``label_added_at`` binds
+    the event to the label that opened the round; legacy events fall back to
+    the event timestamp.
+    """
     events = _labeled_events(client, ref, pr_number)
     if not events:
         return False
     latest_label_at, _ = max(events, key=lambda item: item[0])
-    return latest_label_at > event_at
+    baseline = max(int(event_at), int(current_label_at or 0))
+    return latest_label_at > baseline
 
 
 def _latest_delivery_head(
@@ -3759,26 +3784,22 @@ def _find_rework_retry_signal(
     return None
 
 
-def _consume_explicit_rework_retry(
+def _has_fresh_retry_comment(
     conn: sqlite3.Connection,
     client: Any,
     ref: GithubTaskRef,
-    decision: GithubCompletionDecision,
     task_id: str,
+    row: Mapping[str, Any],
     context: Mapping[str, Any],
-    *,
-    dry_run: bool,
-) -> Optional[dict[str, Any]]:
-    """Start a NEW rework round from an explicit maintainer retry.
+) -> bool:
+    """Cheap existence probe for an unconsumed trusted retry comment.
 
-    Runs only for a BLOCKED card held by a consumed rework round (the
-    rework_human_attention hold).  When a fresh trusted
-    ``AGENT_REWORK_RETRY`` comment exists, the held round is closed and a
-    new ``github_pr_rework`` event (``trigger: maintainer_retry``) is
-    written through the classic ``apply_rework`` intake, so the edge
-    dispatch lane claims the new round exactly like a label-requested
-    round.  Returns ``None`` when no valid retry signal exists — the
-    caller keeps the fail-closed attention path.
+    Mirrors the baseline/consumption rules of
+    ``_consume_explicit_rework_retry`` (postdates the round event, the last
+    attention record, and the provisional completion; never consumed) but
+    without re-verifying the source Issue — used purely as a gate so a DONE
+    card without any retry signal keeps flowing through the ordinary repair
+    paths.
     """
     event = context["event"]
     _, event_at, _ = event
@@ -3786,6 +3807,62 @@ def _consume_explicit_rework_retry(
         int(event_at or 0),
         _last_rework_attention_at(conn, task_id) or 0,
     )
+    row_completed_at = (
+        row.get("completed_at") if "completed_at" in row.keys() else None
+    )
+    if row_completed_at:
+        try:
+            baseline_at = max(baseline_at, int(row_completed_at))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return _find_rework_retry_signal(
+            client,
+            ref,
+            int(context["pr_number"]),
+            task_id,
+            baseline_at=baseline_at,
+            consumed_ids=_consumed_retry_comment_ids(conn, task_id),
+        ) is not None
+    except GithubCompletionError:
+        return False
+
+
+def _consume_explicit_rework_retry(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    task_id: str,
+    row: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    """Start a NEW rework round from an explicit maintainer retry.
+
+    Runs for a card held by a consumed rework round's attention hold
+    (``rework_human_attention``) or parked in a false-terminal DONE while
+    its linked PR is still OPEN.  When a fresh trusted
+    ``AGENT_REWORK_RETRY`` comment exists, the held/spent round is closed
+    and a new ``github_pr_rework`` event (``trigger: maintainer_retry``)
+    is written through the classic ``apply_rework`` intake, so the edge
+    dispatch lane claims the new round exactly like a label-requested
+    round.  Returns ``None`` when no valid retry signal exists — the
+    caller keeps its fail-closed / repair path.
+    """
+    event = context["event"]
+    _, event_at, _ = event
+    row_completed_at = row.get("completed_at") if "completed_at" in row.keys() else None
+    baseline_at = max(
+        int(event_at or 0),
+        _last_rework_attention_at(conn, task_id) or 0,
+    )
+    if row_completed_at:
+        try:
+            baseline_at = max(baseline_at, int(row_completed_at))
+        except (TypeError, ValueError):
+            pass
     consumed_ids = _consumed_retry_comment_ids(conn, task_id)
     try:
         retry_comment = _find_rework_retry_signal(
@@ -3995,6 +4072,67 @@ def _reconcile_rework_lifecycle(
             # lane in the same tick.
 
     if len(labels & lifecycle) > 1:
+        # RC3 (t_aff9017c incident): an ACTIVE worker legitimately owns
+        # agent-working while a fresh trusted agent-rework request arrives
+        # mid-round.  Fail-closed here would strand the pending round behind
+        # an operator hand-restore, so defer instead: the worker keeps its
+        # label and the new request stays on the PR.  The deferral holds only
+        # while the worker's run is open — once it ends, the stale
+        # agent-working is cleaned below and the pending round proceeds.
+        if WORKING_LABEL in labels and _task_has_active_rework_claim(conn, row):
+            return {
+                "task_id": task_id,
+                "status": status,
+                "changed": False,
+                "reason": "lifecycle_conflict_deferred_active_worker",
+                "lifecycle": {"labels": sorted(labels)},
+            }
+        # RC1 invariant sweep: never leave a GitHub-backed card parked in
+        # false-terminal DONE while its linked PR is still OPEN.  Repair
+        # DONE -> REVIEW first (clearing the stale non-rework labels) and let
+        # the next tick re-evaluate the remaining conflict against REVIEW.
+        if status == "done" and context["pr"].state == "open":
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": "done", "changed": True,
+                    "reason": "done_open_pr_repair_predicted",
+                    "diagnostic": "lifecycle_label_conflict",
+                    "lifecycle": {"labels": sorted(labels)},
+                }
+            try:
+                context_block = _build_context_block(
+                    client, ref, decision.pull_requests
+                )
+            except GithubCompletionError:
+                context_block = None
+            with conn:
+                db_result = apply_decision(
+                    conn, task_id, decision, context_block=context_block,
+                )
+            try:
+                _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                    client, ref, int(context["pr_number"]),
+                    add=(REVIEW_READY_LABEL,),
+                    remove=(WORKING_LABEL,),
+                )
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id,
+                    "status": str(db_result.get("status") or "review"),
+                    "changed": bool(db_result.get("changed")),
+                    "reason": "review_ready_label_projection_failed",
+                    "error": str(exc),
+                    "diagnostic": "lifecycle_label_conflict",
+                }
+            return {
+                "task_id": task_id,
+                "status": str(db_result.get("status") or "review"),
+                "changed": bool(db_result.get("changed")),
+                "reason": "lifecycle_conflict_done_repaired_to_review",
+                "previous_status": status,
+                "label_action": label_reason,
+                "lifecycle": label_evidence,
+            }
         print(
             f"kanban-github-sync: lifecycle label conflict for {ref.repository}#{context['pr_number']} task={task_id}",
             file=sys.stderr,
@@ -4012,15 +4150,33 @@ def _reconcile_rework_lifecycle(
     # authorizes this narrow retry ingress.  Normal review-ready cards and
     # ordinary REVIEW label intake never enter this branch; a lifecycle-label
     # conflict has already failed closed above.
+    # A false-terminal DONE card with an OPEN PR also accepts an explicit
+    # maintainer retry (RC4, t_aff9017c incident): without this the maintainer
+    # re-request is stranded because no lane owns DONE.  The DONE gate does
+    # not require a prior attention record — the fresh trusted retry comment
+    # itself is the human evidence — but the comment must postdate the
+    # provisional completion (enforced by the baseline in
+    # _consume_explicit_rework_retry).  A DONE card WITHOUT any retry comment
+    # must not be held here: it falls through to the delivery/repair paths so
+    # the ordinary DONE + OPEN PR repair keeps working.
     if (
-        status == "review"
+        status in {"review", "done"}
         and context["pr"].state == "open"
         and REWORK_LABEL in labels
+        and WORKING_LABEL not in labels
     ):
-        attention_at = _current_rework_attention_at(conn, task_id, context["event"])
-        if attention_at is not None:
+        has_retry_signal = _has_fresh_retry_comment(
+            conn, client, ref, task_id, row, context,
+        )
+        attention_at = (
+            None if status == "done"
+            else _current_rework_attention_at(conn, task_id, context["event"])
+        )
+        if (status == "done" and has_retry_signal) or (
+            status == "review" and attention_at is not None
+        ):
             retry_result = _consume_explicit_rework_retry(
-                conn, client, ref, decision, task_id, context,
+                conn, client, ref, decision, task_id, row, context,
                 dry_run=dry_run,
             )
             if retry_result is not None:
@@ -4050,7 +4206,7 @@ def _reconcile_rework_lifecycle(
         # the card stays BLOCKED with the attention record — the
         # self-heal-restored agent-rework label is never retry evidence.
         retry_result = _consume_explicit_rework_retry(
-            conn, client, ref, decision, task_id, context,
+            conn, client, ref, decision, task_id, row, context,
             dry_run=dry_run,
         )
         if retry_result is not None:
@@ -4236,8 +4392,41 @@ def _reconcile_rework_lifecycle(
             }
         return None  # dispatch lane owns intake
     if REWORK_LABEL in labels and status == "done" and _label_is_newer_than_event(
-        client, ref, int(context["pr_number"]), int(context["event_at"]),
+        client,
+        ref,
+        int(context["pr_number"]),
+        int(context["event_at"]),
+        current_label_at=context["event"][0].get("label_added_at"),
     ):
+        # RC2 (t_aff9017c incident): a fresh rework request postdating the
+        # round means the worker is gone — any lingering agent-working label
+        # is stale ownership from a projection that never ran.  Clean it so
+        # the pending request stays the single lifecycle signal, then hand
+        # this tick to the classic DONE -> REVIEW repair below.
+        if WORKING_LABEL in labels:
+            if dry_run:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "stale_working_clean_predicted",
+                    "lifecycle": {"labels": sorted(labels)},
+                }
+            try:
+                _, label_reason, label_evidence = _project_pr_lifecycle_labels(
+                    client, ref, int(context["pr_number"]),
+                    add=(REWORK_LABEL,),
+                    remove=(WORKING_LABEL, REVIEW_READY_LABEL),
+                )
+            except GithubCompletionError as exc:
+                return {
+                    "task_id": task_id, "status": status, "changed": False,
+                    "reason": "stale_working_clean_failed", "error": str(exc),
+                }
+            return {
+                "task_id": task_id, "status": status, "changed": False,
+                "reason": "stale_working_cleaned_new_round_pending",
+                "label_action": label_reason,
+                "lifecycle": label_evidence,
+            }
         return None
 
     if context["pr"].state == "open":
@@ -4303,11 +4492,23 @@ def _reconcile_rework_lifecycle(
                 if repair is not None:
                     entry["repair"] = repair
                 if status in {"running", "review", "done"}:
+                    # A pending newer rework request (postdating this round)
+                    # survives the delivery projection untouched: the classic
+                    # REVIEW -> READY intake owns it on the next tick.
+                    pending_rework = REWORK_LABEL in labels and _label_is_newer_than_event(
+                        client,
+                        ref,
+                        int(context["pr_number"]),
+                        int(context["event_at"]),
+                        current_label_at=context["event"][0].get("label_added_at"),
+                    )
                     try:
                         _, label_reason, label_evidence = _project_pr_lifecycle_labels(
                             client, ref, int(context["pr_number"]),
                             add=(REVIEW_READY_LABEL,),
-                            remove=(REWORK_LABEL, WORKING_LABEL),
+                            remove=()
+                            + ((WORKING_LABEL,) if pending_rework else ())
+                            + (() if pending_rework else (REWORK_LABEL, WORKING_LABEL)),
                         )
                     except GithubCompletionError as exc:
                         return {
