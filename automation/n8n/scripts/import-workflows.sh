@@ -97,6 +97,67 @@ wait_for_n8n_health() {
   return 1
 }
 
+CANARY_HTTP_STATUS="000"
+
+run_canary_once() {
+  local response_file="$RUNTIME_DIR/canary-response.json"
+  local http_status
+
+  if ! http_status="$(curl --silent --show-error --max-time 30 \
+    --config "$CURL_CONFIG" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    --data-binary "$CANARY_PAYLOAD" \
+    -o "$response_file" \
+    -w '%{http_code}' \
+    "$EDGE_SYNC_WEBHOOK_URL")"; then
+    CANARY_HTTP_STATUS="000"
+    return 1
+  fi
+  CANARY_HTTP_STATUS="$http_status"
+  [[ "$http_status" =~ ^2[0-9][0-9]$ ]] || return 1
+
+  python3 - "$response_file" <<'PY2'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+items = value if isinstance(value, list) else [value]
+
+
+def mappings(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from mappings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from mappings(child)
+
+
+if not any(
+    item.get("ignored") is True
+    and item.get("reason") == "unsupported_pull_request_action"
+    for value in items
+    for item in mappings(value)
+):
+    raise SystemExit(1)
+PY2
+}
+
+wait_for_canary() {
+  local attempts="${1:-30}"
+  local attempt
+  for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+    if run_canary_once; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 preflight_actuator() {
   local response
   if ! response="$(curl --fail --silent --show-error --max-time 5 "$ACTUATOR_HEALTH_URL")"; then
@@ -260,40 +321,27 @@ for name in ("GitHub edge sync webhook", "Run edge sync actuator"):
 PY
 
 CANARY_PAYLOAD='{"repository":"example/unsupported-canary","event":"pull_request","action":"opened","merged":false,"label":"","delivery":"hermes-n8n-deploy-canary"}'
-CANARY_RESPONSE=""
-if ! CANARY_RESPONSE="$(curl --fail --silent --show-error --max-time 30 \
-  --config "$CURL_CONFIG" \
-  -X POST \
-  -H "Content-Type: application/json" \
-  --data-binary "$CANARY_PAYLOAD" \
-  "$EDGE_SYNC_WEBHOOK_URL")"; then
-  fail "production edge-sync Webhook canary failed"
-fi
-if ! printf '%s' "$CANARY_RESPONSE" | python3 -c '
-import json
-import sys
+if ! wait_for_canary 30; then
+  if [[ "$CANARY_HTTP_STATUS" != "404" ]]; then
+    fail "production edge-sync Webhook canary failed (HTTP $CANARY_HTTP_STATUS)"
+  fi
 
-value = json.load(sys.stdin)
-items = value if isinstance(value, list) else [value]
-
-def mappings(value):
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from mappings(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from mappings(child)
-
-if not any(
-    item.get("ignored") is True
-    and item.get("reason") == "unsupported_pull_request_action"
-    for value in items
-    for item in mappings(value)
-):
-    raise SystemExit(1)
-'; then
-  fail "production edge-sync Webhook canary was not an unsupported-action no-op"
+  # n8n 2.32.x can retain an imported workflow's inactive runtime registry
+  # after publish/restart, especially when the record previously contained an
+  # unsupported node. Re-publish only this managed workflow so the registry is
+  # rebuilt without touching unrelated workflows.
+  if ! n8n_cli unpublish:workflow --help >/dev/null 2>&1; then
+    fail "production edge-sync Webhook remained unregistered and n8n unpublish command is unavailable"
+  fi
+  n8n_cli unpublish:workflow --id="$MANAGED_WORKFLOW_ID"
+  n8n_cli publish:workflow --id="$MANAGED_WORKFLOW_ID"
+  "${compose[@]}" restart n8n
+  if ! wait_for_n8n_health 30; then
+    fail "n8n did not become healthy after republish fallback"
+  fi
+  if ! wait_for_canary 30; then
+    fail "production edge-sync Webhook canary remained unregistered after republish fallback (HTTP $CANARY_HTTP_STATUS)"
+  fi
 fi
 
 echo "Published managed GitHub PR edge-sync workflow with runtime credential binding."
