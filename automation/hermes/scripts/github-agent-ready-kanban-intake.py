@@ -1175,57 +1175,87 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
         return False
 
 
-def _merged_linked_pr_numbers(token: str, repository: str, issue_number: int) -> tuple[int, ...]:
-    """Return linked PR numbers proven merged into the default branch.
+_GITHUB_GRAPHQL_API = "https://api.github.com/graphql"
 
-    Discovery uses the Issue timeline's ``cross-referenced`` events (the same
-    source the edge sync trusts) and re-queries each referenced pull request
-    from its canonical endpoint. Only PRs with ``merged == true`` count; a
-    query failure raises (fail-closed: the caller must not silently treat an
-    unverifiable Issue as complete).
-    """
-    merged: list[int] = []
-    seen: set[int] = set()
-    timeline, _ = _github_json(
-        token,
-        f"/repos/{repository}/issues/{issue_number}/timeline",
-        {"per_page": 100},
+
+def _github_graphql(token: str, query: str, variables: dict[str, Any]) -> Any:
+    """Run one GraphQL query (fail-closed: raises on HTTP or payload errors)."""
+    payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+    request = Request(
+        _GITHUB_GRAPHQL_API,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "hermes-kanban-github-issue-intake",
+        },
+        method="POST",
     )
-    if not isinstance(timeline, list):
-        raise IntakeError(
-            f"invalid Issue timeline response for {repository}#{issue_number}"
-        )
-    for event in timeline:
-        if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+    try:
+        with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise IntakeError(f"GitHub GraphQL query failed: {exc}") from exc
+    except (ValueError, KeyError) as exc:
+        raise IntakeError(f"invalid GitHub GraphQL response: {exc}") from exc
+    if not isinstance(body, dict) or body.get("errors"):
+        errors = body.get("errors") if isinstance(body, dict) else None
+        raise IntakeError(f"GitHub GraphQL errors: {errors}")
+    return body.get("data")
+
+
+def _closing_merged_pr_numbers(token: str, repository: str, issue_number: int) -> tuple[int, ...]:
+    """Return PR numbers that GitHub itself proves CLOSE this Issue AND are merged.
+
+    Source of truth is GitHub's own closing relationship
+    (``PullRequest.closingIssuesReferences`` — populated only by real closing
+    keywords like Closes/Fixes/Resolves), never a bare ``cross-referenced``
+    timeline event. A plain mention ("follow-up #72", "see #71") does NOT
+    create a closing relationship, so mentioning PRs can no longer clear an
+    open Issue's agent-ready label. Any lookup failure raises (fail-closed:
+    the caller must not silently treat an unverifiable Issue as complete).
+    """
+    owner, _, name = repository.partition("/")
+    if not owner or not name:
+        raise IntakeError(f"invalid repository name: {repository!r}")
+    query = (
+        "query($owner:String!,$name:String!,$issue:Int!){"
+        "repository(owner:$owner,name:$name){"
+        "issue(number:$issue){"
+        "timelineItems(first:100,itemTypes:CROSS_REFERENCED_EVENT){"
+        "nodes{... on CrossReferencedEvent{source{... on PullRequest{"
+        "number merged closingIssuesReferences(first:20){nodes{number}}}}}}}}}}"
+    )
+    data = _github_graphql(token, query, {
+        "owner": owner, "name": name, "issue": int(issue_number),
+    })
+    repo_payload = data.get("repository") if isinstance(data, dict) else None
+    issue_payload = repo_payload.get("issue") if isinstance(repo_payload, dict) else None
+    if issue_payload is None:
+        # Unknown/removed Issue: nothing can be proven closed.
+        return ()
+    timeline = (
+        issue_payload.get("timelineItems", {}).get("nodes", [])
+        if isinstance(issue_payload, dict) else []
+    )
+    closing: set[int] = set()
+    for node in timeline:
+        if not isinstance(node, dict):
             continue
-        source = event.get("source")
+        source = node.get("source")
         if not isinstance(source, dict):
             continue
-        source_issue = source.get("issue")
-        if not isinstance(source_issue, dict):
-            continue
-        if not isinstance(source_issue.get("pull_request"), dict):
-            continue
-        number = source_issue.get("number")
         try:
-            number = int(number)
+            pr_number = int(source.get("number"))
         except (TypeError, ValueError):
             continue
-        if number in seen or number <= 0:
+        if source.get("merged") is not True:
             continue
-        pr, _ = _github_json(token, f"/repos/{repository}/pulls/{number}", {})
-        if not isinstance(pr, dict):
-            raise IntakeError(f"invalid pull request payload for {repository}#{number}")
-        seen.add(number)
-        base = pr.get("base")
-        merged_into_branch = (
-            pr.get("merged") is True
-            and isinstance(base, dict)
-            and bool(base.get("ref"))
-        )
-        if merged_into_branch:
-            merged.append(number)
-    return tuple(sorted(merged))
+        closing_refs = source.get("closingIssuesReferences") or {}
+        for ref in closing_refs.get("nodes", []):
+            if isinstance(ref, dict) and int(ref.get("number") or -1) == int(issue_number):
+                closing.add(pr_number)
+    return tuple(sorted(closing))
 
 
 def _issue_candidates(
@@ -1473,19 +1503,20 @@ def _run(args: argparse.Namespace) -> int:
         if args.dry_run:
             results.append({"key": key, "board": config.board, "title": issue.get("title", "")})
             continue
-        # Completed-work guard: an OPEN agent-ready Issue whose every linked
-        # PR is already merged has no remaining automated work. Creating a
-        # card here would only re-run the verify-only cycle (intake → edge
-        # merge proof → done). Skip the card and clear the agent-ready label
-        # (same atomic label-clear contract as closed-issue cleanup) so the
-        # re-intake loop cannot recur on the next tick.
+        # Completed-work guard: an OPEN agent-ready Issue that a merged PR
+        # actually CLOSES (GitHub's own closing relationship — Closes/Fixes/
+        # Resolves) has no remaining automated work. A bare cross-reference
+        # ("follow-up #72", "see #71") is NEVER completion evidence; treating
+        # mentions as done wrongly stripped agent-ready from open follow-up
+        # issues (ctrl-hangul#72 hotfix). Skip + label-clear only when GitHub
+        # itself proves the closing relation.
         try:
-            merged_prs = _merged_linked_pr_numbers(
+            merged_prs = _closing_merged_pr_numbers(
                 token, config.name, int(issue["number"])
             )
         except IntakeError as exc:
             raise IntakeError(
-                f"merged-PR lookup failed for {config.name}#{issue['number']}: {exc}"
+                f"closing-relationship lookup failed for {config.name}#{issue['number']}: {exc}"
             ) from exc
         if merged_prs and not args.dry_run:
             labels = _issue_labels(issue)
