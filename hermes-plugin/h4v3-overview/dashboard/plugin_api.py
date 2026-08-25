@@ -13,6 +13,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any, Mapping, Optional
 
 try:
@@ -206,6 +207,35 @@ def _repository_from_key(value: Any) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _latest_rework_payload(events: list[sqlite3.Row]) -> dict[str, Any]:
+    """Newest actionable rework event payload (events are newest-first)."""
+    for event in events:
+        payload = _json_payload(event["payload"])
+        if payload.get("repository") and payload.get("pr_number"):
+            return payload
+    return {}
+
+
+def _github_pr_url(repository: Any, pr_number: Any) -> Optional[str]:
+    """Canonical GitHub PR URL from rework event provenance (read-only link)."""
+    repo = str(repository or "").strip()
+    number = str(pr_number or "").strip()
+    if repo and number.isdigit() and "/" in repo and "://" not in repo:
+        return f"https://github.com/{repo}/pull/{number}"
+    return None
+
+
+def _github_open_prs_url(repositories: list[str]) -> Optional[str]:
+    """All open PRs across this board's repositories (no label filter)."""
+    repos = [repo for repo in repositories if repo and "://" not in repo]
+    if not repos:
+        return None
+    query = "is:pr is:open " + " ".join(
+        f"repo:{repo}" for repo in sorted(repos)
+    )
+    return "https://github.com/pulls?q=" + quote(query.strip(), safe="")
+
+
 def _kanban_url(slug: str, task_id: Optional[str] = None) -> str:
     # The board query is understood by the existing Kanban dashboard. The task
     # query is retained as a stable provenance/deep-link hint without copying
@@ -236,6 +266,7 @@ def _empty_board(metadata: Mapping[str, Any], *, error: Optional[str] = None) ->
         "name": _display_name(metadata, slug),
         "metadata": _public_metadata(metadata),
         "repositories": [],
+        "open_prs_url": None,
         "counts": _empty_counts(),
         "rework_count": 0,
         "recent_meaningful": None,
@@ -322,6 +353,7 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             rework_events = [event for event in task_events if event["kind"] in _REWORK_EVENT_KINDS]
             if status in _ACTIONABLE_STATUSES:
                 rework_count += len(rework_events)
+            latest_rework = _latest_rework_payload(rework_events)
 
             attention = False
             attention_reason = ""
@@ -352,10 +384,18 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
                 "rework_count": len(rework_events),
                 "repository": repository,
                 "kanban_url": _kanban_url(str(board["slug"]), task_id),
+                "rework_pr_url": _github_pr_url(
+                    latest_rework.get("repository"), latest_rework.get("pr_number")
+                ),
+                "rework_pr_number": (
+                    int(latest_rework["pr_number"])
+                    if str(latest_rework.get("pr_number") or "").isdigit() else None
+                ),
             }
             tasks.append(task)
 
         board["repositories"] = sorted(repositories, key=str.casefold)
+        board["open_prs_url"] = _github_open_prs_url(board["repositories"])
         board["rework_count"] = rework_count
         board["recent_meaningful"] = recent_meaningful
         board["tasks"] = tasks

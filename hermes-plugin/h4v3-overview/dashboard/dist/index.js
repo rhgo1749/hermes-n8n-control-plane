@@ -87,6 +87,10 @@
     return item && item.kanban_url ? item.kanban_url : "/kanban";
   }
 
+  function openPrsUrl(board) {
+    return board && board.open_prs_url ? board.open_prs_url : null;
+  }
+
   function SummaryStrip(props) {
     const summary = props.summary || {};
     return h("section", { className: "h4v3-summary", "aria-label": "H4V3 summary" },
@@ -152,8 +156,26 @@
   function ProjectLink(props) {
     const board = props.board || {};
     const slug = board.slug || "default";
-    return h("a", { className: "h4v3-project-link", href: board.kanban_url || "/kanban" },
+    // The board NAME always opens ALL open PRs of the board's repositories
+    // on GitHub — no label filter — keeping GitHub as the canonical review
+    // surface. The ↗ mark signals the external jump; Kanban remains one
+    // click away via each task's own deep link.
+    const githubUrl = openPrsUrl(board);
+    if (!githubUrl) {
+      return h("a", { className: "h4v3-project-link", href: board.kanban_url || "/kanban" },
+        h("span", { className: "h4v3-board-name" }, board.name || slug),
+        h("span", { className: "h4v3-visually-hidden" }, " Board slug: ", slug),
+      );
+    }
+    return h("a", {
+      className: "h4v3-project-link h4v3-project-link--github",
+      href: githubUrl,
+      target: "_blank",
+      rel: "noopener noreferrer",
+      title: "GitHub에서 open PR 목록 열기",
+    },
       h("span", { className: "h4v3-board-name" }, board.name || slug),
+      h("span", { className: "h4v3-board-github-mark", "aria-hidden": "true" }, "↗"),
       h("span", { className: "h4v3-visually-hidden" }, " Board slug: ", slug),
     );
   }
