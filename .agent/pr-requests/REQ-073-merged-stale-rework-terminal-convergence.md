@@ -92,10 +92,13 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
    3. Issue-open / open PR / closed-unmerged PR / GitHub lookup error
       보존
    4. active claim/run/worker ownership 거부
-   5. unrelated/ambiguous ancestor 거부
-   6. fresh-GitHub interleaving에서 late ancestor activation / late active
+   5. unrelated/ambiguous ancestor 및 durable rework/reviewer provenance
+      누락 거부
+   6. pending root의 comments/runs text-source lookup failure가 incomplete
+      PR evidence로 수렴하지 않고 graph/event를 보존하는 fail-closed 경로
+   7. fresh-GitHub interleaving에서 late ancestor activation / late active
       parent insertion 시 graph/event 보존
-   7. cyclic link bounded refusal + diamond/shared-ancestor traversal
+   8. cyclic link bounded refusal + diamond/shared-ancestor traversal
 3. `docs/EDGE_REWORK_LIFECYCLE.md`: terminal convergence contract 추가
 
 ## 4. Explicit non-goals
@@ -119,6 +122,14 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
 - durable evidence: convergence는 `github_pr_sync` event
   (`reason: terminal_merge_convergence`, merged-PR provenance,
   `merge_authority: human`, `auto_merge: false`)로 기록.
+- mutable ancestor provenance: `blocked` node는 exact Issue/PR/head와
+  `rework_round`가 있는 edge-owned `github_pr_rework`(또는 retry) event와
+  canonical developer creation/parent evidence가 있어야 하며, allowed
+  status node는 `kanban-reviewer` creation role과 stale rework parent
+  evidence가 모두 있어야 한다. Status/title/body/Issue/PR 일치만으로는
+  수렴하지 않는다.
+- pending comments/runs lookup failure는 body-only fallback을 금지하고
+  `text_source_lookup_failed`로 graph/event를 보존한다.
 - fresh GitHub evidence 이후 `BEGIN IMMEDIATE` write transaction 안에서
   reachable node/edge closure, status/ownership, cycle/dangling/edge-set
   drift를 재검증하고, drift 시 write/event를 남기지 않는다.
@@ -190,8 +201,10 @@ env -u HERMES_DELEGATED_CHILD_CONTEXT \
 
 **PASS conditions**
 
-- [ ] PR 머지 후 deploy된 edge의 dry-run이 `terminal_merge_convergence`
-      (수렴 시) 또는 classic gate reason(미수렴 시)를 반환
+- [ ] PR 머지 후 deploy된 edge의 dry-run이
+      `terminal_merge_convergence_predicted` (수렴 시)를 반환하고,
+      provenance/lookup 실패 시 `terminal_convergence_node_unconvergeable`
+      또는 `text_source_lookup_failed`를 반환하며 graph/event를 보존
 - [ ] live #88 그래프가 수렴되면 `t_fbd3f0b9 -> done`,
       `t_9a6395f0 -> archived`, `t_7e4e4523 -> done`
 

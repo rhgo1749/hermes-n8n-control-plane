@@ -279,6 +279,13 @@ proven in the same pass:
    is terminal, a stale `blocked` node, or an unstarted
    `todo`/`review`/`ready`/`scheduled` node) and none has an active
    claim/run/worker.
+5. every mutable `blocked` ancestor has a durable edge-owned
+   `github_pr_rework`/retry event whose repository, Issue, PR, round, and
+   full head SHA match the fresh merged-PR evidence;
+6. every mutable allowed-status ancestor has a durable `created` role of
+   `kanban-reviewer`, and its recorded parent set proves that it is the
+   reviewer/waiting node for the stale rework round. Status, title, body, or
+   a matching Issue/PR alone is never sufficient.
 
 The single transaction then terminalizes the graph: the stale `blocked`
 implementation/rework node becomes `done` with explicit GitHub-merge
@@ -303,23 +310,30 @@ graphs remain valid and bounded.
 
 Fail-closed boundaries: open Issue, an open or closed-unmerged required
 PR, a non-authoritative/failing GitHub read, any active claim/run/worker
-ownership, or an unrelated/ambiguous ancestor preserves the graph
-unchanged (the classic `internal_dependency_pending` lane keeps the root
-runnable).  This is not a generic dependency bypass: the gate still
+ownership, missing/mismatched rework or reviewer provenance, or an
+unrelated/ambiguous ancestor preserves the graph unchanged (the classic
+`internal_dependency_pending` lane keeps the root runnable).  Comment/run
+lookup failure is also fail-closed: the edge returns
+`text_source_lookup_failed` instead of treating incomplete handoff text as
+an empty source set. This is not a generic dependency bypass: the gate still
 protects active work, and the classic lane remains the owner of every
-non-qualifying shape.  The convergence entry is
+non-qualifying shape.  A mutating convergence entry is
 `reason: terminal_merge_convergence` (root/blocked) or
-`terminal_merge_convergence_archived_unstarted` (reviewer); refusals
-report `terminal_convergence_active_ownership`,
-`terminal_convergence_node_unconvergeable`, or
-`terminal_convergence_ambiguous_graph` without mutation.
+`terminal_merge_convergence_archived_unstarted` (reviewer); dry-run predicts
+with `terminal_merge_convergence_predicted`. Refusals report
+`terminal_convergence_active_ownership`,
+`terminal_convergence_node_unconvergeable`,
+`terminal_convergence_ambiguous_graph`, or
+`text_source_lookup_failed` without mutation.
 
 `edge/test-kanban-github-sync-terminal-convergence.py` pins the #88
 topology convergence, repeat-pass idempotence without claim/spawn, the
 issue-open / open-PR / closed-unmerged-PR / GitHub-error preservation
-matrix, active-ownership refusal, unrelated-ancestor refusal, late ancestor
-activation and late active-parent insertion during the GitHub read, bounded
-cycle refusal, and diamond/shared-ancestor traversal.
+matrix, active-ownership refusal, unrelated blocked/allowed-status ancestor
+refusal, missing rework provenance, comments/runs lookup failure with
+incomplete PR text, late ancestor activation and late active-parent insertion
+during the GitHub read, bounded cycle refusal, and diamond/shared-ancestor
+traversal.
 
 ## Deployment (host)
 

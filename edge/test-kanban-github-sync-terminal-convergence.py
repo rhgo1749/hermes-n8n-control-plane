@@ -119,10 +119,14 @@ def pr_payload(number: int, *, state: str = "closed", merged: bool = True,
 class FakeGitHub:
     def __init__(self, *, issue_state: str = "closed",
                  pr: dict | None = pr_payload(PR_N),
+                 extra_pr: dict | None = None,
+                 include_timeline_pr: bool = True,
                  fail_pr_fetch: bool = False,
                  on_issue_get: Any = None):
         self.issue_state = issue_state
         self.pr = pr
+        self.extra_pr = extra_pr
+        self.include_timeline_pr = include_timeline_pr
         self.fail_pr_fetch = fail_pr_fetch
         self.on_issue_get = on_issue_get
         self.issue_gets = 0
@@ -140,11 +144,15 @@ class FakeGitHub:
             number = int(path.rsplit("/", 1)[1])
             if number == PR_N:
                 return self.pr, {}
+            if self.extra_pr is not None and number == int(self.extra_pr["number"]):
+                return self.extra_pr, {}
             raise mod.GithubCompletionError(f"unknown PR {number}")
         raise mod.GithubCompletionError(f"unexpected GET: {path}")
 
     def get_paginated(self, path: str, params: Any = None, max_pages: int = 10):
         if path.endswith(f"/issues/{ISSUE_N}/timeline"):
+            if not self.include_timeline_pr:
+                return []
             return [{
                 "event": "cross-referenced",
                 "source": {
@@ -183,21 +191,23 @@ def link_body() -> str:
     return "# Rework / reviewer handoff card (no intake provenance).\n"
 
 
-def _create_task(status: str, body: str, idempotency_key: str) -> str:
+def _create_task(status: str, body: str, idempotency_key: str, *,
+                 assignee: str = "kanban-developer",
+                 parents: list[str] | None = None) -> str:
     with connect_closing() as conn:
         tid = kanban_db.create_task(
             conn,
             title=f"tc73 {idempotency_key}",
             body=body,
-            assignee="kanban-developer",
+            assignee=assignee,
             created_by="tc73-fixture",
             workspace_kind="scratch",
             idempotency_key=idempotency_key,
             skills=["github"],
+            parents=parents or [],
         )
-        if status != "ready":
-            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
-            conn.commit()
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+        conn.commit()
     return tid
 
 
@@ -206,7 +216,8 @@ def build_graph(root_status: str = "todo",
                 reviewer_status: str = "todo",
                 impl_status: str = "done",
                 blocked_claim: str | None = None,
-                extra_ancestor: tuple[str, str] | None = None) -> dict:
+                extra_ancestor: tuple[str, str] | None = None,
+                rework_evidence: bool = True) -> dict:
     """Create the #88-shaped chain and return the node ids used.
 
     Links (parent -> child): impl -> blocked -> reviewer -> root.
@@ -214,13 +225,41 @@ def build_graph(root_status: str = "todo",
     model an unrelated/ambiguous node.
     """
     impl = _create_task(impl_status, link_body(), "impl-88")
-    blocked = _create_task(blocked_status, link_body(), "rework-88")
-    reviewer = _create_task(reviewer_status, link_body(), "reviewer-88")
-    root = _create_task(root_status, intake_body(), "root-88")
+    blocked = _create_task(
+        blocked_status, link_body(), "rework-88", parents=[impl]
+    )
+    reviewer = _create_task(
+        reviewer_status,
+        link_body(),
+        "reviewer-88",
+        assignee="kanban-reviewer",
+        parents=[blocked],
+    )
+    root = _create_task(root_status, intake_body(), "root-88", parents=[reviewer])
     with connect_closing() as conn:
-        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (impl, blocked))
-        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (blocked, reviewer))
-        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (reviewer, root))
+        if rework_evidence:
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (
+                    blocked,
+                    "github_pr_rework",
+                    json.dumps({
+                        "previous_status": "blocked",
+                        "new_status": "ready",
+                        "repository": REPO,
+                        "issue_number": ISSUE_N,
+                        "pr_number": PR_N,
+                        "head_sha": pr_payload(PR_N)["head"]["sha"],
+                        "reason": "agent_rework",
+                        "rework_round": 1,
+                        "source": "github",
+                        "merge_authority": "human",
+                        "auto_merge": False,
+                    }, sort_keys=True),
+                    2,
+                ),
+            )
         if blocked_claim is not None:
             conn.execute(
                 "UPDATE tasks SET claim_lock = ? WHERE id = ?",
@@ -253,6 +292,10 @@ def events_for(task_id: str) -> list[dict]:
             (task_id,),
         ).fetchall()
         return [{"kind": r["kind"], "payload": json.loads(r["payload"] or "{}")} for r in rows]
+
+
+def event_snapshot(ids: dict) -> dict[str, list[dict]]:
+    return {tid: events_for(tid) for tid in ids.values()}
 
 
 def run_sync(fake: FakeGitHub) -> list[dict]:
@@ -359,9 +402,13 @@ def test_2_idempotent_repeat():
 # ---------------------------------------------------------------------------
 def _preserve_graph(name, fake, ids, root_reason="internal_dependency_pending"):
     before = statuses(ids)
+    events_before = event_snapshot(ids)
     results = run_sync(fake)
     after = statuses(ids)
+    events_after = event_snapshot(ids)
     check(f"{name}: graph preserved", before == after, f"{before} -> {after}")
+    check(f"{name}: events preserved", events_before == events_after,
+          f"{events_before} -> {events_after}")
     root_entry = next(r for r in results if r["task_id"] == ids["root"])
     check(f"{name}: root still todo via classic gate",
           root_entry["status"] == "todo" and root_entry["changed"] is False
@@ -444,6 +491,133 @@ def test_5_ambiguous_ancestor():
               root_entry.get("reason") == "terminal_convergence_node_unconvergeable"
               and root_entry["changed"] is False, str(root_entry))
         assert_no_workers(ids)
+
+
+def _unrelated_ancestor_case(status: str, key: str) -> None:
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(issue_state="closed", pr=pr_payload(PR_N, state="closed", merged=True))
+        ids = build_graph(extra_ancestor=(status, key))
+        before = statuses(ids)
+        events_before = event_snapshot(ids)
+        results = run_sync(fake)
+        after = statuses(ids)
+        events_after = event_snapshot(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(f"unrelated {status} ancestor preserves graph", before == after,
+              f"{before} -> {after}")
+        check(f"unrelated {status} ancestor preserves events",
+              events_before == events_after,
+              f"{events_before} -> {events_after}")
+        check(f"unrelated {status} ancestor fails closed",
+              root_entry["changed"] is False
+              and root_entry.get("reason") == "terminal_convergence_node_unconvergeable",
+              str(root_entry))
+        assert_no_workers(ids)
+
+
+def test_5b_unrelated_allowed_status_ancestors():
+    print("5b. unrelated blocked and allowed-status ancestors are preserved")
+    _unrelated_ancestor_case("blocked", "unrelated-blocked")
+    _unrelated_ancestor_case("ready", "unrelated-ready")
+
+
+def test_5c_missing_rework_provenance():
+    print("5c. missing stale rework provenance refuses convergence")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(issue_state="closed", pr=pr_payload(PR_N, state="closed", merged=True))
+        ids = build_graph(rework_evidence=False)
+        before = statuses(ids)
+        events_before = event_snapshot(ids)
+        results = run_sync(fake)
+        after = statuses(ids)
+        events_after = event_snapshot(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check("missing rework provenance preserves graph", before == after,
+              f"{before} -> {after}")
+        check("missing rework provenance preserves events",
+              events_before == events_after,
+              f"{events_before} -> {events_after}")
+        check("missing rework provenance fails closed",
+              root_entry["changed"] is False
+              and root_entry.get("reason") == "terminal_convergence_node_unconvergeable",
+              str(root_entry))
+        assert_no_workers(ids)
+
+
+def _text_source_lookup_failure_case(name: str, failing_attr: str) -> None:
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        extra_pr_number = PR_N + 1
+        fake = FakeGitHub(
+            issue_state="closed",
+            pr=pr_payload(PR_N, state="closed", merged=True),
+            extra_pr=pr_payload(extra_pr_number, state="open", merged=False),
+        )
+        ids = build_graph()
+        with connect_closing() as conn:
+            handoff_url = f"https://github.com/{REPO}/pull/{extra_pr_number}"
+            if failing_attr == "list_comments":
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ids["root"], "kanban-main", f"required handoff: {handoff_url}", 3),
+                )
+            else:
+                kanban_db._synthesize_ended_run(  # type: ignore[attr-defined]
+                    conn,
+                    ids["root"],
+                    outcome="completed",
+                    summary=f"required handoff: {handoff_url}",
+                )
+            conn.commit()
+        before = statuses(ids)
+        events_before = event_snapshot(ids)
+        runs_before = run_counts()
+        original = getattr(kanban_db, failing_attr)
+
+        def fail_lookup(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(f"simulated {failing_attr} failure")
+
+        setattr(kanban_db, failing_attr, fail_lookup)
+        try:
+            results = run_sync(fake)
+        finally:
+            setattr(kanban_db, failing_attr, original)
+
+        after = statuses(ids)
+        events_after = event_snapshot(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(f"{name}: graph preserved", before == after,
+              f"{before} -> {after}")
+        check(f"{name}: events preserved", events_before == events_after,
+              f"{events_before} -> {events_after}")
+        check(f"{name}: lookup failure is fail-closed",
+              root_entry["changed"] is False
+              and root_entry.get("reason") == "text_source_lookup_failed",
+              str(root_entry))
+        check(f"{name}: no worker run spawned", run_counts() == runs_before,
+              f"{runs_before} -> {run_counts()}")
+        for tid, row in after.items():
+            check(f"{name}: no ownership for {tid}",
+                  row["claim_lock"] is None
+                  and row["worker_pid"] is None
+                  and row["current_run_id"] is None,
+                  str(row))
+
+
+def test_5d_comments_lookup_failure():
+    print("5d. pending comments lookup failure preserves graph and events")
+    _text_source_lookup_failure_case("comments lookup failure", "list_comments")
+
+
+def test_5e_runs_lookup_failure():
+    print("5e. pending runs lookup failure preserves graph and events")
+    _text_source_lookup_failure_case("runs lookup failure", "list_runs")
 
 
 def test_6_dry_run_predicts_without_mutation():
@@ -610,12 +784,14 @@ def test_10_diamond_shared_ancestor_converges():
         _prepare_isolated_environment()
         init_db()
         ids = build_graph()
-        second_reviewer = _create_task("todo", link_body(), "reviewer-88-second")
+        second_reviewer = _create_task(
+            "todo",
+            link_body(),
+            "reviewer-88-second",
+            assignee="kanban-reviewer",
+            parents=[ids["blocked"]],
+        )
         with connect_closing() as conn:
-            conn.execute(
-                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                (ids["blocked"], second_reviewer),
-            )
             conn.execute(
                 "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
                 (second_reviewer, ids["root"]),
@@ -651,6 +827,10 @@ def main() -> int:
         test_3_fail_closed,
         test_4_active_ownership,
         test_5_ambiguous_ancestor,
+        test_5b_unrelated_allowed_status_ancestors,
+        test_5c_missing_rework_provenance,
+        test_5d_comments_lookup_failure,
+        test_5e_runs_lookup_failure,
         test_6_dry_run_predicts_without_mutation,
         test_7_late_ancestor_activation_is_refused,
         test_8_late_active_parent_is_refused,
