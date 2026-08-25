@@ -38,6 +38,7 @@ def _uuid(key: str) -> str:
 
 EDGE_SYNC_WORKFLOW_ID = _uuid("github-pr-edge-sync:workflow")
 EDGE_SYNC_WORKFLOW_NAME = "Hermes Webhook · GitHub PR edge sync"
+EDGE_SYNC_WEBHOOK_ID = _uuid("github-pr-edge-sync:webhook-id")
 EDGE_SYNC_CREDENTIAL_ID = _uuid("github-pr-edge-sync:control-token-credential")
 EDGE_SYNC_CREDENTIAL_NAME = "Hermes edge-sync control token"
 EDGE_SYNC_CREDENTIAL_NODE_NAMES = (
@@ -65,6 +66,7 @@ def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
                     "options": {},
                 },
                 "id": _uuid(f"{workflow['slug']}:webhook"),
+                "webhookId": EDGE_SYNC_WEBHOOK_ID,
                 "name": webhook_name,
                 "type": "n8n-nodes-base.webhook",
                 "typeVersion": 2.1,
