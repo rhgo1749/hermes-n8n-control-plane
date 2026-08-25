@@ -69,6 +69,24 @@ class IntakeError(RuntimeError):
     """A deterministic intake prerequisite or command failure."""
 
 
+class BoardOwnership(set[str]):
+    """GitHub owners plus total/non-GitHub task occupancy for one board."""
+
+    task_count: int
+    non_github_task_count: int
+
+    def __init__(
+        self,
+        owners: Iterable[str] = (),
+        *,
+        task_count: int = 0,
+        non_github_task_count: int = 0,
+    ) -> None:
+        super().__init__(owners)
+        self.task_count = int(task_count)
+        self.non_github_task_count = int(non_github_task_count)
+
+
 def _select_repositories(
     configs: tuple[RepositoryConfig, ...],
     repository: str | None,
@@ -734,8 +752,8 @@ def _verify_bootstrap_checkout(repository: str, checkout: str) -> Path:
     return path.resolve()
 
 
-def _board_repository_owners(board: str) -> set[str]:
-    """Read live GitHub provenance for a candidate board before reuse/create."""
+def _board_repository_owners(board: str) -> BoardOwnership:
+    """Read provenance and occupancy for a candidate board before reuse/create."""
     configured_boards_root = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
     boards_root = (
         Path(configured_boards_root).expanduser()
@@ -748,18 +766,43 @@ def _board_repository_owners(board: str) -> set[str]:
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            rows = con.execute(
-                "SELECT idempotency_key FROM tasks WHERE idempotency_key IS NOT NULL"
-            ).fetchall()
+            rows = con.execute("SELECT idempotency_key FROM tasks").fetchall()
         finally:
             con.close()
     except sqlite3.Error as exc:
         raise IntakeError(f"could not inspect existing board ownership for {board}: {exc}") from exc
     owners: set[str] = set()
+    non_github_task_count = 0
     for (raw_key,) in rows:
         match = _GITHUB_ISSUE_KEY.match(str(raw_key or ""))
         if match:
             owners.add(match.group(1).casefold())
+        else:
+            non_github_task_count += 1
+    return BoardOwnership(
+        owners,
+        task_count=len(rows),
+        non_github_task_count=non_github_task_count,
+    )
+
+
+def _validate_existing_bootstrap_board(board: str, repository: str) -> set[str]:
+    """Reject occupied unmanaged boards before a bootstrap create/intake."""
+    raw_ownership = _board_repository_owners(board)
+    owners = set(raw_ownership)
+    if isinstance(raw_ownership, BoardOwnership) and (
+        raw_ownership.non_github_task_count
+        or (raw_ownership.task_count and not owners)
+    ):
+        raise IntakeError(
+            f"bootstrap board {board} is occupied by unmanaged task rows; "
+            "refusing bootstrap"
+        )
+    if owners and owners != {repository.casefold()}:
+        raise IntakeError(
+            f"bootstrap board {board} has conflicting ownership: "
+            f"owned by {', '.join(sorted(owners))}, not {repository}"
+        )
     return owners
 
 
@@ -838,12 +881,7 @@ def _provision_bootstrap_boards(
                 None,
             )
             if existing_slug is not None:
-                owners = _board_repository_owners(existing_slug)
-                if owners and owners != {repository.casefold()}:
-                    raise IntakeError(
-                        f"bootstrap board {existing_slug} has conflicting ownership: "
-                        f"owned by {', '.join(sorted(owners))}, not {repository}"
-                    )
+                _validate_existing_bootstrap_board(existing_slug, repository)
                 continue
             provisioned.append(
                 {
@@ -860,12 +898,7 @@ def _provision_bootstrap_boards(
                 None,
             )
             if existing_slug is not None:
-                owners = _board_repository_owners(existing_slug)
-                if owners and owners != {repository.casefold()}:
-                    raise IntakeError(
-                        f"bootstrap board {existing_slug} has conflicting ownership: "
-                        f"owned by {', '.join(sorted(owners))}, not {repository}"
-                    )
+                _validate_existing_bootstrap_board(existing_slug, repository)
                 continue
             _run_hermes(
                 "kanban",

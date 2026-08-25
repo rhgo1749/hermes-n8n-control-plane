@@ -869,6 +869,39 @@ def test_provision_rejects_foreign_existing_board_owner() -> None:
             setattr(intake, name, value)
 
 
+def test_provision_rejects_occupied_unmanaged_existing_board() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "brand-new",
+        "/ws/projects/brand-new",
+    )
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_board_repository_owners": intake._board_repository_owners,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_run_hermes": intake._run_hermes,
+    }
+    try:
+        intake.__dict__["_board_slugs"] = lambda: {"brand-new"}
+        intake.__dict__["_board_repository_owners"] = lambda board: intake.BoardOwnership(
+            task_count=1,
+            non_github_task_count=1,
+        )
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_run_hermes"] = lambda *args, **kwargs: (
+            (_ for _ in ()).throw(AssertionError("occupied board must not create"))
+        )
+        try:
+            intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+        except intake.IntakeError as exc:
+            assert "occupied" in str(exc)
+        else:
+            raise AssertionError("occupied unmanaged board must fail closed")
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
 def test_provision_without_intents_makes_no_board_calls() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no bootstrap intent, no Hermes CLI calls")

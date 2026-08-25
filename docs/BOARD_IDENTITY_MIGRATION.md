@@ -26,8 +26,10 @@ default archive). No ad-hoc production SQLite writes.
 - multiple legacy boards for one repository;
 - a live canonical board with non-anchor tasks beside a live legacy board
   (canonical conflict);
-- unresolvable checkout when the canonical board must be created
-  (no `--checkout`, no legacy `default_workdir`, no `--checkout-root`);
+- missing or unverified checkout when the canonical board must be created
+  (it must be an existing absolute Git root whose normalized `origin` matches
+  the requested repository; no `--checkout`, no legacy `default_workdir`, or
+  no `--checkout-root` also fails closed);
 - missing/stale/mismatched migration evidence for `transition` /
   `postcheck` / `rollback`.
 - busy migration/intake lease or a legacy task/provenance change observed by
@@ -172,7 +174,7 @@ live mutation):
 - #72-class churn prevention (anchor hit, no duplicate root card; fresh
   registry dry-run `board_provisioning=[]`);
 - fail-closed: non-terminal legacy, mixed provenance, canonical conflict,
-  missing checkout, missing/stale/foreign evidence;
+  missing/non-Git/wrong-origin checkout, missing/stale/foreign evidence;
 - unrelated boards untouched (`default`, other boards);
 - canonical-only display normalization (already on the canonical slug, stale
   display name);

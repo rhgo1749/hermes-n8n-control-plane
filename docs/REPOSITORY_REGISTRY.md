@@ -127,9 +127,9 @@ one bounded exception when no durable provenance exists for the target repo:
 
 1. derive the canonical slug from the repository name with `casefold()`;
 2. find a live board whose directory name matches that slug case-insensitively;
-3. accept it only if the board currently has no GitHub repository provenance ->
-   `resolved_empty_canonical_board`;
-4. if that board carries another repository's provenance ->
+3. accept it only if the board currently has **zero task rows** (no GitHub
+   provenance and no manual/default tasks) -> `resolved_empty_canonical_board`;
+4. if that board is occupied or carries another repository's provenance ->
    `canonical_board_conflict`;
 5. if multiple case-insensitive canonical boards exist ->
    `ambiguous_canonical_boards`;

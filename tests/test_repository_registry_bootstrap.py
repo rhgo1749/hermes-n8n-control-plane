@@ -46,6 +46,20 @@ def test_empty_canonical_board_bootstraps_first_intake() -> None:
         )
 
 
+def test_occupied_unmanaged_canonical_board_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _create_board_db(root, "h4v3-meowcore", ["manual:task"])
+        evidence = registry._kanban_board_repository_evidence(root)
+        board_evidence = evidence["h4v3-meowcore"]
+        assert board_evidence.task_count == 1
+        assert board_evidence.non_github_task_count == 1
+        assert registry._resolve_board("rhgo1749/H4V3-Meowcore", evidence) == (
+            None,
+            "canonical_board_conflict",
+        )
+
+
 def test_noncanonical_empty_board_is_not_guessed() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

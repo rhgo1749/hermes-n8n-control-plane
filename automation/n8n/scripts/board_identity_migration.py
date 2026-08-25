@@ -736,6 +736,73 @@ def _remove_anchors(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_remote(value: str) -> str:
+    """Normalize common GitHub remotes to ``owner/repository``."""
+    raw = value.strip().rstrip("/")
+    raw = raw.removesuffix(".git")
+    for prefix in (
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git://github.com/",
+        "git@github.com:",
+    ):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+            break
+    return raw.strip("/")
+
+
+def _verify_checkout(repository: str, checkout: str) -> str:
+    """Require an existing Git root whose origin matches ``repository``."""
+    path = Path(checkout)
+    if not path.is_absolute():
+        raise MigrationError(f"checkout must be absolute: {checkout}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise MigrationError(f"checkout does not exist: {checkout}") from exc
+    if not resolved.is_dir():
+        raise MigrationError(f"checkout is not an existing directory: {checkout}")
+
+    try:
+        root_proc = subprocess.run(
+            ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MigrationError(f"checkout is not a verified Git root: {checkout}") from exc
+    if root_proc.returncode != 0 or not root_proc.stdout.strip():
+        raise MigrationError(f"checkout is not a verified Git root: {checkout}")
+    try:
+        git_root = Path(root_proc.stdout.strip()).resolve(strict=True)
+    except OSError as exc:
+        raise MigrationError(f"checkout is not a verified Git root: {checkout}") from exc
+    if git_root != resolved:
+        raise MigrationError(f"checkout is not a verified Git root: {checkout}")
+
+    try:
+        remote_proc = subprocess.run(
+            ["git", "-C", str(resolved), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MigrationError(f"checkout origin is unavailable: {checkout}") from exc
+    expected = repository.casefold()
+    if (
+        remote_proc.returncode != 0
+        or _normalise_remote(remote_proc.stdout).casefold() != expected
+    ):
+        raise MigrationError(f"checkout origin mismatch for {repository}: {checkout}")
+    return str(resolved)
+
+
 def _resolve_checkout(
     args: argparse.Namespace,
     repository: str,
@@ -758,9 +825,7 @@ def _resolve_checkout(
         raise MigrationError(
             "cannot resolve checkout: pass --checkout or --checkout-root"
         )
-    if not Path(checkout).is_absolute():
-        raise MigrationError(f"checkout must be absolute: {checkout}")
-    return checkout
+    return _verify_checkout(repository, checkout)
 
 
 def _stage_preflight(
@@ -1407,6 +1472,12 @@ def _stage_rollback_locked(
             "task(s); refusing to remove a populated canonical board"
         )
 
+    # Every rollback precondition must pass before any legacy restore or
+    # canonical/anchor mutation. In particular, a populated canonical board
+    # is post-transition work and must leave both live board paths untouched.
+    if errors:
+        raise MigrationError("rollback failed closed: " + "; ".join(errors))
+
     restored: list[str] = []
     for slug in legacy_slugs:
         if slug in live:
@@ -1439,9 +1510,6 @@ def _stage_rollback_locked(
 
     if canonical_fact is not None and not errors and not dry_run:
         _run_hermes(args.hermes_bin, "kanban", "boards", "rm", canonical_slug)
-
-    if errors:
-        raise MigrationError("rollback failed closed: " + "; ".join(errors))
 
     if not dry_run:
         # Revert to the migrated stage so a corrected retry can re-transition.

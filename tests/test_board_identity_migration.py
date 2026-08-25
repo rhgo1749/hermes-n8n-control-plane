@@ -72,6 +72,38 @@ class Sandbox:
         ):
             self.env.pop(key, None)
 
+    @staticmethod
+    def _ensure_checkout(path: Path, repository: str) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        if not (path / ".git").exists():
+            subprocess.run(
+                ["git", "init", "--quiet", str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        remote = f"https://github.com/{repository}.git"
+        current = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if current.returncode != 0:
+            subprocess.run(
+                ["git", "-C", str(path), "remote", "add", "origin", remote],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        elif current.stdout.strip() != remote:
+            subprocess.run(
+                ["git", "-C", str(path), "remote", "set-url", "origin", remote],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def make_board(
         self,
         slug: str,
@@ -79,6 +111,13 @@ class Sandbox:
         workdir: str | None = None,
         tasks: list[tuple[str, str | None]] | None = None,
     ) -> Path:
+        if workdir:
+            repository = "rhgo1749/ctrl-hangul"
+            for _status, key in tasks or []:
+                if key and key.startswith("github:") and ":issue:" in key:
+                    repository = key[len("github:") :].rsplit(":issue:", 1)[0]
+                    break
+            self._ensure_checkout(Path(workdir), repository)
         board_dir = self.boards_root / slug
         board_dir.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(board_dir / "kanban.db")
@@ -185,6 +224,10 @@ class Sandbox:
         )
 
     def run_with_checkout(self, *args: str) -> subprocess.CompletedProcess:
+        self._ensure_checkout(
+            self.checkout_root / "ctrl-hangul",
+            "rhgo1749/ctrl-hangul",
+        )
         cmd = [
             sys.executable,
             str(MIGRATION),
@@ -667,6 +710,72 @@ def test_missing_checkout_fails_closed(tmp: Path) -> None:
     )
 
 
+def test_missing_checkout_cannot_create_canonical(tmp: Path) -> None:
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    metadata_path = sandbox.boards_root / "ctrlhangul" / "board.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["default_workdir"] = str(tmp / "missing-checkout")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    proc = sandbox.run("migrate", "--repository", repo)
+    assert proc.returncode == 1
+    assert "does not exist" in proc.stderr
+    assert "ctrl-hangul" not in sandbox.live_slugs()
+    assert not sandbox.backup_root.exists()
+
+
+def test_non_git_checkout_cannot_create_canonical(tmp: Path) -> None:
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    checkout = tmp / "non-git-checkout"
+    checkout.mkdir()
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    metadata_path = sandbox.boards_root / "ctrlhangul" / "board.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["default_workdir"] = str(checkout)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    proc = sandbox.run("migrate", "--repository", repo)
+    assert proc.returncode == 1
+    assert "verified Git root" in proc.stderr
+    assert "ctrl-hangul" not in sandbox.live_slugs()
+    assert not sandbox.backup_root.exists()
+
+
+def test_wrong_origin_checkout_cannot_create_canonical(tmp: Path) -> None:
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    checkout = tmp / "wrong-origin-checkout"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(checkout),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "set-url", "origin", "https://github.com/rhgo1749/re-bound.git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    proc = sandbox.run("migrate", "--repository", repo)
+    assert proc.returncode == 1
+    assert "origin mismatch" in proc.stderr
+    assert "ctrl-hangul" not in sandbox.live_slugs()
+    assert not sandbox.backup_root.exists()
+
+
 def test_rollback_restores_and_reruns(tmp: Path) -> None:
     sandbox = Sandbox(tmp)
     repo = "rhgo1749/ctrl-hangul"
@@ -736,10 +845,15 @@ def test_rollback_refuses_populated_canonical(tmp: Path) -> None:
     )
     con.commit()
     con.close()
+    canonical_before = sandbox.board_tasks("ctrl-hangul")
     proc = sandbox.run_with_checkout("rollback", "--confirm-rollback", *common)
     assert proc.returncode == 1
     assert "populated canonical" in proc.stderr
     assert "ctrl-hangul" in sandbox.live_slugs()
+    # Rollback preconditions are all-or-nothing: the legacy board must not be
+    # restored and canonical task/removal state must remain untouched.
+    assert "ctrlhangul" not in sandbox.live_slugs()
+    assert sandbox.board_tasks("ctrl-hangul") == canonical_before
 
 
 def test_transition_rejects_missing_or_stale_evidence(tmp: Path) -> None:
