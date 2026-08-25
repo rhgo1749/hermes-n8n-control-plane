@@ -260,6 +260,55 @@ fail-closed: the card stays in its current state, no duplicate
 forcing recovered `REVIEW` back to `BLOCKED` — is intentionally rejected so
 the normal review lane does not acquire a new state transition.
 
+## Terminal merge convergence of a stale rework graph (Issue #73)
+
+A merged GitHub PR is an authoritative fact, but the internal dependency
+gate holds the intake root open while ANY reachable node is still
+non-terminal -- including *stale* blocked or unstarted rework/reviewer
+nodes whose work was already delivered and merged on GitHub (the H4V3-DJ
+#88 topology: done implementation -> blocked rework -> todo reviewer ->
+todo intake root).  The edge therefore converges such a graph in one
+reconciliation pass, and ONLY when the full authority chain is freshly
+proven in the same pass:
+
+1. the card is a canonical GitHub Issue intake root;
+2. a fresh GitHub read reports the source Issue `closed`;
+3. every required linked PR is freshly read as closed, merged, and
+   targeting the configured target branch;
+4. the reachable dependency-chain nodes are unambiguous (every ancestor
+   is terminal, a stale `blocked` node, or an unstarted
+   `todo`/`review`/`ready`/`scheduled` node) and none has an active
+   claim/run/worker.
+
+The single transaction then terminalizes the graph: the stale `blocked`
+implementation/rework node becomes `done` with explicit GitHub-merge
+provenance (the merge is the authoritative record that the work was
+delivered), the unstarted reviewer/waiting node becomes `archived` (never
+a fabricated reviewer PASS), and the intake root projects to
+authoritative `done` -- each with a durable `github_pr_sync` event
+(`reason: terminal_merge_convergence`, merged-PR provenance,
+`merge_authority: human`, `auto_merge: false`) and stale claim/block
+fields cleared.  A second pass is a no-op, and no worker is ever
+promoted, claimed, spawned, or re-run.
+
+Fail-closed boundaries: open Issue, an open or closed-unmerged required
+PR, a non-authoritative/failing GitHub read, any active claim/run/worker
+ownership, or an unrelated/ambiguous ancestor preserves the graph
+unchanged (the classic `internal_dependency_pending` lane keeps the root
+runnable).  This is not a generic dependency bypass: the gate still
+protects active work, and the classic lane remains the owner of every
+non-qualifying shape.  The convergence entry is
+`reason: terminal_merge_convergence` (root/blocked) or
+`terminal_merge_convergence_archived_unstarted` (reviewer); refusals
+report `terminal_convergence_active_ownership`,
+`terminal_convergence_node_unconvergeable`, or
+`terminal_convergence_ambiguous_graph` without mutation.
+
+`edge/test-kanban-github-sync-terminal-convergence.py` pins the #88
+topology convergence, repeat-pass idempotence without claim/spawn, the
+issue-open / open-PR / closed-unmerged-PR / GitHub-error preservation
+matrix, active-ownership refusal, and unrelated-ancestor refusal.
+
 ## Deployment (host)
 
 The authoritative intake job remains Hermes job `default:bf431b2a6ba6`, but
