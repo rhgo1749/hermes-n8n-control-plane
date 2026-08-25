@@ -313,7 +313,7 @@ hermes kanban show <task-id>
 
 | Validation | Result | Notes |
 |---|---|---|
-| Static/unit (py_compile + exact-file Pyright + diff-check) | PASS | pushed head `74ac1de8a6948ddd599ce16c7c571667459ca5e8`; Pyright 0 errors/warnings/informations |
+| Static/unit (py_compile + exact-file Pyright + diff-check) | PASS | pushed head `c95ba38d3d39b9405c155cf07ad467f99e76ae02`; Pyright 0 errors/warnings/informations |
 | n8n validation | NOT RUN | n8n topology out of scope |
 | Edge terminal convergence | PASS | 95 passed, 0 failed; sabotage restored prior guard behavior: exit 1, 86 passed, 9 failed |
 | Edge rework/head-binding | PASS | 738 passed, 0 failed each |
