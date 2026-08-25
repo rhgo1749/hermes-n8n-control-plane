@@ -1,6 +1,6 @@
 # REQ-073: merged Issue의 stale rework 그래프 terminal convergence
 
-- Status: Bounded rework implemented (local validation complete, PR #74 update pending)
+- Status: Bounded rework implemented and pushed (PR #74 open; human review/merge pending)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / Pyright / diff-check)
@@ -298,9 +298,9 @@ hermes kanban show <task-id>
 
 ### Git / PR
 
-- Base SHA: (fetched origin/main SHA)
+- Base SHA: `7e3262816da0202b924c3356e10f23daa8f5eb88`
 - Branch: `fix/issue-73-terminal-merge-convergence`
 - Commits: (see git log)
-- PR number/title/URL: (Korean PR, `Closes #73`)
+- PR number/title/URL: PR #74 — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/74 (Korean title/body, `Closes #73`)
 - Working tree: clean after commit
 - Merge performed: NO
