@@ -1978,6 +1978,37 @@ def _task_creation_provenance(
     }
 
 
+def _terminal_convergence_rework_is_current_governing_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_kind: str,
+    rework_created_at: int,
+    rework_event_id: int,
+) -> bool:
+    """Prove the selected rework event is still the governing transition.
+
+    The edge has one canonical ordering for status-affecting lifecycle events:
+    ``(created_at, id)`` over ``_REWORK_GOVERNING_KINDS``.  Terminal
+    convergence must not reuse a validated old rework event after any newer
+    governing transition, even when the task row still looks stale.
+    """
+    kinds = tuple(sorted(_REWORK_GOVERNING_KINDS))
+    placeholders = ",".join("?" * len(kinds))
+    row = conn.execute(
+        "SELECT kind, created_at, id FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders}) "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,) + kinds,
+    ).fetchone()
+    if row is None:
+        return False
+    return (
+        str(row["kind"]) == rework_kind
+        and int(row["created_at"] or 0) == rework_created_at
+        and int(row["id"]) == rework_event_id
+    )
+
+
 def _terminal_convergence_rework_provenance(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1998,6 +2029,16 @@ def _terminal_convergence_rework_provenance(
         (task_id,),
     ).fetchone()
     if row is None:
+        return None
+    rework_created_at = int(row["created_at"] or 0)
+    rework_event_id = int(row["id"])
+    if not _terminal_convergence_rework_is_current_governing_event(
+        conn,
+        task_id,
+        str(row["kind"]),
+        rework_created_at,
+        rework_event_id,
+    ):
         return None
     try:
         payload = json.loads(row["payload"] or "{}")
@@ -2039,8 +2080,8 @@ def _terminal_convergence_rework_provenance(
         conn,
         task_id,
         payload,
-        int(row["created_at"] or 0),
-        int(row["id"]),
+        rework_created_at,
+        rework_event_id,
     )
     if human_hold is not None:
         return {
@@ -2070,9 +2111,11 @@ def _terminal_convergence_current_round_human_hold(
     block metadata.  A later canonical ``blocked`` event, however, is an
     explicit worker/operator hold and must remain sticky.  Attention events
     are guarded more narrowly by the current round's repository/Issue/PR and
-    round identity so an old attention record cannot suppress a newer round.
-    Event id is included in the ordering because the DB timestamps have
-    second-level precision and a later event may share the rework timestamp.
+    round identity; malformed or mismatched later attention is ambiguous and
+    must remain sticky rather than being ignored.  An earlier-round attention
+    record cannot suppress a newer round.  Event id is included in the
+    ordering because the DB timestamps have second-level precision and a
+    later event may share the rework timestamp.
     """
     current_identity = tuple(
         rework_payload.get(key)
@@ -2088,30 +2131,49 @@ def _terminal_convergence_current_round_human_hold(
         event_order = (int(row["created_at"] or 0), int(row["id"]))
         if event_order <= (rework_created_at, rework_event_id):
             continue
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except (TypeError, ValueError):
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
         kind = str(row["kind"])
         if kind == "blocked":
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
             return {
                 "event_kind": kind,
                 "event_id": int(row["id"]),
                 "created_at": event_order[0],
                 "block_kind": payload.get("kind"),
             }
-        if tuple(payload.get(key) for key in (
-            "repository", "issue_number", "pr_number", "rework_round"
-        )) == current_identity:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
             return {
                 "event_kind": kind,
                 "event_id": int(row["id"]),
                 "created_at": event_order[0],
-                "rework_round": rework_payload.get("rework_round"),
-                "pr_number": rework_payload.get("pr_number"),
+                "reason": "rework_attention_malformed",
             }
+        attention_identity = tuple(
+            payload.get(key)
+            for key in ("repository", "issue_number", "pr_number", "rework_round")
+        )
+        if attention_identity != current_identity:
+            return {
+                "event_kind": kind,
+                "event_id": int(row["id"]),
+                "created_at": event_order[0],
+                "reason": "rework_attention_mismatched",
+            }
+        return {
+            "event_kind": kind,
+            "event_id": int(row["id"]),
+            "created_at": event_order[0],
+            "rework_round": rework_payload.get("rework_round"),
+            "pr_number": rework_payload.get("pr_number"),
+        }
     return None
 
 

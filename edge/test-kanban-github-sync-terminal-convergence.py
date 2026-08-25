@@ -237,6 +237,14 @@ def build_graph(root_status: str = "todo",
     )
     root = _create_task(root_status, intake_body(), "root-88", parents=[reviewer])
     with connect_closing() as conn:
+        # Keep the synthetic blocked-node lifecycle ordered like production:
+        # creation precedes the rework event, while later regressions can
+        # exercise equal-second event ids deterministically.
+        conn.execute(
+            "UPDATE task_events SET created_at = 1 "
+            "WHERE task_id = ? AND kind = 'created'",
+            (blocked,),
+        )
         if rework_evidence:
             conn.execute(
                 "INSERT INTO task_events "
@@ -618,6 +626,149 @@ def test_5g_later_current_round_attention_preserves_graph():
     )
 
 
+def test_5h_later_governing_transition_preserves_graph():
+    print("5h. later canonical governing transition prevents stale convergence")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(issue_state="closed", pr=pr_payload(PR_N, state="closed", merged=True))
+        ids = build_graph()
+        with connect_closing() as conn:
+            # Same-second insertion exercises the durable (created_at, id)
+            # ordering used by the canonical governing-event contract.
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (
+                    ids["blocked"],
+                    "status",
+                    json.dumps({"new_status": "ready", "source": "test"}, sort_keys=True),
+                    2,
+                ),
+            )
+            conn.commit()
+        before = statuses(ids)
+        events_before = event_snapshot(ids)
+        results = run_sync(fake)
+        after = statuses(ids)
+        events_after = event_snapshot(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check("later governing transition preserves graph", before == after,
+              f"{before} -> {after}")
+        check("later governing transition preserves events",
+              events_before == events_after,
+              f"{events_before} -> {events_after}")
+        check("later governing transition fails closed",
+              root_entry["changed"] is False
+              and root_entry.get("reason") == "terminal_convergence_node_unconvergeable",
+              str(root_entry))
+        assert_no_workers(ids)
+
+
+def _later_attention_ambiguity_case(name: str, payload: Any) -> None:
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(issue_state="closed", pr=pr_payload(PR_N, state="closed", merged=True))
+        ids = build_graph()
+        with connect_closing() as conn:
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (ids["blocked"], "github_pr_rework_attention", json.dumps(payload, sort_keys=True), 3),
+            )
+            conn.commit()
+        before = statuses(ids)
+        events_before = event_snapshot(ids)
+        results = run_sync(fake)
+        after = statuses(ids)
+        events_after = event_snapshot(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(f"{name}: graph preserved", before == after, f"{before} -> {after}")
+        check(f"{name}: events preserved", events_before == events_after,
+              f"{events_before} -> {events_after}")
+        check(f"{name}: ambiguous attention fails closed",
+              root_entry["changed"] is False
+              and root_entry.get("reason") == "terminal_convergence_node_unconvergeable",
+              str(root_entry))
+        assert_no_workers(ids)
+
+
+def test_5i_later_malformed_or_mismatched_attention_preserves_graph():
+    print("5i. later malformed or mismatched attention preserves graph")
+    _later_attention_ambiguity_case("malformed attention", ["not-a-mapping"])
+    _later_attention_ambiguity_case(
+        "mismatched attention",
+        {
+            "repository": REPO,
+            "issue_number": ISSUE_N,
+            "pr_number": PR_N + 1,
+            "rework_round": 1,
+        },
+    )
+
+
+def test_5j_earlier_attention_before_newer_rework_allows_convergence():
+    print("5j. earlier-round attention before newer rework remains eligible")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(issue_state="closed", pr=pr_payload(PR_N, state="closed", merged=True))
+        ids = build_graph()
+        with connect_closing() as conn:
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (
+                    ids["blocked"],
+                    "github_pr_rework_attention",
+                    json.dumps({
+                        "repository": REPO,
+                        "issue_number": ISSUE_N,
+                        "pr_number": PR_N,
+                        "rework_round": 1,
+                    }, sort_keys=True),
+                    3,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (
+                    ids["blocked"],
+                    "github_pr_rework_retry",
+                    json.dumps({
+                        "previous_status": "blocked",
+                        "new_status": "ready",
+                        "repository": REPO,
+                        "issue_number": ISSUE_N,
+                        "pr_number": PR_N,
+                        "head_sha": pr_payload(PR_N)["head"]["sha"],
+                        "reason": "agent_rework",
+                        "rework_round": 2,
+                        "source": "github_edge_rework_recovery",
+                        "merge_authority": "human",
+                        "auto_merge": False,
+                    }, sort_keys=True),
+                    4,
+                ),
+            )
+            conn.commit()
+        results = run_sync(fake)
+        after = statuses(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check("earlier attention does not block newer rework",
+              root_entry["changed"] is True
+              and root_entry.get("reason") == "terminal_merge_convergence",
+              str(root_entry))
+        check("newer rework graph converges",
+              after[ids["blocked"]]["status"] == "done"
+              and after[ids["reviewer"]]["status"] == "archived"
+              and after[ids["root"]]["status"] == "done",
+              str(after))
+        assert_no_workers(ids)
+
+
 def _text_source_lookup_failure_case(name: str, failing_attr: str) -> None:
     with isolated_test_environment():
         _prepare_isolated_environment()
@@ -901,6 +1052,9 @@ def main() -> int:
         test_5c_missing_rework_provenance,
         test_5f_later_human_block_preserves_graph,
         test_5g_later_current_round_attention_preserves_graph,
+        test_5h_later_governing_transition_preserves_graph,
+        test_5i_later_malformed_or_mismatched_attention_preserves_graph,
+        test_5j_earlier_attention_before_newer_rework_allows_convergence,
         test_5d_comments_lookup_failure,
         test_5e_runs_lookup_failure,
         test_6_dry_run_predicts_without_mutation,

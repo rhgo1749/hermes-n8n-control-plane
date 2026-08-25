@@ -1,6 +1,6 @@
 # REQ-073: merged Issue의 stale rework 그래프 terminal convergence
 
-- Status: Bounded rework round 3 implemented and pushed (PR #74 open; human review/merge pending)
+- Status: Bounded rework round 4 implemented locally; PR #74 update pending push (human review/merge pending)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / Pyright / diff-check)
@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#73`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/73
-- Kanban task ID: `t_2fb0b688` (bounded rework round 3; prior round `t_2b00c07a`, review `t_86d72c71`)
+- Kanban task ID: `t_6474cb15` (bounded rework round 4; prior round `t_2fb0b688`, review `5024562752`)
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:73`
 - Planning/lead owner: `kanban-main`
 - Implementation owner: `kanban-developer`
@@ -99,6 +99,10 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
    7. fresh-GitHub interleaving에서 late ancestor activation / late active
       parent insertion 시 graph/event 보존
    8. cyclic link bounded refusal + diamond/shared-ancestor traversal
+   9. selected rework 뒤 canonical governing transition의 supersession 및
+      malformed/mismatched later attention의 ambiguity 보존
+  10. earlier-round attention + newer valid rework positive path, existing
+      current-round attention/human-block holds, and original #88 convergence
 3. `docs/EDGE_REWORK_LIFECYCLE.md`: terminal convergence contract 추가
 
 ## 4. Explicit non-goals
@@ -134,11 +138,16 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
   reachable node/edge closure, status/ownership, cycle/dangling/edge-set
   drift를 재검증하고, drift 시 write/event를 남기지 않는다.
 - root write는 최종 direct-parent terminal predicate를 다시 평가한다.
-- stale `blocked` convergence는 governing rework round 이후의 canonical
-  `blocked` human hold 또는 matching current-round
-  `github_pr_rework_attention` event가 있으면 fail-closed한다. 기존
-  `block_kind`만으로 stale identity를 추론하지 않으며, hold rejection은
-  node/root/event를 변경하지 않는다.
+- stale `blocked` convergence는 selected rework event가
+  `_REWORK_GOVERNING_KINDS`의 durable `(created_at, id)` 순서상 현재
+  governing transition인지 먼저 증명한다. 그 뒤 canonical governing
+  event가 하나라도 있으면 fail-closed한다. governing round 이후의
+  canonical `blocked` human hold 또는 matching current-round
+  `github_pr_rework_attention` event도 fail-closed하며, later attention이
+  malformed 또는 repository/Issue/PR/round identity-mismatched이면
+  ambiguous evidence로 fail-closed한다. 기존 `block_kind`만으로 stale
+  identity를 추론하지 않으며, 모든 rejection은 node/root/event를
+  변경하지 않는다.
 - ancestor walk는 active-path cycle detection을 사용하며 diamond/shared
   ancestor traversal은 허용한다.
 

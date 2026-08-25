@@ -289,11 +289,21 @@ proven in the same pass:
 
 The blocked-node predicate is round-aware.  A stale `blocked` row's existing
 `block_kind` is not enough to refuse the original #88-shaped convergence, but
-any later canonical `blocked` event is an explicit worker/operator hold and
+the selected rework event must first still be the node's current governing
+transition.  The edge proves that with the canonical
+`_REWORK_GOVERNING_KINDS` ordering `(created_at, id)`; any later
+status-affecting governing event (`github_pr_sync`, `completed`, `status`,
+`promoted`, `unblocked`, `reclaimed`, `scheduled`, `archived`, or another
+canonical transition) supersedes the old round and blocks terminalization.
+
+Any later canonical `blocked` event is an explicit worker/operator hold and
 blocks terminalization.  A later `github_pr_rework_attention` event blocks it
-when its repository, Issue, PR, and `rework_round` match the governing round.
-Both holds preserve the blocked node's metadata and all durable events; an old
-attention record from an earlier round cannot suppress a newer round.
+when its repository, Issue, PR, and `rework_round` match the governing round;
+if that later attention record is malformed or has mismatched identity, the
+evidence is ambiguous and also fails closed rather than being ignored.  Both
+holds and ambiguous records preserve the blocked node's metadata and all
+durable events.  An old attention record from an earlier round cannot suppress
+a newer valid rework round because it precedes the newer governing event.
 
 The single transaction then terminalizes the graph: the stale `blocked`
 implementation/rework node becomes `done` with explicit GitHub-merge
@@ -319,10 +329,11 @@ graphs remain valid and bounded.
 
 Fail-closed boundaries: open Issue, an open or closed-unmerged required
 PR, a non-authoritative/failing GitHub read, any active claim/run/worker
-ownership, missing/mismatched rework or reviewer provenance, or an
+ownership, missing/mismatched rework or reviewer provenance, a rework event
+superseded by a later canonical governing transition, or an
 unrelated/ambiguous ancestor, a later explicit human `blocked` event, or a
-later matching current-round `github_pr_rework_attention` event preserves the
-graph unchanged (the classic
+later matching or malformed/mismatched current-round
+`github_pr_rework_attention` event preserves the graph unchanged (the classic
 `internal_dependency_pending` lane keeps the root runnable).  Comment/run
 lookup failure is also fail-closed: the edge returns
 `text_source_lookup_failed` instead of treating incomplete handoff text as
@@ -344,8 +355,11 @@ matrix, active-ownership refusal, unrelated blocked/allowed-status ancestor
 refusal, missing rework provenance, comments/runs lookup failure with
 incomplete PR text, late ancestor activation and late active-parent insertion
 during the GitHub read, bounded cycle refusal, and diamond/shared-ancestor
-traversal.  Later durable human-block and current-round attention holds are
-also regression-tested to preserve the blocked node and root dependency gate.
+traversal.  Later durable human-block and current-round attention holds,
+superseded governing transitions, malformed/mismatched later attention, and
+earlier-round attention before a newer valid rework are also regression-tested
+to preserve the blocked node and root dependency gate without weakening the
+original positive convergence path.
 
 ## Deployment (host)
 
