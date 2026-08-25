@@ -34,10 +34,12 @@ GitHub signed webhook
 ```
 
 The tracked workflow is `automation/n8n/workflows/github-pr-edge-sync.json`.
-It is inactive after import until the operator binds the protected Header Auth
-credential on both the Webhook and actuator nodes, then activates it after a
-signed host canary. There is no tracked n8n Schedule Trigger and no direct
-GitHub webhook registration to n8n.
+The repository-owned `automation/n8n/scripts/import-workflows.sh` command
+creates the protected Header Auth credential, binds it to both the Webhook and
+actuator nodes, publishes the managed workflow, restarts n8n, and runs a safe
+unsupported-action canary against the production Webhook. There is no tracked
+n8n Schedule Trigger and no direct GitHub webhook registration to n8n. No n8n
+UI setup is part of the deployment path.
 
 The authenticated router `/fallback` endpoint remains available for deliberate
 operator recovery/full-registry intake. It is not called periodically.
@@ -241,7 +243,31 @@ The repository tracks exactly one inactive edge-sync workflow:
 `render_workflows.py` generates that Webhook graph and never generates a
 Schedule Trigger. `import-workflows.sh` clears only its own rendered
 `github-*.json`/legacy `schedule-*.json` files, renders the current workflow,
-and imports it through the local n8n CLI.
+and deploys it through the local n8n server CLI.
+
+Run the complete host deployment command:
+
+```bash
+automation/n8n/scripts/import-workflows.sh
+```
+
+The command fails closed unless the protected token file exists with safe
+permissions, the actuator health response contains
+`edge_sync_runtime_ready=true`, and n8n exposes the required
+`import:credentials`, `import:workflow`, `publish:workflow`, and
+`export:workflow` server CLI commands. It imports one stable managed credential
+and one stable managed workflow, so repeated runs update only those records and
+do not delete unrelated workflows. n8n 2.x persists publication in the
+database but requires an n8n restart before production workers use the new
+published version; the command waits for `/healthz` after that restart.
+
+The command generates the decrypted `httpHeaderAuth` import record with header
+name `Authorization` and value `Bearer <control-token>`, binds its ID/name to
+both the Webhook and `Run edge sync actuator` nodes, and keeps the credential
+JSON plus canary curl config in a private `0600` temporary directory under the
+external state root. The cleanup trap removes that directory on success or
+failure; the token is never printed or placed in a tracked workflow, `.env`
+example, GitHub payload, command argument, or log message.
 
 If an older persisted n8n database still contains:
 
@@ -256,11 +282,18 @@ workflow and from Hermes job `bf431b2a6ba6`.
 This persisted n8n cleanup is separate from the Hermes job. Never delete the
 Hermes `bf431b2a6ba6` job while removing the old n8n Schedule workflow.
 
-After importing, bind Header Auth credentials with header name `Authorization`
-and value `Bearer <the protected loopback control token>` on the Webhook and
-actuator nodes. The same token is sent by `github-router` to the n8n Webhook and
-by n8n to the actuator. Do not put the token in tracked workflow JSON,
-`.env.example`, GitHub payloads, or logs.
+The command's production canary sends a bounded `pull_request` payload with an
+unsupported `opened` action and requires the workflow's explicit
+`unsupported_pull_request_action` no-op response. It must not resolve a board
+or invoke the actuator side effect. The same protected token is sent by
+`github-router` to the n8n Webhook and by n8n to the actuator. Do not put the
+token in tracked workflow JSON, `.env.example`, GitHub payloads, or logs.
+
+This canary is only an authenticated production Webhook/import evidence gate.
+The full host-runtime gate still requires one validly signed GitHub delivery or
+redelivery, with router HMAC/delivery/repository admission evidence and the
+expected downstream actuator result. A repository test or the unsupported
+canary does not claim that live signed-delivery gate passed.
 
 ## 8. One-time transition from active polling to async-only
 
@@ -332,6 +365,7 @@ Local deterministic validation:
 
 ```bash
 python3 automation/n8n/scripts/validate.py
+python3 tests/test_n8n_import_contract.py
 python3 tests/test_github_event_concurrency_contract.py
 python3 tests/test_github_router.py
 python3 tests/test_github_intake_actuator.py

@@ -13,10 +13,12 @@ N8N = ROOT / "automation" / "n8n"
 sys.path.insert(0, str(N8N / "scripts"))
 
 from render_workflows import (
+    EDGE_SYNC_CREDENTIAL_NAME,
     EDGE_SYNC_ACTUATOR_URL,
     EDGE_SYNC_TIMEOUT_MS,
     EDGE_SYNC_WEBHOOK_PATH,
     EDGE_SYNC_WORKFLOWS,
+    EDGE_SYNC_WORKFLOW_ID,
 )
 
 
@@ -28,6 +30,7 @@ def validate_edge_sync(workflow: dict[str, str]) -> None:
     path = N8N / "workflows" / f"{workflow['slug']}.json"
     data = load(path)
 
+    assert data["id"] == EDGE_SYNC_WORKFLOW_ID
     assert data["name"] == "Hermes Webhook · GitHub PR edge sync"
     assert data["active"] is False
 
@@ -59,6 +62,7 @@ def validate_edge_sync(workflow: dict[str, str]) -> None:
         "options": {},
     }
     assert webhook["credentials"]["httpHeaderAuth"]["id"] == "REPLACE_AFTER_IMPORT"
+    assert webhook["credentials"]["httpHeaderAuth"]["name"] == EDGE_SYNC_CREDENTIAL_NAME
 
     normalize = nodes["Normalize bounded event"]
     assert normalize["type"] == "n8n-nodes-base.set"
@@ -88,6 +92,7 @@ def validate_edge_sync(workflow: dict[str, str]) -> None:
     assert actuator["parameters"]["jsonBody"] == "={{ JSON.stringify($json) }}"
     assert actuator["parameters"]["options"]["timeout"] == EDGE_SYNC_TIMEOUT_MS
     assert actuator["credentials"]["httpHeaderAuth"]["id"] == "REPLACE_AFTER_IMPORT"
+    assert actuator["credentials"]["httpHeaderAuth"]["name"] == EDGE_SYNC_CREDENTIAL_NAME
 
     ignored = nodes["Ignore unsupported event"]
     assert ignored["type"] == "n8n-nodes-base.set"

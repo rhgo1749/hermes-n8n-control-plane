@@ -67,9 +67,11 @@ n8n/event migration.
   delayed pauses from overtaking a newer trigger for the existing Issue intake
   path.
 - The tracked n8n Webhook workflow filters only merged PR close and trusted
-  `agent-rework` label events, then calls the fixed loopback actuator. It is
-  inactive after import until the operator binds the protected control-token
-  credentials and activates it.
+  `agent-rework` label events, then calls the fixed loopback actuator. The
+  repository-owned `import-workflows.sh` command creates the protected
+  control-token credential, binds it to both nodes, publishes the managed
+  workflow, restarts n8n, and runs a safe unsupported-action canary. No n8n UI
+  credential binding or activation step is required.
 - The loopback actuator resolves repository → board through the existing
   repository registry/task provenance and executes the edge script with fixed
   argv. It is not a generic command or completion API.
@@ -139,7 +141,8 @@ reviewed decision.
 | `automation/n8n/workflows/github-pr-edge-sync.json` | Private PR lifecycle Webhook → filter → fixed edge actuator |
 | `automation/n8n/scripts/repository_registry.py` | `hermes-agent` repository discovery and board/checkout authority |
 | `automation/n8n/scripts/reconcile-github-router.sh` | Explicit webhook-registry reconciliation |
-| `automation/n8n/scripts/import-workflows.sh` | Render/import the inactive on-demand edge-sync workflow |
+| `automation/n8n/scripts/import-workflows.sh` | Render, bind, publish, restart, and canary the managed edge-sync workflow |
+| `automation/n8n/scripts/prepare_edge_sync_runtime.py` | Build private 0600 credential/canary artifacts and bind the runtime workflow |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Canonical GitHub intake + reconciliation tick |
 | `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
 | `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
@@ -176,10 +179,23 @@ automation/n8n/scripts/configure-github-router-secrets.sh \
 #    then reconcile topic-managed repository webhooks.
 automation/n8n/scripts/reconcile-github-router.sh
 
-# 5. Import the inactive private PR edge-sync workflow, bind the protected
-#    router/actuator control-token credential, and activate it after canary.
+# 5. Render/import the private PR edge-sync workflow, bind the protected
+#    control-token credential, publish it, restart n8n, and run a safe canary.
 automation/n8n/scripts/import-workflows.sh
 ```
+
+`import-workflows.sh` is the complete n8n deployment command. It fails closed
+unless the loopback actuator reports `edge_sync_runtime_ready=true` and the
+n8n 2.x server CLI provides the required credential/workflow import, publish,
+and read-back commands. It keeps the decrypted Header Auth JSON and curl
+authorization config in a private `0600` temporary directory under the
+external state root and removes them on exit. The canary uses an unsupported
+`pull_request` action, so it must not invoke the edge-sync side effect.
+
+The command's local canary proves that the published production Webhook is
+reachable and authenticated. A live signed GitHub delivery or redelivery is
+still a separate host-runtime evidence gate for the full router → n8n →
+actuator path; repository validation does not claim that gate was run.
 
 If an older persisted n8n workflow named
 `Hermes schedule · GitHub agent-ready Issue intake` exists in the n8n database,
@@ -206,6 +222,7 @@ For the live host, verify all of the following:
 
 ```bash
 python3 automation/n8n/scripts/validate.py
+python3 tests/test_n8n_import_contract.py
 python3 tests/test_github_event_concurrency_contract.py
 python3 tests/test_github_router.py
 python3 tests/test_github_intake_actuator.py

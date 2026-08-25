@@ -142,5 +142,8 @@ automation/n8n/scripts/reconcile-github-router.sh
 The authenticated `/fallback` endpoint remains available for deliberate
 operator recovery/full-registry intake, but no tracked n8n workflow calls it
 automatically. The tracked workflow is
-`automation/n8n/workflows/github-pr-edge-sync.json`; it is inactive until its
-loopback Header Auth credentials are bound and a host canary passes.
+`automation/n8n/workflows/github-pr-edge-sync.json`; the repository-owned
+`automation/n8n/scripts/import-workflows.sh` binds its loopback Header Auth
+credential, publishes it, and runs an unsupported-action production canary.
+A live signed GitHub delivery or redelivery remains the host-runtime evidence
+gate for the full path.

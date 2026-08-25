@@ -8,6 +8,7 @@ the two PR lifecycle events that may invoke the fixed edge-sync actuator.
 from __future__ import annotations
 
 import argparse
+import copy
 import ipaddress
 import json
 import sys
@@ -35,6 +36,16 @@ def _uuid(key: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, key))
 
 
+EDGE_SYNC_WORKFLOW_ID = _uuid("github-pr-edge-sync:workflow")
+EDGE_SYNC_WORKFLOW_NAME = "Hermes Webhook · GitHub PR edge sync"
+EDGE_SYNC_CREDENTIAL_ID = _uuid("github-pr-edge-sync:control-token-credential")
+EDGE_SYNC_CREDENTIAL_NAME = "Hermes edge-sync control token"
+EDGE_SYNC_CREDENTIAL_NODE_NAMES = (
+    "GitHub edge sync webhook",
+    "Run edge sync actuator",
+)
+
+
 def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
     webhook_name = "GitHub edge sync webhook"
     normalize_name = "Normalize bounded event"
@@ -42,7 +53,8 @@ def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
     sync_name = "Run edge sync actuator"
     ignore_name = "Ignore unsupported event"
     return {
-        "name": f"Hermes Webhook · {workflow['name']}",
+        "id": EDGE_SYNC_WORKFLOW_ID,
+        "name": EDGE_SYNC_WORKFLOW_NAME,
         "nodes": [
             {
                 "parameters": {
@@ -60,7 +72,7 @@ def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
                 "credentials": {
                     "httpHeaderAuth": {
                         "id": "REPLACE_AFTER_IMPORT",
-                        "name": "Hermes router control token",
+                        "name": EDGE_SYNC_CREDENTIAL_NAME,
                     }
                 },
             },
@@ -163,7 +175,7 @@ def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
                 "credentials": {
                     "httpHeaderAuth": {
                         "id": "REPLACE_AFTER_IMPORT",
-                        "name": "Hermes edge sync actuator token",
+                        "name": EDGE_SYNC_CREDENTIAL_NAME,
                     }
                 },
             },
@@ -221,6 +233,95 @@ def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
         "meta": {"templateCredsSetupCompleted": False},
         "tags": [],
     }
+
+
+def build_runtime_credential(
+    token: str,
+    *,
+    credential_id: str = EDGE_SYNC_CREDENTIAL_ID,
+    credential_name: str = EDGE_SYNC_CREDENTIAL_NAME,
+) -> list[dict[str, Any]]:
+    """Build the one decrypted credential record used only during host import.
+
+    n8n's server CLI encrypts plain ``data`` on import.  Keeping this helper
+    pure makes it possible to test the credential envelope without ever
+    storing a real control token in the repository.
+    """
+    if not isinstance(token, str):
+        raise ValueError("credential token must be text")
+    token = token.strip()
+    if not token or any(character.isspace() for character in token):
+        raise ValueError("credential token must be a single non-empty value")
+    if not isinstance(credential_id, str) or not credential_id.strip():
+        raise ValueError("credential id must be non-empty")
+    if not isinstance(credential_name, str) or not credential_name.strip():
+        raise ValueError("credential name must be non-empty")
+    return [
+        {
+            "id": credential_id,
+            "name": credential_name,
+            "type": "httpHeaderAuth",
+            "data": {
+                "name": "Authorization",
+                "value": f"Bearer {token}",
+            },
+        }
+    ]
+
+
+def bind_runtime_credential(
+    workflow: dict[str, Any],
+    *,
+    credential_id: str = EDGE_SYNC_CREDENTIAL_ID,
+    credential_name: str = EDGE_SYNC_CREDENTIAL_NAME,
+    workflow_id: str = EDGE_SYNC_WORKFLOW_ID,
+) -> dict[str, Any]:
+    """Return an inactive workflow with one credential bound to both HTTP nodes."""
+    if not isinstance(credential_id, str) or not credential_id.strip():
+        raise ValueError("credential id must be non-empty")
+    if not isinstance(credential_name, str) or not credential_name.strip():
+        raise ValueError("credential name must be non-empty")
+    if (
+        not isinstance(workflow_id, str)
+        or not workflow_id
+        or workflow_id != workflow_id.strip()
+        or any(character.isspace() for character in workflow_id)
+    ):
+        raise ValueError("workflow id must be one non-empty value")
+
+    runtime = copy.deepcopy(workflow)
+    runtime["id"] = workflow_id
+    runtime["active"] = False
+    runtime["meta"] = {
+        **(runtime.get("meta") or {}),
+        "templateCredsSetupCompleted": True,
+    }
+
+    raw_nodes = runtime.get("nodes")
+    if not isinstance(raw_nodes, list):
+        raise ValueError("workflow nodes must be a list")
+    nodes = {
+        node.get("name"): node
+        for node in raw_nodes
+        if isinstance(node, dict)
+    }
+    expected_types = {
+        "GitHub edge sync webhook": "n8n-nodes-base.webhook",
+        "Run edge sync actuator": "n8n-nodes-base.httpRequest",
+    }
+    for node_name in EDGE_SYNC_CREDENTIAL_NODE_NAMES:
+        node = nodes.get(node_name)
+        if not isinstance(node, dict):
+            raise ValueError(f"required credential node is missing: {node_name}")
+        if node.get("type") != expected_types[node_name]:
+            raise ValueError(f"unexpected credential node type: {node_name}")
+        node["credentials"] = {
+            "httpHeaderAuth": {
+                "id": credential_id,
+                "name": credential_name,
+            }
+        }
+    return runtime
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
