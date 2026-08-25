@@ -1,9 +1,9 @@
 # REQ-073: merged Issue의 stale rework 그래프 terminal convergence
 
-- Status: Implemented (local validation complete, PR pending)
+- Status: Bounded rework implemented (local validation complete, PR #74 update pending)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
-- Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / diff-check)
+- Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / Pyright / diff-check)
 - Integration target branch: `main`
 - Required work branch: `fix/issue-73-terminal-merge-convergence`
 - Source-of-truth base: latest fetched `origin/main`
@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#73`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/73
-- Kanban task ID: `t_c190a1ba`
+- Kanban task ID: `t_5acc2399` (bounded rework; prior implementation `t_c190a1ba`, review `t_6ebf305a`)
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:73`
 - Planning/lead owner: `kanban-main`
 - Implementation owner: `kanban-developer`
@@ -93,6 +93,9 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
       보존
    4. active claim/run/worker ownership 거부
    5. unrelated/ambiguous ancestor 거부
+   6. fresh-GitHub interleaving에서 late ancestor activation / late active
+      parent insertion 시 graph/event 보존
+   7. cyclic link bounded refusal + diamond/shared-ancestor traversal
 3. `docs/EDGE_REWORK_LIFECYCLE.md`: terminal convergence contract 추가
 
 ## 4. Explicit non-goals
@@ -116,6 +119,12 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
 - durable evidence: convergence는 `github_pr_sync` event
   (`reason: terminal_merge_convergence`, merged-PR provenance,
   `merge_authority: human`, `auto_merge: false`)로 기록.
+- fresh GitHub evidence 이후 `BEGIN IMMEDIATE` write transaction 안에서
+  reachable node/edge closure, status/ownership, cycle/dangling/edge-set
+  drift를 재검증하고, drift 시 write/event를 남기지 않는다.
+- root write는 최종 direct-parent terminal predicate를 다시 평가한다.
+- ancestor walk는 active-path cycle detection을 사용하며 diamond/shared
+  ancestor traversal은 허용한다.
 
 ## 6. Validation contract
 
@@ -159,6 +168,9 @@ env -u HERMES_DELEGATED_CHILD_CONTEXT \
 ```bash
 python3 -m py_compile edge/kanban-github-sync.py
 python3 -m py_compile edge/test-kanban-github-sync-terminal-convergence.py
+PYTHONPATH=/ws/hermes-agent \
+  /home/hermes/.hermes/profiles/kanban-main/lsp/node_modules/.bin/pyright \
+  edge/kanban-github-sync.py edge/test-kanban-github-sync-terminal-convergence.py
 git diff --check
 ```
 

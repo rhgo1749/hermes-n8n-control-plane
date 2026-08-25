@@ -119,10 +119,12 @@ def pr_payload(number: int, *, state: str = "closed", merged: bool = True,
 class FakeGitHub:
     def __init__(self, *, issue_state: str = "closed",
                  pr: dict | None = pr_payload(PR_N),
-                 fail_pr_fetch: bool = False):
+                 fail_pr_fetch: bool = False,
+                 on_issue_get: Any = None):
         self.issue_state = issue_state
         self.pr = pr
         self.fail_pr_fetch = fail_pr_fetch
+        self.on_issue_get = on_issue_get
         self.issue_gets = 0
 
     def get(self, path: str, params: Any = None):
@@ -130,6 +132,8 @@ class FakeGitHub:
             raise mod.GithubCompletionError("simulated PR fetch failure")
         if path.endswith(f"/issues/{ISSUE_N}"):
             self.issue_gets += 1
+            if self.on_issue_get is not None:
+                self.on_issue_get()
             return {"number": ISSUE_N, "state": self.issue_state}, {}
         marker = "/pulls/"
         if marker in path:
@@ -299,11 +303,11 @@ def test_1_qualifying_convergence():
                 and e["payload"].get("reason") == "terminal_merge_convergence"]
         check("root durable github_pr_sync event", len(conv) == 1, str(root_events))
         check("event carries merged PR provenance",
-              conv and conv[0]["payload"].get("merged_prs") == [
+              bool(conv) and conv[0]["payload"].get("merged_prs") == [
                   {"number": PR_N, "head_sha": pr_payload(PR_N)["head"]["sha"], "base_branch": "main"}
               ], str(conv))
         check("event merge_authority=human / auto_merge=False",
-              conv and conv[0]["payload"].get("merge_authority") == "human"
+              bool(conv) and conv[0]["payload"].get("merge_authority") == "human"
               and conv[0]["payload"].get("auto_merge") is False)
         blocked_events = [e for e in events_for(ids["blocked"])
                           if e["kind"] == "github_pr_sync"]
@@ -468,6 +472,178 @@ def test_6_dry_run_predicts_without_mutation():
         assert_no_workers(ids)
 
 
+def test_7_late_ancestor_activation_is_refused():
+    print("7. late ancestor activation during fresh GitHub read is refused")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        ids = build_graph()
+
+        def activate_ancestor() -> None:
+            with connect_closing() as conn:
+                conn.execute(
+                    "UPDATE tasks SET status = 'running' WHERE id = ?",
+                    (ids["impl"],),
+                )
+
+        fake = FakeGitHub(
+            issue_state="closed",
+            pr=pr_payload(PR_N, state="closed", merged=True),
+            on_issue_get=activate_ancestor,
+        )
+        events_before = sum(len(events_for(tid)) for tid in ids.values())
+        results = run_sync(fake)
+        after = statuses(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(
+            "late active ancestor refuses convergence",
+            root_entry["changed"] is False
+            and root_entry["status"] == "todo"
+            and root_entry.get("reason") == "terminal_convergence_state_changed",
+            str(root_entry),
+        )
+        check(
+            "late ancestor remains active while root is preserved",
+            after[ids["impl"]]["status"] == "running"
+            and after[ids["root"]]["status"] == "todo",
+            str(after),
+        )
+        check(
+            "late ancestor drift writes no events",
+            sum(len(events_for(tid)) for tid in ids.values()) == events_before,
+        )
+        assert_no_workers(ids)
+
+
+def test_8_late_active_parent_is_refused():
+    print("8. late active parent insertion during fresh GitHub read is refused")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        ids = build_graph()
+        late_parent: dict[str, str] = {}
+
+        def insert_active_parent() -> None:
+            parent_id = _create_task("running", link_body(), "late-parent-88")
+            late_parent["id"] = parent_id
+            with connect_closing() as conn:
+                conn.execute(
+                    "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                    (parent_id, ids["root"]),
+                )
+
+        fake = FakeGitHub(
+            issue_state="closed",
+            pr=pr_payload(PR_N, state="closed", merged=True),
+            on_issue_get=insert_active_parent,
+        )
+        events_before = sum(len(events_for(tid)) for tid in ids.values())
+        results = run_sync(fake)
+        after = statuses({**ids, "late_parent": late_parent["id"]})
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        parent_id = late_parent["id"]
+        check(
+            "late active parent refuses convergence",
+            root_entry["changed"] is False
+            and root_entry["status"] == "todo"
+            and root_entry.get("reason") == "terminal_convergence_state_changed",
+            str(root_entry),
+        )
+        check(
+            "late parent remains active and linked",
+            after[ids["root"]]["status"] == "todo"
+            and after[parent_id]["status"] == "running",
+            str(after),
+        )
+        check(
+            "late parent drift writes no events",
+            sum(len(events_for(tid)) for tid in ids.values()) == events_before,
+        )
+        assert_no_workers(ids)
+
+
+def test_9_cycle_is_bounded_and_preserved():
+    print("9. cyclic task links return an ambiguous-graph refusal")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        ids = build_graph()
+        with connect_closing() as conn:
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (ids["root"], ids["impl"]),
+            )
+            before_events = sum(
+                conn.execute(
+                    "SELECT count(*) FROM task_events WHERE task_id = ?", (tid,)
+                ).fetchone()[0]
+                for tid in ids.values()
+            )
+            nodes, error = mod._terminal_chain_ancestors(conn, ids["root"])
+        check(
+            "cycle returns no ancestor closure",
+            nodes is None and bool(error),
+            f"nodes={nodes!r} error={error!r}",
+        )
+        check(
+            "cycle leaves graph events unchanged",
+            sum(len(events_for(tid)) for tid in ids.values()) == before_events,
+        )
+        fake = FakeGitHub(
+            issue_state="closed",
+            pr=pr_payload(PR_N, state="closed", merged=True),
+        )
+        results = run_sync(fake)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(
+            "cycle sync fails closed",
+            root_entry["changed"] is False
+            and root_entry.get("reason") == "terminal_convergence_ambiguous_graph",
+            str(root_entry),
+        )
+        assert_no_workers(ids)
+
+
+def test_10_diamond_shared_ancestor_converges():
+    print("10. diamond graph with a shared ancestor still converges")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        ids = build_graph()
+        second_reviewer = _create_task("todo", link_body(), "reviewer-88-second")
+        with connect_closing() as conn:
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (ids["blocked"], second_reviewer),
+            )
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (second_reviewer, ids["root"]),
+            )
+        ids["second_reviewer"] = second_reviewer
+        fake = FakeGitHub(
+            issue_state="closed",
+            pr=pr_payload(PR_N, state="closed", merged=True),
+        )
+        results = run_sync(fake)
+        after = statuses(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(
+            "diamond root converges",
+            root_entry["changed"] is True
+            and root_entry.get("reason") == "terminal_merge_convergence",
+            str(root_entry),
+        )
+        check(
+            "diamond shared blocked ancestor terminalized once",
+            after[ids["blocked"]]["status"] == "done"
+            and after[ids["reviewer"]]["status"] == "archived"
+            and after[second_reviewer]["status"] == "archived",
+            str(after),
+        )
+        assert_no_workers(ids)
+
+
 def main() -> int:
     tests = [
         test_1_qualifying_convergence,
@@ -476,6 +652,10 @@ def main() -> int:
         test_4_active_ownership,
         test_5_ambiguous_ancestor,
         test_6_dry_run_predicts_without_mutation,
+        test_7_late_ancestor_activation_is_refused,
+        test_8_late_active_parent_is_refused,
+        test_9_cycle_is_bounded_and_preserved,
+        test_10_diamond_shared_ancestor_converges,
     ]
     for t in tests:
         t()

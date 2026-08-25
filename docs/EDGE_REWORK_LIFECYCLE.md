@@ -291,6 +291,16 @@ authoritative `done` -- each with a durable `github_pr_sync` event
 fields cleared.  A second pass is a no-op, and no worker is ever
 promoted, claimed, spawned, or re-run.
 
+After the fresh GitHub evidence is accepted, the edge acquires a write
+transaction and re-reads the complete reachable node and edge closure before
+the first mutation.  Any status/ownership change, late parent or removed edge,
+dangling link, or closure cycle is a fail-closed refusal; the transaction
+preserves every node and event.  The final root write also re-evaluates the
+direct-parent terminal predicate in the same transaction, so a late active
+parent cannot bypass the dependency gate.  Ancestor traversal uses an active
+path cycle check while still skipping completed shared ancestors, so diamond
+graphs remain valid and bounded.
+
 Fail-closed boundaries: open Issue, an open or closed-unmerged required
 PR, a non-authoritative/failing GitHub read, any active claim/run/worker
 ownership, or an unrelated/ambiguous ancestor preserves the graph
@@ -307,7 +317,9 @@ report `terminal_convergence_active_ownership`,
 `edge/test-kanban-github-sync-terminal-convergence.py` pins the #88
 topology convergence, repeat-pass idempotence without claim/spawn, the
 issue-open / open-PR / closed-unmerged-PR / GitHub-error preservation
-matrix, active-ownership refusal, and unrelated-ancestor refusal.
+matrix, active-ownership refusal, unrelated-ancestor refusal, late ancestor
+activation and late active-parent insertion during the GitHub read, bounded
+cycle refusal, and diamond/shared-ancestor traversal.
 
 ## Deployment (host)
 

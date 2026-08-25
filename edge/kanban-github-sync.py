@@ -1816,7 +1816,7 @@ _TERMINAL_CONVERGE_ROOT_STATUSES = frozenset({"todo", "review"})
 def _terminal_chain_ancestors(
     conn: sqlite3.Connection,
     root_id: str,
-) -> tuple[dict[str, dict[str, Any]], Optional[str]]:
+) -> tuple[Optional[dict[str, dict[str, Any]]], Optional[str]]:
     """Walk the direct ``task_links`` parent edges above ``root_id``.
 
     Returns ``(nodes, None)`` where ``nodes`` maps every reachable id
@@ -1826,8 +1826,11 @@ def _terminal_chain_ancestors(
     closed, never crash the whole board sync and never be treated as a
     satisfied dependency.
     """
-    columns = "t.id, t.status, t.assignee, t.claim_lock, t.worker_pid, " \
-              "t.current_run_id, t.block_kind"
+    columns = (
+        "t.id, t.status, t.assignee, t.claim_lock, t.claim_expires, "
+        "t.worker_pid, t.current_run_id, t.block_kind, t.block_recurrences, "
+        "t.completed_at"
+    )
     root_row = conn.execute(
         f"SELECT {columns} FROM tasks AS t WHERE t.id = ?", (root_id,)
     ).fetchone()
@@ -1836,32 +1839,82 @@ def _terminal_chain_ancestors(
     nodes: dict[str, dict[str, Any]] = {
         root_id: {key: root_row[key] for key in root_row.keys()}
     }
-    frontier: list[str] = [root_id]
-    while frontier:
-        batch = ",".join("?" for _ in frontier)
-        rows = conn.execute(
+    def _parent_rows(child_id: str) -> list[Any]:
+        return conn.execute(
             f"SELECT l.parent_id, {columns} "
             f"FROM task_links AS l LEFT JOIN tasks AS t ON t.id = l.parent_id "
-            f"WHERE l.child_id IN ({batch})",
-            (*frontier,),
+            "WHERE l.child_id = ? ORDER BY l.parent_id",
+            (child_id,),
         ).fetchall()
-        frontier = []
-        for row in rows:
-            parent_id = str(row["parent_id"])
-            if row["id"] is None:
-                return None, f"missing parent task for link: {parent_id}"
-            if parent_id not in nodes:
-                nodes[parent_id] = {
-                    "id": parent_id,
-                    "status": row["status"],
-                    "assignee": row["assignee"],
-                    "claim_lock": row["claim_lock"],
-                    "worker_pid": row["worker_pid"],
-                    "current_run_id": row["current_run_id"],
-                    "block_kind": row["block_kind"],
-                }
-            frontier.append(parent_id)
+
+    # Iterative depth-first traversal with white/gray/black colors.  A gray
+    # parent is on the active path and therefore proves a cycle; a black
+    # parent is a completed shared ancestor and is safe to skip.  Keeping the
+    # active path separate from pending sibling work preserves diamond graphs
+    # without re-queuing a cycle forever.
+    colors: dict[str, int] = {root_id: 1}
+    stack: list[tuple[str, list[Any], int]] = [
+        (root_id, _parent_rows(root_id), 0)
+    ]
+    while stack:
+        child_id, parent_rows, index = stack[-1]
+        if index >= len(parent_rows):
+            colors[child_id] = 2
+            stack.pop()
+            continue
+        row = parent_rows[index]
+        stack[-1] = (child_id, parent_rows, index + 1)
+        parent_id = str(row["parent_id"])
+        if row["id"] is None:
+            return None, f"missing parent task for link: {parent_id}"
+        parent_color = colors.get(parent_id, 0)
+        if parent_color == 1:
+            return None, f"cyclic task link: {parent_id} -> {child_id}"
+        if parent_color == 2:
+            continue
+        nodes[parent_id] = {
+            "id": parent_id,
+            "status": row["status"],
+            "assignee": row["assignee"],
+            "claim_lock": row["claim_lock"],
+            "claim_expires": row["claim_expires"],
+            "worker_pid": row["worker_pid"],
+            "current_run_id": row["current_run_id"],
+            "block_kind": row["block_kind"],
+            "block_recurrences": row["block_recurrences"],
+            "completed_at": row["completed_at"],
+        }
+        colors[parent_id] = 1
+        stack.append((parent_id, _parent_rows(parent_id), 0))
     return nodes, None
+
+
+def _terminal_chain_edge_snapshot(
+    conn: sqlite3.Connection,
+    node_ids: Iterable[str],
+) -> tuple[Optional[tuple[tuple[str, str], ...]], Optional[str]]:
+    """Return every reachable parent edge, including duplicate rows.
+
+    The edge list is part of the convergence snapshot: a late parent link,
+    removed link, duplicate, or dangling link must not be hidden by comparing
+    node rows alone.
+    """
+    ids = tuple(sorted({str(node_id) for node_id in node_ids}))
+    if not ids:
+        return (), None
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            "SELECT parent_id, child_id FROM task_links "
+            f"WHERE child_id IN ({placeholders}) "
+            "ORDER BY child_id, parent_id",
+            ids,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    return tuple(
+        (str(row["parent_id"]), str(row["child_id"])) for row in rows
+    ), None
 
 
 def _node_has_active_ownership(node: Mapping[str, Any]) -> bool:
@@ -1996,6 +2049,16 @@ def _attempt_terminal_merge_convergence(
             "reason": "terminal_convergence_ambiguous_graph",
             "error": error,
         }
+    edges, edge_error = _terminal_chain_edge_snapshot(conn, nodes.keys())
+    if edges is None:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_ambiguous_graph",
+            "error": edge_error or "edge snapshot unavailable",
+        }
+    root_body = str(row["body"] or "")
     for node_id, node in sorted(nodes.items()):
         if _node_has_active_ownership(node):
             return {
@@ -2054,8 +2117,131 @@ def _attempt_terminal_merge_convergence(
                 "archive": archive,
             },
         }
-    now = int(time.time())
     with conn:
+        # Acquire the write lock before the final closure read.  GitHub is an
+        # external authority and may have taken seconds to answer; the
+        # original prevalidation is only a snapshot.  Re-read every node and
+        # edge while the write transaction owns the database, then refuse the
+        # pass before any mutation when the graph drifted.
+        conn.execute("BEGIN IMMEDIATE")
+        fresh_nodes, fresh_error = _terminal_chain_ancestors(conn, task_id)
+        if fresh_nodes is None:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_ambiguous_graph",
+                "error": fresh_error or "ancestor closure unavailable",
+            }
+        fresh_edges, fresh_edge_error = _terminal_chain_edge_snapshot(
+            conn, fresh_nodes.keys()
+        )
+        if fresh_edges is None:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_ambiguous_graph",
+                "error": fresh_edge_error or "edge snapshot unavailable",
+            }
+        if fresh_nodes != nodes or fresh_edges != edges:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_node_ids": sorted(nodes),
+                    "actual_node_ids": sorted(fresh_nodes),
+                    "expected_edges": [list(edge) for edge in edges],
+                    "actual_edges": [list(edge) for edge in fresh_edges],
+                },
+            }
+        root_row = conn.execute(
+            "SELECT body, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            root_row is None
+            or str(root_row["body"] or "") != root_body
+            or str(root_row["status"] or "") != root_status
+        ):
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {"node_id": task_id, "node_status": root_status},
+            }
+        try:
+            fresh_gate = _internal_dependency_gate(conn, task_id)
+        except (SyncError, sqlite3.Error) as exc:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_ambiguous_graph",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if fresh_gate.get("parents") != gate.get("parents"):
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_parents": gate.get("parents"),
+                    "actual_parents": fresh_gate.get("parents"),
+                },
+            }
+        for node_id, node in sorted(fresh_nodes.items()):
+            if _node_has_active_ownership(node):
+                return {
+                    "task_id": task_id,
+                    "status": root_status,
+                    "changed": False,
+                    "reason": "terminal_convergence_active_ownership",
+                    "evidence": {
+                        "node_id": node_id,
+                        "node_status": str(node.get("status") or ""),
+                    },
+                }
+        fresh_terminalize: list[str] = []
+        fresh_archive: list[str] = []
+        for node_id, node in sorted(fresh_nodes.items()):
+            if node_id == task_id:
+                continue
+            status = str(node.get("status") or "")
+            if status in _TERMINAL_CONVERGE_OK_TERMINAL:
+                continue
+            if status in _TERMINAL_CONVERGE_TERMINALIZE:
+                fresh_terminalize.append(node_id)
+            elif status in _TERMINAL_CONVERGE_ARCHIVE:
+                fresh_archive.append(node_id)
+            else:
+                return {
+                    "task_id": task_id,
+                    "status": root_status,
+                    "changed": False,
+                    "reason": "terminal_convergence_node_unconvergeable",
+                    "evidence": {
+                        "node_id": node_id,
+                        "node_status": status,
+                    },
+                }
+        if fresh_terminalize != terminalize or fresh_archive != archive:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_terminalize": terminalize,
+                    "actual_terminalize": fresh_terminalize,
+                    "expected_archive": archive,
+                    "actual_archive": fresh_archive,
+                },
+            }
+        now = int(time.time())
         # Stale blocked implementation/rework node: the merged PR is the
         # authoritative record that the work was delivered, so
         # terminalize it to done with explicit GitHub-merge provenance.
@@ -2121,13 +2307,15 @@ def _attempt_terminal_merge_convergence(
             )
         # Intake root: authoritative done with the same fresh evidence and
         # the full converged set recorded as the durable event trail.
+        dependency_guard = _dependency_guard_sql()
         cur = conn.execute(
             "UPDATE tasks SET status = 'done', completed_at = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
             "current_run_id = NULL, block_kind = NULL, block_recurrences = 0 "
             "WHERE id = ? AND status = ? AND claim_lock IS NULL "
-            "AND worker_pid IS NULL AND current_run_id IS NULL",
-            (now, task_id, root_status),
+            "AND worker_pid IS NULL AND current_run_id IS NULL "
+            f"{dependency_guard}",
+            (now, task_id, root_status, task_id),
         )
         if cur.rowcount != 1:
             raise SyncError(
