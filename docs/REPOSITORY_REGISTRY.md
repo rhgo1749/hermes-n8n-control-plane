@@ -28,6 +28,10 @@ For every discovered repository the registry records:
 - GitHub full name and immutable repository ID;
 - GitHub `default_branch`;
 - canonical slug (`repo-name.casefold()`);
+- canonical display identity (`repo-name`, the repository's own name — the ONLY
+  display authority for board labels and notifications; there is no static
+  board->label map, no `GitHub Intake` suffix convention, and no per-board
+  alias/allowlist);
 - resolved checkout path;
 - whether checkout `origin` matches the GitHub repository;
 - repository contract files present on the GitHub default branch;

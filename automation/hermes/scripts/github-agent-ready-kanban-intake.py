@@ -47,6 +47,11 @@ class RepositoryConfig:
     checkout: str
     default_branch: str
     contract_paths: tuple[str, ...]
+    # Repository-derived display identity (GitHub repository name). It is the
+    # ONLY display authority for board labels and notifications; there is no
+    # static board->label map. The value comes from the registry (live/
+    # fixture) and is validated against the repository name on load.
+    display_name: str
 
 
 class IntakeError(RuntimeError):
@@ -293,16 +298,27 @@ def _repository_configs_from_registry(
         checkout = str(entry.get("checkout") or "").strip()
         default_branch = str(entry.get("default_branch") or "").strip()
         raw_contracts = entry.get("contract_paths")
+        display_name = str(entry.get("display_name") or "").strip()
 
         if (
             not name
             or not board
             or not checkout
             or not default_branch
+            or not display_name
             or not isinstance(raw_contracts, list)
             or not all(isinstance(item, str) for item in raw_contracts)
         ):
             raise IntakeError(f"invalid ready registry entry: {name or '(unknown)'}")
+
+        # Fail closed if a registry entry presents a display identity that is
+        # not the repository's own name: repository metadata is the only
+        # display authority (no static label map).
+        if display_name.casefold() != name.split("/", 1)[-1].casefold():
+            raise IntakeError(
+                f"registry display_name for {name} is not repository-derived: "
+                f"{display_name!r}"
+            )
 
         configs.append(
             RepositoryConfig(
@@ -311,6 +327,7 @@ def _repository_configs_from_registry(
                 checkout=checkout,
                 default_branch=default_branch,
                 contract_paths=tuple(raw_contracts),
+                display_name=display_name,
             )
         )
 
@@ -356,6 +373,12 @@ def _fixture_repository_configs(path: Path) -> tuple[RepositoryConfig, ...]:
     ):
         raise IntakeError(f"invalid fixture repository_config for {repository}")
 
+    display_name = str(raw.get("display_name") or "").strip() or repository.split("/", 1)[-1]
+    if display_name.casefold() != repository.split("/", 1)[-1].casefold():
+        raise IntakeError(
+            f"fixture display_name must equal the repository name for {repository}"
+        )
+
     return (
         RepositoryConfig(
             name=repository,
@@ -363,6 +386,7 @@ def _fixture_repository_configs(path: Path) -> tuple[RepositoryConfig, ...]:
             checkout=checkout,
             default_branch=default_branch,
             contract_paths=tuple(contracts),
+            display_name=display_name,
         ),
     )
 
@@ -909,14 +933,6 @@ def _run_closed_issue_cleanup(
 # (ticks are 5 minutes apart; 120s grace is safe against clock skew).
 _CREATE_FRESHNESS_SECONDS = 120
 
-_BOARD_SHORT_NAMES = {
-    "ctrlhangul": "CtrlHangul",
-    "re-bound": "Re-Bound",
-    "h4v3-dj": "H4V3-DJ",
-    "h4v3-meowcore-avatar-lab": "Avatar-Lab",
-    "h4v3-meowcore-voice-lab": "Voice-Lab",
-}
-
 # Telegram is an action channel, not a second Kanban event stream. Keep the
 # normal lifecycle quiet and classify only existing edge evidence as an
 # operator incident. Unknown results are suppressed (fail-closed).
@@ -976,8 +992,20 @@ def _telegram_config() -> tuple[str, str] | None:
     return chat_id, thread_id
 
 
-def _board_short_name(board: str) -> str:
-    return _BOARD_SHORT_NAMES.get(board, board)
+def _board_display_name(
+    board: str,
+    repository: str,
+    configs: tuple[RepositoryConfig, ...],
+) -> str:
+    """Repository-derived display identity for board labels.
+
+    The GitHub repository name is the ONLY display authority (no static
+    board->label map, no hardcoded alias, no ``GitHub Intake`` suffix rule).
+    """
+    for config in configs:
+        if config.name.casefold() == str(repository).casefold():
+            return config.display_name
+    return str(repository).split("/")[-1]
 
 
 def _board_for_repository(
@@ -1555,7 +1583,9 @@ def _run(args: argparse.Namespace) -> int:
             if not _should_notify_entry(entry):
                 continue
             board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_short_name(board)
+            short_name = _board_display_name(
+                board, str(entry["repository"]), selected_configs
+            )
             predicted.append(
                 _attention_notification_line(
                     board,
@@ -1569,7 +1599,9 @@ def _run(args: argparse.Namespace) -> int:
             if not _should_notify_entry(entry):
                 continue
             board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_short_name(board)
+            short_name = _board_display_name(
+                board, str(entry["repository"]), selected_configs
+            )
             notification_lines.append(
                 _attention_notification_line(
                     board,
@@ -1595,6 +1627,10 @@ def _run(args: argparse.Namespace) -> int:
         "closed_issue_cleanup": cleanup_results,
         "closed_issue_cleanup_count": len(cleanup_results),
         "repositories": [config.name for config in selected_configs],
+        # Repository-derived display identity (the ONLY label authority).
+        "display_names": {
+            config.name: config.display_name for config in selected_configs
+        },
         "registry_unready": registry_unready,
         "board_provisioning": board_provisioning,
         "wake_scope": {

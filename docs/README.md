@@ -21,6 +21,7 @@ Do not preload every document. Use the narrowest route that covers the change su
 | Worker completion vs GitHub review/done projection | [`GITHUB_COMPLETION_LIFECYCLE.md`](GITHUB_COMPLETION_LIFECYCLE.md) |
 | Kanban role ownership and role-specific authority | [`KANBAN_ROLE_CONTRACTS.md`](KANBAN_ROLE_CONTRACTS.md) |
 | `hermes-agent` discovery, checkout/board authority, bootstrap and registry semantics | [`REPOSITORY_REGISTRY.md`](REPOSITORY_REGISTRY.md) |
+| Repository-derived board identity cutover (migration/transition/rollback) | [`BOARD_IDENTITY_MIGRATION.md`](BOARD_IDENTITY_MIGRATION.md) |
 | Host deployment, service lifecycle, recovery and operator procedures | [`OPERATIONS.md`](OPERATIONS.md) |
 | Cross-project H4V3 ownership and read-only overview semantics | [`H4V3_OVERVIEW.md`](H4V3_OVERVIEW.md) |
 | Known deferred work that is not part of the current contract | [`FUTURE_IMPROVEMENTS.md`](FUTURE_IMPROVEMENTS.md) |

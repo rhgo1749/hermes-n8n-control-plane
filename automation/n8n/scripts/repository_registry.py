@@ -48,6 +48,7 @@ class RegistryEntry:
     repository_id: int
     default_branch: str
     canonical_slug: str
+    display_name: str
     board: str | None
     board_status: str
     checkout: str
@@ -360,6 +361,7 @@ def build_entry(
 
     repo_name = full_name.split("/", 1)[1]
     slug = repo_name.casefold()
+    display_name = repo_name
     checkout = checkout_path if checkout_path is not None else checkout_root / slug
     read_origin = origin_reader or _git_origin
     origin = read_origin(checkout) if checkout.is_dir() else None
@@ -408,6 +410,7 @@ def build_entry(
         repository_id=repository_id,
         default_branch=default_branch,
         canonical_slug=slug,
+        display_name=display_name,
         board=board,
         board_status=board_status,
         checkout=str(checkout),

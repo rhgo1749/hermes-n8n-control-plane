@@ -45,6 +45,7 @@ def _config(
         checkout=checkout,
         default_branch=default_branch,
         contract_paths=contract_paths,
+        display_name=repository.split("/", 1)[1],
     )
 
 
@@ -64,6 +65,7 @@ def _entry(
         "repository_id": 1,
         "default_branch": default_branch,
         "canonical_slug": slug,
+        "display_name": repository.split("/", 1)[1],
         "board": board or slug,
         "board_status": (
             "resolved_task_provenance"
