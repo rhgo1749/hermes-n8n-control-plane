@@ -22,6 +22,8 @@ from prepare_edge_sync_runtime import (  # noqa: E402
 from render_workflows import (  # noqa: E402
     EDGE_SYNC_CREDENTIAL_ID,
     EDGE_SYNC_CREDENTIAL_NAME,
+    EDGE_SYNC_WEBHOOK_ID,
+    EDGE_SYNC_WEBHOOK_PATH,
     EDGE_SYNC_WORKFLOW_ID,
     bind_runtime_credential,
     build_runtime_credential,
@@ -81,6 +83,25 @@ def test_edge_sync_http_request_uses_pinned_n8n_supported_version() -> None:
 
         assert actuator["type"] == "n8n-nodes-base.httpRequest"
         assert actuator["typeVersion"] == 4.4
+
+
+def test_edge_sync_webhook_has_stable_full_path_identity() -> None:
+    workflows = (
+        _workflow(),
+        edge_sync_workflow(
+            {"slug": "github-pr-edge-sync", "name": "GitHub PR edge sync"}
+        ),
+    )
+    for workflow in workflows:
+        webhook = next(
+            node
+            for node in workflow["nodes"]
+            if node["name"] == "GitHub edge sync webhook"
+        )
+
+        assert webhook["type"] == "n8n-nodes-base.webhook"
+        assert webhook["parameters"]["path"] == EDGE_SYNC_WEBHOOK_PATH
+        assert webhook["webhookId"] == EDGE_SYNC_WEBHOOK_ID
 
 
 def test_runtime_credential_helper_can_reuse_legacy_workflow_id() -> None:
