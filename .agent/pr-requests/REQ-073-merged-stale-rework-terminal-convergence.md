@@ -1,6 +1,6 @@
 # REQ-073: merged Issue의 stale rework 그래프 terminal convergence
 
-- Status: Bounded rework round 4 implemented locally; PR #74 update pending push (human review/merge pending)
+- Status: Bounded rework round 4 implemented and pushed (PR #74 open; human review/merge pending)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / Pyright / diff-check)
@@ -300,10 +300,11 @@ hermes kanban show <task-id>
 
 ### Files changed
 
-- `edge/kanban-github-sync.py`: terminal merge convergence pass plus the
-  current-round human/operator hold predicate
+- `edge/kanban-github-sync.py`: terminal merge convergence pass plus current
+  governing-round and human/operator hold predicates
 - `edge/test-kanban-github-sync-terminal-convergence.py`: deterministic
-  convergence, race, and later human-block/attention preservation regressions
+  convergence, race, governing-transition, and later attention preservation
+  regressions
 - `docs/EDGE_REWORK_LIFECYCLE.md`: terminal convergence contract
 - `.agent/pr-requests/REQ-073-merged-stale-rework-terminal-convergence.md`:
   this request
@@ -312,9 +313,9 @@ hermes kanban show <task-id>
 
 | Validation | Result | Notes |
 |---|---|---|
-| Static/unit (py_compile + exact-file Pyright + diff-check) | PASS | latest pushed head; Pyright 0 errors/warnings/informations |
+| Static/unit (py_compile + exact-file Pyright + diff-check) | PASS | pushed head `74ac1de8a6948ddd599ce16c7c571667459ca5e8`; Pyright 0 errors/warnings/informations |
 | n8n validation | NOT RUN | n8n topology out of scope |
-| Edge terminal convergence | PASS | 84 passed, 0 failed; sabotage without hold predicate: exit 1, 76 passed, 8 failed |
+| Edge terminal convergence | PASS | 95 passed, 0 failed; sabotage restored prior guard behavior: exit 1, 86 passed, 9 failed |
 | Edge rework/head-binding | PASS | 738 passed, 0 failed each |
 | Dependency/completion/race gates | PASS | all named regression markers PASS |
 | Parking-comment suite | PASS | 20 passed, 0 failed |
@@ -330,9 +331,9 @@ hermes kanban show <task-id>
 
 - PR base SHA: `7e3262816da0202b924c3356e10f23daa8f5eb88`
 - Fetched `origin/main` validation SHA: `a9aadafa48617ffa33df1f3702d7a2d4ac4a7d36`
-- Worktree branch: `wt/t_2fb0b688` (tracking `origin/fix/issue-73-terminal-merge-convergence`)
+- Worktree branch: `wt/t_6474cb15` (push target `origin/fix/issue-73-terminal-merge-convergence`)
 - PR branch: `fix/issue-73-terminal-merge-convergence`
-- Commit: see the PR REST read-back and `git log` for the latest pushed head
+- Commit: `74ac1de8a6948ddd599ce16c7c571667459ca5e8`
 - PR number/title/URL: PR #74 — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/74 (Korean title/body, `Closes #73`)
 - Working tree: clean after commit
 - PR REST read-back: OPEN, non-draft, base `main`, exact head verified, four-file allowlist verified
