@@ -194,6 +194,9 @@ def test_import_command_is_fail_closed_and_canaries_production_noop() -> None:
         "export:workflow",
         "export:workflow \\\n  --all \\\n  --output=\"$INVENTORY_CONTAINER_PATH\"",
         '"$INVENTORY_JSON"',
+        'PUBLISHED_PROBE_CONTAINER_PATH="/files/$RUNTIME_REL/published-before-import.json"',
+        "--published",
+        'n8n_cli unpublish:workflow --id="$MANAGED_WORKFLOW_ID"',
         '--workflow-id "$MANAGED_WORKFLOW_ID"',
         "select_managed_workflow_id",
         "managed workflow inventory selection failed; no workflow was imported",
@@ -214,6 +217,9 @@ def test_import_command_is_fail_closed_and_canaries_production_noop() -> None:
 
     assert source.index(
         "n8n_cli export:workflow \\\n  --all \\\n  --output=\"$INVENTORY_CONTAINER_PATH\""
+    ) < source.index("n8n_cli import:credentials")
+    assert source.index(
+        'n8n_cli unpublish:workflow --id="$MANAGED_WORKFLOW_ID"'
     ) < source.index("n8n_cli import:credentials")
     assert "After import, bind" not in source
     assert "manual UI" not in source

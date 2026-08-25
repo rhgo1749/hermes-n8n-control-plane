@@ -206,6 +206,7 @@ INVENTORY_CONTAINER_PATH="/files/$RUNTIME_REL/workflows-all.json"
 CREDENTIAL_JSON="$RUNTIME_DIR/credential.json"
 WORKFLOW_JSON="$RUNTIME_DIR/workflow.json"
 CURL_CONFIG="$RUNTIME_DIR/canary.curlrc"
+PUBLISHED_PROBE_CONTAINER_PATH="/files/$RUNTIME_REL/published-before-import.json"
 
 # Inventory the server before preparing or importing any replacement. The
 # export stays in the private runtime directory and is never printed.
@@ -231,6 +232,21 @@ except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
     raise SystemExit(1)
 PY
 )" || fail "managed workflow inventory selection failed; no workflow was imported"
+
+# A previously published legacy record can contain an unsupported node. n8n's
+# import command tries to deactivate that old graph before replacing it and may
+# crash while clearing its webhooks. Unpublish only the exact managed record
+# first when a published version exists; this avoids touching unrelated flows
+# and lets the replacement import start from an inactive record.
+if n8n_cli export:workflow \
+  --id="$MANAGED_WORKFLOW_ID" \
+  --published \
+  --output="$PUBLISHED_PROBE_CONTAINER_PATH" >/dev/null 2>&1; then
+  if ! n8n_cli unpublish:workflow --help >/dev/null 2>&1; then
+    fail "managed workflow is published but n8n unpublish command is unavailable"
+  fi
+  n8n_cli unpublish:workflow --id="$MANAGED_WORKFLOW_ID"
+fi
 
 PYTHONDONTWRITEBYTECODE=1 python3 "$N8N_DIR/scripts/prepare_edge_sync_runtime.py" \
   --token-file "$TOKEN_FILE" \
