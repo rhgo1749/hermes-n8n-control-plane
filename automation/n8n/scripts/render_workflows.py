@@ -170,7 +170,7 @@ def edge_sync_workflow(workflow: dict[str, str]) -> dict[str, Any]:
                 "id": _uuid(f"{workflow['slug']}:actuator"),
                 "name": sync_name,
                 "type": "n8n-nodes-base.httpRequest",
-                "typeVersion": 4.5,
+                "typeVersion": 4.4,
                 "position": [920, 220],
                 "credentials": {
                     "httpHeaderAuth": {

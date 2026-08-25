@@ -25,6 +25,7 @@ from render_workflows import (  # noqa: E402
     EDGE_SYNC_WORKFLOW_ID,
     bind_runtime_credential,
     build_runtime_credential,
+    edge_sync_workflow,
 )
 
 
@@ -62,6 +63,24 @@ def test_runtime_credential_helper_binds_both_nodes_without_mutating_template() 
             "name": EDGE_SYNC_CREDENTIAL_NAME,
         },
     }
+
+
+def test_edge_sync_http_request_uses_pinned_n8n_supported_version() -> None:
+    workflows = (
+        _workflow(),
+        edge_sync_workflow(
+            {"slug": "github-pr-edge-sync", "name": "GitHub PR edge sync"}
+        ),
+    )
+    for workflow in workflows:
+        actuator = next(
+            node
+            for node in workflow["nodes"]
+            if node["name"] == "Run edge sync actuator"
+        )
+
+        assert actuator["type"] == "n8n-nodes-base.httpRequest"
+        assert actuator["typeVersion"] == 4.4
 
 
 def test_runtime_credential_helper_can_reuse_legacy_workflow_id() -> None:
@@ -170,7 +189,9 @@ def test_prepare_runtime_writes_private_artifacts_and_curl_config(tmp_path: Path
         "name": "Authorization",
         "value": f"Bearer {synthetic_value}",
     }
-    assert synthetic_value in curl_config
+    assert curl_config == (
+        f'header = {json.dumps("Authorization: " + "Bearer " + synthetic_value)}\n'
+    )
     assert synthetic_value not in json.dumps(workflow)
     assert workflow["id"] == "legacy-random-workflow-id"
     assert all(

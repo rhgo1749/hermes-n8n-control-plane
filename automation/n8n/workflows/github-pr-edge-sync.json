@@ -127,7 +127,7 @@
       "id": "3add3d8a-5ad0-59db-92f2-cdd684e3ca01",
       "name": "Run edge sync actuator",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.5,
+      "typeVersion": 4.4,
       "position": [
         920,
         220

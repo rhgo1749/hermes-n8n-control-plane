@@ -136,7 +136,8 @@ def _write_json(path: Path, value: Any) -> None:
 def _write_curl_config(path: Path, token: str) -> None:
     """Write only the canary Authorization header to a private curl config."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    config = f"header = {json.dumps(f'Authorization: Bearer {token}')}\n"
+    header = "Authorization: " + "Bearer " + token
+    config = f"header = {json.dumps(header)}\n"
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     descriptor = os.open(path, flags, 0o600)
     try:
