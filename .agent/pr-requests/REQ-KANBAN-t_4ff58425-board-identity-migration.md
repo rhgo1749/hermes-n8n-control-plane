@@ -36,11 +36,15 @@
    `deploy-intake-edge.sh`): preflight -> migrate -> transition -> postcheck
    -> rollback with dry-run, content-stamped backups, evidence-gated
    transition, idempotency anchor carry-over (the board-scoped dedup boundary
-   for #72-class issues), and fail-closed gates (non-terminal legacy tasks,
-   mixed/ambiguous provenance, canonical conflict, unresolvable checkout,
-   incomplete evidence). Legacy boards are archived (recoverable), never
-   hard-deleted. No GitHub mutation, no Hermes core change, no ad-hoc
-   production SQLite writes.
+   for #72-class issues), durable per-anchor checkpoints/reconciliation,
+   shared exclusive migration/intake leases with under-lock rescans, and
+   fail-closed gates (non-terminal legacy tasks, mixed/ambiguous provenance,
+   canonical conflict, unresolvable checkout, incomplete evidence, and
+   backup-content drift). Legacy boards are archived (recoverable), never
+   hard-deleted. Bootstrap provisioning validates repository-derived slugs,
+   verified checkout origin, and existing-board ownership before any create.
+   No GitHub mutation, no Hermes core change, no ad-hoc production SQLite
+   writes.
 
 3. Runbook + deployed-runtime verification plan:
    `docs/BOARD_IDENTITY_MIGRATION.md`.
@@ -55,9 +59,9 @@
 
 ## Validation
 
-- `tests/test_board_identity_migration.py` (15 fixture/integration tests,
+- `tests/test_board_identity_migration.py` (20 fixture/integration tests,
   standalone runner, no live mutation).
-- Registry/intake/actuator/router suites re-run; `validate.py` n8n contract
-  check.
+- `tests/test_repo_scoped_intake.py` (27 fixture tests) plus registry/intake/
+  actuator/router suites re-run; `validate.py` n8n contract check.
 - Evidence: exact-head test evidence recorded in the PR body and Kanban
   handoff.

@@ -62,6 +62,27 @@ def _ensure_db(slug: str) -> None:
         con.close()
 
 
+def _fail_task_create_if_requested() -> bool:
+    """Inject one deterministic task-create failure for recovery tests."""
+    try:
+        target = int(os.environ.get("FAKE_KANBAN_FAIL_TASK_CREATE_N", "0"))
+    except ValueError:
+        target = 0
+    if target <= 0:
+        return False
+    marker = _boards_root() / ".fake-task-create-count"
+    try:
+        count = int(marker.read_text(encoding="utf-8")) if marker.is_file() else 0
+    except ValueError:
+        count = 0
+    count += 1
+    marker.write_text(str(count), encoding="utf-8")
+    if count == target:
+        print("fake-hermes: injected task create failure", file=sys.stderr)
+        return True
+    return False
+
+
 def _boards_list(args: list[str]) -> int:
     root = _boards_root()
     items = []
@@ -158,6 +179,8 @@ def _task_create(args: list[str], board: str) -> int:
         else:
             i += 2
     _ensure_db(board)
+    if _fail_task_create_if_requested():
+        return 91
     con = _connect(board)
     if key is not None:
         row = con.execute(

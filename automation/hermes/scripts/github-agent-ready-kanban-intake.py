@@ -15,21 +15,25 @@ clears; fixture mode never touches GitHub.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
 
 DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
 DEFAULT_HERMES_BIN = "/home/hermes/.local/bin/hermes"
@@ -38,6 +42,13 @@ GITHUB_LABEL = "agent-ready"
 LEAD_PROFILE = "kanban-main"
 HTTP_TIMEOUT_SECONDS = 30
 MAX_ISSUE_PAGES = 10
+_BOOTSTRAP_REPOSITORY = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
+)
+_GITHUB_ISSUE_KEY = re.compile(
+    r"^github:([^:]+/[^:]+):issue:\d+$", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -394,6 +405,45 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_KANBAN_INTAKE_HOME") or os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME)
 
 
+def _intake_migration_lease_path() -> Path:
+    configured = os.environ.get("HERMES_INTAKE_MIGRATION_LEASE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    configured_boards_root = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
+    if configured_boards_root:
+        return Path(configured_boards_root).expanduser() / ".intake-migration.lock"
+    return _hermes_home() / "kanban" / "boards" / ".intake-migration.lock"
+
+
+@contextmanager
+def _intake_mutation_lease() -> Iterator[None]:
+    """Admit one Kanban writer unless a migration owns the handoff lease."""
+    path = _intake_migration_lease_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+    except OSError as exc:
+        raise IntakeError(f"cannot open migration/intake lease {path}: {exc}") from exc
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise IntakeError(
+                    "migration/intake lease is held; refusing Kanban mutation"
+                ) from exc
+            raise IntakeError(f"cannot acquire migration/intake lease {path}: {exc}") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        handle.close()
+
+
 def _hermes_bin() -> str:
     configured = os.environ.get("HERMES_KANBAN_INTAKE_BIN")
     if configured:
@@ -667,6 +717,52 @@ def _board_slugs() -> set[str]:
     return {str(item.get("slug")) for item in items if isinstance(item, dict) and item.get("slug")}
 
 
+def _verify_bootstrap_checkout(repository: str, checkout: str) -> Path:
+    path = Path(checkout)
+    if not path.is_absolute() or not path.is_dir():
+        raise IntakeError(
+            f"bootstrap checkout must be an absolute existing directory for {repository}: "
+            f"{checkout}"
+        )
+    code, root, _ = _run_git(checkout, "rev-parse", "--show-toplevel")
+    if code != 0 or Path(root).resolve() != path.resolve():
+        raise IntakeError(f"bootstrap checkout is not a verified Git root: {checkout}")
+    code, remote, _ = _run_git(checkout, "remote", "get-url", "origin")
+    expected = _normalise_remote(f"https://github.com/{repository}.git")
+    if code != 0 or _normalise_remote(remote) != expected:
+        raise IntakeError(f"bootstrap checkout origin mismatch for {repository}")
+    return path.resolve()
+
+
+def _board_repository_owners(board: str) -> set[str]:
+    """Read live GitHub provenance for a candidate board before reuse/create."""
+    configured_boards_root = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
+    boards_root = (
+        Path(configured_boards_root).expanduser()
+        if configured_boards_root
+        else _hermes_home() / "kanban" / "boards"
+    )
+    db = boards_root / board / "kanban.db"
+    if not db.is_file():
+        raise IntakeError(f"cannot verify ownership of existing board {board}")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT idempotency_key FROM tasks WHERE idempotency_key IS NOT NULL"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise IntakeError(f"could not inspect existing board ownership for {board}: {exc}") from exc
+    owners: set[str] = set()
+    for (raw_key,) in rows:
+        match = _GITHUB_ISSUE_KEY.match(str(raw_key or ""))
+        if match:
+            owners.add(match.group(1).casefold())
+    return owners
+
+
 def _provision_bootstrap_boards(
     snapshot: dict[str, Any],
     *,
@@ -691,8 +787,10 @@ def _provision_bootstrap_boards(
         entries = []
     scope_keys = {key.casefold() for key in scope} if scope else None
 
-    # Candidate intents within the tick scope (validated, ordered).
+    # Candidate intents within the tick scope. Validate every identity and
+    # checkout before reading or creating any candidate board.
     candidates: list[tuple[str, str, str]] = []
+    board_owners: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -707,19 +805,46 @@ def _provision_bootstrap_boards(
                 f"malformed bootstrap intent for {repository or '(unknown)'}: "
                 "requires repository, board, and checkout"
             )
+        if not _BOOTSTRAP_REPOSITORY.fullmatch(repository):
+            raise IntakeError(f"invalid bootstrap repository syntax: {repository!r}")
+        canonical_board = repository.rsplit("/", 1)[-1].casefold()
+        if board != canonical_board:
+            raise IntakeError(
+                f"bootstrap board {board!r} is not repository-derived for {repository}; "
+                f"expected {canonical_board!r}"
+            )
         if scope_keys is not None and repository.casefold() not in scope_keys:
             continue
-        candidates.append((repository, board, checkout))
+        _verify_bootstrap_checkout(repository, checkout)
+        prior_repository = board_owners.get(board)
+        if prior_repository is not None and prior_repository.casefold() != repository.casefold():
+            raise IntakeError(
+                f"bootstrap board {board} has duplicate repository ownership: "
+                f"{prior_repository} and {repository}"
+            )
+        board_owners[board] = repository
+        if (repository, board, checkout) not in candidates:
+            candidates.append((repository, board, checkout))
 
     if not candidates:
         return []
 
-    existing = _board_slugs()
     provisioned: list[dict[str, str]] = []
     for repository, board, checkout in candidates:
-        if board in existing:
-            continue
         if dry_run:
+            existing = _board_slugs()
+            existing_slug = next(
+                (slug for slug in existing if slug.casefold() == board.casefold()),
+                None,
+            )
+            if existing_slug is not None:
+                owners = _board_repository_owners(existing_slug)
+                if owners and owners != {repository.casefold()}:
+                    raise IntakeError(
+                        f"bootstrap board {existing_slug} has conflicting ownership: "
+                        f"owned by {', '.join(sorted(owners))}, not {repository}"
+                    )
+                continue
             provisioned.append(
                 {
                     "repository": repository,
@@ -728,18 +853,33 @@ def _provision_bootstrap_boards(
                 }
             )
             continue
-        _run_hermes(
-            "kanban",
-            "boards",
-            "create",
-            board,
-            "--default-workdir",
-            checkout,
-            parse_json=False,
-        )
-        # Fail closed if the board did not actually land.
-        if board not in _board_slugs():
-            raise IntakeError(f"board provisioning did not land for {board}")
+        with _intake_mutation_lease():
+            existing = _board_slugs()
+            existing_slug = next(
+                (slug for slug in existing if slug.casefold() == board.casefold()),
+                None,
+            )
+            if existing_slug is not None:
+                owners = _board_repository_owners(existing_slug)
+                if owners and owners != {repository.casefold()}:
+                    raise IntakeError(
+                        f"bootstrap board {existing_slug} has conflicting ownership: "
+                        f"owned by {', '.join(sorted(owners))}, not {repository}"
+                    )
+                continue
+            _run_hermes(
+                "kanban",
+                "boards",
+                "create",
+                board,
+                "--default-workdir",
+                checkout,
+                parse_json=False,
+            )
+            # Fail closed if the board did not actually land.
+            landed = _board_slugs()
+            if not any(slug.casefold() == board.casefold() for slug in landed):
+                raise IntakeError(f"board provisioning did not land for {board}")
         provisioned.append(
             {
                 "repository": repository,
@@ -809,30 +949,31 @@ def _create_task(
     key = _idempotency_key(config.name, issue["number"])
     title = str(issue.get("title") or "(untitled)").replace("\n", " ").strip()
     body = _task_body(config, snapshot, issue, key, imported_at)
-    payload = _run_hermes(
-        "kanban",
-        "--board",
-        config.board,
-        "create",
-        f"GitHub Issue intake: {config.name}#{issue['number']} — {title}",
-        "--body",
-        body,
-        "--assignee",
-        LEAD_PROFILE,
-        "--created-by",
-        "github-issue-intake",
-        "--workspace",
-        "worktree",
-        "--idempotency-key",
-        key,
-        "--skill",
-        "github",
-        "--skill",
-        "github-issue-to-pr",
-        "--skill",
-        "pr-specification-execution",
-        "--json",
-    )
+    with _intake_mutation_lease():
+        payload = _run_hermes(
+            "kanban",
+            "--board",
+            config.board,
+            "create",
+            f"GitHub Issue intake: {config.name}#{issue['number']} — {title}",
+            "--body",
+            body,
+            "--assignee",
+            LEAD_PROFILE,
+            "--created-by",
+            "github-issue-intake",
+            "--workspace",
+            "worktree",
+            "--idempotency-key",
+            key,
+            "--skill",
+            "github",
+            "--skill",
+            "github-issue-to-pr",
+            "--skill",
+            "pr-specification-execution",
+            "--json",
+        )
     if not isinstance(payload, dict) or not payload.get("id"):
         raise IntakeError(f"Hermes create returned no task id for {key}")
     # Idempotent create returns the EXISTING card's id and created_at; a
@@ -1358,13 +1499,15 @@ def _sync_board(
     if dry_run:
         command.append("--dry-run")
     try:
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
+        with _intake_mutation_lease():
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+                check=False,
+            )
     except subprocess.TimeoutExpired as exc:
         raise IntakeError(
             f"kanban-github-sync timed out for {config.board}: {exc}"

@@ -55,6 +55,8 @@ explicit confirm flags and run only when an operator invokes them.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -64,6 +66,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +75,7 @@ from typing import Any
 GITHUB_ISSUE_KEY = re.compile(r"^github:([^:]+/[^:]+):issue:\d+$", re.IGNORECASE)
 TERMINAL_STATUSES = frozenset({"done", "review", "archived"})
 EVIDENCE_SCHEMA_VERSION = 1
+MIGRATION_LEASE_TIMEOUT_SECONDS = 5.0
 # Files that are volatile at runtime and must not gate integrity checks.
 _VOLATILE_NAMES = frozenset(
     {
@@ -216,9 +221,10 @@ def _classify(
         if fact.archived:
             continue
         if fact.slug.casefold() == canonical_slug:
-            if not fact.provenance:
-                canonical = fact
-            elif set(fact.provenance) == {repository.casefold()}:
+            valid_canonical = not fact.provenance or set(fact.provenance) == {
+                repository.casefold()
+            }
+            if valid_canonical and canonical is None:
                 canonical = fact
             else:
                 ambiguous.append(fact)
@@ -307,6 +313,52 @@ def _load_evidence(state_root: Path, repository: str) -> dict[str, Any]:
     return payload
 
 
+@contextmanager
+def _exclusive_migration_lease(
+    path: Path,
+    *,
+    timeout: float = MIGRATION_LEASE_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Hold the exclusive lease shared with the production intake writer.
+
+    The intake takes the same non-blocking lock around every Kanban mutation.
+    Transition waits briefly for an in-flight tick to drain, then fails closed
+    rather than archiving a board while a writer is still admitted.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+    except OSError as exc:
+        raise MigrationError(f"cannot open migration/intake lease {path}: {exc}") from exc
+
+    acquired = False
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise MigrationError(
+                        f"cannot acquire migration/intake lease {path}: {exc}"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise MigrationError(
+                        f"migration/intake lease is busy; refusing transition: {path}"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
 def _save_evidence(state_root: Path, repository: str, evidence: dict[str, Any]) -> None:
     path = _evidence_path(state_root, repository)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,6 +391,45 @@ def _task_count_excluding(board_dir: Path, task_ids: frozenset[str]) -> int:
     finally:
         con.close()
     return total - anchored
+
+
+def _existing_anchor_task_ids(
+    board_dir: Path,
+    keys: frozenset[str],
+    *,
+    include_archived: bool = False,
+) -> dict[str, str]:
+    """Find live canonical tasks for source keys after an interrupted carry.
+
+    A successful Hermes create can be followed by a process failure before the
+    evidence checkpoint is written. Re-reading the canonical DB by its
+    idempotency keys makes the next transition/rollback converge instead of
+    treating that task as an unexplained canonical conflict.
+    """
+    if not keys:
+        return {}
+    db = board_dir / "kanban.db"
+    if not db.is_file():
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT id, idempotency_key, status FROM tasks "
+                "WHERE idempotency_key IS NOT NULL"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise MigrationError(
+            f"could not inspect canonical anchor tasks in {board_dir}: {exc}"
+        ) from exc
+    return {
+        str(key): str(task_id)
+        for task_id, key, status in rows
+        if str(key) in keys
+        and (include_archived or str(status) != "archived")
+    }
 
 
 def _preflight(
@@ -522,10 +613,12 @@ def _carry_anchors(
     hermes_bin: str,
     repository: str,
     source_board_dir: Path,
+    canonical_board_dir: Path,
     canonical_slug: str,
     display_name: str,
     *,
     dry_run: bool,
+    checkpoint: Callable[[str, str], None] | None = None,
 ) -> dict[str, str]:
     """Carry terminal idempotency anchors to the canonical board.
 
@@ -540,6 +633,10 @@ def _carry_anchors(
     anchors = _terminal_anchor_keys(source_board_dir, repository)
     if not anchors:
         return {}
+    existing = _existing_anchor_task_ids(
+        canonical_board_dir,
+        frozenset(anchors),
+    )
     task_ids: dict[str, str] = {}
     for key in sorted(anchors):
         number = key.rsplit(":", 1)[-1]
@@ -561,29 +658,31 @@ def _carry_anchors(
         if dry_run:
             task_ids[key] = "would-carry"
             continue
-        payload = _run_hermes(
-            hermes_bin,
-            "kanban",
-            "--board",
-            canonical_slug,
-            "create",
-            title,
-            "--body",
-            body,
-            "--created-by",
-            "board-identity-migration",
-            "--idempotency-key",
-            key,
-            "--initial-status",
-            "blocked",
-            "--json",
-            parse_json=True,
-        )
-        if not isinstance(payload, dict) or not payload.get("id"):
-            raise MigrationError(
-                f"anchor create returned no task id for {key}: {payload!r}"
+        task_id = existing.get(key)
+        if task_id is None:
+            payload = _run_hermes(
+                hermes_bin,
+                "kanban",
+                "--board",
+                canonical_slug,
+                "create",
+                title,
+                "--body",
+                body,
+                "--created-by",
+                "board-identity-migration",
+                "--idempotency-key",
+                key,
+                "--initial-status",
+                "blocked",
+                "--json",
+                parse_json=True,
             )
-        task_id = str(payload["id"])
+            if not isinstance(payload, dict) or not payload.get("id"):
+                raise MigrationError(
+                    f"anchor create returned no task id for {key}: {payload!r}"
+                )
+            task_id = str(payload["id"])
         _run_hermes(
             hermes_bin,
             "kanban",
@@ -596,6 +695,12 @@ def _carry_anchors(
             parse_json=False,
         )
         task_ids[key] = task_id
+        existing[key] = task_id
+        if checkpoint is not None:
+            # The checkpoint is deliberately after create + terminalization.
+            # If the process dies before this callback, the next retry
+            # reconciles the canonical DB by idempotency key.
+            checkpoint(key, task_id)
     return task_ids
 
 
@@ -681,7 +786,7 @@ def _stage_preflight(
     return report
 
 
-def _stage_migrate(
+def _stage_migrate_locked(
     args: argparse.Namespace,
     facts: list[BoardFact],
     *,
@@ -749,6 +854,9 @@ def _stage_migrate(
                     slug: info["checksums"] for slug, info in backups.items()
                 },
                 "legacy_task_counts": {b.slug: b.task_count for b in legacy},
+                "legacy_provenance": {
+                    b.slug: list(b.provenance) for b in legacy
+                },
                 "stage": "migrated",
             }
         )
@@ -790,16 +898,32 @@ def _archived_variants(boards_root: Path, slug: str) -> list[Path]:
     ]
 
 
-def _stage_transition(
+def _stage_migrate(
     args: argparse.Namespace,
     facts: list[BoardFact],
     *,
     dry_run: bool,
 ) -> dict[str, Any]:
-    if not args.require_provenance:
-        raise MigrationError("transition requires --require-provenance")
-    if not args.confirm_live_transition:
-        raise MigrationError("transition requires --confirm-live-transition")
+    if dry_run:
+        return _stage_migrate_locked(args, facts, dry_run=True)
+    del facts  # The authoritative snapshot is taken only after the lease.
+    lease_path = getattr(args, "lease_path", None) or (
+        args.boards_root / ".intake-migration.lock"
+    )
+    with _exclusive_migration_lease(Path(lease_path)):
+        return _stage_migrate_locked(
+            args,
+            _scan_boards(args.boards_root),
+            dry_run=False,
+        )
+
+
+def _stage_transition_locked(
+    args: argparse.Namespace,
+    facts: list[BoardFact],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
     repository = _require_repository(args)
     evidence = _load_evidence(args.state_root, repository)
     if evidence.get("stage") != "migrated" or not evidence.get("repository"):
@@ -808,8 +932,52 @@ def _stage_transition(
         )
     if str(evidence.get("repository", "")).casefold() != repository.casefold():
         raise MigrationError("migration evidence belongs to a different repository")
+    recorded_anchor_ids = evidence.get("anchor_task_ids", {})
+    recorded_anchor_keys = evidence.get("anchor_keys", [])
+    if not isinstance(recorded_anchor_ids, dict) or not isinstance(
+        recorded_anchor_keys, list
+    ):
+        raise MigrationError("migration evidence has malformed anchor checkpoint data")
 
-    anchor_task_ids = frozenset(evidence.get("anchor_task_ids", {}).values())
+    # Reconcile canonical tasks by source idempotency key before preflight.
+    # This recovers a create that succeeded immediately before a worker died,
+    # even when its evidence checkpoint was never written.
+    _canonical, live_legacy, _ambiguous, _unrelated = _classify(repository, facts)
+    source_anchor_keys: set[str] = set()
+    for legacy_fact in live_legacy:
+        source_anchor_keys.update(
+            _terminal_anchor_keys(legacy_fact.directory, repository)
+        )
+    carried: dict[str, str] = {
+        str(key): str(task_id)
+        for key, task_id in recorded_anchor_ids.items()
+        if str(key) and str(task_id)
+    }
+    canonical_fact = _canonical
+    if canonical_fact is None and live_legacy:
+        raise MigrationError(
+            "canonical board is missing from migrated evidence; refusing transition"
+        )
+    if canonical_fact is not None and source_anchor_keys:
+        carried.update(
+            {
+                key: task_id
+                for key, task_id in _existing_anchor_task_ids(
+                    canonical_fact.directory,
+                    frozenset(source_anchor_keys),
+                ).items()
+                if key not in carried
+            }
+        )
+    if carried != recorded_anchor_ids or (
+        source_anchor_keys
+        and sorted(source_anchor_keys) != sorted(recorded_anchor_keys)
+    ):
+        evidence["anchor_task_ids"] = carried
+        evidence["anchor_keys"] = sorted(source_anchor_keys)
+        _save_evidence(args.state_root, repository, evidence)
+
+    anchor_task_ids = frozenset(carried.values())
     report = _preflight(
         repository,
         facts,
@@ -827,12 +995,31 @@ def _stage_transition(
         # ones recorded in the migration evidence (same tasks, still
         # terminal-only) before the archive step runs.
         recorded_counts = evidence.get("legacy_task_counts", {})
+        recorded_provenance = evidence.get("legacy_provenance", {})
+        if not isinstance(recorded_counts, dict) or not isinstance(
+            recorded_provenance, dict
+        ):
+            raise MigrationError(
+                "migration evidence is missing final task-count/provenance records"
+            )
+        if set(report["legacy_boards"]) != set(evidence.get("legacy_boards", [])):
+            raise MigrationError(
+                "live legacy board set changed since migrate; refusing transition"
+            )
         for slug in report["legacy_boards"]:
             fact = next(f for f in facts if f.slug == slug)
             if int(recorded_counts.get(slug, -1)) != fact.task_count:
                 raise MigrationError(
                     f"legacy board {slug} task count changed since migrate "
                     f"({recorded_counts.get(slug)!r} -> {fact.task_count})"
+                )
+            expected_provenance = tuple(
+                sorted(str(item).casefold() for item in recorded_provenance.get(slug, []))
+            )
+            if expected_provenance != fact.provenance:
+                raise MigrationError(
+                    f"legacy board {slug} provenance changed since migrate "
+                    f"({expected_provenance!r} -> {fact.provenance!r})"
                 )
             if fact.non_terminal:
                 raise MigrationError(
@@ -867,7 +1054,6 @@ def _stage_transition(
             )
 
     legacy_slugs = report["legacy_boards"]
-    carried: dict[str, str] = dict(evidence.get("anchor_task_ids", {}))
     if not dry_run:
         # Carry the idempotency anchors BEFORE the legacy board leaves the
         # live set: the source database must still be readable at its
@@ -876,18 +1062,61 @@ def _stage_transition(
         carry_sources = {
             slug: next(f for f in facts if f.slug == slug) for slug in legacy_slugs
         }
+
+        def checkpoint_anchor(key: str, task_id: str) -> None:
+            carried[key] = task_id
+            evidence["anchor_task_ids"] = dict(carried)
+            evidence["anchor_keys"] = sorted(source_anchor_keys)
+            _save_evidence(args.state_root, repository, evidence)
+
         for slug in legacy_slugs:
             carried.update(
                 _carry_anchors(
                     args.hermes_bin,
                     repository,
                     carry_sources[slug].directory,
+                    canonical.directory,
                     report["canonical_slug"],
                     report["display_name"],
                     dry_run=dry_run,
+                    checkpoint=checkpoint_anchor,
                 )
             )
+
+        # A cooperating intake cannot write while the lease is held, but the
+        # second scan also catches an out-of-band writer and refuses to archive
+        # a board whose task/provenance set changed during the handoff.
+        after_carry = _scan_boards(args.boards_root)
+        after_report = _preflight(
+            repository,
+            after_carry,
+            allow_recreate_canonical=args.allow_recreate_canonical,
+            anchor_task_ids=frozenset(carried.values()),
+        )
+        if after_report["errors"]:
+            raise MigrationError(
+                "transition overlap re-check failed: "
+                + "; ".join(after_report["errors"])
+            )
+        if after_report["legacy_boards"] != legacy_slugs:
+            raise MigrationError(
+                "live legacy board set changed during transition; refusing archive"
+            )
+        for slug in legacy_slugs:
+            before = next(f for f in facts if f.slug == slug)
+            after = next(f for f in after_carry if f.slug == slug)
+            if (
+                after.task_count != before.task_count
+                or after.provenance != before.provenance
+                or after.non_terminal != before.non_terminal
+            ):
+                raise MigrationError(
+                    f"legacy board {slug} changed during transition; refusing archive"
+                )
+
         evidence["anchor_task_ids"] = carried
+        evidence["anchor_keys"] = sorted(source_anchor_keys)
+        _save_evidence(args.state_root, repository, evidence)
         for slug in legacy_slugs:
             # Recoverable archive (the CLI default); never --delete.
             _run_hermes(args.hermes_bin, "kanban", "boards", "rm", slug)
@@ -914,7 +1143,29 @@ def _stage_transition(
     return {**report, "archived_legacy": list(legacy_slugs)}
 
 
-def _stage_postcheck(
+def _stage_transition(
+    args: argparse.Namespace,
+    facts: list[BoardFact],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if not args.require_provenance:
+        raise MigrationError("transition requires --require-provenance")
+    if not args.confirm_live_transition:
+        raise MigrationError("transition requires --confirm-live-transition")
+    del facts  # The authoritative snapshot is taken only after the lease.
+    lease_path = getattr(args, "lease_path", None) or (
+        args.boards_root / ".intake-migration.lock"
+    )
+    with _exclusive_migration_lease(Path(lease_path)):
+        return _stage_transition_locked(
+            args,
+            _scan_boards(args.boards_root),
+            dry_run=dry_run,
+        )
+
+
+def _stage_postcheck_locked(
     args: argparse.Namespace,
     facts: list[BoardFact],
     *,
@@ -929,24 +1180,78 @@ def _stage_postcheck(
 
     canonical_slug = str(evidence["canonical_slug"])
     display_name = str(evidence["display_name"])
+    recorded_legacy_raw = evidence.get("legacy_boards", [])
+    recorded_backups = evidence.get("legacy_backups", {})
+    recorded_checksums = evidence.get("legacy_checksums", {})
+    if (
+        not isinstance(recorded_legacy_raw, list)
+        or not isinstance(recorded_backups, dict)
+        or not isinstance(recorded_checksums, dict)
+    ):
+        raise MigrationError("postcheck evidence has malformed legacy board records")
     live = _live_boards(args.hermes_bin)
+    del facts
+    fresh_facts = _scan_boards(args.boards_root)
 
     errors: list[str] = []
-    if canonical_slug not in live:
+    canonical_matches = [
+        fact
+        for fact in fresh_facts
+        if not fact.archived and fact.slug.casefold() == canonical_slug
+    ]
+    canonical_live_slugs = [
+        slug for slug in live if slug.casefold() == canonical_slug
+    ]
+    if len(canonical_matches) != 1 or len(canonical_live_slugs) != 1:
         errors.append("canonical board is not live after transition")
-    elif live[canonical_slug].casefold() != display_name.casefold():
+    elif live[canonical_live_slugs[0]].casefold() != display_name.casefold():
         errors.append(
-            f"canonical display name is {live[canonical_slug]!r}, "
+            f"canonical display name is {live[canonical_live_slugs[0]]!r}, "
             f"expected {display_name!r}"
         )
-    for slug in evidence.get("legacy_boards", []):
-        if slug in live:
+    _canonical, target_legacy, ambiguous, _unrelated = _classify(
+        repository,
+        fresh_facts,
+    )
+    if ambiguous:
+        errors.append(
+            "fresh live-board provenance is ambiguous/mixed: "
+            + ", ".join(
+                f"{fact.slug}({'+'.join(fact.provenance) or 'no-provenance'})"
+                for fact in ambiguous
+            )
+        )
+    target_provenance = [
+        fact
+        for fact in fresh_facts
+        if not fact.archived and repository.casefold() in fact.provenance
+    ]
+    if len(target_provenance) > 1:
+        errors.append(
+            "fresh live-board provenance is ambiguous: repository appears on "
+            + ", ".join(sorted(fact.slug for fact in target_provenance))
+        )
+    recorded_legacy = {str(slug) for slug in recorded_legacy_raw}
+    recorded_legacy_casefold = {slug.casefold() for slug in recorded_legacy}
+    extra_target_boards = sorted(
+        fact.slug
+        for fact in target_legacy
+        if fact.slug.casefold() not in recorded_legacy_casefold
+    )
+    if extra_target_boards:
+        errors.append(
+            "extra live target-provenance board(s) after transition: "
+            + ", ".join(extra_target_boards)
+        )
+    live_casefold = {slug.casefold() for slug in live}
+    for slug in recorded_legacy:
+        if slug.casefold() in live_casefold:
             errors.append(f"legacy board {slug} is still live after transition")
 
     # The archived legacy board must match the recorded backup checksums.
-    for slug, backup_path in evidence.get("legacy_backups", {}).items():
+    for slug, backup_path in recorded_backups.items():
         matches = _archived_variants(args.boards_root, slug)
-        expected = evidence.get("legacy_checksums", {}).get(slug, {})
+        expected = recorded_checksums.get(slug, {})
         if not any(_file_map(candidate) == expected for candidate in matches):
             errors.append(
                 f"archived legacy board {slug} does not match the recorded "
@@ -974,7 +1279,25 @@ def _stage_postcheck(
     return {"ok": True}
 
 
-def _stage_rollback(
+def _stage_postcheck(
+    args: argparse.Namespace,
+    facts: list[BoardFact],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    del facts  # The authoritative snapshot is taken only after the lease.
+    lease_path = getattr(args, "lease_path", None) or (
+        args.boards_root / ".intake-migration.lock"
+    )
+    with _exclusive_migration_lease(Path(lease_path)):
+        return _stage_postcheck_locked(
+            args,
+            _scan_boards(args.boards_root),
+            dry_run=dry_run,
+        )
+
+
+def _stage_rollback_locked(
     args: argparse.Namespace,
     facts: list[BoardFact],
     *,
@@ -990,10 +1313,6 @@ def _stage_rollback(
     live = _live_boards(args.hermes_bin)
     canonical_slug = str(evidence.get("canonical_slug", ""))
     errors: list[str] = []
-
-    # The canonical board may only be removed while it is still empty: the
-    # migration never creates tasks, so a populated canonical board means
-    # post-transition work happened — fail closed instead of deleting data.
     canonical_fact = next(
         (
             f
@@ -1002,7 +1321,81 @@ def _stage_rollback(
         ),
         None,
     )
-    anchor_ids = frozenset(evidence.get("anchor_task_ids", {}).values())
+
+    legacy_slugs = evidence.get("legacy_boards")
+    legacy_backups = evidence.get("legacy_backups")
+    legacy_checksums = evidence.get("legacy_checksums")
+    if (
+        not isinstance(legacy_slugs, list)
+        or not isinstance(legacy_backups, dict)
+        or not isinstance(legacy_checksums, dict)
+    ):
+        raise MigrationError(
+            "rollback evidence is missing legacy board backup/checksum records"
+        )
+
+    # Resolve and validate every candidate before any restore, anchor purge,
+    # or canonical-board removal. A mutable backup is not trusted merely
+    # because its path is recorded in the evidence.
+    candidates: dict[str, Path] = {}
+    for raw_slug in legacy_slugs:
+        slug = str(raw_slug)
+        backup_path = str(legacy_backups.get(slug, "")).strip()
+        candidate: Path | None = Path(backup_path) if backup_path else None
+        if candidate is not None and not candidate.is_dir():
+            candidate = None
+        if candidate is None:
+            matches = _archived_variants(args.boards_root, slug)
+            if len(matches) == 1:
+                candidate = matches[0]
+        expected = legacy_checksums.get(slug)
+        if candidate is None:
+            errors.append(f"cannot locate exactly one archived/backup copy of legacy board {slug}")
+            continue
+        if not isinstance(expected, dict) or _file_map(candidate) != expected:
+            errors.append(
+                f"backup integrity mismatch for legacy board {slug}; refusing rollback"
+            )
+            continue
+        candidates[slug] = candidate
+
+    for slug in legacy_slugs:
+        if slug not in live and (args.boards_root / str(slug)).exists():
+            errors.append(f"target {args.boards_root / str(slug)} already exists; refusing")
+
+    recorded_anchor_keys = evidence.get("anchor_keys", [])
+    if not isinstance(recorded_anchor_keys, list):
+        raise MigrationError("rollback evidence has malformed anchor checkpoint data")
+    anchor_keys = {
+        str(key)
+        for key in recorded_anchor_keys
+        if str(key)
+    }
+    for candidate in candidates.values():
+        anchor_keys.update(_terminal_anchor_keys(candidate, repository))
+    recorded_anchor_ids = evidence.get("anchor_task_ids", {})
+    if not isinstance(recorded_anchor_ids, dict):
+        raise MigrationError("rollback evidence has malformed anchor checkpoint data")
+    anchor_map = {
+        str(key): str(task_id)
+        for key, task_id in recorded_anchor_ids.items()
+        if str(key) and str(task_id)
+    }
+    if canonical_fact is not None and anchor_keys:
+        canonical_anchor_map = _existing_anchor_task_ids(
+            canonical_fact.directory,
+            frozenset(anchor_keys),
+            include_archived=True,
+        )
+        anchor_map = canonical_anchor_map
+    anchor_ids = frozenset(
+        set(anchor_map.values())
+        | set(recorded_anchor_ids.values())
+    )
+
+    # The canonical board may only be removed while it is still empty: the
+    # migration never creates tasks, so a populated canonical board means
+    # post-transition work happened — fail closed instead of deleting data.
     foreign_count = (
         _task_count_excluding(canonical_fact.directory, anchor_ids)
         if canonical_fact is not None
@@ -1015,35 +1408,33 @@ def _stage_rollback(
         )
 
     restored: list[str] = []
-    for slug in evidence.get("legacy_boards", []):
+    for slug in legacy_slugs:
         if slug in live:
             continue  # already restored: idempotent re-run
-        candidate: Path | None = None
-        backup_path = str(evidence.get("legacy_backups", {}).get(slug, "")).strip()
-        if backup_path:
-            candidate = Path(backup_path)
-            if not candidate.is_dir():
-                candidate = None
+        candidate = candidates.get(str(slug))
         if candidate is None:
-            matches = _archived_variants(args.boards_root, slug)
-            if len(matches) != 1:
-                errors.append(
-                    f"cannot locate exactly one archived copy of legacy board {slug}"
-                )
-                continue
-            candidate = matches[0]
+            continue
         if not dry_run:
             target = args.boards_root / slug
-            if target.exists():
-                raise MigrationError(f"target {target} already exists; refusing")
             shutil.copytree(candidate, target, symlinks=True)
             restored.append(slug)
 
     if not dry_run and not errors:
+        # Re-read after the pre-mutation validation so rollback consumes the
+        # durable checkpoint and also removes a partially checkpointed anchor
+        # that was reconciled by idempotency key.
+        if canonical_fact is not None and anchor_keys:
+            anchor_map.update(
+                _existing_anchor_task_ids(
+                    canonical_fact.directory,
+                    frozenset(anchor_keys),
+                    include_archived=True,
+                )
+            )
         _remove_anchors(
             args.hermes_bin,
             canonical_slug,
-            dict(evidence.get("anchor_task_ids", {})),
+            anchor_map,
         )
 
     if canonical_fact is not None and not errors and not dry_run:
@@ -1058,6 +1449,7 @@ def _stage_rollback(
         evidence.pop("transitioned_boards", None)
         evidence.pop("transitioned_at", None)
         evidence.pop("anchor_task_ids", None)
+        evidence.pop("anchor_keys", None)
         _save_evidence(args.state_root, repository, evidence)
 
     print(
@@ -1075,6 +1467,26 @@ def _stage_rollback(
         )
     )
     return {"restored_legacy": restored}
+
+
+def _stage_rollback(
+    args: argparse.Namespace,
+    facts: list[BoardFact],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if not args.confirm_rollback:
+        raise MigrationError("rollback requires --confirm-rollback")
+    del facts  # The authoritative snapshot is taken only after the lease.
+    lease_path = getattr(args, "lease_path", None) or (
+        args.boards_root / ".intake-migration.lock"
+    )
+    with _exclusive_migration_lease(Path(lease_path)):
+        return _stage_rollback_locked(
+            args,
+            _scan_boards(args.boards_root),
+            dry_run=dry_run,
+        )
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -1098,6 +1510,15 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--hermes-bin",
         default=os.environ.get("HERMES_BIN", "hermes"),
         help="Hermes CLI binary (default: $HERMES_BIN or 'hermes')",
+    )
+    parser.add_argument(
+        "--lease-path",
+        default=os.environ.get("HERMES_INTAKE_MIGRATION_LEASE"),
+        type=Path,
+        help=(
+            "exclusive migration/intake lease path (default: "
+            "<boards-root>/.intake-migration.lock)"
+        ),
     )
     parser.add_argument(
         "--state-root",

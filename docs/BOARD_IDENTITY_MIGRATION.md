@@ -30,10 +30,22 @@ default archive). No ad-hoc production SQLite writes.
   (no `--checkout`, no legacy `default_workdir`, no `--checkout-root`);
 - missing/stale/mismatched migration evidence for `transition` /
   `postcheck` / `rollback`.
+- busy migration/intake lease or a legacy task/provenance change observed by
+  the under-lock transition rescan;
+- missing, malformed, repository-mismatched, or foreign-owned bootstrap
+  intent; and
+- any backup whose current file map differs from the checksum map recorded by
+  `migrate` (rollback refuses all destructive work before restoring anything).
 
 Cutover order is strictly `migration -> transition`. `transition` requires
-`--require-provenance` (re-verifies the legacy task counts and terminal-only
-state against the recorded evidence) and `--confirm-live-transition`.
+`--require-provenance` (re-verifies the legacy task counts, provenance, and
+terminal-only state against the recorded evidence) and
+`--confirm-live-transition`. Every mutating migration stage and every intake
+Kanban write shares the exclusive lease at
+`$HERMES_INTAKE_MIGRATION_LEASE` (default:
+`<boards-root>/.intake-migration.lock`); a held lease fails closed for intake,
+while migration waits briefly for an in-flight writer before refusing the
+stage.
 
 ## Stages
 
@@ -48,7 +60,7 @@ bash automation/hermes/scripts/deploy-intake-edge.sh --hermes-home /home/hermes/
 # 1) Preflight (read-only). Repeat after every change.
 python3 $MIG preflight --dry-run --repository $REPO
 
-# 2) Migrate (pre-transition, data-preserving): backs up every legacy board
+# 2) Migrate (pre-transition, data-preserving, under the shared lease): backs up every legacy board
 #    directory, creates the canonical board if it is not live (display name =
 #    repository name; default_workdir = legacy default_workdir or
 #    --checkout-root/<slug>), re-verifies the legacy board byte-identical,
@@ -64,9 +76,10 @@ python3 /home/hermes/.hermes/scripts/repository_registry.py \
   --kanban-root /home/hermes/.hermes/kanban/boards
 /home/hermes/.local/bin/hermes --board default kanban boards list --all --json
 
-# 4) Transition (only after migrate evidence exists and re-verifies): archives
-#    the legacy board (recoverable, never --delete) after carrying the
-#    idempotency anchors, and makes the canonical board the sole live route.
+# 4) Transition (only after migrate evidence exists and re-verifies): acquires
+#    the shared lease, re-scans immediately before carrying anchors, archives
+#    the legacy board (recoverable, never --delete) only after a second
+#    task/provenance rescan, and makes the canonical board the sole live route.
 python3 $MIG transition --require-provenance --confirm-live-transition --repository $REPO
 
 # 5) Postcheck: canonical live with the repository-derived display name,
@@ -74,10 +87,11 @@ python3 $MIG transition --require-provenance --confirm-live-transition --reposit
 #    recorded backup.
 python3 $MIG postcheck --require-provenance --repository $REPO
 
-# 6) Rollback (if needed before any post-transition work lands): restores the
-#    legacy board from its backup, purges carried anchors, and removes the
-#    canonical board only while it is still empty (a populated canonical board
-#    fails closed). Reversible and repeat-safe.
+# 6) Rollback (if needed before any post-transition work lands): under the
+#    shared lease, validates every backup checksum and restore target before
+#    any restore/purge/removal, restores the legacy board, purges carried
+#    anchors, and removes the canonical board only while it is still empty (a
+#    populated canonical board fails closed). Reversible and repeat-safe.
 python3 $MIG rollback --confirm-rollback --repository $REPO
 ```
 
@@ -89,7 +103,10 @@ board). Without a carried anchor, a re-intake of an already-imported issue
 duplicate root card after the cutover. `transition` therefore carries one
 terminal anchor task per GitHub Issue key (created with the same key, no
 assignee, completed) to the canonical board before archiving the legacy board;
-`rollback` purges them. The registry routing stays unambiguous (single
+each successful create/terminalize pair is checkpointed in the evidence file,
+and a retry reconciles the canonical DB by idempotency key if the process dies
+before the checkpoint. `rollback` consumes that checkpoint and purges the
+actual canonical anchor rows. The registry routing stays unambiguous (single
 provenance) in every state.
 
 ## Backup / rollback guarantees
@@ -99,9 +116,10 @@ provenance) in every state.
   source directory afterwards (byte-identical check).
 - `transition` archives via `hermes kanban boards rm <slug>` (default archive
   to `boards/_archived/<slug>-<ts>`; never `--delete`).
-- `rollback` restores from the recorded backup (or the single matching
-  archived copy), purges anchors, and removes the canonical board only when it
-  is still empty.
+- `rollback` first validates every recorded backup (or the single matching
+  archived copy) against the recorded file map. It then restores from the
+  validated candidates, purges checkpointed/reconciled anchors, and removes
+  the canonical board only when it is still empty.
 - Migration evidence is stored under `<state-root>/<canonical-slug>.json`
   (defaults: `automation/n8n/state/board-identity-migration` and
   `automation/n8n/backups/board-identity-migration`; override with
@@ -141,7 +159,7 @@ task; no live migration/archive/deploy/GitHub mutation here):
 
 ## Acceptance test coverage
 
-`tests/test_board_identity_migration.py` (15 tests, all fixture-driven, no
+`tests/test_board_identity_migration.py` (20 tests, all fixture-driven, no
 live mutation):
 
 - 5-repository registry snapshot: slug/display identity derived without any
@@ -159,3 +177,13 @@ live mutation):
 - canonical-only display normalization (already on the canonical slug, stale
   display name);
 - rollback restore + rerun safety, and the populated-canonical refusal.
+- partial Nth-anchor failure with durable checkpoint/retry reconciliation;
+- distinct-content backup corruption rejected before rollback mutation;
+- second live target-provenance board rejected by fresh postcheck; and
+- shared lease rejection of an interleaved intake writer; and
+- under-lock rescan rejection of an out-of-band source task change.
+
+`tests/test_repo_scoped_intake.py` also covers the bootstrap writer contract:
+repository syntax and repository-derived slug validation, verified checkout
+root/`origin`, duplicate/foreign board ownership, idempotent creation, and
+same-tick first-task intake.

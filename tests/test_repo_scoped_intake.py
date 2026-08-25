@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
     ROOT
@@ -629,10 +628,19 @@ def test_provision_creates_missing_board_with_checkout_workdir() -> None:
         existing.add(board)
         return f"Board '{board}' created."
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         report = intake._provision_bootstrap_boards(snapshot, dry_run=False)
         assert report == [
@@ -650,10 +658,19 @@ def test_provision_skips_existing_board_idempotently() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("must not create an already-existing board")
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = forbidden
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         assert intake._provision_bootstrap_boards(snapshot, dry_run=False) == []
     finally:
@@ -667,10 +684,19 @@ def test_provision_dry_run_never_mutates() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("dry-run must never invoke the Hermes CLI")
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = forbidden
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         report = intake._provision_bootstrap_boards(snapshot, dry_run=True)
         assert report == [
@@ -692,10 +718,19 @@ def test_provision_scope_restricts_provisioning() -> None:
         existing.add(board)
         return f"Board '{board}' created."
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot(
             [
                 _bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new"),
@@ -720,10 +755,19 @@ def test_provision_fails_closed_if_board_does_not_land() -> None:
     def fake_run_hermes(*args: str, **kwargs: Any) -> str:
         return "Board created."  # claims success but the board never lands
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         try:
             intake._provision_bootstrap_boards(snapshot, dry_run=False)
@@ -748,14 +792,100 @@ def test_provision_malformed_intent_fails_closed() -> None:
         raise AssertionError("malformed bootstrap intent must fail closed")
 
 
+def test_provision_rejects_repository_derived_slug_mismatch() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "wrong-slug",
+        "/ws/projects/brand-new",
+    )
+    try:
+        intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+    except intake.IntakeError as exc:
+        assert "repository-derived" in str(exc)
+    else:
+        raise AssertionError("repository-derived slug mismatch must fail closed")
+
+
+def test_provision_rejects_malformed_repository_before_create() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/bad repo",
+        "bad repo",
+        "/ws/projects/bad-repo",
+    )
+    try:
+        intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+    except intake.IntakeError as exc:
+        assert "repository" in str(exc) and "invalid" in str(exc)
+    else:
+        raise AssertionError("malformed repository must fail closed")
+
+
+def test_provision_rejects_unverified_checkout_before_create() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "brand-new",
+        "/definitely/missing/bootstrap-checkout",
+    )
+    try:
+        intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+    except intake.IntakeError as exc:
+        assert "checkout" in str(exc)
+    else:
+        raise AssertionError("missing checkout must fail closed")
+
+
+def test_provision_rejects_foreign_existing_board_owner() -> None:
+    existing = {"brand-new"}
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "brand-new",
+        "/ws/projects/brand-new",
+    )
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_board_repository_owners": intake._board_repository_owners,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_run_hermes": intake._run_hermes,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+    }
+    try:
+        intake.__dict__["_board_slugs"] = lambda: set(existing)
+        intake.__dict__["_board_repository_owners"] = lambda board: {
+            "rhgo1749/other-repo"
+        }
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_run_hermes"] = lambda *args, **kwargs: (
+            (_ for _ in ()).throw(AssertionError("foreign owner must block create"))
+        )
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        try:
+            intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=False)
+        except intake.IntakeError as exc:
+            assert "ownership" in str(exc)
+        else:
+            raise AssertionError("foreign board ownership must fail closed")
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
 def test_provision_without_intents_makes_no_board_calls() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no bootstrap intent, no Hermes CLI calls")
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = forbidden
         intake._run_hermes = forbidden
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_entry("rhgo1749/ctrl-hangul")])
         assert intake._provision_bootstrap_boards(snapshot, dry_run=True) == []
     finally:
@@ -812,6 +942,8 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         "_sync_board",
         "_board_slugs",
         "_run_hermes",
+        "_verify_bootstrap_checkout",
+        "_intake_mutation_lease",
     )
     originals = {name: getattr(intake, name) for name in names}
 
@@ -823,6 +955,9 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
         intake._board_slugs = fake_board_slugs
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         intake._issue_candidates = lambda token, fixture_path, configs: [(configs[0], issue)]
         intake._closing_merged_pr_numbers = lambda token, repository, issue_number: ()
         intake._repo_snapshot = lambda config: intake.RepoSnapshot(

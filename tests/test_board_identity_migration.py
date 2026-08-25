@@ -16,6 +16,7 @@ Runs as a standalone script: ``python3 tests/test_board_identity_migration.py``
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -827,6 +828,263 @@ def test_transition_rejects_missing_or_stale_evidence(tmp: Path) -> None:
     )
     assert proc.returncode == 1
     assert "different repository" in proc.stderr
+
+
+def test_partial_anchor_carry_checkpoints_rerun_and_rollback(tmp: Path) -> None:
+    """A failure on the Nth anchor leaves a recoverable checkpoint only."""
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    keys = [
+        "github:rhgo1749/ctrl-hangul:issue:72",
+        "github:rhgo1749/ctrl-hangul:issue:73",
+    ]
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", key) for key in keys],
+    )
+    sandbox.env["FAKE_KANBAN_FAIL_TASK_CREATE_N"] = "2"
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+
+    failed = sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    )
+    assert failed.returncode == 1
+    assert "ctrlhangul" in sandbox.live_slugs()
+    evidence = json.loads((sandbox.state_root / "ctrl-hangul.json").read_text())
+    assert evidence["stage"] == "migrated"
+    assert len(evidence["anchor_task_ids"]) == 1
+    canonical_keys = {
+        row[2]
+        for row in sandbox.board_tasks("ctrl-hangul")
+        if row[2]
+    }
+    assert len(canonical_keys) == 1
+
+    retried = sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    )
+    assert retried.returncode == 0, retried.stderr
+    assert {
+        row[2]
+        for row in sandbox.board_tasks("ctrl-hangul")
+        if row[2]
+    } == set(keys)
+
+    rolled_back = sandbox.run_with_checkout("rollback", "--confirm-rollback", *common)
+    assert rolled_back.returncode == 0, rolled_back.stderr
+    assert "ctrlhangul" in sandbox.live_slugs()
+    assert "ctrl-hangul" not in sandbox.live_slugs()
+    assert not (sandbox.boards_root / "ctrl-hangul").exists()
+
+
+def test_rollback_rejects_distinct_content_backup_corruption(tmp: Path) -> None:
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+    assert sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    ).returncode == 0
+    backup = next(sandbox.backup_root.glob("ctrlhangul-*")) / "board.json"
+    backup.write_text('{"slug":"ctrlhangul","name":"tampered"}\n', encoding="utf-8")
+
+    rollback = sandbox.run_with_checkout("rollback", "--confirm-rollback", *common)
+    assert rollback.returncode == 1
+    assert "backup integrity mismatch" in rollback.stderr
+    assert "ctrl-hangul" in sandbox.live_slugs()
+    assert "ctrlhangul" not in sandbox.live_slugs()
+
+
+def test_postcheck_rejects_second_live_target_provenance_board(tmp: Path) -> None:
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+    assert sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    ).returncode == 0
+    sandbox.make_board(
+        "shadow-board",
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:99")],
+    )
+
+    postcheck = sandbox.run_with_checkout("postcheck", "--require-provenance", *common)
+    assert postcheck.returncode == 1
+    assert "target-provenance" in postcheck.stderr or "ambiguous" in postcheck.stderr
+
+
+def test_transition_lease_blocks_interleaved_intake_writer(tmp: Path) -> None:
+    """The migration lease rejects a writer at the archive boundary."""
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+
+    blocked: list[str] = []
+    intake_config = intake.RepositoryConfig(
+        name=repo,
+        board="ctrlhangul",
+        checkout=str(tmp / "checkout"),
+        default_branch="main",
+        contract_paths=(),
+        display_name="ctrl-hangul",
+    )
+    intake_snapshot = intake.RepoSnapshot(
+        origin_sha="fixture",
+        remote=f"https://github.com/{repo}.git",
+        contract_paths=(),
+    )
+    issue = {"number": 99, "title": "interleaved", "body": "", "labels": []}
+    original_migration_run = migration._run_hermes
+    original_intake_run = intake._run_hermes
+    old_lease = os.environ.get("HERMES_INTAKE_MIGRATION_LEASE")
+    old_fake_root = os.environ.get("FAKE_KANBAN_BOARDS_ROOT")
+    os.environ["FAKE_KANBAN_BOARDS_ROOT"] = str(sandbox.boards_root)
+    os.environ["HERMES_INTAKE_MIGRATION_LEASE"] = str(
+        sandbox.boards_root / ".intake-migration.lock"
+    )
+
+    def forbidden_intake_run(*args: str, **kwargs: object) -> object:
+        raise AssertionError(f"intake writer bypassed the lease: {args}")
+
+    def interleaving_run(hermes_bin: str, *args: str, **kwargs: object) -> object:
+        if args[:4] == ("kanban", "boards", "rm", "ctrlhangul"):
+            try:
+                intake._create_task(
+                    intake_config,
+                    issue,
+                    intake_snapshot,
+                    "2026-08-25T00:00:00Z",
+                    tick_started=0,
+                )
+            except intake.IntakeError as exc:
+                blocked.append(str(exc))
+            else:
+                raise AssertionError("interleaved intake writer unexpectedly succeeded")
+        return original_migration_run(hermes_bin, *args, **kwargs)
+
+    intake.__dict__["_run_hermes"] = forbidden_intake_run
+    migration.__dict__["_run_hermes"] = interleaving_run
+    try:
+        args = argparse.Namespace(
+            repository=repo,
+            boards_root=sandbox.boards_root,
+            hermes_bin=str(sandbox.fake_hermes),
+            state_root=sandbox.state_root,
+            backup_root=sandbox.backup_root,
+            lease_path=sandbox.boards_root / ".intake-migration.lock",
+            allow_recreate_canonical=False,
+            require_provenance=True,
+            confirm_live_transition=True,
+        )
+        migration._stage_transition(args, [], dry_run=False)
+    finally:
+        migration.__dict__["_run_hermes"] = original_migration_run
+        intake.__dict__["_run_hermes"] = original_intake_run
+        if old_fake_root is None:
+            os.environ.pop("FAKE_KANBAN_BOARDS_ROOT", None)
+        else:
+            os.environ["FAKE_KANBAN_BOARDS_ROOT"] = old_fake_root
+        if old_lease is None:
+            os.environ.pop("HERMES_INTAKE_MIGRATION_LEASE", None)
+        else:
+            os.environ["HERMES_INTAKE_MIGRATION_LEASE"] = old_lease
+
+    assert blocked and "lease is held" in blocked[0]
+    assert "ctrlhangul" not in sandbox.live_slugs()
+    assert not any(
+        row[2] == "github:rhgo1749/ctrl-hangul:issue:99"
+        for row in sandbox.board_tasks("ctrl-hangul")
+    )
+
+
+def test_transition_rescan_rejects_out_of_band_source_change(tmp: Path) -> None:
+    """A writer outside the cooperating intake still cannot cross archive."""
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+
+    original_carry = migration._carry_anchors
+    old_fake_root = os.environ.get("FAKE_KANBAN_BOARDS_ROOT")
+    os.environ["FAKE_KANBAN_BOARDS_ROOT"] = str(sandbox.boards_root)
+
+    def inject_after_carry(*args: object, **kwargs: object) -> dict[str, str]:
+        result = original_carry(*args, **kwargs)
+        db = sandbox.boards_root / "ctrlhangul" / "kanban.db"
+        con = sqlite3.connect(db)
+        con.execute(
+            "INSERT INTO tasks VALUES (?,?,?,?)",
+            (
+                "t_injected",
+                "out-of-band",
+                "done",
+                "github:rhgo1749/ctrl-hangul:issue:99",
+            ),
+        )
+        con.commit()
+        con.close()
+        return result
+
+    migration.__dict__["_carry_anchors"] = inject_after_carry
+    try:
+        args = argparse.Namespace(
+            repository=repo,
+            boards_root=sandbox.boards_root,
+            hermes_bin=str(sandbox.fake_hermes),
+            state_root=sandbox.state_root,
+            backup_root=sandbox.backup_root,
+            lease_path=sandbox.boards_root / ".intake-migration.lock",
+            allow_recreate_canonical=False,
+            require_provenance=True,
+            confirm_live_transition=True,
+        )
+        try:
+            migration._stage_transition(args, [], dry_run=False)
+        except migration.MigrationError as exc:
+            assert "changed during transition" in str(exc)
+        else:
+            raise AssertionError("out-of-band source mutation must fail closed")
+    finally:
+        migration.__dict__["_carry_anchors"] = original_carry
+        if old_fake_root is None:
+            os.environ.pop("FAKE_KANBAN_BOARDS_ROOT", None)
+        else:
+            os.environ["FAKE_KANBAN_BOARDS_ROOT"] = old_fake_root
+
+    assert "ctrlhangul" in sandbox.live_slugs()
+    assert "ctrl-hangul" in sandbox.live_slugs()
+    assert any(
+        row[2] == "github:rhgo1749/ctrl-hangul:issue:99"
+        for row in sandbox.board_tasks("ctrlhangul")
+    )
 
 
 def test_deploy_script_carrying() -> None:
