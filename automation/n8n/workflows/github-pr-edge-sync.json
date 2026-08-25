@@ -11,6 +11,7 @@
         "options": {}
       },
       "id": "9f26c863-a9a5-5ec1-bf6b-5136b5b790d9",
+      "webhookId": "7692ea1d-ec73-5f9a-b9ca-5c82375705f2",
       "name": "GitHub edge sync webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2.1,
