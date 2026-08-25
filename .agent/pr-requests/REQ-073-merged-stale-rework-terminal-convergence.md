@@ -1,6 +1,6 @@
 # REQ-073: merged Issue의 stale rework 그래프 terminal convergence
 
-- Status: Bounded rework round 3 implemented and pushed (PR #74 open; human review/merge pending)
+- Status: Bounded rework round 3 implemented and pushed (PR #74 open; head `8cfa929e2d7c98f0dc503d4d235d8e5481346e3e`; human review/merge pending)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / Pyright / diff-check)
@@ -303,9 +303,12 @@ hermes kanban show <task-id>
 
 | Validation | Result | Notes |
 |---|---|---|
-| Static/unit (py_compile + diff-check) | PASS | see commit evidence |
+| Static/unit (py_compile + exact-file Pyright + diff-check) | PASS | head `8cfa929e2d7c98f0dc503d4d235d8e5481346e3e`; Pyright 0 errors/warnings/informations |
 | n8n validation | NOT RUN | n8n topology out of scope |
-| Edge rework (full suite) | PASS | see commit evidence |
+| Edge terminal convergence | PASS | 84 passed, 0 failed; sabotage without hold predicate: exit 1, 76 passed, 8 failed |
+| Edge rework/head-binding | PASS | 738 passed, 0 failed each |
+| Dependency/completion/race gates | PASS | all named regression markers PASS |
+| Parking-comment suite | PASS | 20 passed, 0 failed |
 | Hermes plugin | NOT RUN | out of scope |
 | Host dashboard/network | NOT RUN | operator acceptance pending |
 | Telegram E2E | NOT RUN | out of scope |
@@ -316,9 +319,13 @@ hermes kanban show <task-id>
 
 ### Git / PR
 
-- Base SHA: `7e3262816da0202b924c3356e10f23daa8f5eb88`
-- Branch: `fix/issue-73-terminal-merge-convergence`
-- Commits: (see git log)
+- PR base SHA: `7e3262816da0202b924c3356e10f23daa8f5eb88`
+- Fetched `origin/main` validation SHA: `a9aadafa48617ffa33df1f3702d7a2d4ac4a7d36`
+- Worktree branch: `wt/t_2fb0b688` (tracking `origin/fix/issue-73-terminal-merge-convergence`)
+- PR branch: `fix/issue-73-terminal-merge-convergence`
+- Commit: `8cfa929e2d7c98f0dc503d4d235d8e5481346e3e`
 - PR number/title/URL: PR #74 — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/74 (Korean title/body, `Closes #73`)
 - Working tree: clean after commit
+- PR REST read-back: OPEN, non-draft, base `main`, exact head verified, four-file allowlist verified
+- GitHub Actions: NOT RUN by repository policy
 - Merge performed: NO
