@@ -2035,6 +2035,18 @@ def _terminal_convergence_rework_provenance(
         expected_head = merged_prs.get(pr_number)
         if expected_head is None or head_sha.casefold() != expected_head.casefold():
             return None
+    human_hold = _terminal_convergence_current_round_human_hold(
+        conn,
+        task_id,
+        payload,
+        int(row["created_at"] or 0),
+        int(row["id"]),
+    )
+    if human_hold is not None:
+        return {
+            "role": "human_hold",
+            "human_hold": human_hold,
+        }
     return {
         "role": "stale_rework",
         "event_kind": str(row["kind"]),
@@ -2042,6 +2054,65 @@ def _terminal_convergence_rework_provenance(
         "rework_round": rework_round,
         "head_sha": head_sha,
     }
+
+
+def _terminal_convergence_current_round_human_hold(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_payload: Mapping[str, Any],
+    rework_created_at: int,
+    rework_event_id: int,
+) -> Optional[dict[str, Any]]:
+    """Find a durable human hold newer than the governing rework round.
+
+    A stale ``blocked`` status is not itself a human hold: the original
+    rework graph intentionally converges even when the old row still carries
+    block metadata.  A later canonical ``blocked`` event, however, is an
+    explicit worker/operator hold and must remain sticky.  Attention events
+    are guarded more narrowly by the current round's repository/Issue/PR and
+    round identity so an old attention record cannot suppress a newer round.
+    Event id is included in the ordering because the DB timestamps have
+    second-level precision and a later event may share the rework timestamp.
+    """
+    current_identity = tuple(
+        rework_payload.get(key)
+        for key in ("repository", "issue_number", "pr_number", "rework_round")
+    )
+    rows = conn.execute(
+        "SELECT kind, payload, created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'github_pr_rework_attention') "
+        "ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        event_order = (int(row["created_at"] or 0), int(row["id"]))
+        if event_order <= (rework_created_at, rework_event_id):
+            continue
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        kind = str(row["kind"])
+        if kind == "blocked":
+            return {
+                "event_kind": kind,
+                "event_id": int(row["id"]),
+                "created_at": event_order[0],
+                "block_kind": payload.get("kind"),
+            }
+        if tuple(payload.get(key) for key in (
+            "repository", "issue_number", "pr_number", "rework_round"
+        )) == current_identity:
+            return {
+                "event_kind": kind,
+                "event_id": int(row["id"]),
+                "created_at": event_order[0],
+                "rework_round": rework_payload.get("rework_round"),
+                "pr_number": rework_payload.get("pr_number"),
+            }
+    return None
 
 
 def _terminal_convergence_node_provenance(
@@ -2101,6 +2172,8 @@ def _terminal_convergence_node_provenance(
             or not direct_parents[node_id]
         ):
             return failure(node_id, status, "missing_stale_rework_provenance")
+        if event.get("role") == "human_hold":
+            return failure(node_id, status, "current_round_human_hold")
         provenance[node_id] = {
             **event,
             "role": "stale_rework",

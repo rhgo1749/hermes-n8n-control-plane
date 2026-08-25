@@ -287,6 +287,14 @@ proven in the same pass:
    reviewer/waiting node for the stale rework round. Status, title, body, or
    a matching Issue/PR alone is never sufficient.
 
+The blocked-node predicate is round-aware.  A stale `blocked` row's existing
+`block_kind` is not enough to refuse the original #88-shaped convergence, but
+any later canonical `blocked` event is an explicit worker/operator hold and
+blocks terminalization.  A later `github_pr_rework_attention` event blocks it
+when its repository, Issue, PR, and `rework_round` match the governing round.
+Both holds preserve the blocked node's metadata and all durable events; an old
+attention record from an earlier round cannot suppress a newer round.
+
 The single transaction then terminalizes the graph: the stale `blocked`
 implementation/rework node becomes `done` with explicit GitHub-merge
 provenance (the merge is the authoritative record that the work was
@@ -295,8 +303,9 @@ a fabricated reviewer PASS), and the intake root projects to
 authoritative `done` -- each with a durable `github_pr_sync` event
 (`reason: terminal_merge_convergence`, merged-PR provenance,
 `merge_authority: human`, `auto_merge: false`) and stale claim/block
-fields cleared.  A second pass is a no-op, and no worker is ever
-promoted, claimed, spawned, or re-run.
+fields cleared.  This mutation is not taken when the current round has a
+later human block or matching attention hold.  A second pass is a no-op, and
+no worker is ever promoted, claimed, spawned, or re-run.
 
 After the fresh GitHub evidence is accepted, the edge acquires a write
 transaction and re-reads the complete reachable node and edge closure before
@@ -311,7 +320,9 @@ graphs remain valid and bounded.
 Fail-closed boundaries: open Issue, an open or closed-unmerged required
 PR, a non-authoritative/failing GitHub read, any active claim/run/worker
 ownership, missing/mismatched rework or reviewer provenance, or an
-unrelated/ambiguous ancestor preserves the graph unchanged (the classic
+unrelated/ambiguous ancestor, a later explicit human `blocked` event, or a
+later matching current-round `github_pr_rework_attention` event preserves the
+graph unchanged (the classic
 `internal_dependency_pending` lane keeps the root runnable).  Comment/run
 lookup failure is also fail-closed: the edge returns
 `text_source_lookup_failed` instead of treating incomplete handoff text as
@@ -333,7 +344,8 @@ matrix, active-ownership refusal, unrelated blocked/allowed-status ancestor
 refusal, missing rework provenance, comments/runs lookup failure with
 incomplete PR text, late ancestor activation and late active-parent insertion
 during the GitHub read, bounded cycle refusal, and diamond/shared-ancestor
-traversal.
+traversal.  Later durable human-block and current-round attention holds are
+also regression-tested to preserve the blocked node and root dependency gate.
 
 ## Deployment (host)
 

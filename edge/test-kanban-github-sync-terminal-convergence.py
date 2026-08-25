@@ -278,7 +278,7 @@ def build_graph(root_status: str = "todo",
 def statuses(ids: dict) -> dict:
     with connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, status, claim_lock, worker_pid, current_run_id, completed_at "
+            "SELECT id, status, claim_lock, worker_pid, current_run_id, block_kind, completed_at "
             "FROM tasks WHERE id IN ({})".format(",".join("?" for _ in ids.values())),
             tuple(ids.values()),
         ).fetchall()
@@ -546,6 +546,76 @@ def test_5c_missing_rework_provenance():
               and root_entry.get("reason") == "terminal_convergence_node_unconvergeable",
               str(root_entry))
         assert_no_workers(ids)
+
+
+def _later_human_hold_case(name: str, event_kind: str, payload: dict[str, Any]) -> None:
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(issue_state="closed", pr=pr_payload(PR_N, state="closed", merged=True))
+        ids = build_graph()
+        with connect_closing() as conn:
+            conn.execute(
+                "UPDATE tasks SET block_kind='needs_input' WHERE id=?",
+                (ids["blocked"],),
+            )
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (ids["blocked"], event_kind, json.dumps(payload, sort_keys=True), 3),
+            )
+            conn.commit()
+        before = statuses(ids)
+        events_before = event_snapshot(ids)
+        results = run_sync(fake)
+        after = statuses(ids)
+        events_after = event_snapshot(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+        check(f"{name}: graph preserved", before == after, f"{before} -> {after}")
+        check(f"{name}: events preserved", events_before == events_after,
+              f"{events_before} -> {events_after}")
+        check(f"{name}: root remains dependency-pending",
+              root_entry["status"] == "todo"
+              and root_entry["changed"] is False
+              and root_entry.get("reason") == "terminal_convergence_node_unconvergeable",
+              str(root_entry))
+        check(f"{name}: blocked metadata preserved",
+              after[ids["blocked"]]["status"] == "blocked"
+              and after[ids["blocked"]]["block_kind"] == "needs_input",
+              str(after[ids["blocked"]]))
+        assert_no_workers(ids)
+
+
+def test_5f_later_human_block_preserves_graph():
+    print("5f. later durable human block prevents stale rework convergence")
+    _later_human_hold_case(
+        "later human block",
+        "blocked",
+        {
+            "reason": "needs human decision",
+            "kind": "needs_input",
+            "recurrences": 1,
+            "source_status": "running",
+        },
+    )
+
+
+def test_5g_later_current_round_attention_preserves_graph():
+    print("5g. later current-round rework attention prevents convergence")
+    _later_human_hold_case(
+        "later current-round attention",
+        "github_pr_rework_attention",
+        {
+            "repository": REPO,
+            "issue_number": ISSUE_N,
+            "pr_number": PR_N,
+            "head_sha": pr_payload(PR_N)["head"]["sha"],
+            "rework_round": 1,
+            "reason": "rework_human_attention",
+            "diagnostic": "completion_handoff_missing",
+            "source": "github_edge_rework_reconciliation",
+        },
+    )
 
 
 def _text_source_lookup_failure_case(name: str, failing_attr: str) -> None:
@@ -829,6 +899,8 @@ def main() -> int:
         test_5_ambiguous_ancestor,
         test_5b_unrelated_allowed_status_ancestors,
         test_5c_missing_rework_provenance,
+        test_5f_later_human_block_preserves_graph,
+        test_5g_later_current_round_attention_preserves_graph,
         test_5d_comments_lookup_failure,
         test_5e_runs_lookup_failure,
         test_6_dry_run_predicts_without_mutation,

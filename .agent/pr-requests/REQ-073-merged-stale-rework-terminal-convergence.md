@@ -1,6 +1,6 @@
 # REQ-073: merged Issue의 stale rework 그래프 terminal convergence
 
-- Status: Bounded rework implemented and pushed (PR #74 open; human review/merge pending)
+- Status: Bounded rework round 3 implemented and pushed (PR #74 open; human review/merge pending)
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `EDGE_REWORK` (+ `STATIC_UNIT` py_compile / Pyright / diff-check)
@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#73`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/73
-- Kanban task ID: `t_5acc2399` (bounded rework; prior implementation `t_c190a1ba`, review `t_6ebf305a`)
+- Kanban task ID: `t_2fb0b688` (bounded rework round 3; prior round `t_2b00c07a`, review `t_86d72c71`)
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:73`
 - Planning/lead owner: `kanban-main`
 - Implementation owner: `kanban-developer`
@@ -134,6 +134,11 @@ reconciliation pass**에서 `done / archived / done`으로 수렴시킨다.
   reachable node/edge closure, status/ownership, cycle/dangling/edge-set
   drift를 재검증하고, drift 시 write/event를 남기지 않는다.
 - root write는 최종 direct-parent terminal predicate를 다시 평가한다.
+- stale `blocked` convergence는 governing rework round 이후의 canonical
+  `blocked` human hold 또는 matching current-round
+  `github_pr_rework_attention` event가 있으면 fail-closed한다. 기존
+  `block_kind`만으로 stale identity를 추론하지 않으며, hold rejection은
+  node/root/event를 변경하지 않는다.
 - ancestor walk는 active-path cycle detection을 사용하며 diamond/shared
   ancestor traversal은 허용한다.
 
@@ -286,10 +291,10 @@ hermes kanban show <task-id>
 
 ### Files changed
 
-- `edge/kanban-github-sync.py`: terminal merge convergence pass
-  (helpers + `sync_board` gate-pending lane wiring)
-- `edge/test-kanban-github-sync-terminal-convergence.py`: new deterministic
-  regressions
+- `edge/kanban-github-sync.py`: terminal merge convergence pass plus the
+  current-round human/operator hold predicate
+- `edge/test-kanban-github-sync-terminal-convergence.py`: deterministic
+  convergence, race, and later human-block/attention preservation regressions
 - `docs/EDGE_REWORK_LIFECYCLE.md`: terminal convergence contract
 - `.agent/pr-requests/REQ-073-merged-stale-rework-terminal-convergence.md`:
   this request
