@@ -84,6 +84,17 @@ generated developer/lead handoff.
   failures remain (`test_n8n_cron_auth_plugin.py` is absent, cron-trigger
   pause assertion fails, and cutover fixture lacks `state-root.sh`).
 
+## Delivery evidence
+
+- PR #81: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/81;
+  base `main`, head `wt/t_a7369eda`, state OPEN at delivery.
+- Live REST read-back confirms the Korean title, required body sections,
+  one standalone `Closes #79.` line, five changed files, and no placeholder
+  literals.
+- Live GraphQL `PullRequest.closingIssuesReferences` read-back contains Issue
+  #79; no REST PATCH was needed. `gh pr checks` reports no checks for the
+  branch and `gh run list --commit` is empty (GitHub Actions are disabled).
+
 ## Stop state
 
 `HUMAN_VALIDATION_REQUIRED` + post-merge host deployment NOT RUN: live
