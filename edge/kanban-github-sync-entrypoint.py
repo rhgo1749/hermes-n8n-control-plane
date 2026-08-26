@@ -23,6 +23,10 @@ from types import ModuleType
 import kanban_resource_admission as resource_admission
 from kanban_head_binding_feedback import install_head_binding_feedback
 from kanban_retry_signal_guard import install_retry_signal_guard
+try:
+    from kanban_workspace_admission import install_workspace_admission
+except ImportError:  # backwards-compatible deploy before the overlay exists
+    install_workspace_admission = None  # type: ignore[assignment]
 
 try:
     from kanban_dynamic_resource import install_everywhere
@@ -64,6 +68,8 @@ def _load_core() -> ModuleType:
     resource_admission.install_resource_admission(module)
     install_head_binding_feedback(module)
     install_retry_signal_guard(module)
+    if install_workspace_admission is not None:
+        install_workspace_admission(module)
     return module
 
 
