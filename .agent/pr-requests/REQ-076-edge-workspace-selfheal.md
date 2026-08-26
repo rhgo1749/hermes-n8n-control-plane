@@ -34,18 +34,21 @@
 - running/review/done/archived 카드 및 활성 claim 불간섭
 - 머지/배포 자동화 금지 (인간 권한)
 
-## 검증 프로파일 (실측)
+## 검증 프로파일 (실측 — round 2 rework 후)
 
 | 게이트 | 결과 |
 |---|---|
-| test-kanban-workspace-selfheal.py (신규) | 11 passed, 0 failed |
-| test-kanban-workspace-admission.py | 12 passed, 0 failed |
+| test-kanban-workspace-selfheal.py | 26 passed, 0 failed (CAS rowcount, dry-run preview, 가드카드 제외, INTEGER 타임스탬프 회귀 포함) |
+| test-kanban-workspace-admission.py | 27 passed, 0 failed (pre-spawn 게이트, spawn 콜백 미호출, fail-closed 검증/이벤트, INTEGER 스키마 회귀 포함) |
 | test-kanban-github-sync-rework.py | 738 passed |
+| test-kanban-github-sync-completion.py / dependency-gate / race-gate | ALL PASS |
+| test-kanban-github-sync-parking-comment.py | 20 passed |
 | test-kanban-resource-admission.py | 18 passed |
-| completion / dependency-gate / parking / race-gate / head-binding / retry-guard / dynamic-resource | ALL PASS (738/20/10 등) |
+| head-binding / retry-guard / dynamic-resource | ALL PASS (738/5/10) |
+| 수정 전 bite proof (c27aa25 기준) | 6개 결함 모두 재현 확인: post-spawn 스폰 호출, TEXT created_at, 가드카드 리바인딩, 활성 claim 거짓 repair+이벤트, dry-run 관측 부재, fail-open 검증 |
 | py_compile (전체 변경 파일) | PASS |
+| ruff F/E9 + F401/F811/F841 (변경 파일) | PASS |
 | git diff --check | PASS |
-| **라이브 카나리아** | 시드 위반 카드 → 실제 sync_board 1회 웨이크 → 재바인딩+감사 이벤트 확인, 2차 웨이크 멱등(빈 결과) |
 
 ## 최종 자동화 정지 상태
 

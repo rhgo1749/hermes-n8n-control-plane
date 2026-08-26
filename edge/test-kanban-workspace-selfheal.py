@@ -3,10 +3,20 @@
 
 No Hermes install required: a temporary board DB exercises deterministic
 rebinding, anchor resolution, fail-closed behavior, and idempotence.
+
+Round-2 (PR #77 rework) regressions included:
+  * CAS rowcount honored: a two-connection interleaving that claims a row
+    between scan and UPDATE yields changed=False, NO workspace_repaired
+    event, and untouched claimed rows/event tables;
+  * dry-run preview is strictly read-only: predicted entries, unchanged DB,
+    no spawn;
+  * durable guard/quarantine cards are excluded from repair while ordinary
+    blocked implementation cards still get repaired;
+  * created_at on workspace_repaired events is epoch INTEGER, and a
+    list_events-style ordering consumer reads it correctly.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import sqlite3
 import tempfile
@@ -52,7 +62,7 @@ def make_db(path: Path) -> sqlite3.Connection:
             run_id INTEGER,
             kind TEXT,
             payload TEXT,
-            created_at TEXT NOT NULL
+            created_at INTEGER NOT NULL
         );
         """
     )
@@ -60,10 +70,10 @@ def make_db(path: Path) -> sqlite3.Connection:
 
 
 def insert(conn, tid, title, status="ready", kind="worktree", path="/ws/projects/re-bound",
-           branch="", key=None, claim=None):
+           branch="", key=None, claim=None, body="body"):
     conn.execute(
         "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (tid, title, "body", status, "kanban-developer", kind, path, branch, claim, key),
+        (tid, title, body, status, "kanban-developer", kind, path, branch, claim, key),
     )
 
 
@@ -75,16 +85,16 @@ def main() -> int:
 
     conn = make_db(tmp / "board.db")
 
-    # 1) Incident shape: implementation card bound to shared checkout with
-    #    GitHub provenance key -> repairable via /ws/projects/<repo> anchor.
-    #    Use the existing real sibling checkout as the anchor target.
+    # Use the existing real sibling checkout as the anchor target.
     real_repo = Path("/ws/projects/hermes-n8n-control-plane")
     assert (real_repo / ".git").exists()
+
+    # 1) Incident shape: implementation card bound to shared checkout with
+    #    GitHub provenance key -> repairable via /ws/projects/<repo> anchor.
     insert(conn, "t_drift1", "구현: Issue #110 기능",
            key="github:rhgo1749/hermes-n8n-control-plane:issue:110")
     # 2) Drifted card WITHOUT resolvable anchor -> fail closed, report only.
-    insert(conn, "t_noanchor", "REWORK round 2 fix",
-           path=str(tmp / "nowhere"), key=None)
+    insert(conn, "t_noanchor", "REWORK round 2 fix", path=str(tmp / "nowhere"), key=None)
     # 3) Review card in shared dir -> exempt.
     insert(conn, "t_review", "TECH REVIEW: 검증")
     conn.execute("UPDATE tasks SET title='TECH REVIEW: 검증', workspace_kind='dir',"
@@ -104,7 +114,7 @@ def main() -> int:
     check("rebound to .worktrees/<id>", row["workspace_path"].endswith(".worktrees/t_drift1"),
           row["workspace_path"])
     check("branch set wt/<id>", row["branch_name"] == "wt/t_drift1")
-    ev = conn.execute("SELECT payload FROM task_events WHERE task_id='t_drift1' "
+    ev = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id='t_drift1' "
                       "AND kind='workspace_repaired'").fetchall()
     check("audit event with before/after", len(ev) == 1 and "before" in ev[0]["payload"])
     payload = json.loads(ev[0]["payload"])
@@ -125,6 +135,127 @@ def main() -> int:
     out2 = admission.repair_workspace_drift(conn, None, "test-board")
     check("second pass has no new repairs",
           all(e["reason"] != "workspace_selfhealed" for e in out2), str(out2))
+
+    print("\n-- round-2 regressions --")
+
+    # --- R2: guard/quarantine cards excluded from self-heal ---
+    insert(conn, "t_guard", "SAFETY GUARD: 잘못된 공유 workspace 구현 카드 실행 금지",
+           status="blocked", body="SAFETY GUARD ONLY — 실행/구현 금지.")
+    out_g = admission.repair_workspace_drift(conn, None, "test-board")
+    g_entries = [e for e in out_g if e["task_id"] == "t_guard"]
+    check("guard card NOT repaired", not any(
+        e.get("reason") == "workspace_selfhealed" for e in g_entries), str(g_entries))
+    grow = conn.execute("SELECT workspace_kind, workspace_path FROM tasks "
+                        "WHERE id='t_guard'").fetchone()
+    check("guard binding preserved verbatim",
+          grow["workspace_kind"] == "worktree"
+          and grow["workspace_path"] == "/ws/projects/re-bound", str(dict(grow)))
+    gev = conn.execute("SELECT COUNT(*) c FROM task_events WHERE task_id='t_guard'").fetchone()
+    check("guard card has zero events", gev["c"] == 0)
+    # Ordinary blocked implementation card IS repaired (control).
+    insert(conn, "t_ordblocked", "IMPLEMENT ordinary blocked fix", status="blocked",
+           key="github:rhgo1749/hermes-n8n-control-plane:issue:111")
+    out_ob = admission.repair_workspace_drift(conn, None, "test-board")
+    ob = {e["task_id"]: e for e in out_ob}.get("t_ordblocked", {})
+    check("ordinary blocked impl card still repaired",
+          ob.get("reason") == "workspace_selfhealed" and ob.get("changed") is True, str(ob))
+
+    # --- R2: active-claim race honored via UPDATE rowcount ---
+    db_race = tmp / "race.db"
+    rc = make_db(db_race)
+    insert(rc, "t_race", "REWORK race fix",
+           key="github:rhgo1749/hermes-n8n-control-plane:issue:112")
+    rc.commit()
+
+    # Deterministic two-connection interleaving: A's repair pass scans and
+    # sees an unclaimed drifted row; B claims the row AFTER the scan but
+    # BEFORE A's CAS UPDATE (hooked into anchor resolution, the first write-
+    # path read after the scan). A's UPDATE then matches zero rows.
+    scan_conn = sqlite3.connect(str(db_race))
+    scan_conn.row_factory = sqlite3.Row  # A's view (same file, fresh handle)
+    other = sqlite3.connect(str(db_race))  # B: the competing writer
+    other.row_factory = sqlite3.Row
+
+    real_anchor = admission._repo_anchor_for_task
+
+    def hooked_anchor(c, row):
+        if not hooked_anchor.done:
+            other.execute("UPDATE tasks SET status='running', "
+                          "claim_lock='new-claim' WHERE id='t_race'")
+            other.commit()
+            hooked_anchor.done = True
+        return real_anchor(c, row)
+
+    hooked_anchor.done = False
+    admission._repo_anchor_for_task = hooked_anchor
+    try:
+        before_row = dict(scan_conn.execute(
+            "SELECT status, claim_lock, workspace_kind, workspace_path FROM tasks "
+            "WHERE id='t_race'").fetchone())
+        assert before_row["claim_lock"] is None  # scan saw an unclaimed row
+        out_race = admission.repair_workspace_drift(scan_conn, None, "test-board")
+    finally:
+        admission._repo_anchor_for_task = real_anchor
+    race_entry = {e["task_id"]: e for e in out_race}.get("t_race", {})
+    check("race-lost row skipped with changed=False",
+          race_entry.get("reason") == "selfheal_skipped_active_claim"
+          and race_entry.get("changed") is False, str(race_entry))
+    after_row = dict(other.execute(
+        "SELECT status, claim_lock, workspace_kind, workspace_path FROM tasks "
+        "WHERE id='t_race'").fetchone())
+    check("claimed row untouched by repair pass",
+          after_row["workspace_kind"] == before_row["workspace_kind"]
+          and after_row["workspace_path"] == before_row["workspace_path"],
+          f"{before_row} -> {after_row}")
+    check("claim survives (B's state authoritative)",
+          after_row["status"] == "running"
+          and after_row["claim_lock"] == "new-claim", str(after_row))
+    race_ev = other.execute(
+        "SELECT COUNT(*) c FROM task_events WHERE task_id='t_race'").fetchone()
+    check("no workspace_repaired event for claimed row", race_ev["c"] == 0)
+    other.close()
+    scan_conn.close()
+
+    # --- R2: dry-run preview is strictly read-only ---
+    db_prev = tmp / "preview.db"
+    pc = make_db(db_prev)
+    insert(pc, "t_pred1", "구현: Issue #113 예측",
+           key="github:rhgo1749/hermes-n8n-control-plane:issue:113")
+    insert(pc, "t_pred_na", "IMPLEMENT no anchor here", path=str(tmp / "void"))
+    snapshot_tasks = pc.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    snapshot_events = pc.execute("SELECT * FROM task_events ORDER BY id").fetchall()
+    prev = admission.preview_workspace_drift(pc, "test-board")
+    p_by_id = {e["task_id"]: e for e in prev}
+    p1 = p_by_id.get("t_pred1", {})
+    check("preview predicts repair entry first-class",
+          p1.get("reason") == "workspace_selfhealed" and p1.get("predicted") is True
+          and p1.get("would_change") is True and p1.get("changed") is False, str(p1))
+    check("preview carries from/to prediction",
+          p1.get("from", {}).get("path") == "/ws/projects/re-bound"
+          and p1.get("to", {}).get("path", "").endswith(".worktrees/t_pred1"), str(p1))
+    pna = p_by_id.get("t_pred_na", {})
+    check("preview predicts fail-closed anchor report",
+          pna.get("reason") == "selfheal_anchor_unresolved"
+          and pna.get("predicted") is True, str(pna))
+    after_tasks = pc.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    after_events = pc.execute("SELECT * FROM task_events ORDER BY id").fetchall()
+    check("preview left task rows byte-identical",
+          [tuple(r) for r in snapshot_tasks] == [tuple(r) for r in after_tasks])
+    check("preview wrote zero events", len(after_events) == 0 and len(snapshot_events) == 0)
+
+    # --- R2: INTEGER timestamps + list_events/ordering consumer ---
+    ts_row = conn.execute(
+        "SELECT created_at, typeof(created_at) t FROM task_events "
+        "WHERE kind='workspace_repaired' LIMIT 1").fetchone()
+    check("workspace_repaired created_at is epoch INTEGER",
+          ts_row is not None and ts_row["t"] == "integer"
+          and isinstance(ts_row["created_at"], int),
+          str(dict(ts_row) if ts_row else None))
+    ordered = conn.execute(
+        "SELECT created_at, id FROM task_events ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    vals = [(r["created_at"], r["id"]) for r in ordered]
+    check("ordering consumer sees ascending (created_at, id)", vals == sorted(vals))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
