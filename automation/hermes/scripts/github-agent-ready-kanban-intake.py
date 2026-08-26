@@ -251,7 +251,7 @@ def _load_registry_snapshot(token: str) -> dict[str, Any]:
             "--checkout-root",
             "/ws/projects",
             "--kanban-root",
-            str(_hermes_home() / "kanban" / "boards"),
+            str(_kanban_boards_root()),
         ],
         env=env,
         capture_output=True,
@@ -423,14 +423,26 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_KANBAN_INTAKE_HOME") or os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME)
 
 
+def _kanban_boards_root() -> Path:
+    """Single boards-root resolver for every registry/ownership/lease read.
+
+    ``HERMES_KANBAN_BOARDS_ROOT`` (also exposed by the intake actuator)
+    overrides the default ``<hermes-home>/kanban/boards``; registry snapshot
+    discovery, board ownership checks, the migration/intake lease, and the
+    same-tick post-provision reload all share this one resolution so a
+    custom root is honored consistently.
+    """
+    configured = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _hermes_home() / "kanban" / "boards"
+
+
 def _intake_migration_lease_path() -> Path:
     configured = os.environ.get("HERMES_INTAKE_MIGRATION_LEASE", "").strip()
     if configured:
         return Path(configured).expanduser()
-    configured_boards_root = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
-    if configured_boards_root:
-        return Path(configured_boards_root).expanduser() / ".intake-migration.lock"
-    return _hermes_home() / "kanban" / "boards" / ".intake-migration.lock"
+    return _kanban_boards_root() / ".intake-migration.lock"
 
 
 @contextmanager
@@ -754,13 +766,7 @@ def _verify_bootstrap_checkout(repository: str, checkout: str) -> Path:
 
 def _board_repository_owners(board: str) -> BoardOwnership:
     """Read provenance and occupancy for a candidate board before reuse/create."""
-    configured_boards_root = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
-    boards_root = (
-        Path(configured_boards_root).expanduser()
-        if configured_boards_root
-        else _hermes_home() / "kanban" / "boards"
-    )
-    db = boards_root / board / "kanban.db"
+    db = _kanban_boards_root() / board / "kanban.db"
     if not db.is_file():
         raise IntakeError(f"cannot verify ownership of existing board {board}")
     try:

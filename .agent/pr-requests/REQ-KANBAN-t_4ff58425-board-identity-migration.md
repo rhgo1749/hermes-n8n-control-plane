@@ -59,9 +59,9 @@
 
 ## Validation
 
-- `tests/test_board_identity_migration.py` (20 fixture/integration tests,
+- `tests/test_board_identity_migration.py` (25 fixture/integration tests,
   standalone runner, no live mutation).
-- `tests/test_repo_scoped_intake.py` (27 fixture tests) plus registry/intake/
+- `tests/test_repo_scoped_intake.py` (29 fixture tests) plus registry/intake/
   actuator/router suites re-run; `validate.py` n8n contract check.
 - Evidence: exact-head test evidence recorded in the PR body and Kanban
   handoff.

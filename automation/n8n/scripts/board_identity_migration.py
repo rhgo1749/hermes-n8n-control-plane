@@ -393,6 +393,36 @@ def _task_count_excluding(board_dir: Path, task_ids: frozenset[str]) -> int:
     return total - anchored
 
 
+def _task_id_by_key(
+    board_dir: Path,
+    *,
+    include_archived: bool = False,
+) -> dict[str, str]:
+    """Index every idempotency-keyed live task id in a board by its key."""
+    db = board_dir / "kanban.db"
+    if not db.is_file():
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT id, idempotency_key, status FROM tasks "
+                "WHERE idempotency_key IS NOT NULL"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise MigrationError(
+            f"could not inspect canonical tasks in {board_dir}: {exc}"
+        ) from exc
+    return {
+        str(key): str(task_id)
+        for task_id, key, status in rows
+        if str(key)
+        and (include_archived or str(status) != "archived")
+    }
+
+
 def _existing_anchor_task_ids(
     board_dir: Path,
     keys: frozenset[str],
@@ -1441,22 +1471,35 @@ def _stage_rollback_locked(
     recorded_anchor_ids = evidence.get("anchor_task_ids", {})
     if not isinstance(recorded_anchor_ids, dict):
         raise MigrationError("rollback evidence has malformed anchor checkpoint data")
-    anchor_map = {
+    recorded_pairs = {
         str(key): str(task_id)
         for key, task_id in recorded_anchor_ids.items()
         if str(key) and str(task_id)
     }
-    if canonical_fact is not None and anchor_keys:
-        canonical_anchor_map = _existing_anchor_task_ids(
-            canonical_fact.directory,
-            frozenset(anchor_keys),
-            include_archived=True,
+    # The evidence file lives outside the boards root and is mutable state,
+    # so a recorded task id is never trusted on its own: every recorded
+    # key->task-id pair must match the canonical row carrying the same
+    # idempotency key before that id may join the anchor exclusion set.
+    # A tampered or mismatched mapping fails closed instead of letting
+    # rollback treat populated canonical content as removable anchor data.
+    anchor_map: dict[str, str] = {}
+    if canonical_fact is not None:
+        canonical_index = _task_id_by_key(
+            canonical_fact.directory, include_archived=True
         )
-        anchor_map = canonical_anchor_map
-    anchor_ids = frozenset(
-        set(anchor_map.values())
-        | set(recorded_anchor_ids.values())
-    )
+        for key in sorted(set(recorded_pairs) | anchor_keys):
+            recorded_id = recorded_pairs.get(key)
+            canonical_id = canonical_index.get(key)
+            if recorded_id is not None and canonical_id != recorded_id:
+                errors.append(
+                    f"recorded anchor checkpoint for {key} does not match the "
+                    f"canonical task row (recorded {recorded_id!r}, canonical "
+                    f"{canonical_id!r}); refusing rollback"
+                )
+                continue
+            if canonical_id is not None:
+                anchor_map[key] = canonical_id
+    anchor_ids = frozenset(anchor_map.values())
 
     # The canonical board may only be removed while it is still empty: the
     # migration never creates tasks, so a populated canonical board means
@@ -1490,18 +1533,9 @@ def _stage_rollback_locked(
             shutil.copytree(candidate, target, symlinks=True)
             restored.append(slug)
 
-    if not dry_run and not errors:
-        # Re-read after the pre-mutation validation so rollback consumes the
-        # durable checkpoint and also removes a partially checkpointed anchor
-        # that was reconciled by idempotency key.
-        if canonical_fact is not None and anchor_keys:
-            anchor_map.update(
-                _existing_anchor_task_ids(
-                    canonical_fact.directory,
-                    frozenset(anchor_keys),
-                    include_archived=True,
-                )
-            )
+    if not dry_run:
+        # Only the verified key->id pairs from the pre-mutation validation
+        # are purged; the recorded checkpoint ids were never trusted here.
         _remove_anchors(
             args.hermes_bin,
             canonical_slug,

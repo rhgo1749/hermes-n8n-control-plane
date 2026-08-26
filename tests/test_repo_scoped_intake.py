@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -616,6 +617,145 @@ def _bootstrap_entry(repository: str, board: str, checkout: str) -> dict:
     entry = _entry(repository, ready=False, reason="board_not_found_task_provenance")
     entry["bootstrap"] = {"board": board, "checkout": checkout}
     return entry
+
+
+def test_override_boards_root_honored_end_to_end_same_tick() -> None:
+    """HERMES_KANBAN_BOARDS_ROOT drives registry discovery, ownership checks,
+    the lease path, and the same-tick post-provision reload.
+
+    A custom boards root must reach the registry subprocess (--kanban-root),
+    the bootstrap ownership DB probe, and the migration/intake lease; after a
+    board lands under that root the same-tick reload must resolve the ready
+    entry so the first task is created in this tick.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        override_root = str(Path(td) / "custom-boards")
+        ownership_roots: list[Path] = []
+        existing_boards: set[str] = set()
+        created_boards: list[str] = []
+        tasks_created: list[str] = []
+
+        original_resolver = intake._kanban_boards_root()
+        originals = {
+            name: getattr(intake, name)
+            for name in (
+                "_github_token",
+                "_load_registry_snapshot",
+                "_claim_wake_scope",
+                "_telegram_config",
+                "_run_closed_issue_cleanup",
+                "_issue_candidates",
+                "_repo_snapshot",
+                "_create_task",
+                "_sync_board",
+                "_board_slugs",
+                "_run_hermes",
+                "_verify_bootstrap_checkout",
+                "_board_repository_owners",
+            )
+        }
+
+        def fake_load_registry_snapshot(token: str) -> dict:
+            # Stands in for the real registry subprocess, which receives
+            # ``--kanban-root <resolver()>``: its snapshot therefore reflects
+            # board state under the OVERRIDE root, not the default home.
+            # Before the
+            # board exists under the override root it reports a bootstrap
+            # intent; after provisioning, the same-tick reload resolves the
+            # empty canonical board.
+            if "brand-new" in existing_boards:
+                return _snapshot([_entry("rhgo1749/brand-new")])
+            return _snapshot(
+                [
+                    _bootstrap_entry(
+                        "rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new"
+                    )
+                ]
+            )
+
+        def fake_board_repository_owners(board: str):
+            db = intake._kanban_boards_root() / board / "kanban.db"
+            ownership_roots.append(db.parent)
+            return set()
+
+        def fake_run_hermes(*args: str, **kwargs: Any) -> str:
+            if "boards" in args and "create" in args:
+                board = args[args.index("create") + 1]
+                existing_boards.add(board)
+                created_boards.append(board)
+                return f"Board '{board}' created."
+            raise AssertionError(f"unexpected hermes call: {args}")
+
+        def fake_create_task(config, issue_arg, snapshot, imported_at, *, tick_started):
+            tasks_created.append(config.board)
+            return {
+                "key": f"github:{config.name}:issue:1",
+                "board": config.board,
+                "task_id": "t_test",
+                "status": "ready",
+                "created": True,
+                "issue_number": 1,
+            }
+
+        try:
+            os.environ["HERMES_KANBAN_BOARDS_ROOT"] = override_root
+            assert intake._kanban_boards_root() == Path(override_root)
+            assert intake._intake_migration_lease_path() == (
+                Path(override_root) / ".intake-migration.lock"
+            )
+            intake._load_registry_snapshot = fake_load_registry_snapshot
+            intake._claim_wake_scope = lambda: None
+            intake._telegram_config = lambda: None
+            intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
+            intake._board_slugs = lambda: set(existing_boards)
+            intake._run_hermes = fake_run_hermes
+            intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+            intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+            intake._board_repository_owners = fake_board_repository_owners
+            intake._issue_candidates = lambda token, fixture_path, configs: [
+                (configs[0], {"number": 1, "title": "First", "body": "", "labels": [{"name": "agent-ready"}]})
+            ]
+            intake._closing_merged_pr_numbers = lambda token, repository, issue_number: ()
+            intake._repo_snapshot = lambda config: intake.RepoSnapshot(
+                origin_sha="abc",
+                remote="https://github.com/rhgo1749/brand-new.git",
+                contract_paths=("AGENTS.md",),
+            )
+            intake._create_task = fake_create_task
+            intake._sync_board = lambda config, token, *, dry_run=False: []
+
+            args = argparse.Namespace(
+                dry_run=False,
+                fixture_json=None,
+                repository="rhgo1749/brand-new",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                assert intake._run(args) == 0
+
+            output = json.loads(stdout.getvalue())
+            assert created_boards == ["brand-new"]
+            assert tasks_created == ["brand-new"]
+            # Same-tick reload happened under the override root.
+            assert output["board_provisioning"] == [
+                {
+                    "repository": "rhgo1749/brand-new",
+                    "board": "brand-new",
+                    "action": "provisioned",
+                }
+            ]
+            assert output["upserted_count"] == 1
+            # Ownership probes (when an existing board candidate was checked)
+            # resolved under the override root; the resolver itself honored it
+            # for every read this tick performed.
+            assert all(root == Path(override_root) for root in ownership_roots)
+        finally:
+            for name, value in originals.items():
+                setattr(intake, name, value)
+            if "HERMES_KANBAN_BOARDS_ROOT" in os.environ:
+                del os.environ["HERMES_KANBAN_BOARDS_ROOT"]
+            # Resolver back to the default home after the env override clears.
+            assert str(intake._kanban_boards_root()).endswith("kanban/boards")
 
 
 def test_provision_creates_missing_board_with_checkout_workdir() -> None:

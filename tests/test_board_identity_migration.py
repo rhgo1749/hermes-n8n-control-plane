@@ -994,6 +994,95 @@ def test_partial_anchor_carry_checkpoints_rerun_and_rollback(tmp: Path) -> None:
     assert not (sandbox.boards_root / "ctrl-hangul").exists()
 
 
+def test_rollback_rejects_tampered_recorded_anchor_ids(tmp: Path) -> None:
+    """A forged/mismatched anchor checkpoint must fail closed.
+
+    Rewriting the evidence's recorded key->task-id pair so it points at a
+    task id that the canonical row for that idempotency key does not carry
+    must refuse rollback entirely: both live board paths and every canonical
+    task row remain unchanged (no anchor purge, no board removal).
+    """
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+    assert sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    ).returncode == 0
+
+    evidence_path = sandbox.state_root / "ctrl-hangul.json"
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["stage"] == "transitioned"
+    assert set(evidence["anchor_task_ids"]) == {
+        "github:rhgo1749/ctrl-hangul:issue:72"
+    }
+    # Tamper: point the recorded anchor at a task id that is NOT what the
+    # canonical row for this idempotency key carries.
+    real_id = evidence["anchor_task_ids"]["github:rhgo1749/ctrl-hangul:issue:72"]
+    forged_id = (
+        "t_forged_0001" if real_id != "t_forged_0001" else "t_forged_0002"
+    )
+    evidence["anchor_task_ids"]["github:rhgo1749/ctrl-hangul:issue:72"] = forged_id
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    tasks_before = sandbox.board_tasks("ctrl-hangul")
+    proc = sandbox.run_with_checkout("rollback", "--confirm-rollback", *common)
+    assert proc.returncode == 1, proc.stdout
+    assert "does not match the canonical task row" in proc.stderr
+
+    # Fail-closed: nothing was mutated.
+    assert "ctrl-hangul" in sandbox.live_slugs()
+    assert "ctrlhangul" not in sandbox.live_slugs()
+    assert sandbox.board_tasks("ctrl-hangul") == tasks_before
+
+
+def test_rollback_purges_only_verified_anchor_pairs(tmp: Path) -> None:
+    """Verified anchors are purged by the canonical row's own task id.
+
+    Even when the recorded checkpoint ids are stale relative to a
+    reconciled-by-key canonical carry, rollback removes the canonical rows'
+    actual ids and leaves no other content behind.
+    """
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    keys = [
+        "github:rhgo1749/ctrl-hangul:issue:72",
+        "github:rhgo1749/ctrl-hangul:issue:73",
+    ]
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", key) for key in keys],
+    )
+    sandbox.env["FAKE_KANBAN_FAIL_TASK_CREATE_N"] = "2"
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+    assert sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    ).returncode == 1
+    # The retried transition reconciles by idempotency key; its checkpoint
+    # then records verified pairs only.
+    assert sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    ).returncode == 0
+
+    rolled_back = sandbox.run_with_checkout("rollback", "--confirm-rollback", *common)
+    assert rolled_back.returncode == 0, rolled_back.stderr
+    assert "ctrlhangul" in sandbox.live_slugs()
+    assert "ctrl-hangul" not in sandbox.live_slugs()
+    legacy_keys = {
+        row[2] for row in sandbox.board_tasks("ctrlhangul") if row[2]
+    }
+    assert legacy_keys == set(keys)
+
+
 def test_rollback_rejects_distinct_content_backup_corruption(tmp: Path) -> None:
     sandbox = Sandbox(tmp)
     repo = "rhgo1749/ctrl-hangul"
