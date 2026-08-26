@@ -1785,6 +1785,986 @@ def _restore_pending_dependency(
     }
 
 
+# ---------------------------------------------------------------------------
+# Terminal merge convergence (Issue #73): a stale rework graph under a
+# closed Issue whose required PR(s) merged.
+#
+# A merged GitHub PR is an authoritative fact, but the internal dependency
+# gate (``_restore_pending_dependency``) holds the intake root open while
+# ANY reachable node is still non-terminal -- including *stale* blocked or
+# unstarted rework/reviewer nodes whose work was already delivered and
+# merged on GitHub.  ``_attempt_terminal_merge_convergence`` closes that
+# gap in one safe reconciliation pass, and only when the full authority
+# chain is freshly proven: the card is a canonical GitHub Issue intake
+# root, the reachable dependency chain has no active claim/run/worker
+# ownership, the source Issue is freshly read as ``closed``, and every
+# linked PR is freshly read as closed+merged into the target branch.
+# Any missing or non-authoritative evidence fails closed and preserves the
+# graph untouched; the path never bypasses the dependency gate for active
+# work, and never promotes, claims, spawns, or re-runs a worker.
+# ---------------------------------------------------------------------------
+
+# Ancestor states the convergence pass may terminalize / archive.  Anything
+# else (unknown status, active pipeline states) fails the pass closed.
+_TERMINAL_CONVERGE_OK_TERMINAL = frozenset({"done", "archived"})
+_TERMINAL_CONVERGE_TERMINALIZE = frozenset({"blocked"})
+_TERMINAL_CONVERGE_ARCHIVE = frozenset({"todo", "review", "ready", "scheduled"})
+# Intake-root states eligible for the authoritative done projection.
+_TERMINAL_CONVERGE_ROOT_STATUSES = frozenset({"todo", "review"})
+_TERMINAL_CONVERGE_DEVELOPER_ASSIGNEES = frozenset({"kanban-developer"})
+_TERMINAL_CONVERGE_REVIEWER_ASSIGNEES = frozenset({"kanban-reviewer"})
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _terminal_chain_ancestors(
+    conn: sqlite3.Connection,
+    root_id: str,
+) -> tuple[Optional[dict[str, dict[str, Any]]], Optional[str]]:
+    """Walk the direct ``task_links`` parent edges above ``root_id``.
+
+    Returns ``(nodes, None)`` where ``nodes`` maps every reachable id
+    (root plus all ancestors) to a row dict carrying the ownership
+    signals, and ``(None, error)`` for a dangling or missing edge.  One
+    broken edge is an ambiguous graph: it must fail the convergence pass
+    closed, never crash the whole board sync and never be treated as a
+    satisfied dependency.
+    """
+    columns = (
+        "t.id, t.status, t.assignee, t.claim_lock, t.claim_expires, "
+        "t.worker_pid, t.current_run_id, t.block_kind, t.block_recurrences, "
+        "t.completed_at"
+    )
+    root_row = conn.execute(
+        f"SELECT {columns} FROM tasks AS t WHERE t.id = ?", (root_id,)
+    ).fetchone()
+    if root_row is None:
+        return None, f"missing root task: {root_id}"
+    nodes: dict[str, dict[str, Any]] = {
+        root_id: {key: root_row[key] for key in root_row.keys()}
+    }
+    def _parent_rows(child_id: str) -> list[Any]:
+        return conn.execute(
+            f"SELECT l.parent_id, {columns} "
+            f"FROM task_links AS l LEFT JOIN tasks AS t ON t.id = l.parent_id "
+            "WHERE l.child_id = ? ORDER BY l.parent_id",
+            (child_id,),
+        ).fetchall()
+
+    # Iterative depth-first traversal with white/gray/black colors.  A gray
+    # parent is on the active path and therefore proves a cycle; a black
+    # parent is a completed shared ancestor and is safe to skip.  Keeping the
+    # active path separate from pending sibling work preserves diamond graphs
+    # without re-queuing a cycle forever.
+    colors: dict[str, int] = {root_id: 1}
+    stack: list[tuple[str, list[Any], int]] = [
+        (root_id, _parent_rows(root_id), 0)
+    ]
+    while stack:
+        child_id, parent_rows, index = stack[-1]
+        if index >= len(parent_rows):
+            colors[child_id] = 2
+            stack.pop()
+            continue
+        row = parent_rows[index]
+        stack[-1] = (child_id, parent_rows, index + 1)
+        parent_id = str(row["parent_id"])
+        if row["id"] is None:
+            return None, f"missing parent task for link: {parent_id}"
+        parent_color = colors.get(parent_id, 0)
+        if parent_color == 1:
+            return None, f"cyclic task link: {parent_id} -> {child_id}"
+        if parent_color == 2:
+            continue
+        nodes[parent_id] = {
+            "id": parent_id,
+            "status": row["status"],
+            "assignee": row["assignee"],
+            "claim_lock": row["claim_lock"],
+            "claim_expires": row["claim_expires"],
+            "worker_pid": row["worker_pid"],
+            "current_run_id": row["current_run_id"],
+            "block_kind": row["block_kind"],
+            "block_recurrences": row["block_recurrences"],
+            "completed_at": row["completed_at"],
+        }
+        colors[parent_id] = 1
+        stack.append((parent_id, _parent_rows(parent_id), 0))
+    return nodes, None
+
+
+def _terminal_chain_edge_snapshot(
+    conn: sqlite3.Connection,
+    node_ids: Iterable[str],
+) -> tuple[Optional[tuple[tuple[str, str], ...]], Optional[str]]:
+    """Return every reachable parent edge, including duplicate rows.
+
+    The edge list is part of the convergence snapshot: a late parent link,
+    removed link, duplicate, or dangling link must not be hidden by comparing
+    node rows alone.
+    """
+    ids = tuple(sorted({str(node_id) for node_id in node_ids}))
+    if not ids:
+        return (), None
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            "SELECT parent_id, child_id FROM task_links "
+            f"WHERE child_id IN ({placeholders}) "
+            "ORDER BY child_id, parent_id",
+            ids,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    return tuple(
+        (str(row["parent_id"]), str(row["child_id"])) for row in rows
+    ), None
+
+
+def _task_creation_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the durable role and parent snapshot for one task.
+
+    ``create_task`` records the initial assignee and parent list in its
+    ``created`` event.  Later canonical ``link_tasks`` calls record ``linked``
+    events, so the accepted parent snapshot includes both sources and can be
+    compared with the live edge set without trusting title/body text.
+    """
+    rows = conn.execute(
+        "SELECT kind, payload, created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('created', 'linked') "
+        "ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    created_payload: Optional[dict[str, Any]] = None
+    recorded_parents: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        kind = str(row["kind"])
+        if kind == "created":
+            if created_payload is not None:
+                return None
+            raw_parents = payload.get("parents")
+            if (
+                not isinstance(raw_parents, list)
+                or any(
+                    not isinstance(parent_id, str) or not parent_id
+                    for parent_id in raw_parents
+                )
+            ):
+                return None
+            created_payload = payload
+            recorded_parents.update(raw_parents)
+        else:
+            parent_id = payload.get("parent")
+            child_id = payload.get("child")
+            if str(child_id) != task_id or not isinstance(parent_id, str) or not parent_id:
+                return None
+            recorded_parents.add(parent_id)
+    if created_payload is None:
+        return None
+    assignee = created_payload.get("assignee")
+    if not isinstance(assignee, str) or not assignee:
+        return None
+    return {
+        "assignee": assignee,
+        "parents": tuple(sorted(recorded_parents)),
+    }
+
+
+def _terminal_convergence_rework_is_current_governing_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_kind: str,
+    rework_created_at: int,
+    rework_event_id: int,
+) -> bool:
+    """Prove the selected rework event is still the governing transition.
+
+    The edge has one canonical ordering for status-affecting lifecycle events:
+    ``(created_at, id)`` over ``_REWORK_GOVERNING_KINDS``.  Terminal
+    convergence must not reuse a validated old rework event after any newer
+    governing transition, even when the task row still looks stale.
+    """
+    kinds = tuple(sorted(_REWORK_GOVERNING_KINDS))
+    placeholders = ",".join("?" * len(kinds))
+    row = conn.execute(
+        "SELECT kind, created_at, id FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders}) "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,) + kinds,
+    ).fetchone()
+    if row is None:
+        return False
+    return (
+        str(row["kind"]) == rework_kind
+        and int(row["created_at"] or 0) == rework_created_at
+        and int(row["id"]) == rework_event_id
+    )
+
+
+def _terminal_convergence_rework_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    ref: GithubTaskRef,
+    merged_prs: Optional[Mapping[int, str]] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the latest validated rework round for a stale node.
+
+    The round must be edge-owned, tied to this exact Issue, and carry a full
+    head SHA.  When fresh GitHub evidence is available, both the PR number and
+    head SHA must match that merged evidence; an old or copied rework marker is
+    not enough to authorize terminal cleanup.
+    """
+    row = conn.execute(
+        "SELECT kind, payload, created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('github_pr_rework', 'github_pr_rework_retry') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    rework_created_at = int(row["created_at"] or 0)
+    rework_event_id = int(row["id"])
+    if not _terminal_convergence_rework_is_current_governing_event(
+        conn,
+        task_id,
+        str(row["kind"]),
+        rework_created_at,
+        rework_event_id,
+    ):
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        payload.get("repository") != ref.repository
+        or payload.get("issue_number") != ref.issue_number
+        or payload.get("reason") != "agent_rework"
+        or payload.get("merge_authority") != "human"
+        or payload.get("auto_merge") is not False
+        or payload.get("source") not in {
+            "github", "github_edge_rework_recovery",
+        }
+        or payload.get("new_status") != "ready"
+    ):
+        return None
+    raw_pr_number = payload.get("pr_number")
+    raw_round = payload.get("rework_round")
+    pr_number = raw_pr_number if isinstance(raw_pr_number, int) and not isinstance(raw_pr_number, bool) else None
+    rework_round = raw_round if isinstance(raw_round, int) and not isinstance(raw_round, bool) else None
+    head_sha = payload.get("head_sha")
+    if (
+        pr_number is None
+        or pr_number <= 0
+        or rework_round is None
+        or rework_round <= 0
+        or not isinstance(head_sha, str)
+        or _FULL_SHA_RE.fullmatch(head_sha) is None
+    ):
+        return None
+    if merged_prs is not None:
+        expected_head = merged_prs.get(pr_number)
+        if expected_head is None or head_sha.casefold() != expected_head.casefold():
+            return None
+    human_hold = _terminal_convergence_current_round_human_hold(
+        conn,
+        task_id,
+        payload,
+        rework_created_at,
+        rework_event_id,
+    )
+    if human_hold is not None:
+        return {
+            "role": "human_hold",
+            "human_hold": human_hold,
+        }
+    return {
+        "role": "stale_rework",
+        "event_kind": str(row["kind"]),
+        "pr_number": pr_number,
+        "rework_round": rework_round,
+        "head_sha": head_sha,
+    }
+
+
+def _terminal_convergence_current_round_human_hold(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_payload: Mapping[str, Any],
+    rework_created_at: int,
+    rework_event_id: int,
+) -> Optional[dict[str, Any]]:
+    """Find a durable human hold newer than the governing rework round.
+
+    A stale ``blocked`` status is not itself a human hold: the original
+    rework graph intentionally converges even when the old row still carries
+    block metadata.  A later canonical ``blocked`` event, however, is an
+    explicit worker/operator hold and must remain sticky.  Attention events
+    are guarded more narrowly by the current round's repository/Issue/PR and
+    round identity; malformed or mismatched later attention is ambiguous and
+    must remain sticky rather than being ignored.  An earlier-round attention
+    record cannot suppress a newer round.  Event id is included in the
+    ordering because the DB timestamps have second-level precision and a
+    later event may share the rework timestamp.
+    """
+    current_identity = tuple(
+        rework_payload.get(key)
+        for key in ("repository", "issue_number", "pr_number", "rework_round")
+    )
+    rows = conn.execute(
+        "SELECT kind, payload, created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'github_pr_rework_attention') "
+        "ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        event_order = (int(row["created_at"] or 0), int(row["id"]))
+        if event_order <= (rework_created_at, rework_event_id):
+            continue
+        kind = str(row["kind"])
+        if kind == "blocked":
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            return {
+                "event_kind": kind,
+                "event_id": int(row["id"]),
+                "created_at": event_order[0],
+                "block_kind": payload.get("kind"),
+            }
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            return {
+                "event_kind": kind,
+                "event_id": int(row["id"]),
+                "created_at": event_order[0],
+                "reason": "rework_attention_malformed",
+            }
+        attention_identity = tuple(
+            payload.get(key)
+            for key in ("repository", "issue_number", "pr_number", "rework_round")
+        )
+        if attention_identity != current_identity:
+            return {
+                "event_kind": kind,
+                "event_id": int(row["id"]),
+                "created_at": event_order[0],
+                "reason": "rework_attention_mismatched",
+            }
+        return {
+            "event_kind": kind,
+            "event_id": int(row["id"]),
+            "created_at": event_order[0],
+            "rework_round": rework_payload.get("rework_round"),
+            "pr_number": rework_payload.get("pr_number"),
+        }
+    return None
+
+
+def _terminal_convergence_node_provenance(
+    conn: sqlite3.Connection,
+    root_id: str,
+    ref: GithubTaskRef,
+    nodes: Mapping[str, Mapping[str, Any]],
+    edges: Iterable[tuple[str, str]],
+    *,
+    merged_prs: Optional[Mapping[int, str]] = None,
+) -> tuple[Optional[dict[str, dict[str, Any]]], Optional[dict[str, Any]]]:
+    """Classify every mutable ancestor from durable role/round evidence.
+
+    Status alone is intentionally insufficient.  A mutable ``blocked`` node
+    needs a validated edge rework round, while every unstarted allowed-status
+    node needs the canonical ``kanban-reviewer`` creation role and a recorded
+    dependency on that stale rework node.  Existing terminal ancestors are
+    safe because this pass never mutates them.
+    """
+    direct_parents: dict[str, set[str]] = {str(node_id): set() for node_id in nodes}
+    for parent_id, child_id in edges:
+        if child_id in direct_parents:
+            direct_parents[child_id].add(parent_id)
+
+    provenance: dict[str, dict[str, Any]] = {
+        root_id: {"role": "intake_root"},
+    }
+    stale_rework_ids: set[str] = set()
+
+    def failure(node_id: str, status: str, reason: str) -> tuple[None, dict[str, Any]]:
+        return None, {
+            "node_id": node_id,
+            "node_status": status,
+            "provenance_reason": reason,
+        }
+
+    for node_id, node in sorted(nodes.items()):
+        if node_id == root_id:
+            continue
+        status = str(node.get("status") or "")
+        if status in _TERMINAL_CONVERGE_OK_TERMINAL:
+            provenance[node_id] = {"role": "already_terminal", "status": status}
+            continue
+        if status not in _TERMINAL_CONVERGE_TERMINALIZE | _TERMINAL_CONVERGE_ARCHIVE:
+            return failure(node_id, status, "status_not_convergeable")
+        if status not in _TERMINAL_CONVERGE_TERMINALIZE:
+            continue
+        event = _terminal_convergence_rework_provenance(
+            conn, node_id, ref, merged_prs
+        )
+        creation = _task_creation_provenance(conn, node_id)
+        if (
+            event is None
+            or creation is None
+            or creation["assignee"] not in _TERMINAL_CONVERGE_DEVELOPER_ASSIGNEES
+            or set(creation["parents"]) != direct_parents[node_id]
+            or not direct_parents[node_id]
+        ):
+            return failure(node_id, status, "missing_stale_rework_provenance")
+        if event.get("role") == "human_hold":
+            return failure(node_id, status, "current_round_human_hold")
+        provenance[node_id] = {
+            **event,
+            "role": "stale_rework",
+        }
+        stale_rework_ids.add(node_id)
+
+    for node_id, node in sorted(nodes.items()):
+        if node_id == root_id:
+            continue
+        status = str(node.get("status") or "")
+        if status not in _TERMINAL_CONVERGE_ARCHIVE:
+            continue
+        creation = _task_creation_provenance(conn, node_id)
+        parents = direct_parents[node_id]
+        nonterminal_parents = {
+            parent_id
+            for parent_id in parents
+            if parent_id in nodes
+            and str(nodes[parent_id].get("status") or "")
+            not in _TERMINAL_CONVERGE_OK_TERMINAL
+        }
+        if (
+            creation is None
+            or creation["assignee"] not in _TERMINAL_CONVERGE_REVIEWER_ASSIGNEES
+            or set(creation["parents"]) != parents
+            or not parents
+            or not parents.intersection(stale_rework_ids)
+            or not nonterminal_parents.issubset(stale_rework_ids)
+        ):
+            return failure(node_id, status, "missing_reviewer_provenance")
+        provenance[node_id] = {
+            "role": "stale_reviewer",
+            "assignee": creation["assignee"],
+            "parents": sorted(parents),
+        }
+    return provenance, None
+
+
+def _node_has_active_ownership(node: Mapping[str, Any]) -> bool:
+    """Live claim/run/worker ownership on a node blocks convergence."""
+    if str(node.get("status") or "") == "running":
+        return True
+    return bool(
+        node.get("claim_lock")
+        or node.get("worker_pid")
+        or node.get("current_run_id")
+    )
+
+
+def _issue_is_closed(client: Any, ref: GithubTaskRef) -> bool:
+    """Fresh authoritative source-Issue state read.
+
+    A missing/invalid/non-authoritative read raises
+    ``GithubCompletionError`` -- the caller fails closed on it rather than
+    guessing the Issue state.
+    """
+    payload, _ = client.get(f"/repos/{ref.repository}/issues/{ref.issue_number}")
+    if not isinstance(payload, dict):
+        raise GithubCompletionError(
+            f"GitHub returned an invalid Issue response for #{ref.issue_number}"
+        )
+    state = str(payload.get("state", "")).casefold()
+    if state not in {"open", "closed"}:
+        raise GithubCompletionError(
+            f"GitHub returned incomplete Issue data for #{ref.issue_number}"
+        )
+    return state == "closed"
+
+
+def _terminal_convergence_evidence(
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+) -> Optional[dict[str, Any]]:
+    """Assemble fresh GitHub evidence for a qualifying merged convergence.
+
+    Returns None when the evidence is not fully authoritative: a
+    non-authoritative or non-done decision, a PR set where not every
+    linked PR is closed+merged into the configured target branch (an
+    open or closed-unmerged PR fails closed), or a non-authoritative /
+    open source-Issue read.  On success the result carries the merged PR
+    records that become the durable convergence provenance.
+    """
+    if not decision.authoritative or decision.desired_status != "done":
+        return None
+    prs = decision.pull_requests
+    if not prs or any(not _is_merged_into_target(ref, pr) for pr in prs):
+        return None
+    try:
+        if not _issue_is_closed(client, ref):
+            return None
+    except GithubCompletionError:
+        return None
+    return {
+        "issue_state": "closed",
+        "target_branch": ref.target_branch,
+        "merged_prs": [
+            {
+                "number": pr.number,
+                "head_sha": pr.head_sha,
+                "base_branch": pr.base_branch,
+            }
+            for pr in prs
+        ],
+    }
+
+
+def _attempt_terminal_merge_convergence(
+    conn: sqlite3.Connection,
+    client: Any,
+    task_id: str,
+    row: Mapping[str, Any],
+    ref: GithubTaskRef,
+    text_sources: list[str],
+    *,
+    dry_run: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Single-pass terminal convergence of a stale rework graph.
+
+    Eligible only when the card is a canonical GitHub Issue intake root
+    in a pre-terminal state whose dependency gate is PENDING (the classic
+    lane would otherwise restore it), and when every reachable ancestor
+    is in a stale shape: terminal (``done``/``archived``), a stale
+    ``blocked`` implementation/rework node, or an unstarted
+    ``todo``/``review``/``ready``/``scheduled`` reviewer/waiting node --
+    with no active claim/run/worker ownership anywhere in the chain.  Every
+    mutable ancestor must also carry durable role evidence: a matching
+    ``github_pr_rework`` round for blocked developer work, or a canonical
+    reviewer creation event linked to that rework node for unstarted review
+    work.
+    The fresh GitHub read must then prove the source Issue ``closed`` and
+    every linked PR closed+merged into the target branch.
+
+    When all of that holds, one transaction terminalizes the whole
+    graph: stale ``blocked`` nodes become ``done`` (the merged PR is the
+    authoritative record that their work was delivered), unstarted
+    reviewer/waiting nodes become ``archived`` (never a fabricated
+    reviewer PASS), and the intake root projects to authoritative
+    ``done`` -- each with a durable ``github_pr_sync`` event carrying the
+    fresh GitHub provenance and stale claim/block fields cleared.
+
+    Every other shape fails closed with a diagnostic entry and leaves the
+    graph untouched; no worker is promoted, claimed, spawned, or re-run.
+    A second pass over a converged graph is a no-op: the root is already
+    terminal and the dependency gate is satisfied, so the classic lanes
+    handle it through the existing idempotent contract.
+    """
+    root_status = str(row["status"])
+    if root_status not in _TERMINAL_CONVERGE_ROOT_STATUSES:
+        return None
+    if not is_github_backed_body(row["body"]):
+        return None
+    try:
+        gate = _internal_dependency_gate(conn, task_id)
+    except (SyncError, sqlite3.Error) as exc:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_dependency_ambiguous",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not gate["pending"]:
+        # No pending internal dependency: the classic lanes own this card.
+        return None
+    nodes, error = _terminal_chain_ancestors(conn, task_id)
+    if nodes is None:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_ambiguous_graph",
+            "error": error,
+        }
+    edges, edge_error = _terminal_chain_edge_snapshot(conn, nodes.keys())
+    if edges is None:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_ambiguous_graph",
+            "error": edge_error or "edge snapshot unavailable",
+        }
+    root_body = str(row["body"] or "")
+    for node_id, node in sorted(nodes.items()):
+        if _node_has_active_ownership(node):
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_active_ownership",
+                "evidence": {
+                    "node_id": node_id,
+                    "node_status": str(node.get("status") or ""),
+                },
+            }
+    provenance, provenance_error = _terminal_convergence_node_provenance(
+        conn, task_id, ref, nodes, edges
+    )
+    if provenance is None:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_node_unconvergeable",
+            "evidence": provenance_error or {"provenance": "unavailable"},
+        }
+    terminalize = sorted(
+        node_id
+        for node_id, item in provenance.items()
+        if item.get("role") == "stale_rework"
+    )
+    archive = sorted(
+        node_id
+        for node_id, item in provenance.items()
+        if item.get("role") == "stale_reviewer"
+    )
+    # DB-local shape pre-filter passed: the pending chain is stale, not
+    # active work.  The fresh GitHub read is now the authority gate.
+    decision = verify_completion(client, ref, text_sources)
+    evidence = _terminal_convergence_evidence(client, ref, decision)
+    if evidence is None:
+        # Open Issue, open/closed-unmerged PR, or non-authoritative read:
+        # preserve the graph; the classic gate lane reports the pending
+        # dependency unchanged.
+        return None
+    merged_pr_heads = {
+        int(item["number"]): str(item["head_sha"])
+        for item in evidence.get("merged_prs", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("number"), int)
+        and isinstance(item.get("head_sha"), str)
+    }
+    verified_provenance, verified_provenance_error = (
+        _terminal_convergence_node_provenance(
+            conn,
+            task_id,
+            ref,
+            nodes,
+            edges,
+            merged_prs=merged_pr_heads,
+        )
+    )
+    if verified_provenance is None:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_node_unconvergeable",
+            "evidence": verified_provenance_error or {"provenance": "unavailable"},
+        }
+    if verified_provenance != provenance:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_convergence_state_changed",
+            "evidence": {
+                "expected_provenance": provenance,
+                "actual_provenance": verified_provenance,
+            },
+        }
+    evidence = {
+        **evidence,
+        "convergence_provenance": {
+            node_id: item
+            for node_id, item in verified_provenance.items()
+            if node_id != task_id
+        },
+    }
+    if dry_run:
+        return {
+            "task_id": task_id,
+            "status": root_status,
+            "changed": False,
+            "reason": "terminal_merge_convergence_predicted",
+            "evidence": {
+                **evidence,
+                "terminalize": terminalize,
+                "archive": archive,
+            },
+        }
+    with conn:
+        # Acquire the write lock before the final closure read.  GitHub is an
+        # external authority and may have taken seconds to answer; the
+        # original prevalidation is only a snapshot.  Re-read every node and
+        # edge while the write transaction owns the database, then refuse the
+        # pass before any mutation when the graph drifted.
+        conn.execute("BEGIN IMMEDIATE")
+        fresh_nodes, fresh_error = _terminal_chain_ancestors(conn, task_id)
+        if fresh_nodes is None:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_ambiguous_graph",
+                "error": fresh_error or "ancestor closure unavailable",
+            }
+        fresh_edges, fresh_edge_error = _terminal_chain_edge_snapshot(
+            conn, fresh_nodes.keys()
+        )
+        if fresh_edges is None:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_ambiguous_graph",
+                "error": fresh_edge_error or "edge snapshot unavailable",
+            }
+        if fresh_nodes != nodes or fresh_edges != edges:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_node_ids": sorted(nodes),
+                    "actual_node_ids": sorted(fresh_nodes),
+                    "expected_edges": [list(edge) for edge in edges],
+                    "actual_edges": [list(edge) for edge in fresh_edges],
+                },
+            }
+        root_row = conn.execute(
+            "SELECT body, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            root_row is None
+            or str(root_row["body"] or "") != root_body
+            or str(root_row["status"] or "") != root_status
+        ):
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {"node_id": task_id, "node_status": root_status},
+            }
+        try:
+            fresh_gate = _internal_dependency_gate(conn, task_id)
+        except (SyncError, sqlite3.Error) as exc:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_ambiguous_graph",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if fresh_gate.get("parents") != gate.get("parents"):
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_parents": gate.get("parents"),
+                    "actual_parents": fresh_gate.get("parents"),
+                },
+            }
+        for node_id, node in sorted(fresh_nodes.items()):
+            if _node_has_active_ownership(node):
+                return {
+                    "task_id": task_id,
+                    "status": root_status,
+                    "changed": False,
+                    "reason": "terminal_convergence_active_ownership",
+                    "evidence": {
+                        "node_id": node_id,
+                        "node_status": str(node.get("status") or ""),
+                    },
+                }
+        fresh_provenance, fresh_provenance_error = (
+            _terminal_convergence_node_provenance(
+                conn,
+                task_id,
+                ref,
+                fresh_nodes,
+                fresh_edges,
+                merged_prs=merged_pr_heads,
+            )
+        )
+        if fresh_provenance is None:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_node_unconvergeable",
+                "evidence": fresh_provenance_error or {"provenance": "unavailable"},
+            }
+        if fresh_provenance != verified_provenance:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_provenance": verified_provenance,
+                    "actual_provenance": fresh_provenance,
+                },
+            }
+        fresh_terminalize = sorted(
+            node_id
+            for node_id, item in fresh_provenance.items()
+            if item.get("role") == "stale_rework"
+        )
+        fresh_archive = sorted(
+            node_id
+            for node_id, item in fresh_provenance.items()
+            if item.get("role") == "stale_reviewer"
+        )
+        if fresh_terminalize != terminalize or fresh_archive != archive:
+            return {
+                "task_id": task_id,
+                "status": root_status,
+                "changed": False,
+                "reason": "terminal_convergence_state_changed",
+                "evidence": {
+                    "expected_terminalize": terminalize,
+                    "actual_terminalize": fresh_terminalize,
+                    "expected_archive": archive,
+                    "actual_archive": fresh_archive,
+                },
+            }
+        now = int(time.time())
+        # Stale blocked implementation/rework node: the merged PR is the
+        # authoritative record that the work was delivered, so
+        # terminalize it to done with explicit GitHub-merge provenance.
+        for node_id in terminalize:
+            node = nodes[node_id]
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "current_run_id = NULL, block_kind = NULL, "
+                "block_recurrences = 0 "
+                "WHERE id = ? AND status = ? AND claim_lock IS NULL "
+                "AND worker_pid IS NULL AND current_run_id IS NULL",
+                (now, node_id, str(node["status"])),
+            )
+            if cur.rowcount != 1:
+                raise SyncError(
+                    f"terminal convergence state changed during sync: {node_id}"
+                )
+            _append_sync_event(
+                conn,
+                node_id,
+                {
+                    "source": "github",
+                    "previous_status": str(node["status"]),
+                    "new_status": "done",
+                    "reason": "terminal_merge_convergence",
+                    **evidence,
+                    "merge_authority": "human",
+                    "auto_merge": False,
+                },
+                kind="github_pr_sync",
+            )
+        # Unstarted reviewer/waiting node: archive it rather than fabricate
+        # a reviewer PASS; the merged PR supersedes the review lane.
+        for node_id in archive:
+            node = nodes[node_id]
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'archived', assignee = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "current_run_id = NULL, block_kind = NULL, "
+                "block_recurrences = 0 "
+                "WHERE id = ? AND status = ? AND claim_lock IS NULL "
+                "AND worker_pid IS NULL AND current_run_id IS NULL",
+                (node_id, str(node["status"])),
+            )
+            if cur.rowcount != 1:
+                raise SyncError(
+                    f"terminal convergence state changed during sync: {node_id}"
+                )
+            _append_sync_event(
+                conn,
+                node_id,
+                {
+                    "source": "github",
+                    "previous_status": str(node["status"]),
+                    "new_status": "archived",
+                    "reason": "terminal_merge_convergence_archived_unstarted",
+                    **evidence,
+                    "merge_authority": "human",
+                    "auto_merge": False,
+                },
+                kind="github_pr_sync",
+            )
+        # Intake root: authoritative done with the same fresh evidence and
+        # the full converged set recorded as the durable event trail.
+        dependency_guard = _dependency_guard_sql()
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "current_run_id = NULL, block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status = ? AND claim_lock IS NULL "
+            "AND worker_pid IS NULL AND current_run_id IS NULL "
+            f"{dependency_guard}",
+            (now, task_id, root_status, task_id),
+        )
+        if cur.rowcount != 1:
+            raise SyncError(
+                "terminal convergence state changed during sync: root"
+            )
+        _append_sync_event(
+            conn,
+            task_id,
+            {
+                "source": "github",
+                "previous_status": root_status,
+                "new_status": "done",
+                "reason": "terminal_merge_convergence",
+                "converged": sorted(terminalize + archive),
+                **evidence,
+                "merge_authority": "human",
+                "auto_merge": False,
+            },
+            kind="github_pr_sync",
+        )
+    return {
+        "task_id": task_id,
+        "status": "done",
+        "changed": True,
+        "reason": "terminal_merge_convergence",
+        "evidence": {
+            **evidence,
+            "converged": sorted(terminalize + archive),
+        },
+    }
+
+
 def _dependency_gate_evidence(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5279,6 +6259,65 @@ def sync_board(
                 }, row, ref))
                 continue
             if dependency_gate["pending"]:
+                # Terminal merge convergence (Issue #73): a stale
+                # blocked/unstarted rework chain under a canonical intake
+                # root whose Issue is closed and whose required PR(s)
+                # merged is converged in one pass BEFORE the classic gate
+                # lane restores the root.  Any ambiguous shape, active
+                # ownership, or non-authoritative GitHub read fails closed
+                # and falls through to the classic lane unchanged.
+                # Text sources are collected inside this pending branch
+                # (the general collection below is only reached when the
+                # gate is already satisfied).  A lookup failure is not
+                # equivalent to an empty source set: handoff text may carry
+                # another required PR, so stop this task's sync pass with an
+                # explicit diagnostic rather than risking false merge
+                # completion from incomplete evidence.
+                text_sources: list[str] = [str(row["body"] or "")]
+                try:
+                    for comment in kanban_db.list_comments(conn, task_id):
+                        text_sources.append(comment.body)
+                    for run in kanban_db.list_runs(conn, task_id):
+                        for item in (run.summary, run.error):
+                            if item:
+                                text_sources.append(item)
+                        if run.metadata:
+                            text_sources.append(
+                                json.dumps(
+                                    run.metadata, ensure_ascii=False,
+                                    sort_keys=True,
+                                )
+                            )
+                except Exception as exc:  # run/comment API drift -> fail closed
+                    results.append(_annotate({
+                        "task_id": task_id,
+                        "status": row["status"],
+                        "changed": False,
+                        "reason": "text_source_lookup_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }, row, ref))
+                    continue
+                try:
+                    convergence = _attempt_terminal_merge_convergence(
+                        conn,
+                        client,
+                        task_id,
+                        row,
+                        ref,
+                        text_sources,
+                        dry_run=dry_run,
+                    )
+                except (sqlite3.Error, SyncError, GithubCompletionError) as exc:
+                    convergence = {
+                        "task_id": task_id,
+                        "status": row["status"],
+                        "changed": False,
+                        "reason": "terminal_convergence_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                if convergence is not None:
+                    results.append(_annotate(convergence, row, ref))
+                    continue
                 results.append(_annotate(
                     _restore_pending_dependency(
                         conn, task_id, dependency_gate, dry_run=dry_run,

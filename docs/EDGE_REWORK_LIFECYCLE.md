@@ -260,6 +260,107 @@ fail-closed: the card stays in its current state, no duplicate
 forcing recovered `REVIEW` back to `BLOCKED` — is intentionally rejected so
 the normal review lane does not acquire a new state transition.
 
+## Terminal merge convergence of a stale rework graph (Issue #73)
+
+A merged GitHub PR is an authoritative fact, but the internal dependency
+gate holds the intake root open while ANY reachable node is still
+non-terminal -- including *stale* blocked or unstarted rework/reviewer
+nodes whose work was already delivered and merged on GitHub (the H4V3-DJ
+#88 topology: done implementation -> blocked rework -> todo reviewer ->
+todo intake root).  The edge therefore converges such a graph in one
+reconciliation pass, and ONLY when the full authority chain is freshly
+proven in the same pass:
+
+1. the card is a canonical GitHub Issue intake root;
+2. a fresh GitHub read reports the source Issue `closed`;
+3. every required linked PR is freshly read as closed, merged, and
+   targeting the configured target branch;
+4. the reachable dependency-chain nodes are unambiguous (every ancestor
+   is terminal, a stale `blocked` node, or an unstarted
+   `todo`/`review`/`ready`/`scheduled` node) and none has an active
+   claim/run/worker.
+5. every mutable `blocked` ancestor has a durable edge-owned
+   `github_pr_rework`/retry event whose repository, Issue, PR, round, and
+   full head SHA match the fresh merged-PR evidence;
+6. every mutable allowed-status ancestor has a durable `created` role of
+   `kanban-reviewer`, and its recorded parent set proves that it is the
+   reviewer/waiting node for the stale rework round. Status, title, body, or
+   a matching Issue/PR alone is never sufficient.
+
+The blocked-node predicate is round-aware.  A stale `blocked` row's existing
+`block_kind` is not enough to refuse the original #88-shaped convergence, but
+the selected rework event must first still be the node's current governing
+transition.  The edge proves that with the canonical
+`_REWORK_GOVERNING_KINDS` ordering `(created_at, id)`; any later
+status-affecting governing event (`github_pr_sync`, `completed`, `status`,
+`promoted`, `unblocked`, `reclaimed`, `scheduled`, `archived`, or another
+canonical transition) supersedes the old round and blocks terminalization.
+
+Any later canonical `blocked` event is an explicit worker/operator hold and
+blocks terminalization.  A later `github_pr_rework_attention` event blocks it
+when its repository, Issue, PR, and `rework_round` match the governing round;
+if that later attention record is malformed or has mismatched identity, the
+evidence is ambiguous and also fails closed rather than being ignored.  Both
+holds and ambiguous records preserve the blocked node's metadata and all
+durable events.  An old attention record from an earlier round cannot suppress
+a newer valid rework round because it precedes the newer governing event.
+
+The single transaction then terminalizes the graph: the stale `blocked`
+implementation/rework node becomes `done` with explicit GitHub-merge
+provenance (the merge is the authoritative record that the work was
+delivered), the unstarted reviewer/waiting node becomes `archived` (never
+a fabricated reviewer PASS), and the intake root projects to
+authoritative `done` -- each with a durable `github_pr_sync` event
+(`reason: terminal_merge_convergence`, merged-PR provenance,
+`merge_authority: human`, `auto_merge: false`) and stale claim/block
+fields cleared.  This mutation is not taken when the current round has a
+later human block or matching attention hold.  A second pass is a no-op, and
+no worker is ever promoted, claimed, spawned, or re-run.
+
+After the fresh GitHub evidence is accepted, the edge acquires a write
+transaction and re-reads the complete reachable node and edge closure before
+the first mutation.  Any status/ownership change, late parent or removed edge,
+dangling link, or closure cycle is a fail-closed refusal; the transaction
+preserves every node and event.  The final root write also re-evaluates the
+direct-parent terminal predicate in the same transaction, so a late active
+parent cannot bypass the dependency gate.  Ancestor traversal uses an active
+path cycle check while still skipping completed shared ancestors, so diamond
+graphs remain valid and bounded.
+
+Fail-closed boundaries: open Issue, an open or closed-unmerged required
+PR, a non-authoritative/failing GitHub read, any active claim/run/worker
+ownership, missing/mismatched rework or reviewer provenance, a rework event
+superseded by a later canonical governing transition, or an
+unrelated/ambiguous ancestor, a later explicit human `blocked` event, or a
+later matching or malformed/mismatched current-round
+`github_pr_rework_attention` event preserves the graph unchanged (the classic
+`internal_dependency_pending` lane keeps the root runnable).  Comment/run
+lookup failure is also fail-closed: the edge returns
+`text_source_lookup_failed` instead of treating incomplete handoff text as
+an empty source set. This is not a generic dependency bypass: the gate still
+protects active work, and the classic lane remains the owner of every
+non-qualifying shape.  A mutating convergence entry is
+`reason: terminal_merge_convergence` (root/blocked) or
+`terminal_merge_convergence_archived_unstarted` (reviewer); dry-run predicts
+with `terminal_merge_convergence_predicted`. Refusals report
+`terminal_convergence_active_ownership`,
+`terminal_convergence_node_unconvergeable`,
+`terminal_convergence_ambiguous_graph`, or
+`text_source_lookup_failed` without mutation.
+
+`edge/test-kanban-github-sync-terminal-convergence.py` pins the #88
+topology convergence, repeat-pass idempotence without claim/spawn, the
+issue-open / open-PR / closed-unmerged-PR / GitHub-error preservation
+matrix, active-ownership refusal, unrelated blocked/allowed-status ancestor
+refusal, missing rework provenance, comments/runs lookup failure with
+incomplete PR text, late ancestor activation and late active-parent insertion
+during the GitHub read, bounded cycle refusal, and diamond/shared-ancestor
+traversal.  Later durable human-block and current-round attention holds,
+superseded governing transitions, malformed/mismatched later attention, and
+earlier-round attention before a newer valid rework are also regression-tested
+to preserve the blocked node and root dependency gate without weakening the
+original positive convergence path.
+
 ## Deployment (host)
 
 The authoritative intake job remains Hermes job `default:bf431b2a6ba6`, but
