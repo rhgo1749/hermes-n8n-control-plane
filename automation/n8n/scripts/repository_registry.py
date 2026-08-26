@@ -15,9 +15,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Self
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -42,12 +43,38 @@ class RegistryError(RuntimeError):
     """Discovery or normalization failed closed."""
 
 
+class BoardRepositoryEvidence(tuple[str, ...]):
+    """Repository provenance plus total/non-GitHub task occupancy.
+
+    The tuple base preserves the existing private evidence mapping shape for
+    callers that only need the repository identities. The occupancy fields are
+    carried alongside it so an unmanaged/manual canonical board cannot be
+    mistaken for a truly empty bootstrap board.
+    """
+
+    task_count: int
+    non_github_task_count: int
+
+    def __new__(
+        cls,
+        repositories: Iterable[str] = (),
+        *,
+        task_count: int = 0,
+        non_github_task_count: int = 0,
+    ) -> Self:
+        value = super().__new__(cls, repositories)
+        value.task_count = int(task_count)
+        value.non_github_task_count = int(non_github_task_count)
+        return value
+
+
 @dataclass(frozen=True)
 class RegistryEntry:
     repository: str
     repository_id: int
     default_branch: str
     canonical_slug: str
+    display_name: str
     board: str | None
     board_status: str
     checkout: str
@@ -207,25 +234,28 @@ def _git_origin(checkout: Path) -> str | None:
     return value or None
 
 
-def _kanban_board_repository_evidence(boards_root: Path) -> dict[str, tuple[str, ...]]:
-    """Read GitHub repository identities recorded in each live board's task keys."""
+def _kanban_board_repository_evidence(
+    boards_root: Path,
+) -> dict[str, BoardRepositoryEvidence]:
+    """Read provenance and occupancy recorded in each live board's tasks."""
     if not boards_root.exists():
         return {}
     if not boards_root.is_dir():
         raise RegistryError(f"Kanban boards root is not a directory: {boards_root}")
 
-    evidence: dict[str, tuple[str, ...]] = {}
+    evidence: dict[str, BoardRepositoryEvidence] = {}
     for db in sorted(boards_root.glob("*/kanban.db")):
         board = db.parent.name
         if board.startswith("_"):
             continue
 
         repositories: set[str] = set()
+        non_github_task_count = 0
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             try:
                 rows = con.execute(
-                    "SELECT idempotency_key FROM tasks WHERE idempotency_key IS NOT NULL"
+                    "SELECT idempotency_key FROM tasks"
                 ).fetchall()
             finally:
                 con.close()
@@ -236,7 +266,13 @@ def _kanban_board_repository_evidence(boards_root: Path) -> dict[str, tuple[str,
             match = GITHUB_ISSUE_KEY.match(str(raw_key or ""))
             if match:
                 repositories.add(match.group(1).casefold())
-        evidence[board] = tuple(sorted(repositories))
+            else:
+                non_github_task_count += 1
+        evidence[board] = BoardRepositoryEvidence(
+            sorted(repositories),
+            task_count=len(rows),
+            non_github_task_count=non_github_task_count,
+        )
     return evidence
 
 
@@ -283,7 +319,7 @@ def _board_default_workdir(boards_root: Path, board: str | None) -> Path | None:
 
 def _resolve_board(
     repository: str,
-    evidence: dict[str, tuple[str, ...]],
+    evidence: Mapping[str, tuple[str, ...] | BoardRepositoryEvidence],
 ) -> tuple[str | None, str]:
     """Resolve one live board without inventing a repository association.
 
@@ -297,7 +333,13 @@ def _resolve_board(
     exact: list[str] = []
     conflicted: list[str] = []
 
-    for board, repositories in evidence.items():
+    for board, raw_evidence in evidence.items():
+        board_evidence = (
+            raw_evidence
+            if isinstance(raw_evidence, BoardRepositoryEvidence)
+            else BoardRepositoryEvidence(raw_evidence)
+        )
+        repositories = tuple(board_evidence)
         if repository_key not in repositories:
             continue
         if len(repositories) == 1:
@@ -321,8 +363,16 @@ def _resolve_board(
         return None, "ambiguous_canonical_boards"
     if len(canonical_matches) == 1:
         board = canonical_matches[0]
-        board_repositories = evidence[board]
+        raw_evidence = evidence[board]
+        board_evidence = (
+            raw_evidence
+            if isinstance(raw_evidence, BoardRepositoryEvidence)
+            else BoardRepositoryEvidence(raw_evidence)
+        )
+        board_repositories = tuple(board_evidence)
         if board_repositories:
+            return None, "canonical_board_conflict"
+        if board_evidence.task_count:
             return None, "canonical_board_conflict"
         return board, "resolved_empty_canonical_board"
 
@@ -360,6 +410,7 @@ def build_entry(
 
     repo_name = full_name.split("/", 1)[1]
     slug = repo_name.casefold()
+    display_name = repo_name
     checkout = checkout_path if checkout_path is not None else checkout_root / slug
     read_origin = origin_reader or _git_origin
     origin = read_origin(checkout) if checkout.is_dir() else None
@@ -408,6 +459,7 @@ def build_entry(
         repository_id=repository_id,
         default_branch=default_branch,
         canonical_slug=slug,
+        display_name=display_name,
         board=board,
         board_status=board_status,
         checkout=str(checkout),

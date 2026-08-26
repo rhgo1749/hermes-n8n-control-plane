@@ -31,6 +31,7 @@ def _render_body() -> str:
         checkout="/ws/projects/example",
         default_branch="main",
         contract_paths=("AGENTS.md",),
+        display_name="example",
     )
     snapshot = mod.RepoSnapshot(
         origin_sha="0123456789abcdef",

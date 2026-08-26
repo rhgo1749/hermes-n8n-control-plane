@@ -6,11 +6,11 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
@@ -45,6 +45,7 @@ def _config(
         checkout=checkout,
         default_branch=default_branch,
         contract_paths=contract_paths,
+        display_name=repository.split("/", 1)[1],
     )
 
 
@@ -64,6 +65,7 @@ def _entry(
         "repository_id": 1,
         "default_branch": default_branch,
         "canonical_slug": slug,
+        "display_name": repository.split("/", 1)[1],
         "board": board or slug,
         "board_status": (
             "resolved_task_provenance"
@@ -617,6 +619,231 @@ def _bootstrap_entry(repository: str, board: str, checkout: str) -> dict:
     return entry
 
 
+FAKE_REGISTRY_SNAPSHOT = {
+    "schema_version": 2,
+    "mode": "shadow",
+    "board_authority": "tasks.idempotency_key",
+    "repositories": [],
+}
+
+
+def test_override_boards_root_reaches_real_registry_subprocess() -> None:
+    """HERMES_KANBAN_BOARDS_ROOT must reach the REAL registry subprocess.
+
+    A recording stand-in registry executable captures its actual argv, so
+    this fails deterministically if ``--kanban-root`` is built from anything
+    other than the centralized ``_kanban_boards_root()`` resolver (e.g. the
+    pre-round-3 hard-coded default home path).
+    """
+    with tempfile.TemporaryDirectory() as td:
+        override_root = str(Path(td) / "custom-boards")
+        recorder = Path(td) / "registry_argv.json"
+        registry_script = Path(td) / "fake_registry.py"
+        registry_script.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    "from pathlib import Path",
+                    f"Path({str(recorder)!r}).write_text(json.dumps(sys.argv))",
+                    f"print(json.dumps({FAKE_REGISTRY_SNAPSHOT!r}))",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        originals = {
+            name: os.environ.get(name)
+            for name in (
+                "HERMES_KANBAN_BOARDS_ROOT",
+                "HERMES_REPOSITORY_REGISTRY_SCRIPT",
+                "HERMES_GITHUB_OWNER",
+                "HERMES_GITHUB_TOPIC",
+            )
+        }
+        try:
+            os.environ["HERMES_KANBAN_BOARDS_ROOT"] = override_root
+            os.environ["HERMES_REPOSITORY_REGISTRY_SCRIPT"] = str(registry_script)
+            os.environ["HERMES_GITHUB_OWNER"] = "rhgo1749"
+            os.environ["HERMES_GITHUB_TOPIC"] = "hermes-agent"
+
+            snapshot = intake._load_registry_snapshot("token")
+
+            assert snapshot == FAKE_REGISTRY_SNAPSHOT
+            # The recording executable saw the REAL subprocess construction,
+            # including --kanban-root resolved from the centralized resolver.
+            argv = json.loads(recorder.read_text(encoding="utf-8"))
+            assert "--kanban-root" in argv
+            assert argv[argv.index("--kanban-root") + 1] == override_root
+        finally:
+            for name, value in originals.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def test_override_boards_root_honored_end_to_end_same_tick() -> None:
+    """HERMES_KANBAN_BOARDS_ROOT drives registry discovery, ownership checks,
+    the lease path, and the same-tick post-provision reload.
+
+    A custom boards root must reach the bootstrap ownership DB probe (real
+    reader, real sqlite row under the override root) and the migration/intake
+    lease; after a board lands under that root the same-tick reload must
+    resolve the ready entry so the first task is created in this tick. The
+    real registry subprocess argv is covered separately by
+    ``test_override_boards_root_reaches_real_registry_subprocess``.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        override_root = str(Path(td) / "custom-boards")
+        ownership_roots: list[Path] = []
+        existing_boards: set[str] = set()
+        created_boards: list[str] = []
+        tasks_created: list[str] = []
+
+        originals = {
+            name: getattr(intake, name)
+            for name in (
+                "_github_token",
+                "_load_registry_snapshot",
+                "_claim_wake_scope",
+                "_telegram_config",
+                "_run_closed_issue_cleanup",
+                "_issue_candidates",
+                "_repo_snapshot",
+                "_create_task",
+                "_sync_board",
+                "_board_slugs",
+                "_run_hermes",
+                "_verify_bootstrap_checkout",
+                "_board_repository_owners",
+            )
+        }
+
+        def fake_load_registry_snapshot(token: str) -> dict:
+            # Stands in for the real registry subprocess, which receives
+            # ``--kanban-root <resolver()>`` (argv proven by the dedicated
+            # subprocess regression above): its snapshot reflects board state
+            # under the OVERRIDE root, not the default home. Before the
+            # board exists under the override root it reports a bootstrap
+            # intent; after provisioning, the same-tick reload resolves the
+            # empty canonical board.
+            if "brand-new" in existing_boards:
+                return _snapshot([_entry("rhgo1749/brand-new")])
+            return _snapshot(
+                [
+                    _bootstrap_entry(
+                        "rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new"
+                    )
+                ]
+            )
+
+        def fake_board_repository_owners(board: str):
+            db = intake._kanban_boards_root() / board / "kanban.db"
+            ownership_roots.append(db.parent)
+            return set()
+
+        def fake_run_hermes(*args: str, **kwargs: Any) -> str:
+            if "boards" in args and "create" in args:
+                board = args[args.index("create") + 1]
+                existing_boards.add(board)
+                created_boards.append(board)
+                return f"Board '{board}' created."
+            raise AssertionError(f"unexpected hermes call: {args}")
+
+        def fake_create_task(config, issue_arg, snapshot, imported_at, *, tick_started):
+            tasks_created.append(config.board)
+            return {
+                "key": f"github:{config.name}:issue:1",
+                "board": config.board,
+                "task_id": "t_test",
+                "status": "ready",
+                "created": True,
+                "issue_number": 1,
+            }
+
+        try:
+            os.environ["HERMES_KANBAN_BOARDS_ROOT"] = override_root
+            assert intake._kanban_boards_root() == Path(override_root)
+            assert intake._intake_migration_lease_path() == (
+                Path(override_root) / ".intake-migration.lock"
+            )
+
+            # Real ownership reader against a REAL board DB placed under the
+            # override root: the resolver-derived path must be the one read.
+            board_db_dir = Path(override_root) / "brand-new"
+            board_db_dir.mkdir(parents=True, exist_ok=True)
+            import sqlite3
+
+            con = sqlite3.connect(board_db_dir / "kanban.db")
+            con.execute(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, "
+                "status TEXT, idempotency_key TEXT)"
+            )
+            con.execute(
+                "INSERT INTO tasks VALUES ('t_own', 'owned', 'done', "
+                "'github:rhgo1749/brand-new:issue:9')"
+            )
+            con.commit()
+            con.close()
+            ownership = intake._board_repository_owners("brand-new")
+            assert set(ownership) == {"rhgo1749/brand-new"}
+            assert ownership.task_count == 1
+
+            intake._load_registry_snapshot = fake_load_registry_snapshot
+            intake._claim_wake_scope = lambda: None
+            intake._telegram_config = lambda: None
+            intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
+            intake._board_slugs = lambda: set(existing_boards)
+            intake._run_hermes = fake_run_hermes
+            intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+            intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+            intake._board_repository_owners = fake_board_repository_owners
+            intake._issue_candidates = lambda token, fixture_path, configs: [
+                (configs[0], {"number": 1, "title": "First", "body": "", "labels": [{"name": "agent-ready"}]})
+            ]
+            intake._closing_merged_pr_numbers = lambda token, repository, issue_number: ()
+            intake._repo_snapshot = lambda config: intake.RepoSnapshot(
+                origin_sha="abc",
+                remote="https://github.com/rhgo1749/brand-new.git",
+                contract_paths=("AGENTS.md",),
+            )
+            intake._create_task = fake_create_task
+            intake._sync_board = lambda config, token, *, dry_run=False: []
+
+            args = argparse.Namespace(
+                dry_run=False,
+                fixture_json=None,
+                repository="rhgo1749/brand-new",
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                assert intake._run(args) == 0
+
+            output = json.loads(stdout.getvalue())
+            assert created_boards == ["brand-new"]
+            assert tasks_created == ["brand-new"]
+            # Same-tick reload happened under the override root.
+            assert output["board_provisioning"] == [
+                {
+                    "repository": "rhgo1749/brand-new",
+                    "board": "brand-new",
+                    "action": "provisioned",
+                }
+            ]
+            assert output["upserted_count"] == 1
+            # Ownership probes (when an existing board candidate was checked)
+            # resolved under the override root; the resolver itself honored it
+            # for every read this tick performed.
+            assert all(root == Path(override_root) for root in ownership_roots)
+        finally:
+            for name, value in originals.items():
+                setattr(intake, name, value)
+            if "HERMES_KANBAN_BOARDS_ROOT" in os.environ:
+                del os.environ["HERMES_KANBAN_BOARDS_ROOT"]
+            # Resolver back to the default home after the env override clears.
+            assert str(intake._kanban_boards_root()).endswith("kanban/boards")
+
+
 def test_provision_creates_missing_board_with_checkout_workdir() -> None:
     existing: set[str] = {"ctrlhangul"}
     created: list[str] = []
@@ -627,10 +854,19 @@ def test_provision_creates_missing_board_with_checkout_workdir() -> None:
         existing.add(board)
         return f"Board '{board}' created."
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         report = intake._provision_bootstrap_boards(snapshot, dry_run=False)
         assert report == [
@@ -648,10 +884,19 @@ def test_provision_skips_existing_board_idempotently() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("must not create an already-existing board")
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = forbidden
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         assert intake._provision_bootstrap_boards(snapshot, dry_run=False) == []
     finally:
@@ -665,10 +910,19 @@ def test_provision_dry_run_never_mutates() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("dry-run must never invoke the Hermes CLI")
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = forbidden
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         report = intake._provision_bootstrap_boards(snapshot, dry_run=True)
         assert report == [
@@ -690,10 +944,19 @@ def test_provision_scope_restricts_provisioning() -> None:
         existing.add(board)
         return f"Board '{board}' created."
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot(
             [
                 _bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new"),
@@ -718,10 +981,19 @@ def test_provision_fails_closed_if_board_does_not_land() -> None:
     def fake_run_hermes(*args: str, **kwargs: Any) -> str:
         return "Board created."  # claims success but the board never lands
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         try:
             intake._provision_bootstrap_boards(snapshot, dry_run=False)
@@ -746,14 +1018,133 @@ def test_provision_malformed_intent_fails_closed() -> None:
         raise AssertionError("malformed bootstrap intent must fail closed")
 
 
+def test_provision_rejects_repository_derived_slug_mismatch() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "wrong-slug",
+        "/ws/projects/brand-new",
+    )
+    try:
+        intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+    except intake.IntakeError as exc:
+        assert "repository-derived" in str(exc)
+    else:
+        raise AssertionError("repository-derived slug mismatch must fail closed")
+
+
+def test_provision_rejects_malformed_repository_before_create() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/bad repo",
+        "bad repo",
+        "/ws/projects/bad-repo",
+    )
+    try:
+        intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+    except intake.IntakeError as exc:
+        assert "repository" in str(exc) and "invalid" in str(exc)
+    else:
+        raise AssertionError("malformed repository must fail closed")
+
+
+def test_provision_rejects_unverified_checkout_before_create() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "brand-new",
+        "/definitely/missing/bootstrap-checkout",
+    )
+    try:
+        intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+    except intake.IntakeError as exc:
+        assert "checkout" in str(exc)
+    else:
+        raise AssertionError("missing checkout must fail closed")
+
+
+def test_provision_rejects_foreign_existing_board_owner() -> None:
+    existing = {"brand-new"}
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "brand-new",
+        "/ws/projects/brand-new",
+    )
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_board_repository_owners": intake._board_repository_owners,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_run_hermes": intake._run_hermes,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+    }
+    try:
+        intake.__dict__["_board_slugs"] = lambda: set(existing)
+        intake.__dict__["_board_repository_owners"] = lambda board: {
+            "rhgo1749/other-repo"
+        }
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_run_hermes"] = lambda *args, **kwargs: (
+            (_ for _ in ()).throw(AssertionError("foreign owner must block create"))
+        )
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        try:
+            intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=False)
+        except intake.IntakeError as exc:
+            assert "ownership" in str(exc)
+        else:
+            raise AssertionError("foreign board ownership must fail closed")
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_provision_rejects_occupied_unmanaged_existing_board() -> None:
+    entry = _bootstrap_entry(
+        "rhgo1749/brand-new",
+        "brand-new",
+        "/ws/projects/brand-new",
+    )
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_board_repository_owners": intake._board_repository_owners,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_run_hermes": intake._run_hermes,
+    }
+    try:
+        intake.__dict__["_board_slugs"] = lambda: {"brand-new"}
+        intake.__dict__["_board_repository_owners"] = lambda board: intake.BoardOwnership(
+            task_count=1,
+            non_github_task_count=1,
+        )
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_run_hermes"] = lambda *args, **kwargs: (
+            (_ for _ in ()).throw(AssertionError("occupied board must not create"))
+        )
+        try:
+            intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
+        except intake.IntakeError as exc:
+            assert "occupied" in str(exc)
+        else:
+            raise AssertionError("occupied unmanaged board must fail closed")
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
 def test_provision_without_intents_makes_no_board_calls() -> None:
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no bootstrap intent, no Hermes CLI calls")
 
-    originals = {"_board_slugs": intake._board_slugs, "_run_hermes": intake._run_hermes}
+    originals = {
+        "_board_slugs": intake._board_slugs,
+        "_run_hermes": intake._run_hermes,
+        "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_intake_mutation_lease": intake._intake_mutation_lease,
+        "_board_repository_owners": intake._board_repository_owners,
+    }
     try:
         intake._board_slugs = forbidden
         intake._run_hermes = forbidden
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_entry("rhgo1749/ctrl-hangul")])
         assert intake._provision_bootstrap_boards(snapshot, dry_run=True) == []
     finally:
@@ -810,6 +1201,9 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         "_sync_board",
         "_board_slugs",
         "_run_hermes",
+        "_verify_bootstrap_checkout",
+        "_intake_mutation_lease",
+        "_board_repository_owners",
     )
     originals = {name: getattr(intake, name) for name in names}
 
@@ -821,6 +1215,9 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
         intake._board_slugs = fake_board_slugs
         intake._run_hermes = fake_run_hermes
+        intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
+        intake.__dict__["_board_repository_owners"] = lambda board: set()
         intake._issue_candidates = lambda token, fixture_path, configs: [(configs[0], issue)]
         intake._closing_merged_pr_numbers = lambda token, repository, issue_number: ()
         intake._repo_snapshot = lambda config: intake.RepoSnapshot(

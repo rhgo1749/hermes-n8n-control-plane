@@ -79,6 +79,7 @@ def _config() -> Any:
         checkout="/tmp/repo",
         default_branch="main",
         contract_paths=(),
+        display_name=REPO.split("/", 1)[1],
     )
 
 

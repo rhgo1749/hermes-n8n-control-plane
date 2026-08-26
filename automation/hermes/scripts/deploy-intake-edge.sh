@@ -48,6 +48,7 @@ EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
 EDGE_HEAD_BINDING_SOURCE="$ROOT/edge/kanban_head_binding_feedback.py"
 EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
+MIGRATION_SOURCE="$ROOT/automation/n8n/scripts/board_identity_migration.py"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 DRY_RUN=0
 
@@ -100,7 +101,8 @@ for source in \
   "$EDGE_ADMISSION_SOURCE" \
   "$EDGE_HEAD_BINDING_SOURCE" \
   "$EDGE_RETRY_GUARD_SOURCE" \
-  "$REGISTRY_SOURCE"
+  "$REGISTRY_SOURCE" \
+  "$MIGRATION_SOURCE"
 do
   [[ -f "$source" ]] || {
     echo "intake/edge/registry source missing in checkout: $source" >&2
@@ -123,6 +125,7 @@ cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
 cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
 cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
+cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
 
 # 2) validation: compile + argparse smoke (--help exits 0)
 python3 -m py_compile \
@@ -133,7 +136,8 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_resource_admission.py" \
   "$CANDIDATE/kanban_head_binding_feedback.py" \
   "$CANDIDATE/kanban_retry_signal_guard.py" \
-  "$CANDIDATE/repository_registry.py" || {
+  "$CANDIDATE/repository_registry.py" \
+  "$CANDIDATE/board_identity_migration.py" || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (py_compile)" >&2; exit 1;
 }
 python3 "$CANDIDATE/github-agent-ready-kanban-intake.py" --help >/dev/null 2>&1 || {
@@ -151,6 +155,9 @@ python3 "$CANDIDATE/kanban-github-sync-core.py" --help >/dev/null 2>&1 || {
 python3 "$CANDIDATE/repository_registry.py" --help >/dev/null 2>&1 || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (registry --help)" >&2; exit 1;
 }
+python3 "$CANDIDATE/board_identity_migration.py" --help >/dev/null 2>&1 || {
+  rm -rf "$CANDIDATE"; echo "candidate validation failed (migration --help)" >&2; exit 1;
+}
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run: candidate validated at $CANDIDATE"
@@ -160,6 +167,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_head_binding_feedback.py"
   echo "dry-run:   $TARGET_DIR/kanban_retry_signal_guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
+  echo "dry-run:   $TARGET_DIR/board_identity_migration.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake-core.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
@@ -178,6 +186,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   repository_registry.py \
+  board_identity_migration.py \
   github-agent-ready-kanban-intake-core.py \
   github-agent-ready-kanban-intake.py \
   kanban-github-sync.py
@@ -217,6 +226,9 @@ source_path_for() {
     repository_registry.py)
       printf '%s\n' "$ROOT/automation/n8n/scripts/repository_registry.py"
       ;;
+    board_identity_migration.py)
+      printf '%s\n' "$ROOT/automation/n8n/scripts/board_identity_migration.py"
+      ;;
     *)
       return 2
       ;;
@@ -232,7 +244,8 @@ for name in \
   kanban_resource_admission.py \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
-  repository_registry.py
+  repository_registry.py \
+  board_identity_migration.py
 do
   source_path="$(source_path_for "$name")"
   source_hash="$(sha256sum "$source_path" | cut -d' ' -f1)"

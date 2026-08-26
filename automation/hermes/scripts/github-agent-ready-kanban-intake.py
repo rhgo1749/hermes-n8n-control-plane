@@ -15,21 +15,25 @@ clears; fixture mode never touches GitHub.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
 
 DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
 DEFAULT_HERMES_BIN = "/home/hermes/.local/bin/hermes"
@@ -38,6 +42,13 @@ GITHUB_LABEL = "agent-ready"
 LEAD_PROFILE = "kanban-main"
 HTTP_TIMEOUT_SECONDS = 30
 MAX_ISSUE_PAGES = 10
+_BOOTSTRAP_REPOSITORY = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
+)
+_GITHUB_ISSUE_KEY = re.compile(
+    r"^github:([^:]+/[^:]+):issue:\d+$", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -47,10 +58,33 @@ class RepositoryConfig:
     checkout: str
     default_branch: str
     contract_paths: tuple[str, ...]
+    # Repository-derived display identity (GitHub repository name). It is the
+    # ONLY display authority for board labels and notifications; there is no
+    # static board->label map. The value comes from the registry (live/
+    # fixture) and is validated against the repository name on load.
+    display_name: str
 
 
 class IntakeError(RuntimeError):
     """A deterministic intake prerequisite or command failure."""
+
+
+class BoardOwnership(set[str]):
+    """GitHub owners plus total/non-GitHub task occupancy for one board."""
+
+    task_count: int
+    non_github_task_count: int
+
+    def __init__(
+        self,
+        owners: Iterable[str] = (),
+        *,
+        task_count: int = 0,
+        non_github_task_count: int = 0,
+    ) -> None:
+        super().__init__(owners)
+        self.task_count = int(task_count)
+        self.non_github_task_count = int(non_github_task_count)
 
 
 def _select_repositories(
@@ -217,7 +251,7 @@ def _load_registry_snapshot(token: str) -> dict[str, Any]:
             "--checkout-root",
             "/ws/projects",
             "--kanban-root",
-            str(_hermes_home() / "kanban" / "boards"),
+            str(_kanban_boards_root()),
         ],
         env=env,
         capture_output=True,
@@ -293,16 +327,27 @@ def _repository_configs_from_registry(
         checkout = str(entry.get("checkout") or "").strip()
         default_branch = str(entry.get("default_branch") or "").strip()
         raw_contracts = entry.get("contract_paths")
+        display_name = str(entry.get("display_name") or "").strip()
 
         if (
             not name
             or not board
             or not checkout
             or not default_branch
+            or not display_name
             or not isinstance(raw_contracts, list)
             or not all(isinstance(item, str) for item in raw_contracts)
         ):
             raise IntakeError(f"invalid ready registry entry: {name or '(unknown)'}")
+
+        # Fail closed if a registry entry presents a display identity that is
+        # not the repository's own name: repository metadata is the only
+        # display authority (no static label map).
+        if display_name.casefold() != name.split("/", 1)[-1].casefold():
+            raise IntakeError(
+                f"registry display_name for {name} is not repository-derived: "
+                f"{display_name!r}"
+            )
 
         configs.append(
             RepositoryConfig(
@@ -311,6 +356,7 @@ def _repository_configs_from_registry(
                 checkout=checkout,
                 default_branch=default_branch,
                 contract_paths=tuple(raw_contracts),
+                display_name=display_name,
             )
         )
 
@@ -356,6 +402,12 @@ def _fixture_repository_configs(path: Path) -> tuple[RepositoryConfig, ...]:
     ):
         raise IntakeError(f"invalid fixture repository_config for {repository}")
 
+    display_name = str(raw.get("display_name") or "").strip() or repository.split("/", 1)[-1]
+    if display_name.casefold() != repository.split("/", 1)[-1].casefold():
+        raise IntakeError(
+            f"fixture display_name must equal the repository name for {repository}"
+        )
+
     return (
         RepositoryConfig(
             name=repository,
@@ -363,11 +415,63 @@ def _fixture_repository_configs(path: Path) -> tuple[RepositoryConfig, ...]:
             checkout=checkout,
             default_branch=default_branch,
             contract_paths=tuple(contracts),
+            display_name=display_name,
         ),
     )
 
 def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_KANBAN_INTAKE_HOME") or os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME)
+
+
+def _kanban_boards_root() -> Path:
+    """Single boards-root resolver for every registry/ownership/lease read.
+
+    ``HERMES_KANBAN_BOARDS_ROOT`` (also exposed by the intake actuator)
+    overrides the default ``<hermes-home>/kanban/boards``; registry snapshot
+    discovery, board ownership checks, the migration/intake lease, and the
+    same-tick post-provision reload all share this one resolution so a
+    custom root is honored consistently.
+    """
+    configured = os.environ.get("HERMES_KANBAN_BOARDS_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _hermes_home() / "kanban" / "boards"
+
+
+def _intake_migration_lease_path() -> Path:
+    configured = os.environ.get("HERMES_INTAKE_MIGRATION_LEASE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _kanban_boards_root() / ".intake-migration.lock"
+
+
+@contextmanager
+def _intake_mutation_lease() -> Iterator[None]:
+    """Admit one Kanban writer unless a migration owns the handoff lease."""
+    path = _intake_migration_lease_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+    except OSError as exc:
+        raise IntakeError(f"cannot open migration/intake lease {path}: {exc}") from exc
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise IntakeError(
+                    "migration/intake lease is held; refusing Kanban mutation"
+                ) from exc
+            raise IntakeError(f"cannot acquire migration/intake lease {path}: {exc}") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        handle.close()
 
 
 def _hermes_bin() -> str:
@@ -643,6 +747,71 @@ def _board_slugs() -> set[str]:
     return {str(item.get("slug")) for item in items if isinstance(item, dict) and item.get("slug")}
 
 
+def _verify_bootstrap_checkout(repository: str, checkout: str) -> Path:
+    path = Path(checkout)
+    if not path.is_absolute() or not path.is_dir():
+        raise IntakeError(
+            f"bootstrap checkout must be an absolute existing directory for {repository}: "
+            f"{checkout}"
+        )
+    code, root, _ = _run_git(checkout, "rev-parse", "--show-toplevel")
+    if code != 0 or Path(root).resolve() != path.resolve():
+        raise IntakeError(f"bootstrap checkout is not a verified Git root: {checkout}")
+    code, remote, _ = _run_git(checkout, "remote", "get-url", "origin")
+    expected = _normalise_remote(f"https://github.com/{repository}.git")
+    if code != 0 or _normalise_remote(remote) != expected:
+        raise IntakeError(f"bootstrap checkout origin mismatch for {repository}")
+    return path.resolve()
+
+
+def _board_repository_owners(board: str) -> BoardOwnership:
+    """Read provenance and occupancy for a candidate board before reuse/create."""
+    db = _kanban_boards_root() / board / "kanban.db"
+    if not db.is_file():
+        raise IntakeError(f"cannot verify ownership of existing board {board}")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT idempotency_key FROM tasks").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise IntakeError(f"could not inspect existing board ownership for {board}: {exc}") from exc
+    owners: set[str] = set()
+    non_github_task_count = 0
+    for (raw_key,) in rows:
+        match = _GITHUB_ISSUE_KEY.match(str(raw_key or ""))
+        if match:
+            owners.add(match.group(1).casefold())
+        else:
+            non_github_task_count += 1
+    return BoardOwnership(
+        owners,
+        task_count=len(rows),
+        non_github_task_count=non_github_task_count,
+    )
+
+
+def _validate_existing_bootstrap_board(board: str, repository: str) -> set[str]:
+    """Reject occupied unmanaged boards before a bootstrap create/intake."""
+    raw_ownership = _board_repository_owners(board)
+    owners = set(raw_ownership)
+    if isinstance(raw_ownership, BoardOwnership) and (
+        raw_ownership.non_github_task_count
+        or (raw_ownership.task_count and not owners)
+    ):
+        raise IntakeError(
+            f"bootstrap board {board} is occupied by unmanaged task rows; "
+            "refusing bootstrap"
+        )
+    if owners and owners != {repository.casefold()}:
+        raise IntakeError(
+            f"bootstrap board {board} has conflicting ownership: "
+            f"owned by {', '.join(sorted(owners))}, not {repository}"
+        )
+    return owners
+
+
 def _provision_bootstrap_boards(
     snapshot: dict[str, Any],
     *,
@@ -667,8 +836,10 @@ def _provision_bootstrap_boards(
         entries = []
     scope_keys = {key.casefold() for key in scope} if scope else None
 
-    # Candidate intents within the tick scope (validated, ordered).
+    # Candidate intents within the tick scope. Validate every identity and
+    # checkout before reading or creating any candidate board.
     candidates: list[tuple[str, str, str]] = []
+    board_owners: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -683,19 +854,41 @@ def _provision_bootstrap_boards(
                 f"malformed bootstrap intent for {repository or '(unknown)'}: "
                 "requires repository, board, and checkout"
             )
+        if not _BOOTSTRAP_REPOSITORY.fullmatch(repository):
+            raise IntakeError(f"invalid bootstrap repository syntax: {repository!r}")
+        canonical_board = repository.rsplit("/", 1)[-1].casefold()
+        if board != canonical_board:
+            raise IntakeError(
+                f"bootstrap board {board!r} is not repository-derived for {repository}; "
+                f"expected {canonical_board!r}"
+            )
         if scope_keys is not None and repository.casefold() not in scope_keys:
             continue
-        candidates.append((repository, board, checkout))
+        _verify_bootstrap_checkout(repository, checkout)
+        prior_repository = board_owners.get(board)
+        if prior_repository is not None and prior_repository.casefold() != repository.casefold():
+            raise IntakeError(
+                f"bootstrap board {board} has duplicate repository ownership: "
+                f"{prior_repository} and {repository}"
+            )
+        board_owners[board] = repository
+        if (repository, board, checkout) not in candidates:
+            candidates.append((repository, board, checkout))
 
     if not candidates:
         return []
 
-    existing = _board_slugs()
     provisioned: list[dict[str, str]] = []
     for repository, board, checkout in candidates:
-        if board in existing:
-            continue
         if dry_run:
+            existing = _board_slugs()
+            existing_slug = next(
+                (slug for slug in existing if slug.casefold() == board.casefold()),
+                None,
+            )
+            if existing_slug is not None:
+                _validate_existing_bootstrap_board(existing_slug, repository)
+                continue
             provisioned.append(
                 {
                     "repository": repository,
@@ -704,18 +897,28 @@ def _provision_bootstrap_boards(
                 }
             )
             continue
-        _run_hermes(
-            "kanban",
-            "boards",
-            "create",
-            board,
-            "--default-workdir",
-            checkout,
-            parse_json=False,
-        )
-        # Fail closed if the board did not actually land.
-        if board not in _board_slugs():
-            raise IntakeError(f"board provisioning did not land for {board}")
+        with _intake_mutation_lease():
+            existing = _board_slugs()
+            existing_slug = next(
+                (slug for slug in existing if slug.casefold() == board.casefold()),
+                None,
+            )
+            if existing_slug is not None:
+                _validate_existing_bootstrap_board(existing_slug, repository)
+                continue
+            _run_hermes(
+                "kanban",
+                "boards",
+                "create",
+                board,
+                "--default-workdir",
+                checkout,
+                parse_json=False,
+            )
+            # Fail closed if the board did not actually land.
+            landed = _board_slugs()
+            if not any(slug.casefold() == board.casefold() for slug in landed):
+                raise IntakeError(f"board provisioning did not land for {board}")
         provisioned.append(
             {
                 "repository": repository,
@@ -785,30 +988,31 @@ def _create_task(
     key = _idempotency_key(config.name, issue["number"])
     title = str(issue.get("title") or "(untitled)").replace("\n", " ").strip()
     body = _task_body(config, snapshot, issue, key, imported_at)
-    payload = _run_hermes(
-        "kanban",
-        "--board",
-        config.board,
-        "create",
-        f"GitHub Issue intake: {config.name}#{issue['number']} — {title}",
-        "--body",
-        body,
-        "--assignee",
-        LEAD_PROFILE,
-        "--created-by",
-        "github-issue-intake",
-        "--workspace",
-        "worktree",
-        "--idempotency-key",
-        key,
-        "--skill",
-        "github",
-        "--skill",
-        "github-issue-to-pr",
-        "--skill",
-        "pr-specification-execution",
-        "--json",
-    )
+    with _intake_mutation_lease():
+        payload = _run_hermes(
+            "kanban",
+            "--board",
+            config.board,
+            "create",
+            f"GitHub Issue intake: {config.name}#{issue['number']} — {title}",
+            "--body",
+            body,
+            "--assignee",
+            LEAD_PROFILE,
+            "--created-by",
+            "github-issue-intake",
+            "--workspace",
+            "worktree",
+            "--idempotency-key",
+            key,
+            "--skill",
+            "github",
+            "--skill",
+            "github-issue-to-pr",
+            "--skill",
+            "pr-specification-execution",
+            "--json",
+        )
     if not isinstance(payload, dict) or not payload.get("id"):
         raise IntakeError(f"Hermes create returned no task id for {key}")
     # Idempotent create returns the EXISTING card's id and created_at; a
@@ -909,14 +1113,6 @@ def _run_closed_issue_cleanup(
 # (ticks are 5 minutes apart; 120s grace is safe against clock skew).
 _CREATE_FRESHNESS_SECONDS = 120
 
-_BOARD_SHORT_NAMES = {
-    "ctrlhangul": "CtrlHangul",
-    "re-bound": "Re-Bound",
-    "h4v3-dj": "H4V3-DJ",
-    "h4v3-meowcore-avatar-lab": "Avatar-Lab",
-    "h4v3-meowcore-voice-lab": "Voice-Lab",
-}
-
 # Telegram is an action channel, not a second Kanban event stream. Keep the
 # normal lifecycle quiet and classify only existing edge evidence as an
 # operator incident. Unknown results are suppressed (fail-closed).
@@ -976,8 +1172,20 @@ def _telegram_config() -> tuple[str, str] | None:
     return chat_id, thread_id
 
 
-def _board_short_name(board: str) -> str:
-    return _BOARD_SHORT_NAMES.get(board, board)
+def _board_display_name(
+    board: str,
+    repository: str,
+    configs: tuple[RepositoryConfig, ...],
+) -> str:
+    """Repository-derived display identity for board labels.
+
+    The GitHub repository name is the ONLY display authority (no static
+    board->label map, no hardcoded alias, no ``GitHub Intake`` suffix rule).
+    """
+    for config in configs:
+        if config.name.casefold() == str(repository).casefold():
+            return config.display_name
+    return str(repository).split("/")[-1]
 
 
 def _board_for_repository(
@@ -1330,13 +1538,15 @@ def _sync_board(
     if dry_run:
         command.append("--dry-run")
     try:
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
+        with _intake_mutation_lease():
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+                check=False,
+            )
     except subprocess.TimeoutExpired as exc:
         raise IntakeError(
             f"kanban-github-sync timed out for {config.board}: {exc}"
@@ -1555,7 +1765,9 @@ def _run(args: argparse.Namespace) -> int:
             if not _should_notify_entry(entry):
                 continue
             board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_short_name(board)
+            short_name = _board_display_name(
+                board, str(entry["repository"]), selected_configs
+            )
             predicted.append(
                 _attention_notification_line(
                     board,
@@ -1569,7 +1781,9 @@ def _run(args: argparse.Namespace) -> int:
             if not _should_notify_entry(entry):
                 continue
             board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_short_name(board)
+            short_name = _board_display_name(
+                board, str(entry["repository"]), selected_configs
+            )
             notification_lines.append(
                 _attention_notification_line(
                     board,
@@ -1595,6 +1809,10 @@ def _run(args: argparse.Namespace) -> int:
         "closed_issue_cleanup": cleanup_results,
         "closed_issue_cleanup_count": len(cleanup_results),
         "repositories": [config.name for config in selected_configs],
+        # Repository-derived display identity (the ONLY label authority).
+        "display_names": {
+            config.name: config.display_name for config in selected_configs
+        },
         "registry_unready": registry_unready,
         "board_provisioning": board_provisioning,
         "wake_scope": {

@@ -28,6 +28,10 @@ For every discovered repository the registry records:
 - GitHub full name and immutable repository ID;
 - GitHub `default_branch`;
 - canonical slug (`repo-name.casefold()`);
+- canonical display identity (`repo-name`, the repository's own name — the ONLY
+  display authority for board labels and notifications; there is no static
+  board->label map, no `GitHub Intake` suffix convention, and no per-board
+  alias/allowlist);
 - resolved checkout path;
 - whether checkout `origin` matches the GitHub repository;
 - repository contract files present on the GitHub default branch;
@@ -123,9 +127,9 @@ one bounded exception when no durable provenance exists for the target repo:
 
 1. derive the canonical slug from the repository name with `casefold()`;
 2. find a live board whose directory name matches that slug case-insensitively;
-3. accept it only if the board currently has no GitHub repository provenance ->
-   `resolved_empty_canonical_board`;
-4. if that board carries another repository's provenance ->
+3. accept it only if the board currently has **zero task rows** (no GitHub
+   provenance and no manual/default tasks) -> `resolved_empty_canonical_board`;
+4. if that board is occupied or carries another repository's provenance ->
    `canonical_board_conflict`;
 5. if multiple case-insensitive canonical boards exist ->
    `ambiguous_canonical_boards`;
@@ -157,15 +161,26 @@ checkout also carries no intent.
 The production intake is the only mutation owner. On a tick whose scope covers
 the repository, it:
 
-1. checks the live board list; if the canonical board already exists it does
-   nothing (idempotent);
-2. otherwise provisions it exactly once through the existing
+1. validates the owner/name repository syntax and confirms that the requested
+   board is exactly the repository-derived case-folded slug;
+2. independently verifies the checkout is an absolute Git root whose
+   `origin` matches the repository before admitting any create attempt;
+3. checks the live board list under the shared migration/intake lease; if the
+   canonical board already exists, it reads its durable task provenance and
+   refuses a foreign owner (same-repository ownership remains idempotent);
+4. otherwise provisions it exactly once through the existing
    `hermes kanban boards create <canonical-slug> --default-workdir
    <verified-checkout>` surface and verifies the board actually landed
    (fail-closed otherwise);
-3. reloads the registry snapshot so the freshly created empty canonical board
+5. reloads the registry snapshot so the freshly created empty canonical board
    resolves through the empty-canonical-board rule in the same tick, letting
    the first `agent-ready` task be created immediately.
+
+Task creation and edge synchronization use the same exclusive lease. A
+migration holding it causes intake to fail closed rather than writing a task
+between migration's preflight and archive rescans. The lease path is
+`$HERMES_INTAKE_MIGRATION_LEASE`, or the configured boards root's
+`.intake-migration.lock` by default.
 
 After the first GitHub-backed task is created, its durable
 `tasks.idempotency_key` provenance becomes the long-term association authority;
