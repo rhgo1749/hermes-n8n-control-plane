@@ -1042,6 +1042,63 @@ def test_rollback_rejects_tampered_recorded_anchor_ids(tmp: Path) -> None:
     assert sandbox.board_tasks("ctrl-hangul") == tasks_before
 
 
+def test_rollback_rejects_forged_evidence_anchor_keys(tmp: Path) -> None:
+    """A forged evidence ``anchor_keys`` entry must fail closed.
+
+    Mirrors the reviewer reproduction at round-3 head bec2395: after a
+    completed transition, a post-transition task row is inserted on the
+    canonical board and ONLY the evidence ``anchor_keys`` list is extended
+    with that row's idempotency key (no legacy backup ever carried it). The
+    allowed anchor-key set is derived solely from the validated legacy
+    backups plus the recorded checkpoint pairs, so the forged key must make
+    rollback refuse entirely: both live board paths and every canonical
+    task row remain unchanged.
+    """
+    sandbox = Sandbox(tmp)
+    repo = "rhgo1749/ctrl-hangul"
+    sandbox.make_board(
+        "ctrlhangul",
+        name="ctrl-hangul",
+        workdir=str(tmp / "checkout"),
+        tasks=[("done", "github:rhgo1749/ctrl-hangul:issue:72")],
+    )
+    common = ["--repository", repo]
+    assert sandbox.run_with_checkout("migrate", *common).returncode == 0
+    assert sandbox.run_with_checkout(
+        "transition", "--require-provenance", "--confirm-live-transition", *common
+    ).returncode == 0
+
+    # Post-transition work landed on the canonical board.
+    con = sqlite3.connect(sandbox.boards_root / "ctrl-hangul" / "kanban.db")
+    con.execute(
+        "INSERT INTO tasks (id, title, status, idempotency_key) "
+        "VALUES ('t_post', 'post cutover', 'done', 'manual:post-transition')"
+    )
+    con.commit()
+    con.close()
+
+    # Tamper: append the post-transition key ONLY to the mutable evidence
+    # anchor_keys list so rollback would treat t_post as removable anchor data.
+    evidence_path = sandbox.state_root / "ctrl-hangul.json"
+    evidence = json.loads(evidence_path.read_text())
+    real_keys = list(evidence["anchor_keys"])
+    assert real_keys == ["github:rhgo1749/ctrl-hangul:issue:72"]
+    evidence["anchor_keys"] = sorted(
+        real_keys + ["manual:post-transition"]
+    )
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    canonical_before = sandbox.board_tasks("ctrl-hangul")
+    proc = sandbox.run_with_checkout("rollback", "--confirm-rollback", *common)
+    assert proc.returncode == 1, proc.stdout
+    assert "tampered keys" in proc.stderr
+
+    # Fail-closed: no canonical removal or restore happened; rows unchanged.
+    assert "ctrl-hangul" in sandbox.live_slugs()
+    assert "ctrlhangul" not in sandbox.live_slugs()
+    assert sandbox.board_tasks("ctrl-hangul") == canonical_before
+
+
 def test_rollback_purges_only_verified_anchor_pairs(tmp: Path) -> None:
     """Verified anchors are purged by the canonical row's own task id.
 

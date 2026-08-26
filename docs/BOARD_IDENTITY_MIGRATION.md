@@ -161,7 +161,7 @@ task; no live migration/archive/deploy/GitHub mutation here):
 
 ## Acceptance test coverage
 
-`tests/test_board_identity_migration.py` (25 tests, all fixture-driven, no
+`tests/test_board_identity_migration.py` (26 tests, all fixture-driven, no
 live mutation):
 
 - 5-repository registry snapshot: slug/display identity derived without any

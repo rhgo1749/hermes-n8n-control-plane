@@ -1461,21 +1461,31 @@ def _stage_rollback_locked(
     recorded_anchor_keys = evidence.get("anchor_keys", [])
     if not isinstance(recorded_anchor_keys, list):
         raise MigrationError("rollback evidence has malformed anchor checkpoint data")
-    anchor_keys = {
-        str(key)
-        for key in recorded_anchor_keys
-        if str(key)
-    }
-    for candidate in candidates.values():
-        anchor_keys.update(_terminal_anchor_keys(candidate, repository))
-    recorded_anchor_ids = evidence.get("anchor_task_ids", {})
-    if not isinstance(recorded_anchor_ids, dict):
+    raw_recorded_ids = evidence.get("anchor_task_ids", {})
+    if not isinstance(raw_recorded_ids, dict):
         raise MigrationError("rollback evidence has malformed anchor checkpoint data")
     recorded_pairs = {
         str(key): str(task_id)
-        for key, task_id in recorded_anchor_ids.items()
+        for key, task_id in raw_recorded_ids.items()
         if str(key) and str(task_id)
     }
+    # The allowed anchor-key set is derived SOLELY from the validated legacy
+    # backups plus the recorded checkpoint pairs -- the mutable evidence
+    # ``anchor_keys`` list never admits a key on its own. Every extra,
+    # forged, or empty key in that list fails closed before any mutation.
+    allowed_keys: set[str] = set(recorded_pairs)
+    for candidate in candidates.values():
+        allowed_keys.update(_terminal_anchor_keys(candidate, repository))
+    evidence_keys = {str(key) for key in recorded_anchor_keys if str(key)}
+    tampered_keys = sorted(evidence_keys - allowed_keys)
+    if tampered_keys:
+        raise MigrationError(
+            "rollback failed closed: evidence anchor checkpoint data does not "
+            "match the validated legacy backup anchors (tampered keys: "
+            + ", ".join(tampered_keys)
+            + "); refusing rollback"
+        )
+    anchor_keys = set(recorded_pairs)
     # The evidence file lives outside the boards root and is mutable state,
     # so a recorded task id is never trusted on its own: every recorded
     # key->task-id pair must match the canonical row carrying the same
@@ -1487,18 +1497,17 @@ def _stage_rollback_locked(
         canonical_index = _task_id_by_key(
             canonical_fact.directory, include_archived=True
         )
-        for key in sorted(set(recorded_pairs) | anchor_keys):
-            recorded_id = recorded_pairs.get(key)
+        for key in sorted(anchor_keys):
+            recorded_id = recorded_pairs[key]
             canonical_id = canonical_index.get(key)
-            if recorded_id is not None and canonical_id != recorded_id:
+            if canonical_id != recorded_id:
                 errors.append(
                     f"recorded anchor checkpoint for {key} does not match the "
                     f"canonical task row (recorded {recorded_id!r}, canonical "
                     f"{canonical_id!r}); refusing rollback"
                 )
                 continue
-            if canonical_id is not None:
-                anchor_map[key] = canonical_id
+            anchor_map[key] = canonical_id
     anchor_ids = frozenset(anchor_map.values())
 
     # The canonical board may only be removed while it is still empty: the

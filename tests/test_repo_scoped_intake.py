@@ -619,14 +619,79 @@ def _bootstrap_entry(repository: str, board: str, checkout: str) -> dict:
     return entry
 
 
+FAKE_REGISTRY_SNAPSHOT = {
+    "schema_version": 2,
+    "mode": "shadow",
+    "board_authority": "tasks.idempotency_key",
+    "repositories": [],
+}
+
+
+def test_override_boards_root_reaches_real_registry_subprocess() -> None:
+    """HERMES_KANBAN_BOARDS_ROOT must reach the REAL registry subprocess.
+
+    A recording stand-in registry executable captures its actual argv, so
+    this fails deterministically if ``--kanban-root`` is built from anything
+    other than the centralized ``_kanban_boards_root()`` resolver (e.g. the
+    pre-round-3 hard-coded default home path).
+    """
+    with tempfile.TemporaryDirectory() as td:
+        override_root = str(Path(td) / "custom-boards")
+        recorder = Path(td) / "registry_argv.json"
+        registry_script = Path(td) / "fake_registry.py"
+        registry_script.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    "from pathlib import Path",
+                    f"Path({str(recorder)!r}).write_text(json.dumps(sys.argv))",
+                    f"print(json.dumps({FAKE_REGISTRY_SNAPSHOT!r}))",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        originals = {
+            name: os.environ.get(name)
+            for name in (
+                "HERMES_KANBAN_BOARDS_ROOT",
+                "HERMES_REPOSITORY_REGISTRY_SCRIPT",
+                "HERMES_GITHUB_OWNER",
+                "HERMES_GITHUB_TOPIC",
+            )
+        }
+        try:
+            os.environ["HERMES_KANBAN_BOARDS_ROOT"] = override_root
+            os.environ["HERMES_REPOSITORY_REGISTRY_SCRIPT"] = str(registry_script)
+            os.environ["HERMES_GITHUB_OWNER"] = "rhgo1749"
+            os.environ["HERMES_GITHUB_TOPIC"] = "hermes-agent"
+
+            snapshot = intake._load_registry_snapshot("token")
+
+            assert snapshot == FAKE_REGISTRY_SNAPSHOT
+            # The recording executable saw the REAL subprocess construction,
+            # including --kanban-root resolved from the centralized resolver.
+            argv = json.loads(recorder.read_text(encoding="utf-8"))
+            assert "--kanban-root" in argv
+            assert argv[argv.index("--kanban-root") + 1] == override_root
+        finally:
+            for name, value in originals.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
 def test_override_boards_root_honored_end_to_end_same_tick() -> None:
     """HERMES_KANBAN_BOARDS_ROOT drives registry discovery, ownership checks,
     the lease path, and the same-tick post-provision reload.
 
-    A custom boards root must reach the registry subprocess (--kanban-root),
-    the bootstrap ownership DB probe, and the migration/intake lease; after a
-    board lands under that root the same-tick reload must resolve the ready
-    entry so the first task is created in this tick.
+    A custom boards root must reach the bootstrap ownership DB probe (real
+    reader, real sqlite row under the override root) and the migration/intake
+    lease; after a board lands under that root the same-tick reload must
+    resolve the ready entry so the first task is created in this tick. The
+    real registry subprocess argv is covered separately by
+    ``test_override_boards_root_reaches_real_registry_subprocess``.
     """
     with tempfile.TemporaryDirectory() as td:
         override_root = str(Path(td) / "custom-boards")
@@ -635,7 +700,6 @@ def test_override_boards_root_honored_end_to_end_same_tick() -> None:
         created_boards: list[str] = []
         tasks_created: list[str] = []
 
-        original_resolver = intake._kanban_boards_root()
         originals = {
             name: getattr(intake, name)
             for name in (
@@ -657,9 +721,9 @@ def test_override_boards_root_honored_end_to_end_same_tick() -> None:
 
         def fake_load_registry_snapshot(token: str) -> dict:
             # Stands in for the real registry subprocess, which receives
-            # ``--kanban-root <resolver()>``: its snapshot therefore reflects
-            # board state under the OVERRIDE root, not the default home.
-            # Before the
+            # ``--kanban-root <resolver()>`` (argv proven by the dedicated
+            # subprocess regression above): its snapshot reflects board state
+            # under the OVERRIDE root, not the default home. Before the
             # board exists under the override root it reports a bootstrap
             # intent; after provisioning, the same-tick reload resolves the
             # empty canonical board.
@@ -703,6 +767,28 @@ def test_override_boards_root_honored_end_to_end_same_tick() -> None:
             assert intake._intake_migration_lease_path() == (
                 Path(override_root) / ".intake-migration.lock"
             )
+
+            # Real ownership reader against a REAL board DB placed under the
+            # override root: the resolver-derived path must be the one read.
+            board_db_dir = Path(override_root) / "brand-new"
+            board_db_dir.mkdir(parents=True, exist_ok=True)
+            import sqlite3
+
+            con = sqlite3.connect(board_db_dir / "kanban.db")
+            con.execute(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, "
+                "status TEXT, idempotency_key TEXT)"
+            )
+            con.execute(
+                "INSERT INTO tasks VALUES ('t_own', 'owned', 'done', "
+                "'github:rhgo1749/brand-new:issue:9')"
+            )
+            con.commit()
+            con.close()
+            ownership = intake._board_repository_owners("brand-new")
+            assert set(ownership) == {"rhgo1749/brand-new"}
+            assert ownership.task_count == 1
+
             intake._load_registry_snapshot = fake_load_registry_snapshot
             intake._claim_wake_scope = lambda: None
             intake._telegram_config = lambda: None
@@ -1117,6 +1203,7 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         "_run_hermes",
         "_verify_bootstrap_checkout",
         "_intake_mutation_lease",
+        "_board_repository_owners",
     )
     originals = {name: getattr(intake, name) for name in names}
 
