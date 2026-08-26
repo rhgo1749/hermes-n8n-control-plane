@@ -358,8 +358,257 @@ def _finish(raw2, kb2, edge2, tmp) -> int:
     check("ordering consumer sees ascending INTEGER timestamps",
           vals == sorted(vals))
 
+    _actual_core_regression(tmp)
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
+
+
+# ---------------------------------------------------------------------------
+# ACTUAL-CORE / ENTRYPOINT integration regression (round-3 F1/F2)
+#
+# The unit phase above drives the wrapper with a FAKE original dispatcher, so a
+# _SpawnBlocked that its fake original swallows would still let those checks
+# pass.  This phase instead loads the REAL core dispatcher through the REAL
+# entrypoint overlay stack (dynamic resource -> resource admission ->
+# head-binding -> retry-guard -> workspace admission, production install order)
+# and runs the real ``_dispatch_pending_rework``.  It proves the sentinel
+# actually ESCAPES the core's ``except Exception`` around spawn() and that the
+# stored gate-failure result is what the production call path returns:
+#   * a shared-checkout implementation claim returns the gate result
+#     (reason=workspace_isolation_violation, gate=pre_spawn) with NO worker
+#     spawn and ZERO _record_spawn_failure() accounting;
+#   * the event-write-failure variant returns event_persisted=False with
+#     gate_persistence='failed' (and zero spawn_blocked rows);
+#   * the unidentifiable-claim (F2) path returns a truthful fail-closed result
+#     (no TypeError) with event_persisted=False and gate_persistence='unavailable',
+#     and the sentinel is a BaseException (NOT an Exception) so it survives the
+#     core's ``except Exception``.
+#
+# Gated on ``hermes_cli`` availability: the suite stays runnable without a Hermes
+# install, but in a validation environment this phase MUST run (not skip).
+# ---------------------------------------------------------------------------
+
+def _actual_core_regression(tmp: Path) -> None:
+    try:
+        import importlib
+        if importlib.util.find_spec("hermes_cli") is None:
+            print("\n-- actual-core/entrypoint regression SKIPPED (hermes_cli not installed) --")
+            return
+    except Exception:
+        print("\n-- actual-core/entrypoint regression SKIPPED (hermes_cli not importable) --")
+        return
+
+    import os
+    import subprocess
+    import time as _time
+    import sqlite3 as _sqlite3
+
+    edge_dir = Path(__file__).resolve().parent
+    hermes_src = "/ws/hermes-agent"
+    kanban_env_keys = (
+        "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_ROOT", "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT",
+        "HERMES_KANBAN_WORKSPACE",
+    )
+    saved_env = {k: os.environ.get(k) for k in ("HERMES_HOME", *kanban_env_keys)}
+
+    # Isolated temp HERMES_HOME + a profile dir so profile_exists(assignee) is
+    # true during the real dispatch.  Set BEFORE any hermes_cli import.
+    home = Path(tempfile.mkdtemp(prefix="ws-adm-actualcore-"))
+    os.environ["HERMES_HOME"] = str(home)
+    for k in kanban_env_keys:
+        os.environ.pop(k, None)
+    (home / "profiles" / "kanban-developer").mkdir(parents=True, exist_ok=True)
+    if hermes_src not in sys.path:
+        sys.path.insert(0, hermes_src)
+
+    # Shared-checkout anchor: a real git repo root the impl card is bound to.
+    anchor = home / "shared-checkout"
+    anchor.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=anchor, check=True)
+    (anchor / "f.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(anchor), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(anchor), "-c", "user.email=t@t", "-c",
+                    "user.name=t", "commit", "-qm", "init"], check=True)
+
+    # Load the REAL entrypoint (which loads the real core + installs every
+    # overlay in production order).
+    ep_spec = importlib.util.spec_from_file_location(
+        "kbghsync_entrypoint_actualcore", edge_dir / "kanban-github-sync-entrypoint.py")
+    ep = importlib.util.module_from_spec(ep_spec)
+    sys.modules["kbghsync_entrypoint_actualcore"] = ep
+    ep_spec.loader.exec_module(ep)
+    core = ep._core
+
+    try:
+        from hermes_cli import kanban_db
+        from hermes_cli.kanban_db import connect_closing, init_db
+
+        check("actual-core: entrypoint installed the workspace-admission wrapper",
+              getattr(core._dispatch_pending_rework,
+                      "_workspace_admission_installed", False) is True)
+        check("actual-core: sentinel is a BaseException",
+              issubclass(admission._SpawnBlocked, BaseException))
+        check("actual-core: sentinel is NOT an Exception (escapes core except)",
+              not issubclass(admission._SpawnBlocked, Exception))
+
+        init_db()
+
+        spawn_calls: list[str] = []
+        fail_calls: list[tuple[str, str]] = []
+
+        def spy_default_spawn(task, workspace, *, board=None):
+            spawn_calls.append(str(task.id))
+            return 12345
+
+        def spy_record_spawn_failure(conn, task_id, error, *, failure_limit=None):
+            fail_calls.append((task_id, str(error)[:80]))
+            return False
+
+        kanban_db._default_spawn = spy_default_spawn
+        kanban_db._record_spawn_failure = spy_record_spawn_failure
+
+        def make_impl_task(tag: str) -> str:
+            """A rework-pending implementation card bound to the shared checkout."""
+            with connect_closing() as conn:
+                tid = kanban_db.create_task(
+                    conn,
+                    title=f"REWORK {tag}: fix workspace isolation",
+                    body="bounded developer rework - shared checkout binding must be gated",
+                    assignee="kanban-developer",
+                    created_by="actual-core-regression",
+                    workspace_kind="dir",
+                    workspace_path=str(anchor),
+                )
+                conn.commit()
+            with connect_closing() as conn:
+                conn.execute(
+                    "UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (tid,))
+                # Make the task rework-pending so the REAL rework lane considers it:
+                # the governing event must be github_pr_rework.
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, NULL, 'github_pr_rework', ?, ?)",
+                    (tid, '{"source":"actual_core_regression","pr_number":77}',
+                     int(_time.time())))
+                conn.commit()
+            return tid
+
+        def spawn_blocked_rows(conn, tid: str) -> int:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawn_blocked'",
+                (tid,)).fetchone()[0])
+
+        def task_status(conn, tid: str) -> str:
+            return str(conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0])
+
+        # ---- CASE 1: F1 gate result preserved through the REAL core ----
+        t1 = make_impl_task("c1")
+        spawn_calls.clear()
+        fail_calls.clear()
+        with connect_closing() as conn:
+            out1 = core._dispatch_pending_rework(
+                conn, kanban_db, "default", task_ids=[t1], cfg={})
+        e1 = out1[0] if out1 else {}
+        check("actual-core F1: gate result returned (not spawn_failed)",
+              e1.get("reason") == "workspace_isolation_violation"
+              and e1.get("gate") == "pre_spawn", str(out1))
+        check("actual-core F1: event_persisted is True (durable spawn_blocked)",
+              e1.get("event_persisted") is True, str(e1))
+        check("actual-core F1: ZERO worker spawn (no _default_spawn call)",
+              spawn_calls == [], str(spawn_calls))
+        check("actual-core F1: ZERO _record_spawn_failure() accounting",
+              fail_calls == [], str(fail_calls))
+        with connect_closing() as conn:
+            check("actual-core F1: one durable spawn_blocked event persisted",
+                  spawn_blocked_rows(conn, t1) == 1)
+            check("actual-core F1: claim reclaimed (task back to ready)",
+                  task_status(conn, t1) == "ready",
+                  task_status(conn, t1))
+
+        # ---- CASE 2: F1 event-write-failure variant ----
+        # A conn that fails ONLY the admission's spawn_blocked INSERT (its unique
+        # SQL literal), NOT the core's claimed/reclaimed event INSERTs.
+        class FlakyConn:
+            def __init__(self, raw: _sqlite3.Connection):
+                self._raw = raw
+                self.fail_spawn_blocked_insert = False
+
+            def execute(self, sql, *a, **k):
+                if self.fail_spawn_blocked_insert and "'spawn_blocked'" in sql:
+                    raise _sqlite3.OperationalError("injected event-write failure")
+                return self._raw.execute(sql, *a, **k)
+
+            def commit(self):
+                return self._raw.commit()
+
+            def rollback(self):
+                return self._raw.rollback()
+
+            @property
+            def in_transaction(self):
+                return self._raw.in_transaction
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+        t2 = make_impl_task("c2")
+        spawn_calls.clear()
+        fail_calls.clear()
+        with connect_closing() as raw:
+            fc = FlakyConn(raw)
+            fc.fail_spawn_blocked_insert = True
+            out2 = core._dispatch_pending_rework(
+                fc, kanban_db, "default", task_ids=[t2], cfg={})
+            fc.fail_spawn_blocked_insert = False
+            e2 = out2[0] if out2 else {}
+            check("actual-core F1 (event-write failure): reason is gate result",
+                  e2.get("reason") == "workspace_isolation_violation", str(out2))
+            check("actual-core F1 (event-write failure): event_persisted is False",
+                  e2.get("event_persisted") is False, str(e2))
+            check("actual-core F1 (event-write failure): gate_persistence is 'failed'",
+                  e2.get("gate_persistence") == "failed", str(e2))
+            check("actual-core F1 (event-write failure): ZERO worker spawn",
+                  spawn_calls == [], str(spawn_calls))
+            check("actual-core F1 (event-write failure): ZERO _record_spawn_failure()",
+                  fail_calls == [], str(fail_calls))
+            check("actual-core F1 (event-write failure): zero spawn_blocked rows",
+                  spawn_blocked_rows(raw, t2) == 0)
+
+        # ---- CASE 3: F2 unidentifiable-claim fail-closed (no TypeError) ----
+        class NoIdClaim:
+            id = ""
+
+        with connect_closing() as conn:
+            f2_raised = None
+            f2_result = None
+            try:
+                admission._guarded_spawn(
+                    conn, kanban_db, "default", NoIdClaim(), "/ws/shared",
+                    inner_spawn=None, default_spawn=None)
+            except admission._SpawnBlocked as bl:
+                f2_result = getattr(bl, "result", {})
+            except Exception as exc:  # includes the pre-fix TypeError
+                f2_raised = exc
+            check("actual-core F2: unknown-task path raises the sentinel (not TypeError)",
+                  f2_raised is None and f2_result is not None,
+                  f"raised={f2_raised!r} result={f2_result!r}")
+            check("actual-core F2: fail-closed result reports event_persisted False",
+                  bool(f2_result) and f2_result.get("event_persisted") is False,
+                  str(f2_result))
+            check("actual-core F2: truthfully reports persistence unavailable",
+                  bool(f2_result) and f2_result.get("gate_persistence") in
+                  ("failed", "unavailable"), str(f2_result))
+
+    finally:
+        # Restore the process env so the suite's other phases are unaffected.
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 if __name__ == "__main__":

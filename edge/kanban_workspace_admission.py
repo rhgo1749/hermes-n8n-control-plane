@@ -149,8 +149,20 @@ def _record_spawn_blocked(
     )
 
 
-class _SpawnBlocked(Exception):
-    """Internal: the pre-spawn gate blocked; the real spawn was NEVER called."""
+class _SpawnBlocked(BaseException):
+    """Internal: the pre-spawn gate blocked; the real spawn was NEVER called.
+
+    Derived from ``BaseException`` (deliberately NOT ``Exception``) so the
+    sentinel ESCAPES the core dispatcher's ``except Exception`` wrapper
+    around ``spawn()`` (edge/kanban-github-sync.py, spawn call site).  With
+    an ``Exception`` base the core translated a gate POLICY rejection into
+    an ordinary ``spawn_failed`` result and fired ``_record_spawn_failure()``
+    — the gate's explicit result entry is only ever produced by
+    ``guarded_dispatch``.  Only the admission overlay's own seams catch this
+    sentinel (pre-spawn validation + the dispatch wrapper); it is never a
+    normal control-flow exception and the core's lock/entrypoint catch-all
+    never sees it.
+    """
 
     def __init__(self, violation: str) -> None:
         super().__init__(violation)
@@ -192,19 +204,44 @@ def install_workspace_admission(edge_module: Any) -> None:
             )
 
         kwargs["spawn_fn"] = guarded_spawn
-        results = original(conn, kanban_db, board, *args, **kwargs)
-        # Translate any _SpawnBlocked escape into its explicit result entry.
-        if isinstance(results, list):
-            sanitized: list[dict[str, Any]] = []
-            for entry_any in results:
-                if isinstance(entry_any, _SpawnBlocked):
-                    sanitized.append(dict(entry_any.args and {} or {}) or {
-                        "reason": entry_any.violation,
-                    })
-                    continue
+        # The guarded spawn validates BEFORE any real spawn and raises a
+        # _SpawnBlockedWithResult (a BaseException) when the binding is
+        # invalid.  Because it is NOT an Exception subclass, it ESCAPES the
+        # core dispatcher's ``except Exception`` wrapper around spawn() — so
+        # the core never fires _record_spawn_failure() (a policy rejection
+        # must not consume the task's spawn-failure budget) and never returns
+        # a bogus spawn_failed entry.  We catch it here and return the
+        # stored gate-failure result instead (F1).
+        try:
+            results = original(conn, kanban_db, board, *args, **kwargs)
+        except _SpawnBlocked as blocked:
+            return [_spawn_blocked_result(blocked)]
+        # Defensive normalization so the wrapper's return contract stays
+        # list[dict[str, Any]] even if a future core variant ever returns a
+        # non-dict entry (F3 type-safety).  A sentinel cannot appear here in
+        # production (it raises, it is not returned), so this is a safety net
+        # only.
+        if not isinstance(results, list):
+            # Contract violation safety net (the core returns list[dict]):
+            # normalize a non-list value so the wrapper's typed return
+            # contract (list[dict[str, Any]]) holds unconditionally.
+            return [{
+                "reason": "workspace_admission_unexpected_entry",
+                "entry": repr(results),
+            }]
+        sanitized: list[dict[str, Any]] = []
+        for entry_any in results:
+            if isinstance(entry_any, _SpawnBlocked):
+                sanitized.append(_spawn_blocked_result(entry_any))
+                continue
+            if isinstance(entry_any, dict):
                 sanitized.append(entry_any)
-            return sanitized
-        return results
+            else:
+                sanitized.append({
+                    "reason": "workspace_admission_unexpected_entry",
+                    "entry": repr(entry_any),
+                })
+        return sanitized
 
     guarded_dispatch._workspace_admission_installed = True  # type: ignore[attr-defined]
     guarded_dispatch._workspace_admission_original = original  # type: ignore[attr-defined]
@@ -228,9 +265,14 @@ def _guarded_spawn(
     task_id = str(getattr(claimed, "id", "") or "")
     if not task_id:
         # Nothing identifiable to verify — fail closed without spawning.
+        # The unknown-task branch has NO task id to persist against, so the
+        # result truthfully reports persistence as unavailable instead of
+        # claiming a durable event (F2 fail-closed contract).
         raise _blocked_failure(
-            conn, kanban_db, board, "", "(unidentifiable claim)",
+            conn, kanban_db, board, "",
             "admission could not identify the claimed task",
+            reclaim=False,
+            persistence_unavailable=True,
         )
     try:
         row = conn.execute(
@@ -282,9 +324,11 @@ def _blocked_failure(
     violation: str,
     *,
     reclaim: bool = True,
+    persistence_unavailable: bool = False,
 ) -> _SpawnBlockedWithResult:
     block = _handle_block(
-        conn, kanban_db, board, task_id, violation, reclaim=reclaim
+        conn, kanban_db, board, task_id, violation, reclaim=reclaim,
+        persistence_unavailable=persistence_unavailable,
     )
     exc = _SpawnBlockedWithResult(violation)
     exc.result = block
@@ -299,6 +343,21 @@ class _SpawnBlockedWithResult(_SpawnBlocked):
         self.result: dict[str, Any] = {}
 
 
+def _spawn_blocked_result(blocked: _SpawnBlocked) -> dict[str, Any]:
+    """Convert an escaped ``_SpawnBlocked`` into its explicit result entry.
+
+    Prefers the result dict carried by ``_SpawnBlockedWithResult``; falls
+    back to a minimal entry built from the violation string.
+    """
+    if isinstance(blocked, _SpawnBlockedWithResult) and blocked.result:
+        return dict(blocked.result)
+    return {"task_id": "(unknown)", "status": "ready", "changed": True,
+            "reason": "workspace_isolation_violation",
+            "violation": blocked.violation, "gate": "pre_spawn",
+            "event_persisted": False,
+            "gate_persistence": "unavailable"}
+
+
 def _handle_block(
     conn: sqlite3.Connection,
     kanban_db: Any,
@@ -307,12 +366,16 @@ def _handle_block(
     violation: str,
     *,
     reclaim: bool,
+    persistence_unavailable: bool = False,
 ) -> dict[str, Any]:
     """Recovery-only path: reclaim the just-taken claim, record the event.
 
     Persistence failures are surfaced explicitly instead of swallowed: the
     result carries ``gate_persistence='failed'`` so callers can tell a fully
-    durable block from a degraded one. No spawn ever happened either way.
+    durable block from a degraded one.  A block with no task id to persist
+    against (unidentifiable claim) reports ``gate_persistence='unavailable'``
+    with ``event_persisted=False`` — the gate NEVER claims persistence it did
+    not perform.  No spawn ever happened either way.
     """
     reclaim_error: str | None = None
     if reclaim and task_id:
@@ -325,7 +388,7 @@ def _handle_block(
             reclaim_error = repr(exc)
     persist_failed = False
     persist_error: str | None = None
-    if task_id:
+    if task_id and not persistence_unavailable:
         try:
             _record_spawn_blocked(conn, task_id, violation)
             conn.commit()
@@ -338,18 +401,22 @@ def _handle_block(
                 pass
     _log({"ts": time.time(), "task_id": task_id, "board": board,
           "decision": "blocked", "stage": "pre_spawn",
-          "violation": violation, "persist_failed": persist_failed})
+          "violation": violation, "persist_failed": persist_failed,
+          "persistence_unavailable": persistence_unavailable})
     result: dict[str, Any] = {
         "task_id": task_id or "(unknown)", "status": "ready",
         "changed": True, "reason": "workspace_isolation_violation",
         "violation": violation, "gate": "pre_spawn",
-        "event_persisted": not persist_failed,
+        "event_persisted": bool(task_id) and not persist_failed
+        and not persistence_unavailable,
     }
     if reclaim_error is not None:
         result["reclaim_error"] = reclaim_error
     if persist_failed:
         result["gate_persistence"] = "failed"
         result["persistence_error"] = persist_error
+    elif persistence_unavailable:
+        result["gate_persistence"] = "unavailable"
     return result
 
 
