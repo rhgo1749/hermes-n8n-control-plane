@@ -47,6 +47,7 @@ EDGE_CORE_SOURCE="$ROOT/edge/kanban-github-sync.py"
 EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
 EDGE_HEAD_BINDING_SOURCE="$ROOT/edge/kanban_head_binding_feedback.py"
 EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
+EDGE_WS_ADMISSION_SOURCE="$ROOT/edge/kanban_workspace_admission.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
 MIGRATION_SOURCE="$ROOT/automation/n8n/scripts/board_identity_migration.py"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -101,6 +102,7 @@ for source in \
   "$EDGE_ADMISSION_SOURCE" \
   "$EDGE_HEAD_BINDING_SOURCE" \
   "$EDGE_RETRY_GUARD_SOURCE" \
+  "$EDGE_WS_ADMISSION_SOURCE" \
   "$REGISTRY_SOURCE" \
   "$MIGRATION_SOURCE"
 do
@@ -124,6 +126,7 @@ cp -p "$EDGE_CORE_SOURCE" "$CANDIDATE/kanban-github-sync-core.py"
 cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
 cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
 cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
+cp -p "$EDGE_WS_ADMISSION_SOURCE" "$CANDIDATE/kanban_workspace_admission.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
 
@@ -136,6 +139,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_resource_admission.py" \
   "$CANDIDATE/kanban_head_binding_feedback.py" \
   "$CANDIDATE/kanban_retry_signal_guard.py" \
+  "$CANDIDATE/kanban_workspace_admission.py" \
   "$CANDIDATE/repository_registry.py" \
   "$CANDIDATE/board_identity_migration.py" || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (py_compile)" >&2; exit 1;
@@ -185,6 +189,7 @@ for name in \
   kanban_resource_admission.py \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
+  kanban_workspace_admission.py \
   repository_registry.py \
   board_identity_migration.py \
   github-agent-ready-kanban-intake-core.py \
@@ -223,6 +228,9 @@ source_path_for() {
     kanban_retry_signal_guard.py)
       printf '%s\n' "$ROOT/edge/kanban_retry_signal_guard.py"
       ;;
+    kanban_workspace_admission.py)
+      printf '%s\n' "$ROOT/edge/kanban_workspace_admission.py"
+      ;;
     repository_registry.py)
       printf '%s\n' "$ROOT/automation/n8n/scripts/repository_registry.py"
       ;;
@@ -244,6 +252,7 @@ for name in \
   kanban_resource_admission.py \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
+  kanban_workspace_admission.py \
   repository_registry.py \
   board_identity_migration.py
 do

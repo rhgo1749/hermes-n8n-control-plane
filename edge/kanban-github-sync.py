@@ -6197,6 +6197,33 @@ def sync_board(
     """
     kanban_db = _import_kanban_db()
 
+    # Self-healing workspace drift repair (Issue #76) — runs before any
+    # reconciliation or dispatch so repaired bindings are what the rest of
+    # the wake resolves. Deterministic, idempotent, and fail-closed on
+    # unresolvable anchors (reported, never guessed). Dry-run wakes run the
+    # strictly READ-ONLY preview twin instead: identical detection, zero
+    # UPDATE/event writes, zero spawn. Entries are surfaced at the FRONT of
+    # this wake's JSON result either way.
+    selfheal_entries: list[dict[str, Any]] = []
+    try:
+        ws_admission = sys.modules.get("kanban_workspace_admission")
+        if ws_admission is None:
+            import kanban_workspace_admission as ws_admission  # type: ignore
+        with kanban_db.connect_closing(board=board) as heal_conn:
+            if dry_run:
+                selfheal_entries = ws_admission.preview_workspace_drift(
+                    heal_conn, board
+                )
+            else:
+                selfheal_entries = ws_admission.repair_workspace_drift(
+                    heal_conn, kanban_db, board
+                )
+    except Exception as exc:
+        selfheal_entries = [{
+            "board": board, "reason": "selfheal_pass_failed",
+            "error": f"{type(exc).__name__}: {exc}", "changed": False,
+        }]
+
     def _annotate(
         entry: dict[str, Any], row: Mapping[str, Any], ref: GithubTaskRef
     ) -> dict[str, Any]:
@@ -6703,6 +6730,11 @@ def sync_board(
                             entry["issue_number"] = dref.issue_number
                             entry["issue_title"] = dref.issue_title
             results.extend(dispatch_entries)
+        # Surface the self-healing pass first so operators see what was
+        # repaired (real runs) or predicted (dry-run) ahead of any
+        # reconciliation transition in this wake.
+        if selfheal_entries:
+            results = selfheal_entries + results
         return results
 
 
