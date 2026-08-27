@@ -1,6 +1,6 @@
 # REQ-080: claim-time lifecycle label projection 보강
 
-- Status: Draft
+- Status: Implementation complete; PR #84 open
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`
@@ -14,7 +14,7 @@
 - Kanban task ID: `t_5af76d55`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:80`
 - Implementation owner: `kanban-developer`
-- Automation stop state: `HOST_VALIDATION_REQUIRED`
+- Automation stop state: `HOST_VALIDATION_REQUIRED` (PR #84 open)
 - Merge authority: Human/user only
 
 ## Objective
