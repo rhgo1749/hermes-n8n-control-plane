@@ -95,6 +95,14 @@ generated developer/lead handoff.
   #79; no REST PATCH was needed. `gh pr checks` reports no checks for the
   branch and `gh run list --commit` is empty (GitHub Actions are disabled).
 
+## Rework delivery provenance
+
+Each rework handoff must be bound to a worker-owned commit pushed to the
+existing delivery branch. The completion marker's full `head` SHA must match
+the pushed PR head and the worker's final handoff evidence; do not encode a
+self-referential SHA in tracked provenance, and record the resulting full SHA
+only in the live marker/report.
+
 ## Stop state
 
 `HUMAN_VALIDATION_REQUIRED` + post-merge host deployment NOT RUN: live
