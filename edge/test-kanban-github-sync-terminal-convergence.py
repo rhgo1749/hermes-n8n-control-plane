@@ -166,6 +166,20 @@ class FakeGitHub:
             }]
         raise mod.GithubCompletionError(f"unexpected paginated GET: {path}")
 
+    def graphql(self, query: str, variables: dict[str, Any]):
+        number = int(variables["number"])
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": number,
+                    "closingIssuesReferences": {
+                        "nodes": [{"number": ISSUE_N}],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                },
+            },
+        }
+
 
 # ---------------------------------------------------------------------------
 # Graph fixtures (real Kanban DB layer)

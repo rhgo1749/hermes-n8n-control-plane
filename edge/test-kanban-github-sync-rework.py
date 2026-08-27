@@ -136,6 +136,20 @@ class FakeGitHub:
     def get_paginated(self, path, params=None, max_pages=10):
         return self._route(path)
 
+    def graphql(self, query, variables):
+        number = int(variables["number"])
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": number,
+                    "closingIssuesReferences": {
+                        "nodes": [{"number": ISSUE_N}],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                },
+            },
+        }
+
     def delete(self, path):
         self.delete_calls.append(path)
         if self.fail_delete:

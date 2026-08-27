@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -28,6 +29,7 @@ def pr(
     merged: bool = False,
     head: str = "h4v3-dj/t_23c871a3-github-issue-intake-rhgo1749-h4v3-dj-49",
     base: str = "main",
+    closes_issue: bool = True,
 ):
     return mod.GithubPullRequest(
         number=number,
@@ -41,6 +43,7 @@ def pr(
         author="rhgo1749",
         body="",
         draft=False,
+        closing_issue_numbers=frozenset({ISSUE}) if closes_issue else frozenset(),
     )
 
 
@@ -74,10 +77,14 @@ def payload(p):
 
 
 class FakeGitHub:
-    def __init__(self, issue_state: str, prs):
+    def __init__(self, issue_state: str, prs, *, relationship_error=False,
+                 relationship_response=None):
         self.issue_state = issue_state
         self.prs = {p.number: p for p in prs}
         self.issue_gets = 0
+        self.relationship_calls = 0
+        self.relationship_error = relationship_error
+        self.relationship_response = relationship_response
 
     def get_paginated(self, path, params=None, max_pages=10):
         assert path.endswith(f"/issues/{ISSUE}/timeline")
@@ -110,6 +117,68 @@ class FakeGitHub:
 
         raise AssertionError(f"unexpected GET: {path}")
 
+    def graphql(self, query, variables):
+        assert "closingIssuesReferences" in query
+        self.relationship_calls += 1
+        if self.relationship_error:
+            raise mod.GithubCompletionError("simulated relationship lookup failure")
+        if self.relationship_response is not None:
+            return self.relationship_response
+        number = int(variables["number"])
+        relation = self.prs[number].closing_issue_numbers
+        assert relation is not None
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": number,
+                    "closingIssuesReferences": {
+                        "nodes": [{"number": item} for item in sorted(relation)],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                },
+            },
+        }
+
+
+class _GraphQLResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+
+graphql_calls = []
+original_urlopen = mod.urlopen
+
+def fake_urlopen(request, timeout):
+    graphql_calls.append((request, timeout))
+    return _GraphQLResponse({"data": {"repository": {"pullRequest": {}}}})
+
+mod.__dict__["urlopen"] = fake_urlopen
+try:
+    graphql_client = mod.GithubApiClient("test-token", timeout=7)
+    graphql_client.graphql("query { repository { pullRequest { number } } }", {
+        "owner": "rhgo1749",
+        "name": "H4V3-DJ",
+        "number": 14,
+    })
+finally:
+    mod.__dict__["urlopen"] = original_urlopen
+assert len(graphql_calls) == 1
+request, request_timeout = graphql_calls[0]
+assert request.full_url == "https://api.github.com/graphql"
+assert request.get_method() == "POST"
+assert request.get_header("Authorization") == "Bearer test-token"
+assert request_timeout == 7
+assert json.loads(request.data.decode("utf-8"))["variables"]["number"] == 14
+print("PASS GraphQL client posts bounded closing-reference request")
 
 old = pr(78, merged=False)
 replacement = pr(94, merged=True)
@@ -217,5 +286,90 @@ assert_decision(
 )
 assert fake_unrelated.issue_gets == 0
 print("PASS unrelated PR set added no Issue API call")
+
+merged_closer = pr(14, merged=True, closes_issue=True)
+unrelated_open_mention = pr(
+    15,
+    state="open",
+    merged=False,
+    head="h4v3-dj/issue-12",
+    closes_issue=False,
+)
+fake_mention = FakeGitHub("closed", (merged_closer, unrelated_open_mention))
+assert_decision(
+    "closed issue ignores unrelated open cross-reference mention",
+    mod.verify_completion(fake_mention, REF),
+    "done",
+    "all_linked_prs_merged",
+)
+assert fake_mention.relationship_calls == 2
+print("PASS relationship evidence filtered unrelated OPEN mention")
+
+unrelated_closed_mention = pr(
+    15,
+    state="closed",
+    merged=False,
+    head="h4v3-dj/issue-12",
+    closes_issue=False,
+)
+fake_supersession_with_mention = FakeGitHub(
+    "closed", (old, replacement, unrelated_closed_mention)
+)
+assert_decision(
+    "closed supersession ignores unrelated closed cross-reference mention",
+    mod.verify_completion(fake_supersession_with_mention, REF),
+    "done",
+    "superseded_pr_merged",
+)
+assert fake_supersession_with_mention.issue_gets == 1
+print("PASS supersession filters unrelated closed mention before Issue lookup")
+
+actual_open_closer = pr(15, state="open", merged=False, closes_issue=True)
+fake_open_closer = FakeGitHub("closed", (merged_closer, actual_open_closer))
+assert_decision(
+    "actual open closing PR remains review authority",
+    mod.verify_completion(fake_open_closer, REF),
+    "review",
+    "linked_pr_open",
+)
+assert fake_open_closer.relationship_calls == 2
+print("PASS authoritative OPEN closer remains blocking")
+
+fake_relationship_failure = FakeGitHub(
+    "closed", (merged_closer, unrelated_open_mention), relationship_error=True
+)
+failed_relationship = mod.verify_completion(fake_relationship_failure, REF)
+assert failed_relationship.desired_status is None
+assert failed_relationship.reason == "github_query_failed"
+assert fake_relationship_failure.relationship_calls == 1
+print("PASS relationship lookup failure remains github_query_failed")
+
+fake_relationship_malformed = FakeGitHub(
+    "closed", (merged_closer,),
+    relationship_response={"repository": {"pullRequest": {"number": 14}}},
+)
+malformed_relationship = mod.verify_completion(fake_relationship_malformed, REF)
+assert malformed_relationship.desired_status is None
+assert malformed_relationship.reason == "github_query_failed"
+print("PASS malformed relationship response remains github_query_failed")
+
+fake_relationship_paged = FakeGitHub(
+    "closed", (merged_closer,),
+    relationship_response={
+        "repository": {
+            "pullRequest": {
+                "number": 14,
+                "closingIssuesReferences": {
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": True},
+                },
+            },
+        },
+    },
+)
+paged_relationship = mod.verify_completion(fake_relationship_paged, REF)
+assert paged_relationship.desired_status is None
+assert paged_relationship.reason == "github_query_failed"
+print("PASS unbounded relationship response remains github_query_failed")
 
 print("ALL COMPLETION REGRESSIONS PASS")
