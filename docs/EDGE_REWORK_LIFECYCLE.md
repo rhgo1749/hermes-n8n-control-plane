@@ -70,7 +70,7 @@ Rules:
 
 | Transition | Trigger | Effect |
 |---|---|---|
-| `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; claim released + request label kept if the patch fails |
+| `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; claim is reclaimed and request label restored if claim-time projection fails |
 | `agent-working` maintained | running task with live claim/run | per-pass label projection (idempotent) |
 | `agent-working` → `agent-review-ready` | delivery evidence complete (marker + head + validation) | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
@@ -118,10 +118,23 @@ Rules:
    `agent-review-ready` is still present, normalization removes the stale
    review-ready label, refetches the live labels, and continues the new round's
    REVIEW → READY evaluation in the **same reconciliation pass**. If that
-   refetch fails, reconciliation stops fail-closed until the next wake.
+   refetch fails, reconciliation stops fail-closed until the next wake. The
+   normalization baseline is either the prior `github_pr_rework_delivery` event
+   or an explicit `github_pr_sync` event proving `DONE → REVIEW` for the same PR;
+   missing or ambiguous timestamp/PR evidence still fails closed.
 10. All GitHub label mutations are a single atomic PATCH with read-back
-   verification; failures fail closed (task state preserved).
-11. Head-binding feedback is observational only. Posting failure is logged and
+    verification. A claim-time PATCH non-2xx or stale read-back is recorded as
+    one structured `github_pr_rework_projection_failure` event with the task,
+    repository/Issue/PR, `stage=claim`, `operation=lifecycle_label_projection`,
+    failure class, HTTP status when available, before/desired/observed labels,
+    and `retryable=true`; the claim is reclaimed, `agent-rework` is restored,
+    and no worker is spawned in that tick.
+11. A retryable claim-projection failure remains the rework dispatch gate for a
+    later edge wake. The later wake performs one fresh claim/projection attempt;
+    a successful swap is the only ownership transition and does not duplicate
+    the rework event or worker spawn. Repeated failures are bounded per wake and
+    never spin in the same tick.
+12. Head-binding feedback is observational only. Posting failure is logged and
     the canonical retry/hold result is returned unchanged.
 
 ## Machine-readable completion handoff
@@ -293,8 +306,9 @@ the selected rework event must first still be the node's current governing
 transition.  The edge proves that with the canonical
 `_REWORK_GOVERNING_KINDS` ordering `(created_at, id)`; any later
 status-affecting governing event (`github_pr_sync`, `completed`, `status`,
-`promoted`, `unblocked`, `reclaimed`, `scheduled`, `archived`, or another
-canonical transition) supersedes the old round and blocks terminalization.
+`promoted`, `unblocked`, `reclaimed`, `scheduled`, `archived`, the retryable
+`github_pr_rework_projection_failure` claim diagnostic, or another canonical
+transition) supersedes the old round and blocks terminalization.
 
 Any later canonical `blocked` event is an explicit worker/operator hold and
 blocks terminalization.  A later `github_pr_rework_attention` event blocks it
@@ -393,7 +407,10 @@ continues the new round in the same pass while remaining idempotent (114–115).
 Tests 116–120 pin the Issue #57 operator-recovered `REVIEW` admission, exact
 whole-comment parsing, stale/invalid retry fail-closed behavior, normal
 review-lane isolation, lifecycle-label conflict guard, and the existing
-classic fresh-label path.
+classic fresh-label path. Tests 125–127 pin claim-time PATCH/read-back failure
+classification and durable evidence, READY + `agent-rework` preservation with
+one later retry/spawn, and `github_pr_sync`-provenance stale review-ready
+normalization before claim.
 
 `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-head-binding-feedback.py`
 installs the production head-binding overlay, first exercises focused
