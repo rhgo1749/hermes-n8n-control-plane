@@ -69,7 +69,7 @@ import stat
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
@@ -79,6 +79,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
 GITHUB_API = "https://api.github.com"
+_GITHUB_GRAPHQL_API = f"{GITHUB_API}/graphql"
 DEFAULT_TIMEOUT_SECONDS = 30
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _PR_URL_RE_TEMPLATE = r"https?://github\.com/{repository}/pull/(\d+)"
@@ -197,6 +198,10 @@ class GithubPullRequest:
     author: str = ""
     body: str = ""
     draft: bool = False
+    # ``None`` means a direct evaluator caller did not provide relationship
+    # evidence.  Live verification always replaces this with a finite set
+    # from GitHub's PullRequest.closingIssuesReferences field.
+    closing_issue_numbers: frozenset[int] | None = None
 
     @property
     def is_merged_into_target(self) -> bool:
@@ -228,6 +233,10 @@ class GithubCompletionDecision:
                     "base_branch": pr.base_branch,
                     "html_url": pr.html_url,
                     "title": pr.title,
+                    "closing_issue_numbers": (
+                        sorted(pr.closing_issue_numbers)
+                        if pr.closing_issue_numbers is not None else None
+                    ),
                 }
                 for pr in self.pull_requests
             ],
@@ -301,6 +310,42 @@ class GithubApiClient:
                 return items
             page += 1
         raise GithubCompletionError(f"GitHub pagination exceeded {max_pages} pages for {path}")
+
+    def graphql(self, query: str, variables: Mapping[str, Any]) -> Any:
+        """Run one bounded GraphQL read and return its data object.
+
+        GraphQL is used only for fields unavailable from the REST PR payload,
+        notably ``PullRequest.closingIssuesReferences``.  Transport, payload,
+        and provider-level errors are all non-authoritative failures.
+        """
+        request = Request(
+            _GITHUB_GRAPHQL_API,
+            data=json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8"),
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+                "User-Agent": "hermes-kanban-github-edge-sync",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise GithubCompletionError(
+                f"GitHub GraphQL API {exc.code}", status=int(exc.code)
+            ) from exc
+        except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise GithubCompletionError(
+                f"GitHub GraphQL request failed: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(body, dict) or body.get("errors"):
+            raise GithubCompletionError("GitHub GraphQL returned errors")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise GithubCompletionError("GitHub GraphQL returned no data")
+        return data
 
     def delete(self, path: str) -> int:
         """DELETE with 404 treated as success (resource already gone)."""
@@ -490,6 +535,105 @@ def _parse_pull_request(number: int, payload: Any, ref: GithubTaskRef) -> Github
     )
 
 
+_CLOSING_ISSUES_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){"
+    "pullRequest(number:$number){"
+    "number closingIssuesReferences(first:100){"
+    "nodes{number} pageInfo{hasNextPage}"
+    "}}}}"
+)
+
+
+def _pull_request_closing_issue_numbers(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+) -> frozenset[int]:
+    """Read one PR's authoritative GitHub closing-relationship set.
+
+    REST PR payloads do not expose ``closingIssuesReferences``.  A missing,
+    malformed, paginated, or unavailable GraphQL response is deliberately an
+    error: the caller must preserve the current Kanban state rather than
+    treating a mention as either a closer or proof that no closer exists.
+    """
+    graphql = getattr(client, "graphql", None)
+    if not callable(graphql):
+        raise GithubCompletionError(
+            "GitHub closing-relationship lookup is unavailable"
+        )
+    owner, separator, name = ref.repository.partition("/")
+    if not separator or not owner or not name:
+        raise GithubCompletionError(
+            f"invalid repository name for closing-relationship lookup: {ref.repository!r}"
+        )
+    data = graphql(
+        _CLOSING_ISSUES_QUERY,
+        {"owner": owner, "name": name, "number": int(pr_number)},
+    )
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pull_request = (
+        repository.get("pullRequest")
+        if isinstance(repository, dict) else None
+    )
+    if not isinstance(pull_request, dict):
+        raise GithubCompletionError(
+            f"GitHub returned no relationship data for PR #{pr_number}"
+        )
+    if pull_request.get("number") != pr_number:
+        raise GithubCompletionError(
+            f"GitHub returned mismatched relationship data for PR #{pr_number}"
+        )
+    connection = pull_request.get("closingIssuesReferences")
+    if not isinstance(connection, dict):
+        raise GithubCompletionError(
+            f"GitHub returned malformed closing relationships for PR #{pr_number}"
+        )
+    nodes = connection.get("nodes")
+    page_info = connection.get("pageInfo")
+    if not isinstance(nodes, list) or not isinstance(page_info, dict):
+        raise GithubCompletionError(
+            f"GitHub returned incomplete closing relationships for PR #{pr_number}"
+        )
+    has_next_page = page_info.get("hasNextPage")
+    if not isinstance(has_next_page, bool):
+        raise GithubCompletionError(
+            f"GitHub returned invalid closing-relationship pagination for PR #{pr_number}"
+        )
+    if has_next_page:
+        raise GithubCompletionError(
+            f"GitHub closing relationships exceeded the bounded page for PR #{pr_number}"
+        )
+    issue_numbers: set[int] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise GithubCompletionError(
+                f"GitHub returned malformed closing relationship for PR #{pr_number}"
+            )
+        issue_number = node.get("number")
+        if (
+            not isinstance(issue_number, int)
+            or isinstance(issue_number, bool)
+            or issue_number < 1
+        ):
+            raise GithubCompletionError(
+                f"GitHub returned invalid closing Issue number for PR #{pr_number}"
+            )
+        issue_numbers.add(issue_number)
+    return frozenset(issue_numbers)
+
+
+def _is_effective_linked_pr(ref: GithubTaskRef, pr: GithubPullRequest) -> bool:
+    """Return whether a PR is proven to close this source Issue.
+
+    ``None`` is retained only for direct legacy evaluator callers that do not
+    perform a GitHub read.  ``verify_completion`` always supplies a concrete
+    set and therefore never infers a relationship from text or timeline data.
+    """
+    relationships = pr.closing_issue_numbers
+    return relationships is None or ref.issue_number in relationships
+
+
 def _is_merged_into_target(
     ref: GithubTaskRef,
     pr: GithubPullRequest,
@@ -560,15 +704,26 @@ def evaluate_completion(
             pull_requests=prs,
         )
 
-    if all(_is_merged_into_target(ref, pr) for pr in prs):
+    effective_prs = tuple(
+        pr for pr in prs if _is_effective_linked_pr(ref, pr)
+    )
+    if not effective_prs:
+        return GithubCompletionDecision(
+            desired_status="review",
+            reason="no_linked_pr",
+            linked_pr_numbers=numbers,
+            pull_requests=effective_prs,
+        )
+
+    if all(_is_merged_into_target(ref, pr) for pr in effective_prs):
         return GithubCompletionDecision(
             desired_status="done",
             reason="all_linked_prs_merged",
             linked_pr_numbers=numbers,
-            pull_requests=prs,
+            pull_requests=effective_prs,
         )
 
-    has_open_pr = any(pr.state == "open" for pr in prs)
+    has_open_pr = any(pr.state == "open" for pr in effective_prs)
 
     # A closed Issue may have historical PRs that were intentionally replaced
     # after main advanced. Do not let those stale PRs revive an already
@@ -577,35 +732,35 @@ def evaluate_completion(
     # a newer linked merge from exactly the same head branch.
     if str(issue_state or "").casefold() == "closed" and not has_open_pr:
         unresolved_closed = tuple(
-            pr for pr in prs
+            pr for pr in effective_prs
             if (
                 pr.state == "closed"
                 and not _is_merged_into_target(ref, pr)
             )
         )
-        superseded = _superseded_closed_pr_numbers(ref, prs)
+        superseded = _superseded_closed_pr_numbers(ref, effective_prs)
 
         if (
             unresolved_closed
             and superseded
             and superseded == {pr.number for pr in unresolved_closed}
         ):
-            effective_prs = tuple(
-                pr for pr in prs
+            remaining_prs = tuple(
+                pr for pr in effective_prs
                 if pr.number not in superseded
             )
             if (
-                effective_prs
+                remaining_prs
                 and all(
                     _is_merged_into_target(ref, pr)
-                    for pr in effective_prs
+                    for pr in remaining_prs
                 )
             ):
                 return GithubCompletionDecision(
                     desired_status="done",
                     reason="superseded_pr_merged",
                     linked_pr_numbers=numbers,
-                    pull_requests=prs,
+                    pull_requests=effective_prs,
                 )
 
     if has_open_pr:
@@ -613,7 +768,7 @@ def evaluate_completion(
     elif any(
         pr.state == "closed"
         and not _is_merged_into_target(ref, pr)
-        for pr in prs
+        for pr in effective_prs
     ):
         reason = "linked_pr_closed_not_merged"
     else:
@@ -623,7 +778,7 @@ def evaluate_completion(
         desired_status="review",
         reason=reason,
         linked_pr_numbers=numbers,
-        pull_requests=prs,
+        pull_requests=effective_prs,
     )
 
 
@@ -648,6 +803,15 @@ def verify_completion(
             )
             for number in numbers
         )
+        pull_requests = tuple(
+            replace(
+                pr,
+                closing_issue_numbers=_pull_request_closing_issue_numbers(
+                    client, ref, pr.number
+                ),
+            )
+            for pr in pull_requests
+        )
 
         provisional = evaluate_completion(
             ref,
@@ -660,13 +824,13 @@ def verify_completion(
 
         unresolved_closed = {
             pr.number
-            for pr in pull_requests
+            for pr in provisional.pull_requests
             if (
                 pr.state == "closed"
                 and not _is_merged_into_target(ref, pr)
             )
         }
-        superseded = _superseded_closed_pr_numbers(ref, pull_requests)
+        superseded = _superseded_closed_pr_numbers(ref, provisional.pull_requests)
 
         # Avoid adding one Issue API call to every normal completion tick.
         # Query it only when every unresolved historical PR already has an
