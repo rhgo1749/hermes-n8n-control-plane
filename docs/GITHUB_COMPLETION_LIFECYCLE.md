@@ -180,6 +180,40 @@ A one-time snapshot of current CI/check state may be recorded in a handoff when 
 
 GitHub lookup failures remain fail-closed. Hermes core is not modified.
 
+## Pre-handoff PR closing-reference gate
+
+GitHub closes an Issue only when a merged PR body carries a closing keyword
+(Closes/Fixes/Resolves) adjacent to the Issue number as *visible plain text*,
+and that relationship is reflected in GraphQL
+`PullRequest.closingIssuesReferences`. A backticked or fenced `Closes #N`
+line, or a word-adjacent mention such as `Issue #N의`, never creates the
+relationship (ctrl-hangul#70 / PR #82 hotfix).
+
+Every GitHub-backed intake card therefore carries a
+`GitHub PR closing-reference contract (pre-handoff)` section. The canonical
+intake source owns the wording; the deployed entrypoint requires that exact
+canonical section before emitting a body and refuses drift fail-closed:
+
+- the delivery PR body contains the source Issue closing reference as a
+  visible plain-text line in the exact shape `Closes #<issue-number>.`,
+  outside Markdown backticks/code fences, with whitespace or punctuation
+  after the number;
+- before developer or lead handoff, the worker fresh-reads the existing PR
+  through REST and verifies that GraphQL
+  `PullRequest.closingIssuesReferences` contains the source Issue;
+- if the relationship is absent, only the SAME PR body is updated through the
+  approved REST JSON PATCH endpoint, then the PR and the GraphQL
+  relationship are fresh-read again;
+- no second PR, no merge, no auto-merge, no post-merge Issue close, and no
+  local-comment inference;
+- identity ambiguity, GraphQL/REST/PATCH failure, or a failed post-PATCH
+  read-back is a fail-closed handoff with exact evidence.
+
+The completion authority is unchanged: authoritative `done` still requires
+fresh GitHub merge evidence (`merged_at != null`) for every required linked
+PR, and the intake guard still requires a true closing relationship before
+clearing `agent-ready` from an Issue.
+
 ## Deployment
 
 `automation/hermes/scripts/deploy-intake-edge.sh` deploys:
@@ -188,7 +222,7 @@ GitHub lookup failures remain fail-closed. Hermes core is not modified.
 - `github-agent-ready-kanban-intake-core.py` — canonical intake implementation;
 - the existing edge wrapper/core/overlays and repository registry.
 
-The canonical intake source remains `automation/hermes/scripts/github-agent-ready-kanban-intake.py`. The live wrapper fail-closed overlays two rendered blocks: the GitHub completion contract and the Kanban lead orchestration contract. If either canonical source block drifts unexpectedly, the wrapper refuses to emit an unverified lifecycle contract.
+The canonical intake source remains `automation/hermes/scripts/github-agent-ready-kanban-intake.py`. The live wrapper fail-closed overlays two rendered blocks: the GitHub completion contract and the Kanban lead orchestration contract, and verifies the shared GitHub PR closing-reference contract section in the rendered body. If any canonical source block drifts unexpectedly, the wrapper refuses to emit an unverified lifecycle contract.
 
 Install the completion observer separately on the Hermes runtime that starts
 workers; this is a manual host activation gate, not an automatic repository

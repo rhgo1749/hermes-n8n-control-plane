@@ -53,6 +53,7 @@ _OLD_LEAD_CONTRACT_TEMPLATE = """## Luna lead execution contract
 5. Implement only the Issue's PR-sized scope. Delegate only bounded research, implementation, or test work to Luna workers when useful; delegation does not transfer lead ownership.
 6. Independently review every delegated diff/evidence, run applicable deterministic repository gates, and keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED / BLOCKED states honest. Required UI/browser/device/manual acceptance must be attempted whenever the worker has the necessary execution surface; if it cannot be run, record the exact gate, attempted step, concrete blocker or missing prerequisite, and the smallest human follow-up. A bare `human validation required` note is not sufficient evidence.
 7. Create a GitHub PR only after the executable gates pass. Never merge or enable auto-merge."""
+_ISSUE_BODY_END_MARKER = "--- END GITHUB ISSUE BODY ---\n\n"
 
 _NEW_LEAD_CONTRACT = """## Kanban lead orchestration contract
 
@@ -109,6 +110,30 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
             raise RuntimeError(
                 "Kanban lead contract drifted; refusing to emit an unverified "
                 "orchestration lifecycle contract"
+            )
+        closing_contract = getattr(module, "_CLOSING_REFERENCE_CONTRACT", None)
+        if not isinstance(closing_contract, str) or not closing_contract:
+            raise RuntimeError(
+                "canonical PR closing-reference contract is missing; refusing to emit an unverified handoff contract"
+            )
+        issue_body_end = rendered.rfind(_ISSUE_BODY_END_MARKER)
+        completion_search_start = (
+            issue_body_end + len(_ISSUE_BODY_END_MARKER)
+            if issue_body_end >= 0
+            else 0
+        )
+        completion_start = rendered.find(
+            _OLD_COMPLETION_CONTRACT,
+            completion_search_start,
+        )
+        if completion_start < 0:
+            raise RuntimeError(
+                "GitHub completion contract drifted; refusing to emit an unverified worker lifecycle contract"
+            )
+        completion_end = completion_start + len(_OLD_COMPLETION_CONTRACT)
+        if rendered.find(closing_contract, completion_end) < 0:
+            raise RuntimeError(
+                "PR closing-reference contract drifted; refusing to emit an unverified handoff contract"
             )
         rendered = rendered.replace(
             _OLD_COMPLETION_CONTRACT,
