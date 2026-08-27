@@ -172,9 +172,32 @@ class GithubCompletionError(RuntimeError):
     and locally raised failures.
     """
 
-    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        failure_class: str | None = None,
+        before_labels: Iterable[str] | None = None,
+        desired_labels: Iterable[str] | None = None,
+        observed_labels: Iterable[str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.http_status = status
+        self.failure_class = failure_class
+        self.before_labels = (
+            sorted(str(label) for label in before_labels)
+            if before_labels is not None else None
+        )
+        self.desired_labels = (
+            sorted(str(label) for label in desired_labels)
+            if desired_labels is not None else None
+        )
+        self.observed_labels = (
+            sorted(str(label) for label in observed_labels)
+            if observed_labels is not None else None
+        )
 
 
 @dataclass(frozen=True)
@@ -3658,11 +3681,12 @@ def _reconcile_blocked(
 REWORK_DISPATCH_ENV = "HERMES_KANBAN_REWORK_DISPATCH"
 
 # Event kinds that define which transition currently governs a task's
-# state.  Everything else (assigned/spawned/claimed/heartbeat/
-# respawn_guarded/commented/...) never supersedes a rework.
+# state.  The claim-projection failure diagnostic is included as a
+# retryable pending gate; everything else (assigned/spawned/claimed/
+# heartbeat/respawn_guarded/commented/...) never supersedes a rework.
 _REWORK_GOVERNING_KINDS = frozenset({
     "created", "changes_requested", "github_pr_rework", "github_pr_sync",
-    "github_pr_rework_retry",
+    "github_pr_rework_retry", "github_pr_rework_projection_failure",
     "github_blocked_resolved", "github_blocked_projection",
     "blocked", "completed", "status", "promoted", "unblocked",
     "reclaimed", "scheduled", "archived",
@@ -3714,6 +3738,26 @@ def _latest_rework_event(
         int(row["created_at"] or 0),
         str(row["kind"]),
     )
+
+
+def _claim_projection_failure_is_retryable(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Whether the newest claim projection failure permits a later retry."""
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_rework_projection_failure' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("retryable") is True
 
 
 def _task_run_after_rework(
@@ -4067,12 +4111,20 @@ def _project_pr_lifecycle_labels(
     )
     if not 200 <= status < 300:
         raise GithubCompletionError(
-            f"could not reconcile lifecycle labels (HTTP {status})"
+            f"could not reconcile lifecycle labels (HTTP {status})",
+            status=int(status),
+            failure_class="patch_non_2xx",
+            before_labels=current,
+            desired_labels=desired,
         )
     observed = _pr_labels(client, ref.repository, pr_number)
     if observed != desired:
         raise GithubCompletionError(
-            "lifecycle label read-back mismatch"
+            "lifecycle label read-back mismatch",
+            failure_class="read_back_mismatch",
+            before_labels=current,
+            desired_labels=desired,
+            observed_labels=observed,
         )
     return True, "labels_updated", {
         "before": sorted(current), "after": sorted(observed),
@@ -4094,6 +4146,50 @@ def _append_rework_retry_event(
         "source": "github_edge_rework_recovery",
     })
     _append_sync_event(conn, task_id, retry_payload, kind="github_pr_rework_retry")
+
+
+_CLAIM_PROJECTION_FAILURE_CLASSES = frozenset({
+    "patch_non_2xx",
+    "read_back_mismatch",
+})
+
+
+def _append_claim_projection_failure_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    context: Mapping[str, Any],
+    claim_projection: Mapping[str, Any],
+) -> None:
+    """Persist safe evidence when claim-time label projection fails.
+
+    The claim is reclaimed before this event is written, so a later edge wake
+    can retry the same ``agent-rework`` request without spawning in this tick.
+    Only the two failures that have a trustworthy label diff are recorded;
+    generic lookup/transport failures keep their existing fail-closed path.
+    """
+    failure_class = claim_projection.get("failure_class")
+    if failure_class not in _CLAIM_PROJECTION_FAILURE_CLASSES:
+        return
+    _append_sync_event(
+        conn,
+        task_id,
+        {
+            "task_id": task_id,
+            "repository": str(context["repository"]),
+            "issue_number": int(context["issue_number"]),
+            "pr_number": int(context["pr_number"]),
+            "stage": "claim",
+            "operation": "lifecycle_label_projection",
+            "failure_class": failure_class,
+            "http_status": claim_projection.get("http_status"),
+            "before_labels": claim_projection.get("before_labels"),
+            "desired_labels": claim_projection.get("desired_labels"),
+            "observed_labels": claim_projection.get("observed_labels"),
+            "retryable": True,
+            "source": "github_edge_rework_dispatch",
+        },
+        kind="github_pr_rework_projection_failure",
+    )
 
 
 def _rework_human_attention(reason: str, run: Optional[sqlite3.Row]) -> bool:
@@ -4693,6 +4789,58 @@ def _last_delivery_event_at(
     return int(value) if value is not None else None
 
 
+def _event_targets_pr(payload: Mapping[str, Any], pr_number: int) -> bool:
+    """Return whether a sync event's explicit PR evidence matches ``pr_number``."""
+    linked_numbers = payload.get("linked_pr_numbers")
+    if isinstance(linked_numbers, (list, tuple)):
+        try:
+            return int(pr_number) in {int(number) for number in linked_numbers}
+        except (TypeError, ValueError):
+            return False
+    raw_pr_number = payload.get("pr_number")
+    try:
+        return raw_pr_number is not None and int(raw_pr_number) == int(pr_number)
+    except (TypeError, ValueError):
+        return False
+
+
+def _last_review_parking_event_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pr_number: int,
+) -> int | None:
+    """Epoch time of a prior GitHub sync that parked this PR in REVIEW.
+
+    ``github_pr_sync`` is the durable provenance for the ordinary
+    ``DONE -> REVIEW`` open-PR repair.  It is a valid stale
+    ``agent-review-ready`` baseline even when no rework delivery event exists
+    for the prior round.  Malformed or unrelated events are ignored so they
+    cannot manufacture a normalization decision.
+    """
+    rows = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_sync' "
+        "ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("previous_status") != "done" or payload.get("new_status") != "review":
+            continue
+        if not _event_targets_pr(payload, pr_number):
+            continue
+        try:
+            return int(row["created_at"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _latest_rework_label_at(
     client: Any,
     ref: GithubTaskRef,
@@ -4764,17 +4912,19 @@ def _normalize_stale_review_ready(
     """Remove a stale ``agent-review-ready`` superseded by a newer rework.
 
     A new trusted ``agent-rework`` request that postdates the previous
-    delivery makes the delivered round's ``agent-review-ready`` stale.
+    delivery or a durable ``DONE -> REVIEW`` GitHub sync makes the prior
+    round's ``agent-review-ready`` stale.
     Only that single label is removed (``agent-rework`` is kept so the
     classic REVIEW -> READY intake path or the dispatch lane owns the new
     round on a later tick).  Returns ``None`` — keeping the fail-closed
     lifecycle conflict guard — unless the newest ``agent-rework`` label
-    addition provably postdates the last ``github_pr_rework_delivery``
-    event.
+    addition provably postdates one of those prior review-parking events.
     """
     delivery_at = _last_delivery_event_at(conn, task_id)
+    parking_at = _last_review_parking_event_at(conn, task_id, pr_number)
+    baselines = [value for value in (delivery_at, parking_at) if value is not None]
     request_at = _latest_rework_label_at(client, ref, pr_number)
-    if delivery_at is None or request_at is None or request_at <= delivery_at:
+    if not baselines or request_at is None or request_at <= max(baselines):
         return None
     if dry_run:
         return {
@@ -6002,7 +6152,10 @@ def _pending_rework_tasks(
         if selected is not None and task_id not in selected:
             continue
         governing = _governing_event_kind(conn, task_id)
-        if governing != "github_pr_rework" and not (
+        if governing == "github_pr_rework_projection_failure":
+            if not _claim_projection_failure_is_retryable(conn, task_id):
+                continue
+        elif governing != "github_pr_rework" and not (
             governing == "changes_requested" and task_id in normalized
         ):
             continue
@@ -6181,7 +6334,10 @@ def _dispatch_pending_rework_locked(
             claim_projection = on_claim(claimed)
         except Exception as exc:
             claim_projection = {"ok": False, "error": str(exc)}
-        if not isinstance(claim_projection, Mapping) or not claim_projection.get("ok"):
+        projection_details: Mapping[str, Any] = (
+            claim_projection if isinstance(claim_projection, Mapping) else {}
+        )
+        if not projection_details.get("ok"):
             try:
                 kanban_db.reclaim_task(
                     conn, task_id,
@@ -6193,11 +6349,37 @@ def _dispatch_pending_rework_locked(
                     "reason": "claim_projection_reclaim_failed",
                     "error": f"{claim_projection!r}; {type(exc).__name__}: {exc}",
                 }]
+            if on_failure is not None:
+                try:
+                    on_failure(claimed, "claim")
+                except Exception as exc:  # noqa: BLE001 - isolate label restore failure
+                    print(
+                        f"kanban-github-sync: failed to restore rework label after claim "
+                        f"(task {claimed.id}): {type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+            if client is not None and rework_contexts is not None:
+                failure_context = rework_contexts.get(task_id)
+                if isinstance(failure_context, Mapping):
+                    try:
+                        with conn:
+                            _append_claim_projection_failure_event(
+                                conn,
+                                task_id,
+                                failure_context,
+                                projection_details,
+                            )
+                    except Exception as exc:  # noqa: BLE001 - preserve READY fail-closed
+                        print(
+                            f"kanban-github-sync: failed to record claim projection "
+                            f"failure (task {task_id}): {type(exc).__name__}",
+                            file=sys.stderr,
+                        )
             return [{
                 "task_id": task_id, "status": "ready", "changed": False,
                 "reason": "working_label_projection_failed",
-                "error": str((claim_projection or {}).get("error") or "unknown"),
-                "lifecycle": dict(claim_projection or {}),
+                "error": str(projection_details.get("error") or "unknown"),
+                "lifecycle": dict(projection_details),
             }]
 
     # Resolve the workspace exactly like the core dispatcher does (the
@@ -6829,7 +7011,15 @@ def sync_board(
                         remove=(REWORK_LABEL, REVIEW_READY_LABEL),
                     )
                 except GithubCompletionError as exc:
-                    return {"ok": False, "error": str(exc)}
+                    return {
+                        "ok": False,
+                        "error": str(exc),
+                        "failure_class": exc.failure_class,
+                        "http_status": exc.status,
+                        "before_labels": exc.before_labels,
+                        "desired_labels": exc.desired_labels,
+                        "observed_labels": exc.observed_labels,
+                    }
                 return {"ok": True, "label_action": label_reason, "lifecycle": label_evidence}
 
             def _failure_projection(claimed: Any, stage: str) -> None:

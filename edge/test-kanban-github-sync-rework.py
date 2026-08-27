@@ -127,6 +127,9 @@ class FakeGitHub:
         self.fail_mutations = False
         self.label_race = False  # simulate the 422 label-create race
         self.fail_urls: list[str] = []  # substring match -> GithubCompletionError
+        self.lifecycle_patch_status: int | None = None
+        self.stale_label_readback = False
+        self._stale_label_readback: dict[int, list[str]] = {}
         self._next_comment_id = 1000
 
     # -- client interface -------------------------------------------------
@@ -224,10 +227,16 @@ class FakeGitHub:
         if m:
             n = int(m.group(1))
             names = [str(x) for x in payload.get("labels", [])]
+            if self.lifecycle_patch_status is not None:
+                return int(self.lifecycle_patch_status), None
+            previous = list(self.issue_labels if n == ISSUE_N else self.pr_labels.get(n, []))
             if n == ISSUE_N:
                 self.issue_labels = names
             else:
                 self.pr_labels[n] = names
+            if self.stale_label_readback:
+                self.stale_label_readback = False
+                self._stale_label_readback[n] = previous
             return 200, {"number": n, "labels": [{"name": x} for x in names]}
         raise mod.GithubCompletionError(f"unrouted PATCH {path}")
 
@@ -244,6 +253,8 @@ class FakeGitHub:
             n = int(m.group(1))
             if n == ISSUE_N:
                 return [{"name": x} for x in self.issue_labels]
+            if n in self._stale_label_readback:
+                return [{"name": x} for x in self._stale_label_readback.pop(n)]
             return [{"name": x} for x in self.pr_labels.get(n, [])]
         m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/(\d+)/timeline", path)
         if m:
@@ -4729,6 +4740,182 @@ def test_124_done_open_pr_self_heal_without_any_labels():
         str(results))
 
 
+def test_125_claim_patch_failure_is_durable_and_retries_once():
+    print("125. claim PATCH non-2xx -> durable evidence, READY + rework, later one-shot retry")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws125-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    fake.lifecycle_patch_status = 503
+
+    failed_results = _run_sync_with_dispatch(fake, stub)
+    failures = [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_projection_failure"
+    ]
+    check("125: no spawn on PATCH failure", stub.calls == [], str(failed_results))
+    check("125: task reclaimed READY", task_row(tid)["status"] == "ready",
+          str(task_row(tid)))
+    check("125: agent-rework preserved", fake.pr_labels[PR_N] == ["agent-rework"],
+          str(fake.pr_labels))
+    check("125: exactly one durable failure event", len(failures) == 1,
+          str(task_events(tid)))
+    if failures:
+        payload = failures[0]["payload"]
+        check("125: structured PATCH failure evidence", all(
+            payload.get(key) == value for key, value in {
+                "task_id": tid,
+                "repository": REPO,
+                "issue_number": ISSUE_N,
+                "pr_number": PR_N,
+                "stage": "claim",
+                "operation": "lifecycle_label_projection",
+                "failure_class": "patch_non_2xx",
+                "http_status": 503,
+                "before_labels": ["agent-rework"],
+                "desired_labels": ["agent-working"],
+                "observed_labels": None,
+                "retryable": True,
+            }.items()
+        ), str(payload))
+
+    fake.lifecycle_patch_status = None
+    retry_results = _run_sync_with_dispatch(fake, stub)
+    spawned = [r for r in retry_results if r.get("reason") == "rework_worker_spawned"]
+    failures_after_retry = [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_projection_failure"
+    ]
+    check("125: later wake succeeds once", len(spawned) == 1, str(retry_results))
+    check("125: exactly one spawn", len(stub.calls) == 1, str(stub.calls))
+    check("125: task running after retry", task_row(tid)["status"] == "running",
+          str(task_row(tid)))
+    check("125: working label owns retry", fake.pr_labels[PR_N] == ["agent-working"],
+          str(fake.pr_labels))
+    check("125: failure evidence remains singular", len(failures_after_retry) == 1,
+          str(task_events(tid)))
+
+
+def test_126_claim_readback_failure_is_durable_and_retries_once():
+    print("126. stale claim read-back -> durable evidence, READY + rework, later one-shot retry")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws126-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    fake.stale_label_readback = True
+
+    failed_results = _run_sync_with_dispatch(fake, stub)
+    failures = [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_projection_failure"
+    ]
+    check("126: no spawn on read-back failure", stub.calls == [], str(failed_results))
+    check("126: task reclaimed READY", task_row(tid)["status"] == "ready",
+          str(task_row(tid)))
+    check("126: agent-rework restored", fake.pr_labels[PR_N] == ["agent-rework"],
+          str(fake.pr_labels))
+    check("126: exactly one durable failure event", len(failures) == 1,
+          str(task_events(tid)))
+    if failures:
+        payload = failures[0]["payload"]
+        check("126: structured read-back failure evidence", all(
+            payload.get(key) == value for key, value in {
+                "task_id": tid,
+                "repository": REPO,
+                "issue_number": ISSUE_N,
+                "pr_number": PR_N,
+                "stage": "claim",
+                "operation": "lifecycle_label_projection",
+                "failure_class": "read_back_mismatch",
+                "http_status": None,
+                "before_labels": ["agent-rework"],
+                "desired_labels": ["agent-working"],
+                "observed_labels": ["agent-rework"],
+                "retryable": True,
+            }.items()
+        ), str(payload))
+
+    retry_results = _run_sync_with_dispatch(fake, stub)
+    spawned = [r for r in retry_results if r.get("reason") == "rework_worker_spawned"]
+    failures_after_retry = [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_projection_failure"
+    ]
+    check("126: later wake succeeds once", len(spawned) == 1, str(retry_results))
+    check("126: exactly one spawn", len(stub.calls) == 1, str(stub.calls))
+    check("126: task running after retry", task_row(tid)["status"] == "running",
+          str(task_row(tid)))
+    check("126: working label owns retry", fake.pr_labels[PR_N] == ["agent-working"],
+          str(fake.pr_labels))
+    check("126: failure evidence remains singular", len(failures_after_retry) == 1,
+          str(task_events(tid)))
+
+
+def test_127_github_sync_review_parking_normalizes_stale_review_ready():
+    print("127. DONE->REVIEW github_pr_sync parking + fresh rework -> normalize and dispatch")
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="open", merged=False)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("done")
+
+    parking_results = run_sync(fake)
+    parking_row = task_row(tid)
+    parking_events = [
+        event for event in task_events(tid) if event["kind"] == "github_pr_sync"
+    ]
+    check("127: github sync parks open PR in review",
+          parking_row["status"] == "review", str(parking_results))
+    check("127: parking event has explicit PR evidence", len(parking_events) == 1 and
+          parking_events[0]["payload"].get("previous_status") == "done" and
+          parking_events[0]["payload"].get("new_status") == "review" and
+          parking_events[0]["payload"].get("linked_pr_numbers") == [PR_N],
+          str(parking_events))
+
+    new_label_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 900)
+    )
+    # Simulate the stale label left by that review parking and a new trusted
+    # request arriving afterward, before the first edge rework observation.
+    fake.pr_labels[PR_N] = ["agent-review-ready", "agent-rework"]
+    fake.pr_timeline[PR_N] = labeled_timeline(new_label_at)
+    apply_results = run_sync(fake)
+    check("127: fresh rework opens READY", task_row(tid)["status"] == "ready",
+          str(apply_results))
+    check("127: stale pair remains until claim", sorted(fake.pr_labels[PR_N]) ==
+          ["agent-review-ready", "agent-rework"], str(fake.pr_labels))
+    check("127: no delivery provenance required", not any(
+        event["kind"] == "github_pr_rework_delivery" for event in task_events(tid)
+    ), str(task_events(tid)))
+
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws127-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    patch_count_before_dispatch = len(fake.patch_calls)
+    dispatch_results = _run_sync_with_dispatch(fake, stub)
+    dispatch_label_patches = [
+        call for call in fake.patch_calls[patch_count_before_dispatch:]
+        if call[0].endswith(f"/issues/{PR_N}")
+    ]
+    check("127: no lifecycle conflict diagnostic", not any(
+        result.get("reason") == "lifecycle_label_conflict"
+        for result in dispatch_results
+    ), str(dispatch_results))
+    check("127: normalization and claim each project labels",
+          len(dispatch_label_patches) == 2, str(dispatch_label_patches))
+    check("127: stale review-ready normalized at claim",
+          fake.pr_labels[PR_N] == ["agent-working"], str(dispatch_results))
+    check("127: task dispatched", task_row(tid)["status"] == "running",
+          str(task_row(tid)))
+    check("127: exactly one worker spawn", len(stub.calls) == 1,
+          str(stub.calls))
+    check("127: exactly one rework event", len([
+        event for event in task_events(tid) if event["kind"] == "github_pr_rework"
+    ]) == 1, str(task_events(tid)))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -4843,6 +5030,9 @@ def main() -> int:
         test_122_done_open_pr_new_rework_label_opens_new_round,
         test_123_working_plus_fresh_rework_defers_until_worker_ends,
         test_124_done_open_pr_self_heal_without_any_labels,
+        test_125_claim_patch_failure_is_durable_and_retries_once,
+        test_126_claim_readback_failure_is_durable_and_retries_once,
+        test_127_github_sync_review_parking_normalizes_stale_review_ready,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
