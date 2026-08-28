@@ -105,6 +105,30 @@ For a rework-pending READY task whose assignee matches a resource group:
    (or declined) the task.  Durable task/run state then represents occupancy
    for the next admission check.
 
+## Core claim and health integration
+
+The enabled `h4v3-resource-scheduler` plugin installs the same resource gate at
+both core claim boundaries: `claim_task` for READY work and
+`claim_review_task` for autonomous REVIEW work. A full matched resource returns
+the core sentinel (`None`) without changing the task or failure counter, and
+records a bounded in-process `resource_busy` diagnostic. A verified terminal
+same-task worker may be reaped before replacement admission; active or
+unverifiable PIDs remain fail-closed, and PID reuse is never signalled.
+
+The plugin also wraps the module attributes used by the dispatcher health
+probes (`has_spawnable_ready` and `has_spawnable_review`). When every eligible
+candidate is resource-busy, those probes report no spawnable work, so the
+legacy six-tick `dispatcher stuck` warning is reserved for genuine spawn
+failures. A queue containing any non-resource or available-resource candidate
+continues to report spawnable work. The runtime dispatch result and CLI
+`dispatch --dry-run` output expose `resource_busy` entries and do not present a
+capacity-blocked candidate as a predicted spawn; dry-run performs no claim,
+reap, or database write.
+
+No resource configuration, empty configuration, or unmatched assignee keeps
+the original core probe and dispatch behavior unchanged. Core source remains
+untouched; all integrations are idempotent runtime overlays.
+
 ## Backwards compatibility
 
 The overlay deliberately has three no-op paths:
@@ -161,6 +185,7 @@ Repository test added by this change:
 
 ```bash
 python3 edge/test-kanban-resource-admission.py
+python3 edge/test-kanban-resource-busy-health.py
 ```
 
 It covers:

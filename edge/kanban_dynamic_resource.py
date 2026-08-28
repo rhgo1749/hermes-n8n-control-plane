@@ -33,12 +33,14 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import hashlib
+import io
 import ipaddress
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, cast
 from urllib.parse import urlparse
 
 logger = logging.getLogger("h4v3.resource_scheduler")
@@ -231,7 +233,7 @@ def install_dynamic_resource_policy(admission_module: Any) -> None:
 
     def dynamic_policies(cfg: Mapping[str, Any]) -> tuple[Any, ...]:
         # Let the existing parser own validation/defaults for all legacy fields.
-        parsed = original_policies(cfg)
+        parsed = cast(tuple[Any, ...], original_policies(cfg))
         raw = cfg.get(getattr(admission_module, "RESOURCE_CONFIG_KEY", "worker_resources"))
         raw = raw if isinstance(raw, Mapping) else {}
         out: list[Any] = []
@@ -417,6 +419,479 @@ def _row_assignee(
     return default_assignee or None
 
 
+_last_resource_diagnostics: list[dict[str, Any]] = []
+
+
+def _diagnostic_limit(admission_module: Any) -> int:
+    try:
+        return max(1, int(getattr(admission_module, "RESOURCE_OUTCOME_LIMIT", 128)))
+    except (TypeError, ValueError):
+        return 128
+
+
+def _profile_exists(profile_name: str) -> Optional[bool]:
+    """Return profile existence, or ``None`` when the probe is unavailable."""
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    try:
+        return bool(profile_exists(profile_name))
+    except Exception:
+        return False
+
+
+def _pending_rows(
+    conn: sqlite3.Connection,
+    statuses: tuple[str, ...],
+) -> list[sqlite3.Row]:
+    """Read unclaimed dispatch candidates with a legacy-schema fallback."""
+    placeholders = ", ".join("?" for _ in statuses)
+    try:
+        return conn.execute(
+            "SELECT id, assignee FROM tasks "
+            f"WHERE status IN ({placeholders}) AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC",
+            statuses,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Small isolated fixtures and older installations may not have the
+        # optional claim_lock/ordering columns yet.  The live schema takes the
+        # first path; the fallback remains read-only and conservative.
+        try:
+            return conn.execute(
+                "SELECT id, assignee FROM tasks "
+                f"WHERE status IN ({placeholders}) ORDER BY id ASC",
+                statuses,
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"could not inspect resource candidates: {type(exc).__name__}: {exc}"
+            ) from exc
+
+
+def _classify_pending_resources(
+    kanban_db: Any,
+    admission_module: Any,
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any],
+    statuses: tuple[str, ...],
+) -> Optional[tuple[bool, list[dict[str, Any]]]]:
+    """Classify pending rows without claiming them.
+
+    ``None`` means the configured overlay has no applicable resource (or the
+    profile probe is unavailable), so callers must preserve the core's legacy
+    result.  Otherwise the first item says whether any eligible row is safely
+    spawnable and the second contains bounded deferral diagnostics.
+    """
+    raw = cfg.get(getattr(admission_module, "RESOURCE_CONFIG_KEY", "worker_resources"))
+    if raw in (None, {}):
+        return None
+
+    rows = _pending_rows(conn, statuses)
+    if not rows:
+        return None
+    board = _board_for_connection(kanban_db, conn)
+    active_by_resource: dict[str, list[dict[str, Any]]] = {}
+    diagnostics: list[dict[str, Any]] = []
+    matched_resource = False
+    spawnable = False
+
+    for row in rows:
+        assignee = str(row["assignee"] or "").strip()
+        if not assignee:
+            continue
+        exists = _profile_exists(assignee)
+        if exists is None:
+            # Do not change the core's degraded-install fallback when profile
+            # discovery itself is unavailable.
+            return None
+        if not exists:
+            continue
+        lane = str(statuses[0]) if len(statuses) == 1 else "dispatch"
+        try:
+            resource = admission_module.resource_for_assignee(cfg, assignee)
+        except Exception as exc:
+            matched_resource = True
+            diagnostics.append({
+                "task_id": str(row["id"]),
+                "lane": lane,
+                "reason": "resource_config_invalid",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            continue
+        if resource is None:
+            spawnable = True
+            continue
+
+        matched_resource = True
+        active = active_by_resource.get(resource.name)
+        if active is None:
+            try:
+                active = admission_module._active_resource_workers(
+                    kanban_db, board, resource
+                )
+            except Exception as exc:
+                diagnostics.append({
+                    "task_id": str(row["id"]),
+                    "lane": lane,
+                    "reason": "resource_admission_failed",
+                    "resource_group": resource.name,
+                    "resource_capacity": int(resource.capacity),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            active_by_resource[resource.name] = active
+        active_count = len(active)
+        if active_count >= int(resource.capacity):
+            diagnostics.append({
+                "task_id": str(row["id"]),
+                "lane": lane,
+                "reason": "resource_busy",
+                "resource_group": resource.name,
+                "resource_active": active_count,
+                "resource_capacity": int(resource.capacity),
+            })
+        else:
+            spawnable = True
+
+    if not matched_resource:
+        return None
+    return spawnable, diagnostics[:_diagnostic_limit(admission_module)]
+
+
+def _record_resource_diagnostics(
+    admission_module: Any,
+    diagnostics: list[dict[str, Any]],
+    *,
+    board: Optional[str] = None,
+) -> None:
+    recorder = getattr(admission_module, "record_resource_admission_outcome", None)
+    if not callable(recorder):
+        return
+    for item in diagnostics:
+        try:
+            recorder(
+                task_id=item.get("task_id"),
+                board=board if board is not None else item.get("board"),
+                resource_group=item.get("resource_group"),
+                reason=item.get("reason", "resource_admission"),
+                lane=item.get("lane"),
+                resource_active=item.get("resource_active"),
+                resource_capacity=item.get("resource_capacity"),
+            )
+        except Exception:
+            # Telemetry must never change admission behavior.
+            continue
+
+
+def _dispatch_resource_diagnostics(
+    kanban_db: Any,
+    admission_module: Any,
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    statuses_to_check = [("ready",)]
+    if bool(cfg.get("review_dispatch", True)):
+        statuses_to_check.append(("review",))
+    for statuses in statuses_to_check:
+        classified = _classify_pending_resources(
+            kanban_db, admission_module, conn, cfg, statuses
+        )
+        if classified is not None:
+            diagnostics.extend(classified[1])
+    # A row can be visible through more than one compatibility query only when
+    # a caller supplies an unusual fixture; keep the diagnostic stream stable.
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in diagnostics:
+        key = (
+            item.get("task_id"),
+            item.get("lane"),
+            item.get("reason"),
+            item.get("resource_group"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique[:_diagnostic_limit(admission_module)]
+
+
+def _safe_dispatch_resource_diagnostics(
+    kanban_db: Any,
+    admission_module: Any,
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        return _dispatch_resource_diagnostics(
+            kanban_db, admission_module, conn, cfg
+        )
+    except Exception as exc:
+        return [{
+            "task_id": None,
+            "lane": "dispatch",
+            "reason": "resource_admission_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }]
+
+
+def _attach_dispatch_diagnostics(
+    result: Any,
+    diagnostics: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+) -> None:
+    busy = [item for item in diagnostics if item.get("reason") == "resource_busy"]
+    deferred_ids = {
+        str(item.get("task_id"))
+        for item in diagnostics
+        if item.get("task_id") is not None
+        and item.get("reason")
+        in {
+            "resource_busy",
+            "resource_config_invalid",
+            "resource_admission_failed",
+        }
+    }
+    setattr(result, "resource_busy", busy)
+    setattr(result, "resource_admission", diagnostics)
+    setattr(
+        result,
+        "skipped_resource_busy",
+        [str(item["task_id"]) for item in busy if item.get("task_id") is not None],
+    )
+    if not dry_run or not deferred_ids:
+        return
+    spawned = getattr(result, "spawned", None)
+    if not isinstance(spawned, list):
+        return
+    retained = []
+    for item in spawned:
+        if isinstance(item, (tuple, list)) and item:
+            task_id = item[0]
+        elif isinstance(item, Mapping):
+            task_id = item.get("task_id")
+        else:
+            task_id = None
+        if str(task_id) in deferred_ids:
+            continue
+        retained.append(item)
+    result.spawned = retained
+
+
+def _install_resource_health_probes(
+    kanban_db: Any,
+    admission_module: Any,
+) -> None:
+    """Make core health probes ignore candidates blocked by capacity."""
+    for attr, status in (("has_spawnable_ready", "ready"), ("has_spawnable_review", "review")):
+        original = getattr(kanban_db, attr, None)
+        if not callable(original) or getattr(
+            original, "_h4v3_resource_health_installed", False
+        ):
+            continue
+
+        def make_probe(original_fn: Any, lane: str):
+            def guarded(conn: sqlite3.Connection) -> bool:
+                try:
+                    cfg = _load_kanban_cfg()
+                except Exception:
+                    cfg = {}
+                if not isinstance(cfg, Mapping):
+                    cfg = {}
+                raw = cfg.get(
+                    getattr(admission_module, "RESOURCE_CONFIG_KEY", "worker_resources")
+                )
+                if raw in (None, {}):
+                    return bool(original_fn(conn))
+                try:
+                    classified = _classify_pending_resources(
+                        kanban_db, admission_module, conn, cfg, (lane,)
+                    )
+                except Exception as exc:
+                    # An explicitly configured resource must fail closed: the
+                    # claim wrapper will refuse admission until it can inspect
+                    # capacity safely, so health must not call that state stuck.
+                    board = None
+                    try:
+                        board = _board_for_connection(kanban_db, conn)
+                    except Exception:
+                        pass
+                    _record_resource_diagnostics(
+                        admission_module,
+                        [{
+                            "task_id": None,
+                            "lane": lane,
+                            "reason": "resource_admission_failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }],
+                        board=board,
+                    )
+                    return False
+                if classified is None:
+                    return bool(original_fn(conn))
+                spawnable, diagnostics = classified
+                board = None
+                try:
+                    board = _board_for_connection(kanban_db, conn)
+                except Exception:
+                    pass
+                _record_resource_diagnostics(
+                    admission_module, diagnostics, board=board
+                )
+                return bool(spawnable)
+
+            guarded._h4v3_resource_health_installed = True  # type: ignore[attr-defined]
+            guarded._h4v3_resource_health_original = original_fn  # type: ignore[attr-defined]
+            return guarded
+
+        setattr(kanban_db, attr, make_probe(original, status))
+
+
+def _install_dispatch_overlay(kanban_db: Any, admission_module: Any) -> None:
+    """Annotate dispatch results and make dry-run capacity-aware."""
+    global _last_resource_diagnostics
+    original = getattr(kanban_db, "dispatch_once", None)
+    if not callable(original) or getattr(original, "_h4v3_resource_dispatch_installed", False):
+        return
+
+    def guarded_dispatch_once(
+        conn: sqlite3.Connection,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        global _last_resource_diagnostics
+        dry_run = bool(kwargs.get("dry_run"))
+        try:
+            cfg = _load_kanban_cfg()
+        except Exception:
+            cfg = {}
+        if not isinstance(cfg, Mapping):
+            cfg = {}
+        diagnostics = _safe_dispatch_resource_diagnostics(
+            kanban_db, admission_module, conn, cfg
+        )
+        _last_resource_diagnostics = []
+        result = original(conn, *args, **kwargs)
+        # A real tick may reap a holder before it reaches claim_task. Preserve
+        # the pre-tick busy evidence only when it remains relevant; otherwise
+        # include any post-tick deferral discovered after the core pass.
+        if not dry_run:
+            diagnostics.extend(
+                _safe_dispatch_resource_diagnostics(
+                    kanban_db, admission_module, conn, cfg
+                )
+            )
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for item in diagnostics:
+            key = (
+                item.get("task_id"),
+                item.get("lane"),
+                item.get("reason"),
+                item.get("resource_group"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        unique = unique[:_diagnostic_limit(admission_module)]
+        board = None
+        try:
+            board = _board_for_connection(kanban_db, conn)
+        except Exception:
+            pass
+        _record_resource_diagnostics(admission_module, unique, board=board)
+        _last_resource_diagnostics = list(unique)
+        _attach_dispatch_diagnostics(result, unique, dry_run=dry_run)
+        return result
+
+    guarded_dispatch_once._h4v3_resource_dispatch_installed = True  # type: ignore[attr-defined]
+    guarded_dispatch_once._h4v3_resource_dispatch_original = original  # type: ignore[attr-defined]
+    setattr(kanban_db, "dispatch_once", guarded_dispatch_once)
+
+
+def _install_cli_dispatch_overlay() -> None:
+    """Add resource-specific output to the existing CLI formatter."""
+    try:
+        from hermes_cli import kanban as cli_module
+    except Exception:
+        return
+    original = getattr(cli_module, "_cmd_dispatch", None)
+    if not callable(original) or getattr(original, "_h4v3_resource_cli_installed", False):
+        return
+
+    def guarded_cmd_dispatch(args: Any) -> int:
+        global _last_resource_diagnostics
+        output = io.StringIO()
+        _last_resource_diagnostics = []
+        try:
+            with contextlib.redirect_stdout(output):
+                code = original(args)
+        except BaseException:
+            print(output.getvalue(), end="")
+            raise
+        text = output.getvalue()
+        diagnostics = list(_last_resource_diagnostics)
+        if not diagnostics:
+            print(text, end="")
+            return code if isinstance(code, int) else 0
+        busy = [item for item in diagnostics if item.get("reason") == "resource_busy"]
+        if getattr(args, "json", False):
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                print(text, end="")
+                return code if isinstance(code, int) else 0
+            if isinstance(payload, dict):
+                if busy:
+                    payload["resource_busy"] = busy
+                    busy_ids = {
+                        str(item["task_id"])
+                        for item in busy
+                        if item.get("task_id") is not None
+                    }
+                    payload["skipped_resource_busy"] = sorted(busy_ids)
+                    spawned = payload.get("spawned")
+                    if isinstance(spawned, list):
+                        payload["spawned"] = [
+                            item for item in spawned
+                            if not isinstance(item, dict)
+                            or str(item.get("task_id")) not in busy_ids
+                        ]
+                other = [item for item in diagnostics if item not in busy]
+                if other:
+                    payload["resource_admission"] = other
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+                return code if isinstance(code, int) else 0
+            print(text, end="")
+            return code if isinstance(code, int) else 0
+
+        print(text, end="")
+        for item in diagnostics:
+            task_id = item.get("task_id") or "?"
+            reason = item.get("reason") or "resource_admission"
+            if reason == "resource_busy":
+                reason = "resource_busy"
+            group = item.get("resource_group") or "resource"
+            active = item.get("resource_active")
+            capacity = item.get("resource_capacity")
+            occupancy = (
+                f" ({active}/{capacity})"
+                if active is not None and capacity is not None
+                else ""
+            )
+            print(f"Deferred ({reason}): {task_id} [{group}{occupancy}]")
+        return code if isinstance(code, int) else 0
+
+    guarded_cmd_dispatch._h4v3_resource_cli_installed = True  # type: ignore[attr-defined]
+    guarded_cmd_dispatch._h4v3_resource_cli_original = original  # type: ignore[attr-defined]
+    setattr(cli_module, "_cmd_dispatch", guarded_cmd_dispatch)
+
+
 def install_core_claim_admission(kanban_db: Any, admission_module: Any) -> None:
     """Gate normal READY/REVIEW claims with the same resource policies.
 
@@ -426,6 +901,9 @@ def install_core_claim_admission(kanban_db: Any, admission_module: Any) -> None:
     """
     install_dynamic_resource_policy(admission_module)
     install_cross_board_helpers(admission_module)
+    _install_resource_health_probes(kanban_db, admission_module)
+    _install_dispatch_overlay(kanban_db, admission_module)
+    _install_cli_dispatch_overlay()
 
     for attr in ("claim_task", "claim_review_task"):
         original = getattr(kanban_db, attr, None)
@@ -435,17 +913,28 @@ def install_core_claim_admission(kanban_db: Any, admission_module: Any) -> None:
             continue
 
         def make_guarded(original_fn: Any, function_name: str):
+            lane = "review" if function_name == "claim_review_task" else "ready"
+
             def guarded(conn: sqlite3.Connection, task_id: str, *args: Any, **kwargs: Any):
+                task_key = str(task_id)
                 try:
                     cfg = _load_kanban_cfg()
-                    assignee = _row_assignee(conn, str(task_id), cfg)
+                    assignee = _row_assignee(conn, task_key, cfg)
                     resource = admission_module.resource_for_assignee(cfg, assignee)
                 except Exception as exc:
                     logger.warning(
                         "resource admission: refusing %s(%s): %s",
                         function_name,
-                        task_id,
+                        task_key,
                         exc,
+                    )
+                    _record_resource_diagnostics(
+                        admission_module,
+                        [{
+                            "task_id": task_key,
+                            "lane": lane,
+                            "reason": "resource_config_invalid",
+                        }],
                     )
                     return None
 
@@ -458,23 +947,115 @@ def install_core_claim_admission(kanban_db: Any, admission_module: Any) -> None:
                         kanban_db, board, resource.name
                     ) as held:
                         if not held:
+                            _record_resource_diagnostics(
+                                admission_module,
+                                [{
+                                    "task_id": task_key,
+                                    "lane": lane,
+                                    "reason": "resource_locked",
+                                    "resource_group": resource.name,
+                                    "resource_capacity": int(resource.capacity),
+                                }],
+                                board=board,
+                            )
                             return None
+
+                        # A task may have been requeued after its prior run
+                        # reached a terminal state while the detached worker
+                        # was still alive.  Reap only a verified same-task
+                        # worker; active or unverifiable PIDs remain a hard
+                        # stop and can never be bypassed.
+                        reap = {"ok": True, "reaped": False}
+                        quiesce = getattr(
+                            admission_module, "_quiesce_superseded_worker", None
+                        )
+                        if callable(quiesce):
+                            reap = cast(dict[str, Any], quiesce(
+                                conn,
+                                task_key,
+                                grace_seconds=resource.stale_worker_grace_seconds,
+                            ))
+                        if not reap.get("ok"):
+                            _record_resource_diagnostics(
+                                admission_module,
+                                [{
+                                    "task_id": task_key,
+                                    "lane": lane,
+                                    "reason": str(
+                                        reap.get("reason")
+                                        or "resource_admission_failed"
+                                    ),
+                                    "resource_group": resource.name,
+                                    "resource_capacity": int(resource.capacity),
+                                }],
+                                board=board,
+                            )
+                            return None
+                        if reap.get("reaped"):
+                            _record_resource_diagnostics(
+                                admission_module,
+                                [{
+                                    "task_id": task_key,
+                                    "lane": lane,
+                                    "reason": "superseded_worker_reaped",
+                                    "resource_group": resource.name,
+                                    "resource_capacity": int(resource.capacity),
+                                }],
+                                board=board,
+                            )
+
                         active = admission_module._active_resource_workers(
                             kanban_db, board, resource
                         )
                         if len(active) >= int(resource.capacity):
+                            _record_resource_diagnostics(
+                                admission_module,
+                                [{
+                                    "task_id": task_key,
+                                    "lane": lane,
+                                    "reason": "resource_busy",
+                                    "resource_group": resource.name,
+                                    "resource_active": len(active),
+                                    "resource_capacity": int(resource.capacity),
+                                }],
+                                board=board,
+                            )
                             return None
                         # Keep the host resource lock through the CAS claim.
                         # Once this returns a task, status=running is itself an
                         # in-flight reservation visible to sibling-board scans.
-                        return original_fn(conn, task_id, *args, **kwargs)
+                        claimed = original_fn(conn, task_id, *args, **kwargs)
+                        if claimed is not None:
+                            _record_resource_diagnostics(
+                                admission_module,
+                                [{
+                                    "task_id": task_key,
+                                    "lane": lane,
+                                    "reason": "resource_admitted",
+                                    "resource_group": resource.name,
+                                    "resource_capacity": int(resource.capacity),
+                                }],
+                                board=board,
+                            )
+                        return claimed
                 except Exception as exc:
                     logger.warning(
                         "resource admission: refusing %s(%s) for %s: %s",
                         function_name,
-                        task_id,
+                        task_key,
                         resource.name,
                         exc,
+                    )
+                    _record_resource_diagnostics(
+                        admission_module,
+                        [{
+                            "task_id": task_key,
+                            "lane": lane,
+                            "reason": "resource_admission_failed",
+                            "resource_group": resource.name,
+                            "resource_capacity": int(resource.capacity),
+                        }],
+                        board=board,
                     )
                     return None
 
