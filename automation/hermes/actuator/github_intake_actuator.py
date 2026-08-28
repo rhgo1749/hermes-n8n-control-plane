@@ -220,6 +220,9 @@ def _run_intake() -> int:
             "/usr/local/bin:/usr/bin:/bin"
         ),
         "PYTHONDONTWRITEBYTECODE": "1",
+        # Resolve the GitHub credential once at the trusted actuator
+        # boundary; never place it in the command or URL.
+        "GITHUB_TOKEN": _github_token(),
         # Keep repository-scoped wake claims independent of the retired cron
         # auth plugin.
         "HERMES_INTAKE_SCOPE_TOKEN_FILE": str(TOKEN_FILE),
@@ -364,10 +367,10 @@ def _edge_sync_error_code(exc: RuntimeError) -> str:
 class Handler(BaseHTTPRequestHandler):
     server_version = "HermesGitHubIntakeActuator/1"
 
-    def log_message(self, fmt: str, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         print(
             f"[github-intake-actuator] "
-            f"{self.client_address[0]} {fmt % args}",
+            f"{self.client_address[0]} {format % args}",
             flush=True,
         )
 

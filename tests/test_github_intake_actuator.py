@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -29,7 +30,7 @@ spec = importlib.util.spec_from_file_location(
 )
 assert spec and spec.loader
 
-actuator = importlib.util.module_from_spec(spec)
+actuator: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = actuator
 spec.loader.exec_module(actuator)
 
@@ -107,11 +108,13 @@ def _configure_runtime(td: str):
         actuator.TOKEN_FILE,
         actuator.PYTHON_BIN,
         actuator.INTAKE_SCRIPT,
+        actuator._github_token,
     )
 
     actuator.TOKEN_FILE = token
     actuator.PYTHON_BIN = python_bin
     actuator.INTAKE_SCRIPT = intake
+    actuator._github_token = lambda: "github-token-for-test"
 
     return originals
 
@@ -121,7 +124,8 @@ def _restore_runtime(originals) -> None:
         actuator.TOKEN_FILE,
         actuator.PYTHON_BIN,
         actuator.INTAKE_SCRIPT,
-    ) = originals
+    ) = originals[:3]
+    actuator._github_token = originals[3]
 
 
 def test_health_reports_runtime_and_token_ready() -> None:
@@ -284,6 +288,7 @@ def test_authorized_request_uses_fixed_command_without_shell() -> None:
 
             assert env["HOME"] == "/home/hermes"
             assert env["HERMES_HOME"] == "/home/hermes/.hermes"
+            assert env["GITHUB_TOKEN"] == "github-token-for-test"
             assert (
                 env["HERMES_INTAKE_SCOPE_TOKEN_FILE"]
                 == str(actuator.TOKEN_FILE)

@@ -24,6 +24,7 @@ LISTEN_PORT = int(os.environ.get("GITHUB_ROUTER_LISTEN_PORT", "5681"))
 
 GITHUB_API = "https://api.github.com"
 GITHUB_OWNER = os.environ.get("GITHUB_ROUTER_OWNER", "rhgo1749").strip()
+GITHUB_OWNER_TYPE = os.environ.get("GITHUB_ROUTER_OWNER_TYPE", "personal").strip().casefold()
 GITHUB_TOPIC = os.environ.get("GITHUB_ROUTER_TOPIC", "hermes-agent").strip()
 PUBLIC_URL = os.environ.get("GITHUB_ROUTER_PUBLIC_URL", "").strip()
 LEASE_BASE_URL = os.environ.get(
@@ -73,10 +74,20 @@ INTAKE_TOKEN_FILE = Path(
     )
 )
 MAX_BODY_BYTES = 1024 * 1024
-SUPPORTED_EVENTS = {"issues", "issue_comment", "pull_request", "pull_request_review"}
+SUPPORTED_EVENTS = {
+    "installation",
+    "installation_repositories",
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "public",
+    "repository",
+}
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ACTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAX_SCOPE_REPOSITORIES = 100
 _N8N_EDGE_SYNC_PATH = "/webhook/hermes-github-edge-sync"
 _STATE_LOCK = threading.Lock()
 
@@ -182,14 +193,17 @@ def _prune_queue(raw_queue: object, now: int | None = None) -> list[dict[str, An
         mode = str(raw.get("mode") or "")
         if mode not in {"event", "full"}:
             continue
+        raw_repositories = raw.get("repositories", [])
+        if not isinstance(raw_repositories, list):
+            continue
         repositories = sorted(
             {
                 str(repository).strip()
-                for repository in raw.get("repositories", [])
+                for repository in raw_repositories
                 if _REPOSITORY_RE.match(str(repository).strip())
             },
             key=str.casefold,
-        )
+        )[:_MAX_SCOPE_REPOSITORIES]
         if mode == "event" and not repositories:
             continue
         queue.append(
@@ -204,16 +218,37 @@ def _prune_queue(raw_queue: object, now: int | None = None) -> list[dict[str, An
     return queue
 
 
-def _enqueue_scope(*, full: bool, repository: str | None = None) -> dict[str, Any]:
+def _enqueue_scope(
+    *,
+    full: bool,
+    repository: str | None = None,
+    repositories: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     now = int(time.time())
-    if repository is not None:
-        repository = repository.strip()
-        if not _REPOSITORY_RE.match(repository):
-            raise RouterError(f"invalid repository identity: {repository!r}")
+    if full:
+        scoped_repositories: list[str] = []
+    else:
+        raw_repositories = (
+            list(repositories)
+            if repositories is not None
+            else ([repository] if repository is not None else [])
+        )
+        scoped_repositories = []
+        seen: set[str] = set()
+        for raw_repository in raw_repositories:
+            candidate = str(raw_repository).strip()
+            if not _REPOSITORY_RE.match(candidate):
+                raise RouterError(f"invalid repository identity: {candidate!r}")
+            key = candidate.casefold()
+            if key not in seen:
+                scoped_repositories.append(candidate)
+                seen.add(key)
+        if not scoped_repositories or len(scoped_repositories) > _MAX_SCOPE_REPOSITORIES:
+            raise RouterError("invalid repository scope")
     item = {
         "id": str(uuid.uuid4()),
         "mode": "full" if full else "event",
-        "repositories": [] if full else [repository],
+        "repositories": scoped_repositories,
         "created_at": now,
         "expires_at": now + SCOPE_TTL_SECONDS,
     }
@@ -415,9 +450,10 @@ def _github_request(
                 return None
             return json.loads(raw)
     except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")[:1000]
+        # Never relay a provider response body: proxies can echo credentials
+        # or credential-bearing URLs in an error payload.
         raise RouterError(
-            f"GitHub API {method} {path} returned HTTP {exc.code}: {raw}"
+            f"GitHub API {method} {path} returned HTTP {exc.code}"
         ) from exc
     except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise RouterError(
@@ -531,7 +567,19 @@ def _reconcile_webhooks() -> dict[str, Any]:
     token = _read_secret(GITHUB_TOKEN_FILE, "GitHub token")
     secret = _read_secret(WEBHOOK_SECRET_FILE, "GitHub webhook secret")
     public_url = _validated_public_url()
-    repositories = registry.discover_repositories(token, GITHUB_OWNER, GITHUB_TOPIC)
+    if GITHUB_OWNER_TYPE == "personal":
+        repositories = registry.discover_repositories(
+            token,
+            GITHUB_OWNER,
+            GITHUB_TOPIC,
+        )
+    else:
+        repositories = registry.discover_repositories(
+            token,
+            GITHUB_OWNER,
+            GITHUB_TOPIC,
+            GITHUB_OWNER_TYPE,
+        )
     current = sorted(
         {
             str(repository.get("full_name") or "").strip()
@@ -759,12 +807,107 @@ def _managed_repository(repository: str) -> bool:
     }
 
 
+def _installation_account(payload: dict[str, Any]) -> tuple[str, str]:
+    installation = payload.get("installation")
+    if not isinstance(installation, dict):
+        return "", ""
+    account = installation.get("account")
+    if not isinstance(account, dict):
+        return "", ""
+    return (
+        str(account.get("login") or "").strip(),
+        str(account.get("type") or "").strip(),
+    )
+
+
+def _owner_scope_matches(payload: dict[str, Any], repositories: list[str]) -> bool:
+    configured_owner = GITHUB_OWNER.casefold()
+    if not configured_owner or GITHUB_OWNER_TYPE not in {"personal", "organization"}:
+        return False
+    for repository in repositories:
+        owner, _, _ = repository.partition("/")
+        if owner.casefold() != configured_owner:
+            return False
+    account_login, account_type = _installation_account(payload)
+    if account_login and account_login.casefold() != configured_owner:
+        return False
+    if account_type:
+        expected_type = "User" if GITHUB_OWNER_TYPE == "personal" else "Organization"
+        if account_type.casefold() != expected_type.casefold():
+            return False
+    return True
+
+
+def _has_app_installation_context(payload: dict[str, Any]) -> bool:
+    account_login, _ = _installation_account(payload)
+    return bool(account_login) and account_login.casefold() == GITHUB_OWNER.casefold()
+
+
+def _repository_from_event_item(item: object) -> str:
+    if not isinstance(item, dict):
+        raise RouterError("repository_missing")
+    repository = str(item.get("full_name") or "").strip()
+    if not _REPOSITORY_RE.fullmatch(repository):
+        raise RouterError("repository_missing")
+    return repository
+
+
+def _event_repositories(event: str, payload: dict[str, Any]) -> list[str]:
+    """Extract a bounded repository set from App and repository deliveries."""
+    if event == "installation":
+        raw_items = payload.get("repositories")
+        if raw_items is None:
+            return []
+    elif event == "installation_repositories":
+        if str(payload.get("action") or "").strip().casefold() == "removed":
+            return []
+        raw_items = payload.get("repositories_added")
+        if raw_items is None:
+            return []
+    else:
+        raw_items = [payload.get("repository")]
+    if not isinstance(raw_items, list):
+        raise RouterError("repository_missing")
+    if len(raw_items) > _MAX_SCOPE_REPOSITORIES:
+        raise RouterError("repository_scope_too_large")
+    repositories: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        repository = _repository_from_event_item(item)
+        key = repository.casefold()
+        if key not in seen:
+            repositories.append(repository)
+            seen.add(key)
+    return repositories
+
+
+def _ignored_event_response(
+    *,
+    reason: str,
+    event: str,
+    delivery_id: str,
+    repositories: list[str] | None = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "ok": True,
+        "ignored": True,
+        "reason": reason,
+        "event": event,
+        "delivery": delivery_id,
+    }
+    if repositories:
+        response["repositories"] = repositories
+        if len(repositories) == 1:
+            response["repository"] = repositories[0]
+    return response
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HermesGitHubRouter/2"
 
-    def log_message(self, fmt: str, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         print(
-            f"{self.address_string()} [{self.log_date_time_string()}] {fmt % args}",
+            f"{self.address_string()} [{self.log_date_time_string()}] {format % args}",
             flush=True,
         )
 
@@ -978,65 +1121,116 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "invalid_json"},
             )
             return
-        repository = str(
-            ((payload.get("repository") or {}).get("full_name")) or ""
-        ).strip()
-        if not _REPOSITORY_RE.match(repository):
+        if not isinstance(payload, dict):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": "repository_missing"},
+                {"ok": False, "error": "payload_invalid"},
             )
             return
         try:
-            if not _managed_repository(repository):
+            repositories = _event_repositories(event, payload)
+        except RouterError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": str(exc)},
+            )
+            return
+        if not _owner_scope_matches(payload, repositories):
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                _ignored_event_response(
+                    reason="owner_scope_mismatch",
+                    event=event,
+                    delivery_id=delivery_id,
+                    repositories=repositories,
+                ),
+            )
+            return
+        if not repositories:
+            reason = (
+                "installation_no_repository_candidates"
+                if event in {"installation", "installation_repositories"}
+                else "repository_missing"
+            )
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                _ignored_event_response(
+                    reason=reason,
+                    event=event,
+                    delivery_id=delivery_id,
+                ),
+            )
+            return
+        action = str(payload.get("action") or "").strip().casefold()
+        if event == "repository" and action != "archived":
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                _ignored_event_response(
+                    reason="unsupported_repository_action",
+                    event=event,
+                    delivery_id=delivery_id,
+                    repositories=repositories,
+                ),
+            )
+            return
+        unknown_repositories = [
+            repository
+            for repository in repositories
+            if not _managed_repository(repository)
+        ]
+        if unknown_repositories and not _has_app_installation_context(payload):
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                _ignored_event_response(
+                    reason="repository_not_managed",
+                    event=event,
+                    delivery_id=delivery_id,
+                    repositories=unknown_repositories,
+                ),
+            )
+            return
+        # Only already-managed repositories may use the low-latency PR edge
+        # sync.  An App delivery for an unknown repository must take the
+        # onboarding queue so checkout/contract/board gates run first.
+        if event == "pull_request" and len(repositories) == 1 and not unknown_repositories:
+            repository = repositories[0]
+            try:
+                normalized = _normalise_pull_request_event(
+                    payload,
+                    repository,
+                    delivery_id,
+                )
+            except RouterError as exc:
                 self._send_json(
-                    HTTPStatus.ACCEPTED,
-                    {
-                        "ok": True,
-                        "ignored": True,
-                        "reason": "repository_not_managed",
-                        "repository": repository,
-                        "delivery": delivery_id,
-                    },
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": str(exc)},
                 )
                 return
-            if event == "pull_request":
-                try:
-                    normalized = _normalise_pull_request_event(
-                        payload,
-                        repository,
-                        delivery_id,
-                    )
-                except RouterError as exc:
-                    self._send_json(
-                        HTTPStatus.BAD_REQUEST,
-                        {"ok": False, "error": str(exc)},
-                    )
-                    return
-                try:
-                    edge_sync = _n8n_edge_sync(normalized)
-                except RouterError as exc:
-                    # A failed n8n/actuator hop must remain retryable. The
-                    # delivery claim is released so GitHub can redeliver it.
-                    _release_delivery(delivery_id)
-                    self._send_json(
-                        HTTPStatus.BAD_GATEWAY,
-                        {"ok": False, "error": str(exc)},
-                    )
-                    return
+            try:
+                edge_sync = _n8n_edge_sync(normalized)
+            except RouterError as exc:
+                # A failed n8n/actuator hop must remain retryable. The
+                # delivery claim is released so GitHub can redeliver it.
+                _release_delivery(delivery_id)
                 self._send_json(
-                    HTTPStatus.ACCEPTED,
-                    {
-                        "ok": True,
-                        "edge_sync": True,
-                        "repository": repository,
-                        "event": event,
-                        "delivery": delivery_id,
-                        "upstream_status": edge_sync["status"],
-                    },
+                    HTTPStatus.BAD_GATEWAY,
+                    {"ok": False, "error": str(exc)},
                 )
                 return
-            scope = _enqueue_scope(full=False, repository=repository)
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {
+                    "ok": True,
+                    "edge_sync": True,
+                    "repository": repository,
+                    "event": event,
+                    "delivery": delivery_id,
+                    "upstream_status": edge_sync["status"],
+                },
+            )
+            return
+        try:
+            scope = _enqueue_scope(full=False, repositories=repositories)
             wake = _wake()
         except RouterError as exc:
             # A failed dispatch (lease-controller/GitHub error) must not
@@ -1053,19 +1247,26 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "queued": True,
-                "repository": repository,
+                "repository": repositories[0] if len(repositories) == 1 else None,
+                "repositories": repositories,
                 "event": event,
                 "delivery": delivery_id,
                 "scope": scope,
                 "wake": wake,
             },
         )
+        return
 
 
 def main() -> int:
-    if not GITHUB_OWNER or not GITHUB_TOPIC:
+    if (
+        not GITHUB_OWNER
+        or not GITHUB_TOPIC
+        or GITHUB_OWNER_TYPE not in {"personal", "organization"}
+    ):
         raise SystemExit(
-            "GITHUB_ROUTER_OWNER and GITHUB_ROUTER_TOPIC are required"
+            "GITHUB_ROUTER_OWNER/TOPIC are required and OWNER_TYPE must be "
+            "personal or organization"
         )
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(

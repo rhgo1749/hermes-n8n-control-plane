@@ -21,6 +21,39 @@ written. Event routing is repository-scoped through `github-router`; there is
 no five-minute polling workflow. A full-registry intake remains available only
 as an explicit operator `/fallback` action.
 
+## App-delivery onboarding
+
+The router accepts signed GitHub App deliveries for the configured owner and
+uses the existing durable FIFO scope queue as the handoff to intake. Supported
+discovery/revalidation events are `installation`,
+`installation_repositories`, `repository`, `public`, `issues`,
+`issue_comment`, `pull_request`, and `pull_request_review`. A first delivery
+may name a repository that is absent from the last registry snapshot; the
+router queues it instead of requiring a prior static allowlist. It performs no
+GitHub API lookup or checkout work in the webhook request. `X-GitHub-Delivery`
+deduplication, HMAC verification, owner/install admission, and a 100-repository
+batch limit remain at the router boundary.
+
+For each event-scoped repository, the intake performs fresh GitHub checks before
+touching the filesystem: exact owner identity, non-archived/non-disabled
+status, the opt-in `hermes-agent` topic, a valid default branch and branch SHA,
+and visibility of at least one current contract candidate. Failures are
+reported as bounded semantic reasons such as `owner_scope_mismatch`,
+`repository_archived`, `repository_not_opted_in`, `default_branch_invalid`, or
+`contract_visibility_invalid`; provider response bodies and credentials are
+never copied into diagnostics.
+
+When no canonical checkout exists, intake provisions
+`/ws/projects/<repo-name.casefold()>` (overridable only with an absolute
+`HERMES_REPOSITORY_CHECKOUT_ROOT` for an isolated deployment). It takes a
+per-repository lock for at most 10 seconds, clones with a fixed `shell=False`
+argument vector into a temporary sibling, validates only Git metadata and
+contract paths, and registers the result with an atomic no-replace rename.
+Existing directories are validated and reused; they are never reset, fetched,
+overwritten, or deleted. A later registry or board failure leaves a newly
+registered checkout in place and reports the partial onboarding state for the
+next idempotent intake.
+
 ## Derived fields and authority
 
 For every discovered repository the registry records:

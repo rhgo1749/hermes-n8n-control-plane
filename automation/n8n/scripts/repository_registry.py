@@ -123,20 +123,31 @@ def _github_json(
     except HTTPError as exc:
         if allow_not_found and exc.code == 404:
             return None
-        body = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise RegistryError(f"GitHub API HTTP {exc.code}: {body}") from exc
+        # Do not copy GitHub's response body into diagnostics: a proxy or
+        # upstream error can echo an Authorization header or credential URL.
+        raise RegistryError(f"GitHub API HTTP {exc.code}") from exc
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RegistryError(f"GitHub API request failed: {exc}") from exc
+        raise RegistryError(
+            f"GitHub API request failed: {type(exc).__name__}"
+        ) from exc
 
 
-def discover_repositories(token: str, owner: str, topic: str) -> list[dict[str, Any]]:
+def discover_repositories(
+    token: str,
+    owner: str,
+    topic: str,
+    owner_type: str = "personal",
+) -> list[dict[str, Any]]:
     """Return all accessible, non-archived owner repos carrying ``topic``."""
     owner = owner.strip()
     topic = topic.strip().lower()
+    owner_type = owner_type.strip().casefold()
     if not owner or not topic:
         raise RegistryError("owner and topic must be non-empty")
+    if owner_type not in {"personal", "organization"}:
+        raise RegistryError("owner_type must be personal or organization")
 
-    query = f"user:{owner} topic:{topic}"
+    query = f"{'org' if owner_type == 'organization' else 'user'}:{owner} topic:{topic}"
     found: list[dict[str, Any]] = []
     for page in range(1, MAX_PAGES + 1):
         payload = _github_json(
@@ -158,7 +169,13 @@ def discover_repositories(token: str, owner: str, topic: str) -> list[dict[str, 
     for repo in found:
         full_name = str(repo.get("full_name") or "").strip()
         repo_owner = str((repo.get("owner") or {}).get("login") or "").strip()
-        if not full_name or repo_owner.casefold() != owner.casefold():
+        full_name_owner, separator, _repo_name = full_name.partition("/")
+        if (
+            not full_name
+            or not separator
+            or full_name_owner.casefold() != owner.casefold()
+            or repo_owner.casefold() != owner.casefold()
+        ):
             continue
         if bool(repo.get("archived")):
             continue
@@ -225,6 +242,7 @@ def _git_origin(checkout: Path) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -557,9 +575,15 @@ def live_registry_snapshot(
     topic: str,
     checkout_root: Path,
     kanban_root: Path,
+    owner_type: str | None = None,
 ) -> dict[str, Any]:
     """Build the authoritative live registry snapshot without mutating state."""
-    repositories = discover_repositories(token, owner, topic)
+    if owner_type is None:
+        # Preserve the three-argument call shape used by existing integrations
+        # and tests; personal-owner mode is the historical default.
+        repositories = discover_repositories(token, owner, topic)
+    else:
+        repositories = discover_repositories(token, owner, topic, owner_type)
     board_evidence = _kanban_board_repository_evidence(kanban_root)
 
     return registry_snapshot(
@@ -585,6 +609,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner", default=os.environ.get("HERMES_GITHUB_OWNER", "rhgo1749"))
     parser.add_argument("--topic", default=os.environ.get("HERMES_GITHUB_TOPIC", DEFAULT_TOPIC))
+    parser.add_argument(
+        "--owner-type",
+        default=os.environ.get("HERMES_GITHUB_OWNER_TYPE", "personal"),
+        choices=("personal", "organization"),
+    )
     parser.add_argument("--checkout-root", type=Path, default=DEFAULT_CHECKOUT_ROOT)
     parser.add_argument("--kanban-root", type=Path, default=DEFAULT_KANBAN_BOARDS_ROOT)
     parser.add_argument("--fixture-json", type=Path)
@@ -616,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.topic,
                 args.checkout_root,
                 args.kanban_root,
+                args.owner_type,
             )
         text = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         if args.output:

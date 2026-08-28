@@ -9,27 +9,46 @@ PR completion/rework events use one private n8n Webhook hop and the existing
 edge reconciliation script.
 
 ```text
-GitHub repository webhook
+GitHub App webhook (or reconciled repository webhook)
   -> HTTPS ingress
   -> github-router :5681
        -> HMAC verification
        -> X-GitHub-Delivery replay dedupe
-       -> managed repository admission
-       -> pull_request event: private n8n Webhook :5678
+       -> owner/install admission and bounded repository extraction
+       -> pull_request event for a managed repository: private n8n Webhook :5678
             -> allowlisted filter/normalization
             -> fixed actuator :5682
                  -> kanban-github-sync.py --board <slug> --json
-       -> other intake event: durable FIFO wake-scope queue
+       -> new/unknown or other intake event: durable FIFO wake-scope queue
             -> lease-controller :5680
                  -> existing Hermes job default:bf431b2a6ba6 trigger
 ```
+
+The App webhook is the discovery boundary for repositories that are not yet in
+the read-only registry. `installation`, `installation_repositories`,
+`repository` (the documented `archived` action), `public`, `issues`, `issue_comment`, `pull_request`, and
+`pull_request_review` deliveries are accepted only for the configured owner
+scope. An installation delivery may contain up to 100 repositories; duplicate
+names are folded case-insensitively before one FIFO scope is queued. A valid
+owner installation delivery for an unknown repository is queued rather than
+rejected as `repository_not_managed`, allowing the intake worker to perform the
+fresh metadata/topic/contract checks and checkout provisioning asynchronously.
+Installation deliveries without repository candidates are an acknowledged
+no-op. Foreign owners, invalid repository identities, oversized batches, and
+missing repository objects fail closed without queueing.
+
+The router never installs or changes a GitHub App, webhook, token, or
+permission. The operator must configure the App's signed webhook and HTTPS
+ingress separately. `GITHUB_ROUTER_OWNER_TYPE` is explicitly `personal` or
+`organization`; organization mode is never inferred from the owner name.
 
 The Hermes job itself is preserved. Its stored job ID, name, script, schedule,
 and ownership are not migrated into n8n. Between event-driven invocations the
 job normally remains paused; an accepted lease temporarily triggers that same
 job and the latest lease alone may pause it again.
 
-Each non-PR intake event enqueues its repository scope before triggering Hermes.
+Each non-PR intake event, including a first App delivery for an unknown
+repository, enqueues its repository scope before triggering Hermes.
 Each intake invocation claims exactly one queued scope. Expired unclaimed
 scopes are pruned. A PR event is sent only as bounded normalized data to the
 private n8n Webhook; n8n never receives the external signature boundary or a

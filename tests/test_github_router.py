@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "automation" / "n8n" / "github-router" / "router.py"
 spec = importlib.util.spec_from_file_location("github_router", MODULE_PATH)
 assert spec and spec.loader
-router = importlib.util.module_from_spec(spec)
+router: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = router
 spec.loader.exec_module(router)
 
@@ -1110,4 +1111,176 @@ def test_unknown_get_path_is_not_found() -> None:
             assert status == 404
             assert payload["error"] == "not_found"
         finally:
+            _restore(original)
+
+
+def test_app_event_discovers_unknown_repository_and_wakes_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "action": "opened",
+                    "installation": {
+                        "account": {"login": "rhgo1749", "type": "User"}
+                    },
+                    "repository": {"full_name": "rhgo1749/new-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(body, event="issues", delivery="app-1"),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["repositories"] == ["rhgo1749/new-agent"]
+            assert wakes == [True]
+            state = router._load_state_unlocked()
+            assert state["scope_queue"][0]["repositories"] == ["rhgo1749/new-agent"]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_queues_unknown_pull_request_without_edge_sync() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        original_edge = router._n8n_edge_sync
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            router._n8n_edge_sync = lambda event: (_ for _ in ()).throw(
+                AssertionError("unknown repository must not edge-sync")
+            )
+            body = json.dumps(
+                {
+                    "action": "closed",
+                    "installation": {
+                        "account": {"login": "rhgo1749", "type": "User"}
+                    },
+                    "repository": {"full_name": "rhgo1749/new-agent"},
+                    "pull_request": {"merged": False},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="app-pr-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert wakes == [True]
+        finally:
+            router._wake = original_wake
+            router._n8n_edge_sync = original_edge
+            _restore(original)
+
+
+def test_installation_repository_batch_is_deduplicated_and_queued() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "action": "created",
+                    "installation": {
+                        "account": {"login": "rhgo1749", "type": "User"}
+                    },
+                    "repositories": [
+                        {"full_name": "rhgo1749/one"},
+                        {"full_name": "rhgo1749/two"},
+                        {"full_name": "rhgo1749/ONE"},
+                    ],
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(
+                        body,
+                        event="installation",
+                        delivery="install-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["repositories"] == [
+                "rhgo1749/one",
+                "rhgo1749/two",
+            ]
+            assert wakes == [True]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_foreign_app_installation_is_rejected_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": {
+                        "account": {"login": "other-owner", "type": "User"}
+                    },
+                    "repository": {"full_name": "other-owner/private"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(body, event="issues", delivery="foreign-1"),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scopes", []) == []
+        finally:
+            router._wake = original_wake
             _restore(original)

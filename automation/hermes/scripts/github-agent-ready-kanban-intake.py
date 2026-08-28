@@ -15,15 +15,18 @@ clears; fixture mode never touches GitHub.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import fcntl
 import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -32,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
@@ -41,7 +44,19 @@ GITHUB_API = "https://api.github.com"
 GITHUB_LABEL = "agent-ready"
 LEAD_PROFILE = "kanban-main"
 HTTP_TIMEOUT_SECONDS = 30
+MAX_ONBOARDING_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ISSUE_PAGES = 10
+DEFAULT_CHECKOUT_ROOT = "/ws/projects"
+ONBOARDING_LOCK_TIMEOUT_SECONDS = 10.0
+ONBOARDING_CLONE_TIMEOUT_SECONDS = 240
+ONBOARDING_MAX_CLONE_ATTEMPTS = 2
+ONBOARDING_CONTRACT_CANDIDATES = (
+    "AGENTS.md",
+    "AGENTS_PROJECT.md",
+    "Docs/AGENTS.md",
+    ".agent/REQ_REQUEST_TEMPLATE.md",
+    ".agent/PR_REQUEST_TEMPLATE.md",
+)
 _BOOTSTRAP_REPOSITORY = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
@@ -49,6 +64,12 @@ _BOOTSTRAP_REPOSITORY = re.compile(
 _GITHUB_ISSUE_KEY = re.compile(
     r"^github:([^:]+/[^:]+):issue:\d+$", re.IGNORECASE
 )
+_ONBOARDING_REPOSITORY = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
+)
+_ONBOARDING_BRANCH = re.compile(r"^[^\x00-\x1f\x7f]{1,255}$")
+_ONBOARDING_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 _CLOSING_REFERENCE_CONTRACT = """## GitHub PR closing-reference contract (pre-handoff)
 
@@ -186,6 +207,26 @@ class WakeScope:
     expires_at: int
 
 
+@dataclass(frozen=True)
+class OnboardingRepository:
+    """Fresh, allowlisted GitHub metadata used by checkout provisioning."""
+
+    repository: str
+    repository_id: int
+    default_branch: str
+    default_branch_sha: str | None
+    contract_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CheckoutProvisioning:
+    """The durable checkout outcome returned to the intake result."""
+
+    repository: str
+    checkout: str
+    action: str
+
+
 def _claim_wake_scope() -> WakeScope | None:
     """Claim one durable router wake scope for this intake invocation.
 
@@ -299,10 +340,14 @@ def _registry_script_path() -> Path:
 def _load_registry_snapshot(token: str) -> dict[str, Any]:
     registry_script = _registry_script_path()
     owner = os.environ.get("HERMES_GITHUB_OWNER", "rhgo1749").strip()
+    owner_type = os.environ.get("HERMES_GITHUB_OWNER_TYPE", "personal").strip().casefold()
     topic = os.environ.get("HERMES_GITHUB_TOPIC", "hermes-agent").strip()
 
-    if not owner or not topic:
-        raise IntakeError("HERMES_GITHUB_OWNER and HERMES_GITHUB_TOPIC must be non-empty")
+    if not owner or not topic or owner_type not in {"personal", "organization"}:
+        raise IntakeError(
+            "HERMES_GITHUB_OWNER/TOPIC must be non-empty and OWNER_TYPE must be "
+            "personal or organization"
+        )
 
     env = os.environ.copy()
     env["HERMES_GITHUB_TOKEN"] = token
@@ -313,10 +358,12 @@ def _load_registry_snapshot(token: str) -> dict[str, Any]:
             str(registry_script),
             "--owner",
             owner,
+            "--owner-type",
+            owner_type,
             "--topic",
             topic,
             "--checkout-root",
-            "/ws/projects",
+            str(_checkout_root()),
             "--kanban-root",
             str(_kanban_boards_root()),
         ],
@@ -328,26 +375,22 @@ def _load_registry_snapshot(token: str) -> dict[str, Any]:
     )
 
     if completed.returncode != 0:
-        detail = (
-            completed.stderr.strip().splitlines()[-1]
-            if completed.stderr.strip()
-            else "unknown registry error"
-        )
-        raise IntakeError(f"repository registry failed: {detail[:500]}")
+        # The registry subprocess may include provider diagnostics; keep the
+        # intake boundary to a semantic code so credentials and host paths
+        # cannot cross into the response/log stream.
+        raise IntakeError("registry_unavailable")
 
     try:
         snapshot = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise IntakeError("repository registry returned invalid JSON") from exc
+        raise IntakeError("registry_unavailable") from exc
 
     if not isinstance(snapshot, dict):
-        raise IntakeError("repository registry returned an unexpected shape")
+        raise IntakeError("registry_unavailable")
     if snapshot.get("schema_version") != 2:
-        raise IntakeError(
-            f"unsupported repository registry schema: {snapshot.get('schema_version')!r}"
-        )
+        raise IntakeError("registry_unavailable")
     if not isinstance(snapshot.get("repositories"), list):
-        raise IntakeError("repository registry has no repositories list")
+        raise IntakeError("registry_unavailable")
 
     return snapshot
 
@@ -503,6 +546,24 @@ def _kanban_boards_root() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _hermes_home() / "kanban" / "boards"
+
+
+def _checkout_root() -> Path:
+    """Resolve the canonical checkout root shared with the registry.
+
+    Production defaults to ``/ws/projects``.  Tests and isolated operator
+    recovery may provide an absolute alternate root; relative paths are
+    rejected so repository names can never escape the intended root.
+    """
+    configured = (
+        os.environ.get("HERMES_REPOSITORY_CHECKOUT_ROOT")
+        or os.environ.get("HERMES_ONBOARDING_CHECKOUT_ROOT")
+        or DEFAULT_CHECKOUT_ROOT
+    ).strip()
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise IntakeError("repository checkout root must be an absolute path")
+    return path
 
 
 def _intake_migration_lease_path() -> Path:
@@ -728,6 +789,619 @@ def _normalise_remote(value: str) -> str:
     return value.rstrip("/").lower()
 
 
+def _onboarding_error(code: str) -> IntakeError:
+    """Create a safe, machine-readable onboarding error.
+
+    GitHub and Git diagnostics are intentionally not copied into this error:
+    they may contain a credential-bearing URL or a host-local path.  Callers
+    only need the bounded semantic code to decide whether to skip the scope or
+    retry it later.
+    """
+    return IntakeError(code)
+
+
+def _valid_onboarding_branch(value: object) -> bool:
+    if not isinstance(value, str) or not _ONBOARDING_BRANCH.fullmatch(value):
+        return False
+    return not (
+        value in {".", ".."}
+        or value.startswith(("-", ".", "/"))
+        or value.endswith((".", "/", ".lock"))
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or any(character in value for character in "~^:?*[\\")
+    )
+
+
+def _github_onboarding_json(
+    token: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    *,
+    allow_not_found: bool = False,
+) -> Any:
+    """GET one GitHub resource for onboarding without exposing the token."""
+    query = urlencode(params or {})
+    url = f"{GITHUB_API}{path}?{query}" if query else f"{GITHUB_API}{path}"
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-kanban-github-onboarding",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            raw = response.read(MAX_ONBOARDING_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_ONBOARDING_RESPONSE_BYTES:
+                raise _onboarding_error("repository_unavailable")
+            return json.loads(raw.decode("utf-8"))
+    except HTTPError as exc:
+        if allow_not_found and exc.code == 404:
+            return None
+        raise _onboarding_error("repository_unavailable") from exc
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise _onboarding_error("repository_unavailable") from exc
+
+
+def _onboarding_repository_metadata(
+    token: str,
+    repository: str,
+) -> OnboardingRepository:
+    """Revalidate owner, opt-in policy, branch, and contract visibility.
+
+    This lookup is deliberately separate from the read-only registry search:
+    a webhook can name a repository that was not present in the previous
+    inventory snapshot.  No filesystem operation happens until this complete
+    metadata gate succeeds.
+    """
+    requested = str(repository).strip()
+    if not _ONBOARDING_REPOSITORY.fullmatch(requested):
+        raise _onboarding_error("repository_unavailable")
+    configured_owner = os.environ.get("HERMES_GITHUB_OWNER", "rhgo1749").strip()
+    configured_owner_type = os.environ.get(
+        "HERMES_GITHUB_OWNER_TYPE",
+        "personal",
+    ).strip().casefold()
+    topic = os.environ.get("HERMES_GITHUB_TOPIC", "hermes-agent").strip()
+    if (
+        not configured_owner
+        or not topic
+        or configured_owner_type not in {"personal", "organization"}
+    ):
+        raise _onboarding_error("repository_unavailable")
+    requested_owner, _, requested_name = requested.partition("/")
+    api_path = (
+        f"/repos/{quote(requested_owner, safe='')}/"
+        f"{quote(requested_name, safe='')}"
+    )
+    payload = _github_onboarding_json(token, api_path)
+    if not isinstance(payload, dict):
+        raise _onboarding_error("repository_unavailable")
+
+    full_name = str(payload.get("full_name") or "").strip()
+    owner_payload = payload.get("owner")
+    owner_login = (
+        str(owner_payload.get("login") or "").strip()
+        if isinstance(owner_payload, dict)
+        else ""
+    )
+    owner_type = (
+        str(owner_payload.get("type") or "").strip().casefold()
+        if isinstance(owner_payload, dict)
+        else ""
+    )
+    expected_owner_type = "user" if configured_owner_type == "personal" else "organization"
+    if (
+        not _ONBOARDING_REPOSITORY.fullmatch(full_name)
+        or full_name.casefold() != requested.casefold()
+        or owner_login.casefold() != configured_owner.casefold()
+        or requested_owner.casefold() != configured_owner.casefold()
+        or owner_type != expected_owner_type
+    ):
+        raise _onboarding_error("owner_scope_mismatch")
+
+    repository_id = payload.get("id")
+    if isinstance(repository_id, bool) or not isinstance(repository_id, int) or repository_id <= 0:
+        raise _onboarding_error("repository_unavailable")
+    if payload.get("archived") is True:
+        raise _onboarding_error("repository_archived")
+    if payload.get("disabled") is True:
+        raise _onboarding_error("repository_unavailable")
+
+    default_branch = payload.get("default_branch")
+    if not _valid_onboarding_branch(default_branch):
+        raise _onboarding_error("default_branch_invalid")
+    assert isinstance(default_branch, str)
+
+    try:
+        topics_payload = _github_onboarding_json(
+            token,
+            f"{api_path}/topics",
+        )
+    except IntakeError as exc:
+        raise _onboarding_error("repository_unavailable") from exc
+    if not isinstance(topics_payload, dict) or not isinstance(
+        topics_payload.get("names"), list
+    ):
+        raise _onboarding_error("repository_unavailable")
+    topic_names = {
+        item.casefold()
+        for item in topics_payload["names"]
+        if isinstance(item, str)
+    }
+    if topic.casefold() not in topic_names:
+        raise _onboarding_error("repository_not_opted_in")
+
+    contract_paths: list[str] = []
+    for candidate in ONBOARDING_CONTRACT_CANDIDATES:
+        try:
+            contract_payload = _github_onboarding_json(
+                token,
+                f"{api_path}/contents/{quote(candidate, safe='/')}",
+                {"ref": default_branch},
+                allow_not_found=True,
+            )
+        except IntakeError as exc:
+            raise _onboarding_error("contract_visibility_invalid") from exc
+        if contract_payload is None:
+            continue
+        if not isinstance(contract_payload, dict) or contract_payload.get("type") != "file":
+            raise _onboarding_error("contract_visibility_invalid")
+        contract_paths.append(candidate)
+    if not contract_paths:
+        raise _onboarding_error("contract_visibility_invalid")
+
+    # The branch ref is the only fresh commit identity available before a
+    # clone.  Keeping it optional in the metadata object would allow a stale
+    # local branch to pass silently, so malformed/missing refs fail closed.
+    try:
+        ref_payload = _github_onboarding_json(
+            token,
+            f"{api_path}/git/ref/heads/{quote(default_branch, safe='')}",
+        )
+    except IntakeError as exc:
+        raise _onboarding_error("default_branch_invalid") from exc
+    branch_object = ref_payload.get("object") if isinstance(ref_payload, dict) else None
+    branch_sha = branch_object.get("sha") if isinstance(branch_object, dict) else None
+    if not isinstance(branch_sha, str) or not _ONBOARDING_SHA.fullmatch(branch_sha):
+        raise _onboarding_error("default_branch_invalid")
+
+    return OnboardingRepository(
+        repository=full_name,
+        repository_id=repository_id,
+        default_branch=default_branch,
+        default_branch_sha=branch_sha.lower(),
+        contract_paths=tuple(contract_paths),
+    )
+
+
+def _onboarding_lock_path(repository: str) -> Path:
+    owner, _, name = repository.partition("/")
+    return (
+        _hermes_home()
+        / "state"
+        / "repository-onboarding-locks"
+        / f"{owner.casefold()}--{name.casefold()}.lock"
+    )
+
+
+@contextmanager
+def _repository_onboarding_lock(repository: str) -> Iterator[None]:
+    """Serialize one repository's checkout provisioning for at most 10s."""
+    path = _onboarding_lock_path(repository)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+        os.fchmod(handle.fileno(), 0o600)
+    except OSError as exc:
+        raise _onboarding_error("repository_lock_unavailable") from exc
+    acquired = False
+    deadline = time.monotonic() + ONBOARDING_LOCK_TIMEOUT_SECONDS
+    try:
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise _onboarding_error("repository_lock_unavailable") from exc
+                time.sleep(0.05)
+        if not acquired:
+            raise _onboarding_error("repository_lock_busy")
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        handle.close()
+
+
+def _checkout_path_for_onboarding(repository: str, root: Path) -> Path:
+    if not _ONBOARDING_REPOSITORY.fullmatch(repository):
+        raise _onboarding_error("repository_unavailable")
+    if not root.is_absolute():
+        raise _onboarding_error("checkout_path_conflict")
+    current = root
+    while True:
+        if os.path.lexists(current) and current.is_symlink():
+            raise _onboarding_error("checkout_path_conflict")
+        if current.parent == current:
+            break
+        current = current.parent
+    if root.exists() and not root.is_dir():
+        raise _onboarding_error("checkout_path_conflict")
+    root_resolved = root.resolve(strict=False)
+    checkout = root_resolved / repository.rsplit("/", 1)[-1].casefold()
+    if checkout.parent != root_resolved:
+        raise _onboarding_error("checkout_path_conflict")
+    return checkout
+
+
+def _path_exists_including_broken_symlink(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _git_onboarding(checkout: Path, *args: str) -> tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(checkout), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env={
+                **os.environ,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_TRACE": "0",
+                "GIT_TRACE_CURL": "0",
+                "GIT_CURL_VERBOSE": "0",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", type(exc).__name__
+    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def _validate_onboarding_checkout(
+    metadata: OnboardingRepository,
+    checkout: Path,
+) -> None:
+    """Validate a checkout without fetching, resetting, or executing code."""
+    if checkout.is_symlink() or not checkout.is_dir():
+        raise _onboarding_error("checkout_path_conflict")
+    code, root, _ = _git_onboarding(checkout, "rev-parse", "--show-toplevel")
+    if code != 0 or Path(root).resolve() != checkout.resolve():
+        raise _onboarding_error("checkout_path_conflict")
+    code, remote, _ = _git_onboarding(checkout, "remote", "get-url", "origin")
+    expected_remote = _normalise_remote(
+        f"https://github.com/{metadata.repository}.git"
+    )
+    if code != 0 or _normalise_remote(remote) != expected_remote:
+        raise _onboarding_error("checkout_origin_mismatch")
+    code, branch, _ = _git_onboarding(
+        checkout,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+    )
+    if code != 0 or branch != metadata.default_branch:
+        raise _onboarding_error("checkout_default_branch_invalid")
+    remote_ref = f"origin/{metadata.default_branch}"
+    code, branch_sha, _ = _git_onboarding(
+        checkout,
+        "rev-parse",
+        "--verify",
+        remote_ref,
+    )
+    if code != 0 or not _ONBOARDING_SHA.fullmatch(branch_sha):
+        raise _onboarding_error("checkout_default_branch_invalid")
+    if metadata.default_branch_sha and branch_sha.lower() != metadata.default_branch_sha:
+        raise _onboarding_error("checkout_default_branch_mismatch")
+    code, status, _ = _git_onboarding(
+        checkout,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    )
+    if code != 0:
+        raise _onboarding_error("checkout_path_conflict")
+    if status:
+        raise _onboarding_error("checkout_dirty")
+    for contract_path in metadata.contract_paths:
+        local_contract = checkout / contract_path
+        if (
+            local_contract.is_symlink()
+            or not local_contract.is_file()
+        ):
+            raise _onboarding_error("contract_visibility_invalid")
+        code, _, _ = _git_onboarding(
+            checkout,
+            "cat-file",
+            "-e",
+            f"{remote_ref}:{contract_path}",
+        )
+        if code != 0:
+            raise _onboarding_error("contract_visibility_invalid")
+
+
+def _onboarding_askpass_file(root: Path) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=".repository-onboarding-askpass-",
+        dir=str(root),
+        delete=False,
+    ) as handle:
+        handle.write(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*) printf '%s\\n' \"${GIT_ONBOARDING_USERNAME:-x-access-token}\" ;;\n"
+            "  *) printf '%s\\n' \"${GIT_ONBOARDING_TOKEN:-}\" ;;\n"
+            "esac\n"
+        )
+    path = Path(handle.name)
+    path.chmod(0o700)
+    return path
+
+
+def _safe_remove_onboarding_temp(path: Path, root: Path) -> None:
+    """Remove only an agent-owned temporary sibling, never a winner."""
+    try:
+        if path.parent.resolve() != root.resolve():
+            return
+        if not path.name.startswith(".repository-onboarding-"):
+            return
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically register a directory without replacing a pre-existing path."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError) as exc:
+        raise _onboarding_error("atomic_registration_unavailable") from exc
+    result = renameat2(
+        ctypes.c_int(-100),
+        ctypes.c_char_p(os.fsencode(source)),
+        ctypes.c_int(-100),
+        ctypes.c_char_p(os.fsencode(destination)),
+        ctypes.c_uint(1),  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(str(destination))
+        raise _onboarding_error("atomic_registration_failed")
+
+
+def _clone_onboarding_checkout(
+    token: str,
+    metadata: OnboardingRepository,
+    root: Path,
+    destination: Path,
+) -> None:
+    """Clone into an isolated sibling and atomically install it."""
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise _onboarding_error("checkout_path_conflict")
+    except OSError as exc:
+        raise _onboarding_error("checkout_path_conflict") from exc
+
+    expected_remote = f"https://github.com/{metadata.repository}.git"
+    last_transient = False
+    for attempt in range(ONBOARDING_MAX_CLONE_ATTEMPTS):
+        temp_checkout = Path(
+            tempfile.mkdtemp(prefix=".repository-onboarding-", dir=str(root))
+        )
+        askpass: Path | None = None
+        try:
+            askpass = _onboarding_askpass_file(root)
+            env = {
+                **os.environ,
+                "GIT_ASKPASS": str(askpass),
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ONBOARDING_TOKEN": token,
+                "GIT_ONBOARDING_USERNAME": "x-access-token",
+                "GIT_TRACE": "0",
+                "GIT_TRACE_CURL": "0",
+                "GIT_CURL_VERBOSE": "0",
+            }
+            try:
+                completed = subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--no-checkout",
+                        "--branch",
+                        metadata.default_branch,
+                        expected_remote,
+                        str(temp_checkout),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=ONBOARDING_CLONE_TIMEOUT_SECONDS,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                completed = None
+            if completed is None or completed.returncode != 0:
+                detail = (
+                    "timeout"
+                    if completed is None
+                    else f"{completed.returncode}:{completed.stderr[-500:]}"
+                ).casefold()
+                last_transient = completed is None or any(
+                    marker in detail
+                    for marker in (
+                        "timed out",
+                        "timeout",
+                        "could not resolve",
+                        "connection",
+                        "temporarily unavailable",
+                        "502",
+                        "503",
+                        "504",
+                    )
+                )
+                if last_transient and attempt + 1 < ONBOARDING_MAX_CLONE_ATTEMPTS:
+                    continue
+                raise _onboarding_error("clone_failed")
+            checkout_result = _git_onboarding(
+                temp_checkout,
+                "checkout",
+                metadata.default_branch,
+            )
+            if checkout_result[0] != 0:
+                raise _onboarding_error("clone_failed")
+            _validate_onboarding_checkout(metadata, temp_checkout)
+            try:
+                _rename_noreplace(temp_checkout, destination)
+            except FileExistsError:
+                if _path_exists_including_broken_symlink(destination) and not destination.is_symlink():
+                    _validate_onboarding_checkout(metadata, destination)
+                    return
+                raise _onboarding_error("checkout_path_conflict")
+            _validate_onboarding_checkout(metadata, destination)
+            return
+        finally:
+            try:
+                if askpass is not None:
+                    askpass.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # A successfully renamed temp no longer exists.  On every error,
+            # clean only the sibling created by this invocation.
+            _safe_remove_onboarding_temp(temp_checkout, root)
+    if last_transient:
+        raise _onboarding_error("clone_failed")
+
+
+def _ensure_checkout(
+    token: str,
+    repository: str,
+    *,
+    dry_run: bool = False,
+) -> CheckoutProvisioning:
+    """Provision or safely reuse one repository's canonical checkout."""
+    root = _checkout_root()
+    destination = _checkout_path_for_onboarding(repository, root)
+    with _repository_onboarding_lock(repository):
+        metadata = _onboarding_repository_metadata(token, repository)
+        if _path_exists_including_broken_symlink(destination):
+            _validate_onboarding_checkout(metadata, destination)
+            return CheckoutProvisioning(metadata.repository, str(destination), "reused")
+        if dry_run:
+            return CheckoutProvisioning(
+                metadata.repository,
+                str(destination),
+                "would_register",
+            )
+        _clone_onboarding_checkout(token, metadata, root, destination)
+        return CheckoutProvisioning(metadata.repository, str(destination), "registered")
+
+
+# Kept as a public alias for operator probes and focused regression tests.
+ensure_checkout = _ensure_checkout
+
+
+def _onboarding_error_code(error: BaseException) -> str:
+    value = str(error).split(":", 1)[0].strip()
+    return value if re.fullmatch(r"[a-z][a-z0-9_]{1,63}", value) else "onboarding_failed"
+
+
+def _provision_scoped_checkouts(
+    token: str,
+    repositories: Iterable[str],
+    snapshot: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+    """Provision missing event-scope checkouts before registry bootstrap.
+
+    A ready registry entry already proved its checkout, so it is left alone.
+    Unready or previously unknown entries are revalidated through GitHub and
+    then handled by the bounded, lock-protected provisioner above.  Event
+    failures become scoped diagnostics instead of allowing one foreign,
+    archived, or malformed repository to mutate another board in the same
+    tick.  Manual ``--repository`` callers turn those diagnostics into a
+    normal intake error in ``_run``.
+    """
+    entries = snapshot.get("repositories")
+    entry_by_repository = {
+        str(entry.get("repository") or "").casefold(): entry
+        for entry in entries
+        if isinstance(entry, dict)
+    } if isinstance(entries, list) else {}
+    results: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    reload_required = False
+    seen: set[str] = set()
+    for raw_repository in repositories:
+        repository = str(raw_repository).strip()
+        key = repository.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = entry_by_repository.get(key)
+        if (
+            entry is not None
+            and entry.get("ready") is True
+        ) or (
+            entry is not None
+            and isinstance(entry.get("bootstrap"), dict)
+        ):
+            # A ready registry entry already passed the checkout and contract
+            # gates.  Bootstrap intent is likewise emitted only for a
+            # registry-verified checkout.
+            continue
+        try:
+            outcome = _ensure_checkout(
+                token,
+                repository,
+                dry_run=dry_run,
+            )
+        except IntakeError as exc:
+            skipped.append(
+                {
+                    "repository": repository,
+                    "reason": _onboarding_error_code(exc),
+                }
+            )
+            continue
+        results.append(
+            {
+                "repository": outcome.repository,
+                "checkout": outcome.checkout,
+                "action": outcome.action,
+            }
+        )
+        if not dry_run:
+            reload_required = True
+    return results, skipped, reload_required
+
+
 def _repo_snapshot(config: RepositoryConfig) -> RepoSnapshot:
     checkout = Path(config.checkout)
     if not checkout.is_dir():
@@ -786,6 +1460,8 @@ def _run_hermes(
 ) -> Any:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(_hermes_home())
+    for secret_name in ("GITHUB_TOKEN", "GH_TOKEN", "HERMES_GITHUB_TOKEN"):
+        env.pop(secret_name, None)
     if extra_env:
         env.update(extra_env)
     completed = subprocess.run(
@@ -1520,8 +2196,11 @@ def _closing_merged_pr_numbers(token: str, repository: str, issue_number: int) -
         source = node.get("source")
         if not isinstance(source, dict):
             continue
+        raw_number = source.get("number")
+        if isinstance(raw_number, bool) or not isinstance(raw_number, (int, str)):
+            continue
         try:
-            pr_number = int(source.get("number"))
+            pr_number = int(raw_number)
         except (TypeError, ValueError):
             continue
         if source.get("merged") is not True:
@@ -1615,22 +2294,15 @@ def _sync_board(
                 check=False,
             )
     except subprocess.TimeoutExpired as exc:
-        raise IntakeError(
-            f"kanban-github-sync timed out for {config.board}: {exc}"
-        ) from exc
+        raise IntakeError("edge_sync_timeout") from exc
     if proc.returncode != 0:
-        raise IntakeError(
-            f"kanban-github-sync failed for {config.board}: "
-            f"{(proc.stderr or '').strip() or proc.stdout[-2000:]}"
-        )
+        raise IntakeError(f"edge_sync_failed_{proc.returncode}")
     try:
         payload = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError as exc:
-        raise IntakeError(
-            f"kanban-github-sync returned invalid JSON for {config.board}: {exc}"
-        ) from exc
+        raise IntakeError("edge_sync_invalid_json") from exc
     if not isinstance(payload, list):
-        raise IntakeError(f"kanban-github-sync returned an unexpected shape for {config.board}")
+        raise IntakeError("edge_sync_invalid_shape")
     return [item for item in payload if isinstance(item, dict)]
 
 
@@ -1641,6 +2313,7 @@ def _run(args: argparse.Namespace) -> int:
     wake_scope_mode = "fixture" if fixture_path else "legacy-full"
     wake_scope_repositories: tuple[str, ...] = ()
     scope_skipped: list[dict[str, str]] = []
+    checkout_provisioning: list[dict[str, str]] = []
     board_provisioning: list[dict[str, str]] = []
 
     if fixture_path:
@@ -1655,8 +2328,30 @@ def _run(args: argparse.Namespace) -> int:
         registry_snapshot = _load_registry_snapshot(token)
 
         if args.repository:
-            # Targeted operator scope: provision this repository's missing
-            # canonical board first so the manual onboarding path works.
+            # Targeted operator scope: a missing/unknown checkout is
+            # provisioned before the registry is consulted for board intent.
+            # This is the manual equivalent of an event-scoped wake.
+            (
+                checkout_result,
+                checkout_skipped,
+                checkout_reload,
+            ) = _provision_scoped_checkouts(
+                token,
+                (args.repository,),
+                registry_snapshot,
+                dry_run=bool(args.dry_run),
+            )
+            checkout_provisioning = checkout_result
+            if checkout_skipped:
+                reason = checkout_skipped[0]["reason"]
+                raise IntakeError(
+                    f"repository onboarding failed for {args.repository}: {reason}"
+                )
+            if checkout_reload and not args.dry_run:
+                registry_snapshot = _load_registry_snapshot(token)
+
+            # The registry remains read-only; the intake owns canonical board
+            # bootstrap after the checkout has been verified.
             board_provisioning = _provision_bootstrap_boards(
                 registry_snapshot,
                 dry_run=bool(args.dry_run),
@@ -1679,6 +2374,22 @@ def _run(args: argparse.Namespace) -> int:
             wake_scope_repositories = (args.repository,)
         else:
             wake_scope = _claim_wake_scope()
+            if wake_scope is not None and wake_scope.mode == "event":
+                (
+                    checkout_provisioning,
+                    checkout_skipped,
+                    checkout_reload,
+                ) = _provision_scoped_checkouts(
+                    token,
+                    wake_scope.repositories,
+                    registry_snapshot,
+                    dry_run=bool(args.dry_run),
+                )
+                scope_skipped.extend(checkout_skipped)
+                if checkout_reload and not args.dry_run:
+                    # Same-tick reload: the registry now sees a freshly
+                    # registered checkout and can declare board bootstrap.
+                    registry_snapshot = _load_registry_snapshot(token)
             # Board provisioning is scope-limited to the same repositories the
             # tick will process: the woken set in event mode, every
             # bootstrap-intent entry in a full fallback sweep.
@@ -1712,6 +2423,11 @@ def _run(args: argparse.Namespace) -> int:
                     for entry in registry_snapshot.get("repositories", [])
                     if isinstance(entry, dict)
                 }
+                already_skipped = {
+                    item.get("repository", "").casefold()
+                    for item in scope_skipped
+                    if isinstance(item.get("repository"), str)
+                }
                 selected: list[RepositoryConfig] = []
                 seen: set[str] = set()
                 for repository in wake_scope.repositories:
@@ -1728,12 +2444,14 @@ def _run(args: argparse.Namespace) -> int:
                         if entry is not None
                         else "not_managed"
                     )
-                    scope_skipped.append(
-                        {
-                            "repository": repository,
-                            "reason": reason,
-                        }
-                    )
+                    if key not in already_skipped:
+                        scope_skipped.append(
+                            {
+                                "repository": repository,
+                                "reason": reason,
+                            }
+                        )
+                        already_skipped.add(key)
                 selected_configs = tuple(
                     sorted(
                         selected,
@@ -1780,6 +2498,8 @@ def _run(args: argparse.Namespace) -> int:
         if args.dry_run:
             results.append({"key": key, "board": config.board, "title": issue.get("title", "")})
             continue
+        if token is None:
+            raise IntakeError("GitHub token is required for non-dry-run intake")
         # Completed-work guard: an OPEN agent-ready Issue that a merged PR
         # actually CLOSES (GitHub's own closing relationship — Closes/Fixes/
         # Resolves) has no remaining automated work. A bare cross-reference
@@ -1881,6 +2601,7 @@ def _run(args: argparse.Namespace) -> int:
             config.name: config.display_name for config in selected_configs
         },
         "registry_unready": registry_unready,
+        "checkout_provisioning": checkout_provisioning,
         "board_provisioning": board_provisioning,
         "wake_scope": {
             "mode": wake_scope_mode,

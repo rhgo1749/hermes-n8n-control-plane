@@ -7,13 +7,14 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "automation" / "n8n" / "scripts" / "repository_registry.py"
 
 spec = importlib.util.spec_from_file_location("repository_registry", MODULE_PATH)
 assert spec and spec.loader
-registry = importlib.util.module_from_spec(spec)
+registry: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = registry
 spec.loader.exec_module(registry)
 
@@ -59,6 +60,37 @@ def test_remote_normalization() -> None:
         "git://github.com/rhgo1749/ctrl-hangul.git",
     ):
         assert registry._normalise_remote(value) == expected
+
+
+def test_discovery_uses_explicit_organization_scope_and_full_name_filter() -> None:
+    calls = []
+    original = registry._github_json
+
+    def fake_github_json(token, path, params=None, *, allow_not_found=False):
+        calls.append((token, path, params, allow_not_found))
+        return {
+            "items": [
+                _repo("acme/valid", repo_id=11),
+                {
+                    **_repo("acme/valid", repo_id=12),
+                    "full_name": "other-owner/forged",
+                },
+            ]
+        }
+
+    registry._github_json = fake_github_json
+    try:
+        result = registry.discover_repositories(
+            "unit-token",
+            "acme",
+            "hermes-agent",
+            "organization",
+        )
+    finally:
+        registry._github_json = original
+
+    assert [item["full_name"] for item in result] == ["acme/valid"]
+    assert calls[0][2]["q"] == "org:acme topic:hermes-agent"
 
 
 def test_verified_checkout_and_resolved_board_is_ready() -> None:
