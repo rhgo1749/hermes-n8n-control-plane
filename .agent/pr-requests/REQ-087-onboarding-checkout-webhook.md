@@ -71,6 +71,6 @@ Live acceptance must prove an active personal-owner GitHub App webhook, protecte
 - Base SHA: `dd7f6ad6c6fe39108d87a821c635046ab1fb88e1`
 - Branch: `issue87/onboarding-checkout-webhook`
 - Commits: implementation commit (final SHA recorded in delivery handoff)
-- PR number/title/URL: to be recorded after remote delivery
-- Working tree: clean implementation commit; remote delivery pending
+- PR number/title/URL: PR #88 — `Issue #87: 신규 hermes-agent 저장소 webhook 온보딩` — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/88
+- Working tree: clean; PR #88 open and verified by REST/GraphQL read-back
 - Merge performed: NO
