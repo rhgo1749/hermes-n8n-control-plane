@@ -476,13 +476,18 @@ def _classify_pending_resources(
     conn: sqlite3.Connection,
     cfg: Mapping[str, Any],
     statuses: tuple[str, ...],
+    *,
+    virtual_reservations: Optional[dict[str, int]] = None,
 ) -> Optional[tuple[bool, list[dict[str, Any]]]]:
     """Classify pending rows without claiming them.
 
     ``None`` means the configured overlay has no applicable resource (or the
     profile probe is unavailable), so callers must preserve the core's legacy
-    result.  Otherwise the first item says whether any eligible row is safely
-    spawnable and the second contains bounded deferral diagnostics.
+    result.  Otherwise the first item says whether health should keep treating
+    the queue as pending and the second contains bounded deferral diagnostics.
+    When ``virtual_reservations`` is provided, each available candidate
+    consumes one same-tick virtual slot so dry-run classification mirrors the
+    claim-to-spawn reservation window without mutating the database.
     """
     raw = cfg.get(getattr(admission_module, "RESOURCE_CONFIG_KEY", "worker_resources"))
     if raw in (None, {}):
@@ -496,6 +501,7 @@ def _classify_pending_resources(
     diagnostics: list[dict[str, Any]] = []
     matched_resource = False
     spawnable = False
+    health_failure = False
 
     for row in rows:
         assignee = str(row["assignee"] or "").strip()
@@ -513,6 +519,7 @@ def _classify_pending_resources(
             resource = admission_module.resource_for_assignee(cfg, assignee)
         except Exception as exc:
             matched_resource = True
+            health_failure = True
             diagnostics.append({
                 "task_id": str(row["id"]),
                 "lane": lane,
@@ -525,24 +532,33 @@ def _classify_pending_resources(
             continue
 
         matched_resource = True
-        active = active_by_resource.get(resource.name)
-        if active is None:
-            try:
-                active = admission_module._active_resource_workers(
-                    kanban_db, board, resource
-                )
-            except Exception as exc:
-                diagnostics.append({
-                    "task_id": str(row["id"]),
-                    "lane": lane,
-                    "reason": "resource_admission_failed",
-                    "resource_group": resource.name,
-                    "resource_capacity": int(resource.capacity),
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                continue
-            active_by_resource[resource.name] = active
-        active_count = len(active)
+        if (
+            virtual_reservations is not None
+            and resource.name in virtual_reservations
+        ):
+            active_count = int(virtual_reservations[resource.name])
+        else:
+            active = active_by_resource.get(resource.name)
+            if active is None:
+                try:
+                    active = admission_module._active_resource_workers(
+                        kanban_db, board, resource
+                    )
+                except Exception as exc:
+                    health_failure = True
+                    diagnostics.append({
+                        "task_id": str(row["id"]),
+                        "lane": lane,
+                        "reason": "resource_admission_failed",
+                        "resource_group": resource.name,
+                        "resource_capacity": int(resource.capacity),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    continue
+                active_by_resource[resource.name] = active
+            active_count = len(active)
+            if virtual_reservations is not None:
+                virtual_reservations[resource.name] = active_count
         if active_count >= int(resource.capacity):
             diagnostics.append({
                 "task_id": str(row["id"]),
@@ -554,10 +570,17 @@ def _classify_pending_resources(
             })
         else:
             spawnable = True
+            if virtual_reservations is not None:
+                virtual_reservations[resource.name] = active_count + 1
 
     if not matched_resource:
         return None
-    return spawnable, diagnostics[:_diagnostic_limit(admission_module)]
+    # A resource failure must remain visible to the existing dispatcher health
+    # signal.  Only an all-capacity-wait queue may intentionally report false.
+    return (
+        spawnable or health_failure,
+        diagnostics[:_diagnostic_limit(admission_module)],
+    )
 
 
 def _record_resource_diagnostics(
@@ -590,14 +613,22 @@ def _dispatch_resource_diagnostics(
     admission_module: Any,
     conn: sqlite3.Connection,
     cfg: Mapping[str, Any],
+    *,
+    dry_run: bool = False,
 ) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
+    virtual_reservations = {} if dry_run else None
     statuses_to_check = [("ready",)]
     if bool(cfg.get("review_dispatch", True)):
         statuses_to_check.append(("review",))
     for statuses in statuses_to_check:
         classified = _classify_pending_resources(
-            kanban_db, admission_module, conn, cfg, statuses
+            kanban_db,
+            admission_module,
+            conn,
+            cfg,
+            statuses,
+            virtual_reservations=virtual_reservations,
         )
         if classified is not None:
             diagnostics.extend(classified[1])
@@ -624,10 +655,16 @@ def _safe_dispatch_resource_diagnostics(
     admission_module: Any,
     conn: sqlite3.Connection,
     cfg: Mapping[str, Any],
+    *,
+    dry_run: bool = False,
 ) -> list[dict[str, Any]]:
     try:
         return _dispatch_resource_diagnostics(
-            kanban_db, admission_module, conn, cfg
+            kanban_db,
+            admission_module,
+            conn,
+            cfg,
+            dry_run=dry_run,
         )
     except Exception as exc:
         return [{
@@ -638,12 +675,50 @@ def _safe_dispatch_resource_diagnostics(
         }]
 
 
+def _spawned_task_ids(result: Any) -> set[str]:
+    spawned = getattr(result, "spawned", None)
+    if not isinstance(spawned, (list, tuple)):
+        return set()
+    task_ids: set[str] = set()
+    for item in spawned:
+        if isinstance(item, (tuple, list)) and item:
+            task_id = item[0]
+        elif isinstance(item, Mapping):
+            task_id = item.get("task_id")
+        else:
+            task_id = None
+        if task_id is not None:
+            task_ids.add(str(task_id))
+    return task_ids
+
+
+def _normalize_dispatch_diagnostics(
+    result: Any,
+    diagnostics: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop stale busy evidence when that task spawned in this same tick."""
+    spawned_ids = _spawned_task_ids(result)
+    if not spawned_ids:
+        return diagnostics
+    return [
+        item
+        for item in diagnostics
+        if not (
+            item.get("reason") == "resource_busy"
+            and item.get("task_id") is not None
+            and str(item.get("task_id")) in spawned_ids
+        )
+    ]
+
+
 def _attach_dispatch_diagnostics(
     result: Any,
     diagnostics: list[dict[str, Any]],
     *,
     dry_run: bool,
 ) -> None:
+    if not dry_run:
+        diagnostics = _normalize_dispatch_diagnostics(result, diagnostics)
     busy = [item for item in diagnostics if item.get("reason") == "resource_busy"]
     deferred_ids = {
         str(item.get("task_id"))
@@ -698,8 +773,25 @@ def _install_resource_health_probes(
             def guarded(conn: sqlite3.Connection) -> bool:
                 try:
                     cfg = _load_kanban_cfg()
-                except Exception:
-                    cfg = {}
+                except Exception as exc:
+                    _record_resource_diagnostics(
+                        admission_module,
+                        [{
+                            "task_id": None,
+                            "lane": lane,
+                            "reason": "resource_admission_failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }],
+                    )
+                    logger.warning(
+                        "resource admission health %s config load failed: %s",
+                        lane,
+                        exc,
+                    )
+                    # Let the existing core health surface see pending work;
+                    # an unknown resource state must not look like a healthy
+                    # capacity wait.
+                    return bool(original_fn(conn))
                 if not isinstance(cfg, Mapping):
                     cfg = {}
                 raw = cfg.get(
@@ -712,9 +804,9 @@ def _install_resource_health_probes(
                         kanban_db, admission_module, conn, cfg, (lane,)
                     )
                 except Exception as exc:
-                    # An explicitly configured resource must fail closed: the
-                    # claim wrapper will refuse admission until it can inspect
-                    # capacity safely, so health must not call that state stuck.
+                    # An explicitly configured resource failure is not a
+                    # legitimate capacity wait. Keep pending work visible to
+                    # the existing stuck/failure health surface.
                     board = None
                     try:
                         board = _board_for_connection(kanban_db, conn)
@@ -730,7 +822,12 @@ def _install_resource_health_probes(
                         }],
                         board=board,
                     )
-                    return False
+                    logger.warning(
+                        "resource admission health %s classification failed: %s",
+                        lane,
+                        exc,
+                    )
+                    return True
                 if classified is None:
                     return bool(original_fn(conn))
                 spawnable, diagnostics = classified
@@ -772,7 +869,11 @@ def _install_dispatch_overlay(kanban_db: Any, admission_module: Any) -> None:
         if not isinstance(cfg, Mapping):
             cfg = {}
         diagnostics = _safe_dispatch_resource_diagnostics(
-            kanban_db, admission_module, conn, cfg
+            kanban_db,
+            admission_module,
+            conn,
+            cfg,
+            dry_run=dry_run,
         )
         _last_resource_diagnostics = []
         result = original(conn, *args, **kwargs)
@@ -782,7 +883,11 @@ def _install_dispatch_overlay(kanban_db: Any, admission_module: Any) -> None:
         if not dry_run:
             diagnostics.extend(
                 _safe_dispatch_resource_diagnostics(
-                    kanban_db, admission_module, conn, cfg
+                    kanban_db,
+                    admission_module,
+                    conn,
+                    cfg,
+                    dry_run=False,
                 )
             )
         unique: list[dict[str, Any]] = []
@@ -799,6 +904,8 @@ def _install_dispatch_overlay(kanban_db: Any, admission_module: Any) -> None:
             seen.add(key)
             unique.append(item)
         unique = unique[:_diagnostic_limit(admission_module)]
+        if not dry_run:
+            unique = _normalize_dispatch_diagnostics(result, unique)
         board = None
         try:
             board = _board_for_connection(kanban_db, conn)

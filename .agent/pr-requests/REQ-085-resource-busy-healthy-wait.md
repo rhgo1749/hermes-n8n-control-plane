@@ -1,6 +1,6 @@
 # REQ-085: resource-busy READY 대기와 worker reclaim health 통합
 
-- Status: Implementation complete; review handoff pending
+- Status: Rework round 1 implementation complete; review handoff pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
@@ -10,6 +10,7 @@
 - Source issue: `rhgo1749/hermes-n8n-control-plane#85`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/85
 - Kanban implementation task: `t_9378b599`
+- Kanban rework task: `t_89a3c0a8`
 - Intake root provenance: `t_7494ffd8`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:85`
 - Planning/lead owner: `kanban-main`
@@ -47,7 +48,9 @@ REVIEW claims, safely release/reclaim dead or terminal workers, and make
 3. Regression coverage for capacity-1 READY/REVIEW waits, health
    classification, release/reclaim, dry-run filtering, mixed queues, bounded
    diagnostics, and terminal/active/PID-reuse safety.
-4. Canonical `docs/EDGE_WORKER_RESOURCE_ADMISSION.md` update.
+4. Dry-run virtual reservations, health-visible configuration/inspection
+   failures, and same-tick stale `resource_busy` normalization.
+5. Canonical `docs/EDGE_WORKER_RESOURCE_ADMISSION.md` update.
 
 ## Explicit non-goals
 
@@ -67,7 +70,12 @@ REVIEW claims, safely release/reclaim dead or terminal workers, and make
 - Dead holder releases capacity; subsequent claims become RUNNING: focused
   health test.
 - Dry-run remains read-only, omits busy candidates from `spawned`, and exposes
-  `resource_busy`: focused health + CLI formatter tests.
+  `resource_busy`; same-resource candidates consume virtual capacity in order:
+  focused health + CLI formatter tests.
+- Policy-resolution and active-worker inspection failures keep health
+  spawnable/visible and record explicit diagnostics: focused health test.
+- A pre-tick busy candidate that is spawned after same-task terminal-worker reap
+  appears only in spawn evidence: focused health test.
 - Terminal live, active live, and PID-reuse paths preserve no-duplicate safety:
   focused same-task safety test plus existing resource-admission suite.
 - Legacy/backend/cloud and reservation behavior remains unchanged: existing
@@ -76,7 +84,7 @@ REVIEW claims, safely release/reclaim dead or terminal workers, and make
 
 ## Validation record
 
-- `python3 edge/test-kanban-resource-busy-health.py` — PASS (26 checks)
+- `python3 edge/test-kanban-resource-busy-health.py` — PASS (35 checks)
 - `python3 edge/test-kanban-resource-admission.py` — PASS (18 checks)
 - `python3 edge/test-kanban-dynamic-resource.py` — PASS (10 checks)
 - `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py` —

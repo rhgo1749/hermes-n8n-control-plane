@@ -332,6 +332,201 @@ def test_dry_run_filters_busy_without_claim() -> None:
         conn_holder.close()
 
 
+def test_dry_run_consumes_virtual_reservations() -> None:
+    root = Path(tempfile.mkdtemp(prefix="resource-busy-dry-run-reservation-"))
+    kb = FakeKanban(root)
+    install_fake_claims(kb)
+    conn = make_db(kb.kanban_db_path(board="default"))
+    conn.executemany(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        [
+            ("t-first", "kanban-developer", "ready", None, None),
+            ("t-second", "kanban-developer", "ready", None, None),
+        ],
+    )
+    conn.commit()
+
+    def dispatch_once(conn, **kwargs):
+        del conn, kwargs
+        return types.SimpleNamespace(
+            spawned=[
+                ("t-first", "kanban-developer", ""),
+                ("t-second", "kanban-developer", ""),
+            ],
+        )
+
+    kb.dispatch_once = dispatch_once
+    old_seams = install_test_seams()
+    old_alive = admission._pid_alive
+    old_identity = admission._worker_identity
+    admission._pid_alive = lambda pid: False
+    admission._worker_identity = lambda pid, task_id: True
+    clear_outcomes()
+    try:
+        dynamic.install_core_claim_admission(kb, admission)
+        result = kb.dispatch_once(conn, dry_run=True)
+        busy_ids = {
+            item.get("task_id")
+            for item in getattr(result, "resource_busy", [])
+        }
+        check(
+            "dry-run reserves first same-resource candidate",
+            result.spawned == [("t-first", "kanban-developer", "")],
+            str(result),
+        )
+        check(
+            "dry-run marks later same-resource candidate busy",
+            busy_ids == {"t-second"},
+            str(getattr(result, "resource_busy", [])),
+        )
+        check(
+            "virtual reservation keeps both tasks READY",
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status='ready'"
+            ).fetchone()[0]
+            == 2,
+        )
+    finally:
+        admission._pid_alive = old_alive
+        admission._worker_identity = old_identity
+        clear_outcomes()
+        restore_test_seams(old_seams)
+        conn.close()
+
+
+def test_health_failure_stays_visible() -> None:
+    root = Path(tempfile.mkdtemp(prefix="resource-busy-health-failure-"))
+    kb = FakeKanban(root)
+    install_fake_claims(kb)
+    conn = make_db(kb.kanban_db_path(board="default"))
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        ("t-failure", "kanban-developer", "ready", None, None),
+    )
+    conn.commit()
+
+    old_seams = install_test_seams()
+    old_resource_for_assignee = admission.resource_for_assignee
+    old_active_workers = admission._active_resource_workers
+    old_alive = admission._pid_alive
+    old_identity = admission._worker_identity
+    admission._pid_alive = lambda pid: False
+    admission._worker_identity = lambda pid, task_id: True
+    clear_outcomes()
+    try:
+        dynamic.install_core_claim_admission(kb, admission)
+
+        def fail_policy_resolution(cfg, assignee):
+            del cfg, assignee
+            raise RuntimeError("injected policy-resolution failure")
+
+        admission.resource_for_assignee = fail_policy_resolution
+        check(
+            "policy failure remains visible to health",
+            kb.has_spawnable_ready(conn) is True,
+            str(admission.resource_admission_outcomes()),
+        )
+
+        admission.resource_for_assignee = old_resource_for_assignee
+
+        def fail_worker_inspection(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("injected active-worker inspection failure")
+
+        admission._active_resource_workers = fail_worker_inspection
+        check(
+            "active-worker inspection failure remains visible to health",
+            kb.has_spawnable_ready(conn) is True,
+            str(admission.resource_admission_outcomes()),
+        )
+        failures = admission.resource_admission_outcomes()
+        check(
+            "health failure diagnostics are explicit",
+            {item.get("reason") for item in failures}
+            >= {"resource_config_invalid", "resource_admission_failed"},
+            str(failures),
+        )
+    finally:
+        admission.resource_for_assignee = old_resource_for_assignee
+        admission._active_resource_workers = old_active_workers
+        admission._pid_alive = old_alive
+        admission._worker_identity = old_identity
+        clear_outcomes()
+        restore_test_seams(old_seams)
+        conn.close()
+
+
+def test_dispatch_normalizes_reaped_busy_spawn() -> None:
+    root = Path(tempfile.mkdtemp(prefix="resource-busy-reaped-spawn-"))
+    kb = FakeKanban(root)
+    install_fake_claims(kb)
+    conn = make_db(kb.kanban_db_path(board="default"))
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        ("t-requeued", "kanban-developer", "ready", None, None),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (1, "t-requeued", "kanban-developer", "done", "completed", 7301, 100),
+    )
+    conn.commit()
+
+    def dispatch_once(conn, **kwargs):
+        del kwargs
+        claimed = kb.claim_task(conn, "t-requeued")
+        return types.SimpleNamespace(
+            spawned=[("t-requeued", "kanban-developer", "")] if claimed else [],
+        )
+
+    kb.dispatch_once = dispatch_once
+    old_seams = install_test_seams()
+    old_alive = admission._pid_alive
+    old_identity = admission._worker_identity
+    old_terminate = admission._terminate_verified_worker
+    live = {7301}
+    killed: list[int] = []
+    admission._pid_alive = lambda pid: pid is not None and int(pid) in live
+    admission._worker_identity = lambda pid, task_id: True
+
+    def terminate(pid, grace):
+        del grace
+        killed.append(int(pid))
+        live.discard(int(pid))
+        return True
+
+    admission._terminate_verified_worker = terminate
+    clear_outcomes()
+    try:
+        dynamic.install_core_claim_admission(kb, admission)
+        result = kb.dispatch_once(conn, dry_run=False)
+        check(
+            "same-task terminal worker is reaped and spawned",
+            result.spawned == [("t-requeued", "kanban-developer", "")]
+            and killed == [7301],
+            str((result, killed)),
+        )
+        check(
+            "reaped spawn has no stale resource busy evidence",
+            getattr(result, "resource_busy", []) == [],
+            str(getattr(result, "resource_busy", [])),
+        )
+        check(
+            "reaped spawn excludes busy from diagnostics",
+            not any(
+                item.get("reason") == "resource_busy"
+                for item in getattr(result, "resource_admission", [])
+            ),
+            str(getattr(result, "resource_admission", [])),
+        )
+    finally:
+        admission._pid_alive = old_alive
+        admission._worker_identity = old_identity
+        admission._terminate_verified_worker = old_terminate
+        clear_outcomes()
+        restore_test_seams(old_seams)
+        conn.close()
+
+
 def test_cli_dry_run_formatter_reports_busy() -> None:
     from argparse import Namespace
 
@@ -496,6 +691,9 @@ def main() -> int:
     test_ready_and_review_busy_then_release()
     test_no_resource_config_preserves_legacy_probe()
     test_dry_run_filters_busy_without_claim()
+    test_dry_run_consumes_virtual_reservations()
+    test_health_failure_stays_visible()
+    test_dispatch_normalizes_reaped_busy_spawn()
     test_cli_dry_run_formatter_reports_busy()
     test_same_task_terminal_pid_safety()
     test_diagnostics_are_bounded()

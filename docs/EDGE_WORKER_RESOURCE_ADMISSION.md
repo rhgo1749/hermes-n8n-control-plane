@@ -120,10 +120,15 @@ probes (`has_spawnable_ready` and `has_spawnable_review`). When every eligible
 candidate is resource-busy, those probes report no spawnable work, so the
 legacy six-tick `dispatcher stuck` warning is reserved for genuine spawn
 failures. A queue containing any non-resource or available-resource candidate
-continues to report spawnable work. The runtime dispatch result and CLI
+continues to report spawnable work. Configuration or worker-inspection failures
+remain health-visible and emit an explicit admission diagnostic; they are not
+treated as healthy capacity waits. The runtime dispatch result and CLI
 `dispatch --dry-run` output expose `resource_busy` entries and do not present a
-capacity-blocked candidate as a predicted spawn; dry-run performs no claim,
-reap, or database write.
+capacity-blocked candidate as a predicted spawn. Dry-run consumes virtual
+reservations in candidate order, including across READY and REVIEW lanes, but
+performs no claim, reap, or database write. A real tick removes pre-tick busy
+evidence when that same task is successfully spawned after a holder is reaped,
+so one task cannot appear as both `spawned` and `resource_busy` in one result.
 
 No resource configuration, empty configuration, or unmatched assignee keeps
 the original core probe and dispatch behavior unchanged. Core source remains
@@ -193,6 +198,12 @@ It covers:
 - configuration absent -> legacy dispatcher delegates unchanged;
 - unmatched/parallel profile -> delegates unchanged;
 - capacity 1 blocks a matching live worker on a sibling board;
+- capacity 1 dry-run reserves the first candidate and reports the next one as
+  `resource_busy`;
+- policy-resolution and active-worker inspection failures remain visible to
+  health rather than suppressing the stuck warning;
+- pre-tick busy evidence is removed after same-task terminal-worker reap and
+  successful spawn;
 - capacity 2 admits the second worker;
 - terminal same-task live worker is reaped before replacement admission;
 - active same-task run is never killed;
