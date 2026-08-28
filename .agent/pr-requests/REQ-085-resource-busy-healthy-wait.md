@@ -84,17 +84,25 @@ REVIEW claims, safely release/reclaim dead or terminal workers, and make
 
 ## Validation record
 
+- Final rework head: `641310b5abe0a590072809b4891d5f9f832c4ed0`
 - `python3 edge/test-kanban-resource-busy-health.py` — PASS (35 checks)
 - `python3 edge/test-kanban-resource-admission.py` — PASS (18 checks)
 - `python3 edge/test-kanban-dynamic-resource.py` — PASS (10 checks)
 - `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py` —
-  PASS (769 checks on the final source)
+  PASS (769 checks at the final head)
 - `python3 -m py_compile edge/kanban_resource_admission.py
   edge/kanban_dynamic_resource.py edge/test-kanban-resource-busy-health.py` — PASS
+- `PYTHONPATH=/ws/hermes-agent /home/hermes/.hermes/profiles/kanban-main/lsp/node_modules/.bin/pyright
+  edge/kanban_dynamic_resource.py edge/test-kanban-resource-busy-health.py` —
+  PASS (0 errors, 0 warnings, 0 informations)
+- `ruff check --select I edge/kanban_dynamic_resource.py
+  edge/test-kanban-resource-busy-health.py` — PASS
 - `git diff --check` — PASS
-- LSP: no new diagnostics in changed dynamic/test files; the remaining dynamic
-  diagnostic matches the pre-edit baseline. Admission-file diagnostics likewise
-  match the pre-edit baseline.
+- `bash -n automation/hermes/scripts/deploy-intake-edge.sh` plus isolated
+  temporary-target `--dry-run` — PASS
+- Sabotage: pre-fix `HEAD^` source with the new focused regressions exited
+  non-zero as expected (29 passed, 6 failed); virtual reservation, health
+  failure visibility, and stale busy normalization checks each failed.
 - GitHub Actions: intentionally disabled by repository policy; local gates are
   authoritative.
 
