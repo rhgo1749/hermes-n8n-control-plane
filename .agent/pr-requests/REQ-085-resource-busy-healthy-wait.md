@@ -84,7 +84,7 @@ REVIEW claims, safely release/reclaim dead or terminal workers, and make
 
 ## Validation record
 
-- Final rework head: `641310b5abe0a590072809b4891d5f9f832c4ed0`
+- Implementation commit validated: `641310b5abe0a590072809b4891d5f9f832c4ed0`
 - `python3 edge/test-kanban-resource-busy-health.py` — PASS (35 checks)
 - `python3 edge/test-kanban-resource-admission.py` — PASS (18 checks)
 - `python3 edge/test-kanban-dynamic-resource.py` — PASS (10 checks)
@@ -100,9 +100,10 @@ REVIEW claims, safely release/reclaim dead or terminal workers, and make
 - `git diff --check` — PASS
 - `bash -n automation/hermes/scripts/deploy-intake-edge.sh` plus isolated
   temporary-target `--dry-run` — PASS
-- Sabotage: pre-fix `HEAD^` source with the new focused regressions exited
-  non-zero as expected (29 passed, 6 failed); virtual reservation, health
-  failure visibility, and stale busy normalization checks each failed.
+- Sabotage: the pre-fix source at `838e336f4bb863ae303a82a3b1baac6145a735ba`
+  with the new focused regressions exited non-zero as expected (29 passed, 6
+  failed); virtual reservation, health failure visibility, and stale busy
+  normalization checks each failed.
 - GitHub Actions: intentionally disabled by repository policy; local gates are
   authoritative.
 
