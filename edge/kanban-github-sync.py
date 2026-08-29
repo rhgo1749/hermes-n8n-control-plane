@@ -958,26 +958,20 @@ def _rework_request_comment_id(
     pr_number: int,
     label_added_at: int,
 ) -> Optional[int]:
-    """Return the newest trusted PR comment before the rework label."""
-    comments = client.get_paginated(
-        f"/repos/{ref.repository}/issues/{pr_number}/comments",
-        {"per_page": 100},
-    )
-    candidates: list[tuple[str, int]] = []
-    for item in comments:
-        if not isinstance(item, dict):
-            continue
-        author = str((item.get("user") or {}).get("login") or "")
-        comment_id = item.get("id")
-        if author not in TRUSTED_GITHUB_ACTORS or not isinstance(comment_id, int):
-            continue
-        created_at = _parse_iso_ts(item.get("created_at"))
-        if created_at is None or created_at > label_added_at:
-            continue
-        candidates.append((str(item.get("created_at") or ""), comment_id))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item[0])[1]
+    """Do not infer a request identity from an arbitrary prior comment.
+
+    A GitHub ``agent-rework`` label is a label-only request.  The previous
+    implementation treated the newest trusted comment before the label as its
+    request, which allowed a prior completion handoff (or unrelated review
+    comment) to contaminate a fresh round.  ``request_comment_id`` is reserved
+    for the exact trusted ``AGENT_REWORK_RETRY`` path, whose consumed comment
+    id is passed to :func:`apply_rework` explicitly.
+
+    Keep this helper and its signature for callers/tests that exercise the
+    label evaluator directly, but deliberately return no inferred identity.
+    """
+    del client, ref, pr_number, label_added_at
+    return None
 
 
 def evaluate_rework(
@@ -1880,12 +1874,19 @@ def _append_sync_event(
     kind: str = "github_pr_sync",
     event_table: str = "task_events",
     created_at: Optional[int] = None,
+    run_id: Optional[int] = None,
 ) -> None:
     timestamp = int(time.time()) if created_at is None else int(created_at)
     conn.execute(
         f"INSERT INTO {event_table} (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, NULL, ?, ?, ?)",
-        (task_id, kind, json.dumps(payload, ensure_ascii=False, sort_keys=True), timestamp),
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            task_id,
+            int(run_id) if run_id is not None else None,
+            kind,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            timestamp,
+        ),
     )
 
 
@@ -3310,7 +3311,8 @@ def apply_rework(
     round (one-shot consumption).
     """
     row = conn.execute(
-        "SELECT status, body, completed_at FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, body, completed_at, assignee FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return {"task_id": task_id, "changed": False, "reason": "task_missing"}
@@ -3328,7 +3330,7 @@ def apply_rework(
         UPDATE tasks
            SET status = 'ready',
                completed_at = NULL,
-               assignee = NULL,
+               assignee = ?,
                claim_lock = NULL,
                claim_expires = NULL,
                worker_pid = NULL,
@@ -3337,7 +3339,7 @@ def apply_rework(
                body = ?
          WHERE id = ? AND status = ?
         """,
-        (new_body, task_id, current_status),
+        (REWORK_RESERVED_ASSIGNEE, new_body, task_id, current_status),
     )
     if cur.rowcount != 1:
         return {
@@ -3365,6 +3367,7 @@ def apply_rework(
         "rework_round": rework_round,
         "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
         "label_actor": rework.label_actor,
+        "previous_assignee": row["assignee"],
         "merge_authority": "human",
         "auto_merge": False,
         "source": "github",
@@ -3680,6 +3683,15 @@ def _reconcile_blocked(
 
 REWORK_DISPATCH_ENV = "HERMES_KANBAN_REWORK_DISPATCH"
 
+# ``kanban_db.dispatch_once`` is intentionally unaware of GitHub rework.  A
+# fresh round therefore reserves its READY row with an assignee that cannot be
+# resolved to a Hermes profile until this edge lane replaces it immediately
+# before its own claim.  This is a reservation, not a worker/profile name.
+REWORK_RESERVED_ASSIGNEE = "__github_edge_rework_dispatcher__"
+REWORK_DISPATCH_CLAIM_PREFIX = "github-edge-rework:"
+REWORK_DISPATCH_PROVENANCE_KIND = "github_pr_rework_dispatch"
+REWORK_DISPATCH_PROVENANCE_SOURCE = "github_edge_rework_dispatch"
+
 # Event kinds that define which transition currently governs a task's
 # state.  The claim-projection failure diagnostic is included as a
 # retryable pending gate; everything else (assigned/spawned/claimed/
@@ -3764,14 +3776,151 @@ def _task_run_after_rework(
     conn: sqlite3.Connection,
     task_id: str,
     rework_at: int,
-) -> Optional[sqlite3.Row]:
-    """Return the newest finished run started by this rework round."""
-    return conn.execute(
+    *,
+    rework_round: Any = None,
+) -> sqlite3.Row | None:
+    """Return the newest run claimed by this edge rework round.
+
+    ``started_at >= rework_at`` is only a time hint.  The core dispatcher can
+    create an indistinguishable run after a rework event, so accepting the
+    newest timestamp-matching row would let an ordinary/default-assignee run
+    satisfy the rework delivery contract.  The edge dispatch lane records a
+    run-linked provenance event after its claim; only that exact source and
+    round identity are eligible here.
+    """
+    runs = conn.execute(
         "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
         "FROM task_runs WHERE task_id = ? AND started_at >= ? "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (task_id, max(0, rework_at - 1)),
-    ).fetchone()
+    ).fetchall()
+    expected_round = rework_round
+    if expected_round is not None:
+        try:
+            expected_round = int(expected_round)
+        except (TypeError, ValueError):
+            return None
+    for run in runs:
+        run_id = int(str(run["id"]))
+        provenance_rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = ? ORDER BY id DESC",
+            (task_id, run_id, REWORK_DISPATCH_PROVENANCE_KIND),
+        ).fetchall()
+        for provenance_row in provenance_rows:
+            try:
+                provenance = json.loads(provenance_row["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(provenance, dict):
+                continue
+            if provenance.get("source") != REWORK_DISPATCH_PROVENANCE_SOURCE:
+                continue
+            if provenance.get("task_id") != task_id:
+                continue
+            try:
+                if int(str(provenance.get("rework_event_at"))) != int(rework_at):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if expected_round is not None:
+                try:
+                    if int(str(provenance.get("rework_round"))) != expected_round:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if provenance.get("phase") not in {"claimed", "spawned"}:
+                continue
+            return run
+    return None
+
+
+def _untrusted_task_run_after_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+) -> sqlite3.Row | None:
+    """Return an ordinary run only for crash/attention classification.
+
+    This is intentionally separate from ``_task_run_after_rework``.  An
+    unproven core run can explain why a rework is recoverable after a crash,
+    but it can never satisfy the completion-delivery contract.  Runs carrying
+    any edge provenance are skipped here when the strict round check rejected
+    them, so a prior round cannot be mistaken for the current one.
+    """
+    runs = conn.execute(
+        "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? AND started_at >= ? "
+        "ORDER BY id DESC",
+        (task_id, max(0, rework_at - 1)),
+    ).fetchall()
+    for run in runs:
+        run_id = int(str(run["id"]))
+        provenance_rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = ? LIMIT 1",
+            (task_id, run_id, REWORK_DISPATCH_PROVENANCE_KIND),
+        ).fetchall()
+        if provenance_rows:
+            continue
+        return run
+    return None
+
+
+def _rework_dispatch_claim_lock(
+    task_id: str,
+    event: tuple[dict[str, Any], int, str] | None,
+) -> str:
+    """Build a stable edge-owned lock identity for one rework round."""
+    round_value = "unknown"
+    if event is not None:
+        try:
+            round_value = str(int(str(event[0].get("rework_round"))))
+        except (TypeError, ValueError):
+            pass
+    return f"{REWORK_DISPATCH_CLAIM_PREFIX}{task_id}:{round_value}"
+
+
+def _append_rework_dispatch_provenance(
+    conn: sqlite3.Connection,
+    claimed: Any,
+    *,
+    context: Mapping[str, Any] | None,
+    phase: str,
+    pid: int | None = None,
+) -> None:
+    """Record claim/spawn ownership linked to the exact task run."""
+    task_id = str(claimed.id)
+    run_id = getattr(claimed, "current_run_id", None)
+    if run_id is None:
+        raise RuntimeError(f"edge rework claim has no run id: {task_id}")
+    run_id_int = int(str(run_id))
+    event = context.get("event") if isinstance(context, Mapping) else None
+    if not isinstance(event, tuple) or len(event) != 3:
+        event = _latest_rework_event(conn, task_id)
+    if event is None:
+        raise RuntimeError(f"edge rework claim has no governing event: {task_id}")
+    payload, event_at, _event_kind = event
+    dispatch_payload: dict[str, Any] = {
+        "source": REWORK_DISPATCH_PROVENANCE_SOURCE,
+        "phase": phase,
+        "task_id": task_id,
+        "run_id": run_id_int,
+        "rework_event_at": int(event_at),
+        "rework_round": payload.get("rework_round"),
+        "request_comment_id": payload.get("request_comment_id"),
+        "head_sha": payload.get("head_sha"),
+        "claim_lock": getattr(claimed, "claim_lock", None),
+    }
+    if pid is not None:
+        dispatch_payload["pid"] = int(pid)
+    _append_sync_event(
+        conn,
+        task_id,
+        dispatch_payload,
+        kind=REWORK_DISPATCH_PROVENANCE_KIND,
+        run_id=run_id_int,
+    )
 
 
 def _run_metadata(run: Optional[sqlite3.Row]) -> dict[str, Any]:
@@ -3848,7 +3997,10 @@ def _completion_marker(
             continue
         if fields.get("validation") != "passed" or head != pr.head_sha.casefold():
             continue
-        if request_comment_id is not None and request_comment != str(request_comment_id):
+        expected_request_comment = (
+            str(request_comment_id) if request_comment_id is not None else "none"
+        )
+        if request_comment != expected_request_comment:
             continue
         return {
             "comment_id": comment.get("id"),
@@ -3916,10 +4068,10 @@ def _malformed_completion_marker(
             missing.append("head")
         if fields.get("validation") != "passed":
             missing.append("validation")
-        if (
-            request_comment_id is not None
-            and fields.get("request_comment") != str(request_comment_id)
-        ):
+        expected_request_comment = (
+            str(request_comment_id) if request_comment_id is not None else "none"
+        )
+        if fields.get("request_comment") != expected_request_comment:
             missing.append("request_comment")
         if not missing:
             return None  # a structurally valid marker exists on the PR
@@ -3989,7 +4141,12 @@ def _rework_delivery_evidence(
         current_label_at=payload.get("label_added_at"),
     ):
         return False, "delivery_superseded_by_new_rework", {"rework_at": rework_at}
-    run = _task_run_after_rework(conn, task_id, rework_at)
+    run = _task_run_after_rework(
+        conn,
+        task_id,
+        rework_at,
+        rework_round=payload.get("rework_round"),
+    )
     if run is None or run["ended_at"] is None:
         return False, "delivery_run_missing", {"rework_at": rework_at}
     if str(run["outcome"] or "") not in {"completed", "blocked", "review_requested"}:
@@ -4067,6 +4224,8 @@ def _rework_delivery_evidence(
             evidence = {
                 "run_id": run["id"],
                 "run_outcome": run["outcome"],
+                "rework_round": payload.get("rework_round"),
+                "rework_event_at": rework_at,
                 "request_comment_id": payload.get("request_comment_id"),
                 "head": marker["head"],
                 "validation": marker["validation"],
@@ -4081,6 +4240,8 @@ def _rework_delivery_evidence(
     evidence = {
         "run_id": run["id"],
         "run_outcome": run["outcome"],
+        "rework_round": payload.get("rework_round"),
+        "rework_event_at": rework_at,
         "request_comment_id": payload.get("request_comment_id"),
         "head": marker["head"],
         "validation": marker["validation"],
@@ -4207,6 +4368,13 @@ def _rework_human_attention(reason: str, run: Optional[sqlite3.Row]) -> bool:
         # 'crashed'/error outcome (never 'review_requested'), so they remain
         # recoverable and requeued.
         return True
+    if reason == "delivery_run_missing" and run is not None:
+        terminal_state = str(run["status"] or "").casefold()
+        outcome = str(run["outcome"] or "").casefold()
+        if terminal_state in {"crashed", "reclaimed", "failed"} or outcome in {
+            "crashed", "reclaimed", "failed",
+        }:
+            return False
     return any(marker in text for marker in (
         "review-required", "needs_input", "needs maintainer",
         "human review", "host_validation_required", "human_validation_required",
@@ -4729,50 +4897,65 @@ def _current_round_delivery(
     and a past delivery can never justify ``agent-review-ready``.
     """
     payload, event_at, _ = event
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind = 'github_pr_rework_delivery' "
-        "AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        "AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, int(event_at)),
-    ).fetchone()
-    if row is None or not row["payload"]:
+    ).fetchall()
+    if not rows:
         return None
-    try:
-        delivery_payload = json.loads(row["payload"])
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(delivery_payload, dict):
-        return None
-    round_request_id = payload.get("request_comment_id")
-    delivery_request_id = delivery_payload.get("request_comment_id")
-    if (
-        round_request_id is not None
-        and delivery_request_id is not None
-        and int(round_request_id) != int(delivery_request_id)
-    ):
-        # Identity mismatch: the recorded delivery belongs to another round.
-        return None
+    round_number = payload.get("rework_round")
+    expected_round: int | None = None
+    if round_number is not None:
+        try:
+            expected_round = int(round_number)
+        except (TypeError, ValueError):
+            return None
+
+    def request_identity(value: Any) -> str | None:
+        if value is None or str(value).casefold() == "none":
+            return None
+        try:
+            return str(int(str(value)))
+        except (TypeError, ValueError):
+            return str(value)
+
+    expected_request = request_identity(payload.get("request_comment_id"))
     round_requested_head = str(payload.get("head_sha") or "").casefold()
-    delivery_head = str(delivery_payload.get("head") or "").casefold()
-    if round_requested_head and delivery_head == round_requested_head:
-        # The recorded delivery head equals the head this round started
-        # from.  For a *fresh* rework round that means the round's worker
-        # has not yet pushed a new head, so the recorded same-head delivery
-        # is the previous round's delivery.  For a verification-only /
-        # handoff-repair round (trusted maintainer retry) the requested
-        # rework is already present at the live head, so a same-head
-        # completion is the *expected* current-round delivery, not a stale
-        # one.  The identity bound (request_comment_id match) and the time
-        # bound (delivery at/after this round's event) still exclude a
-        # genuinely past-round delivery, so exempting same-head for
-        # maintainer-retry rounds is safe.
-        if payload.get("trigger") == "maintainer_retry":
-            return delivery_payload
-        # The recorded delivery head equals the head this round started
-        # from: it is the previous round's delivery, not current-round
-        # evidence.
-        return None
-    return delivery_payload
+    for row in rows:
+        if not row["payload"]:
+            continue
+        try:
+            delivery_payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(delivery_payload, dict):
+            continue
+        # New round events must bind delivery to the same explicit round;
+        # legacy events without a round are not trusted for a new round.
+        if expected_round is not None:
+            try:
+                if int(str(delivery_payload.get("rework_round"))) != expected_round:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if request_identity(delivery_payload.get("request_comment_id")) != expected_request:
+            # Identity mismatch: the recorded delivery belongs to another
+            # round.  Continue so a later valid event can still be found.
+            continue
+        delivery_head = str(delivery_payload.get("head") or "").casefold()
+        if round_requested_head and delivery_head == round_requested_head:
+            # The recorded delivery head equals the head this round started
+            # from.  For a *fresh* rework round that means the round's worker
+            # has not yet pushed a new head, so the recorded same-head
+            # delivery is the previous round's delivery.  Verification-only /
+            # handoff-repair rounds are exempt.
+            if payload.get("trigger") == "maintainer_retry":
+                return delivery_payload
+            continue
+        return delivery_payload
+    return None
 
 
 def _last_delivery_event_at(
@@ -5878,7 +6061,16 @@ def _reconcile_rework_lifecycle(
         if status == "review":
             # The human review lane owns this card; never requeue from here.
             return None
-        run = _task_run_after_rework(conn, task_id, int(context["event_at"]))
+        run = _task_run_after_rework(
+            conn,
+            task_id,
+            int(context["event_at"]),
+            rework_round=context["event"][0].get("rework_round"),
+        )
+        if run is None:
+            run = _untrusted_task_run_after_rework(
+                conn, task_id, int(context["event_at"]),
+            )
         if _rework_human_attention(delivery_reason, run):
             if status == "done" and decision.desired_status == "review":
                 # A human-attention hold must never leave a GitHub-backed card
@@ -5898,6 +6090,9 @@ def _reconcile_rework_lifecycle(
                         "reason": "done_open_pr_repair_predicted",
                         "repair_predicted": "done_open_pr_repaired",
                         "diagnostic": delivery_reason,
+                        "operator_attention_predicted": {
+                            "reason": "rework_human_attention",
+                        },
                     }
                 context_block: Optional[str] = None
                 try:
@@ -5911,25 +6106,45 @@ def _reconcile_rework_lifecycle(
                         conn, task_id, decision, context_block=context_block,
                     )
                 try:
-                    _, label_reason, label_evidence = _project_pr_lifecycle_labels(
-                        client, ref, int(context["pr_number"]),
-                        add=(REVIEW_READY_LABEL,),
-                        remove=(REWORK_LABEL, WORKING_LABEL),
+                    label_reason, label_evidence = _restore_rework_labels(
+                        client, context,
                     )
                 except GithubCompletionError as exc:
                     return {
                         "task_id": task_id,
                         "status": str(db_result.get("status") or "review"),
                         "changed": bool(db_result.get("changed")),
-                        "reason": "review_ready_label_projection_failed",
+                        "reason": "rework_attention_label_projection_failed",
                         "error": str(exc),
-                        "evidence": decision.to_dict(),
+                        "diagnostic": delivery_reason,
                     }
+                _record_rework_attention(
+                    conn,
+                    task_id,
+                    context,
+                    reason=delivery_reason,
+                    evidence=evidence,
+                )
+                try:
+                    _post_rework_attention_pr_comment(
+                        client,
+                        ref,
+                        int(context["pr_number"]),
+                        task_id,
+                        reason=delivery_reason,
+                        evidence=evidence,
+                    )
+                except GithubCompletionError as exc:
+                    print(
+                        f"kanban-github-sync: attention PR comment failed for "
+                        f"{ref.repository}#{context['pr_number']} task={task_id}: {exc}",
+                        file=sys.stderr,
+                    )
                 return {
                     "task_id": task_id,
                     "status": str(db_result.get("status") or "review"),
                     "changed": bool(db_result.get("changed")),
-                    "reason": str(db_result.get("reason") or "linked_pr_open"),
+                    "reason": "rework_human_attention",
                     "diagnostic": delivery_reason,
                     "label_action": label_reason,
                     "lifecycle": label_evidence,
@@ -6032,7 +6247,7 @@ def _normalize_changes_requested_rework(
     existing edge dispatch lane; it does not change the READY status itself.
     """
     row = conn.execute(
-        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, assignee, claim_lock FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None or str(row["status"]) != "ready":
         return None
@@ -6057,6 +6272,7 @@ def _normalize_changes_requested_rework(
         "pr_number": pr.number,
         "head_sha": pr.head_sha,
         "rework_round": rework_round,
+        "previous_assignee": row["assignee"],
     }
     if dry_run:
         return {
@@ -6080,13 +6296,14 @@ def _normalize_changes_requested_rework(
         "canonical_open_pr": True,
         "canonical_pr_source": "github_linked_pr",
         "rework_round": rework_round,
+        "previous_assignee": row["assignee"],
         "merge_authority": "human",
         "auto_merge": False,
         "source": "github_edge_rework_normalization",
     }
     with conn:
         latest = conn.execute(
-            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, assignee, claim_lock FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if (
             latest is None
@@ -6100,6 +6317,11 @@ def _normalize_changes_requested_rework(
                 "changed": False,
                 "reason": "state_changed_during_sync",
             }
+        conn.execute(
+            "UPDATE tasks SET assignee = ? "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+            (REWORK_RESERVED_ASSIGNEE, task_id),
+        )
         source_row = conn.execute(
             "SELECT MAX(created_at) FROM task_events "
             "WHERE task_id = ? AND kind = 'changes_requested'",
@@ -6172,21 +6394,36 @@ def _resolve_rework_assignee(
 ) -> tuple[Optional[str], Optional[str]]:
     """Return (assignee, error_reason) for a rework-pending task.
 
-    ``apply_rework`` clears the assignee; mirror the core dispatcher's
-    auto-assign behaviour by persisting ``kanban.default_assignee`` on the
-    row (with an ``assigned`` event) before the worker is spawned.
+    Fresh rework rows are reserved with ``REWORK_RESERVED_ASSIGNEE`` so the
+    core dispatcher cannot claim them before this edge lane.  Replace that
+    reservation (or a legacy NULL assignee) with
+    ``kanban.default_assignee`` only while holding the shared dispatch lock,
+    immediately before the edge-owned claim.
     """
     assignee = str(row.get("assignee") or "").strip() or None
+    if assignee == REWORK_RESERVED_ASSIGNEE:
+        assignee = None
     if assignee:
         return assignee, None
+    if not default_assignee:
+        event = _latest_rework_event(conn, str(row["id"]))
+        previous_assignee = (
+            event[0].get("previous_assignee") if event is not None else None
+        )
+        if (
+            isinstance(previous_assignee, str)
+            and previous_assignee.strip()
+            and previous_assignee.strip() != REWORK_RESERVED_ASSIGNEE
+        ):
+            default_assignee = previous_assignee.strip()
     if not default_assignee:
         return None, "unassigned"
     if dry_run:
         return default_assignee, None
     cur = conn.execute(
         "UPDATE tasks SET assignee = ? WHERE id = ? "
-        "AND (assignee IS NULL OR assignee = '')",
-        (default_assignee, row["id"]),
+        "AND (assignee IS NULL OR assignee = '' OR assignee = ?)",
+        (default_assignee, row["id"], REWORK_RESERVED_ASSIGNEE),
     )
     if cur.rowcount == 1:
         _append_sync_event(
@@ -6195,6 +6432,15 @@ def _resolve_rework_assignee(
             kind="assigned",
         )
     return default_assignee, None
+
+
+def _reserve_rework_task(conn: sqlite3.Connection, task_id: str) -> None:
+    """Keep a released rework row out of the generic core dispatcher."""
+    conn.execute(
+        "UPDATE tasks SET assignee = ? "
+        "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+        (REWORK_RESERVED_ASSIGNEE, task_id),
+    )
 
 
 def _dispatch_pending_rework_locked(
@@ -6264,6 +6510,19 @@ def _dispatch_pending_rework_locked(
         return []
     row = pending[0]
     task_id = str(row["id"])
+    context = (
+        rework_contexts.get(task_id)
+        if isinstance(rework_contexts, Mapping)
+        else None
+    )
+    claim_event = (
+        context.get("event")
+        if isinstance(context, Mapping)
+        else None
+    )
+    if not isinstance(claim_event, tuple) or len(claim_event) != 3:
+        claim_event = _latest_rework_event(conn, task_id)
+    claim_lock = _rework_dispatch_claim_lock(task_id, claim_event)
 
     # Duplicate-ownership guards (GitHub label + Kanban PR owner), applied
     # before any claim so a second worker is never spawned beside a live one.
@@ -6322,11 +6581,49 @@ def _dispatch_pending_rework_locked(
                 "reason": "assignee_profile_missing", "assignee": assignee,
             }]
 
-    claimed = kanban_db.claim_task(conn, task_id)
+    claimed = kanban_db.claim_task(conn, task_id, claimer=claim_lock)
     if claimed is None:
         return [{
             "task_id": task_id, "status": "ready", "changed": False,
             "reason": "claim_failed",
+        }]
+
+    try:
+        _append_rework_dispatch_provenance(
+            conn,
+            claimed,
+            context=context if isinstance(context, Mapping) else None,
+            phase="claimed",
+        )
+    except Exception as exc:  # noqa: BLE001 - reclaim on provenance failure
+        try:
+            kanban_db.reclaim_task(
+                conn,
+                task_id,
+                reason="edge rework claim provenance write failed",
+            )
+        except Exception as reclaim_exc:  # noqa: BLE001 - preserve READY fail-closed
+            return [{
+                "task_id": task_id, "status": "running", "changed": True,
+                "reason": "claim_projection_reclaim_failed",
+                "error": f"{type(exc).__name__}: {exc}; "
+                          f"{type(reclaim_exc).__name__}: {reclaim_exc}",
+            }]
+        _reserve_rework_task(conn, task_id)
+        if on_failure is not None:
+            try:
+                on_failure(claimed, "claim_provenance_failed")
+            except Exception as projection_exc:  # noqa: BLE001 - isolate label restore failure
+                print(
+                    f"kanban-github-sync: failed to restore rework label after "
+                    f"claim provenance failure (task {task_id}): "
+                    f"{type(projection_exc).__name__}",
+                    file=sys.stderr,
+                )
+        return [{
+            "task_id": task_id, "status": "ready", "changed": False,
+            "reason": "rework_claim_provenance_failed",
+            "error": f"{type(exc).__name__}: {exc}",
         }]
 
     if on_claim is not None:
@@ -6349,6 +6646,7 @@ def _dispatch_pending_rework_locked(
                     "reason": "claim_projection_reclaim_failed",
                     "error": f"{claim_projection!r}; {type(exc).__name__}: {exc}",
                 }]
+            _reserve_rework_task(conn, task_id)
             if on_failure is not None:
                 try:
                     on_failure(claimed, "claim")
@@ -6398,6 +6696,7 @@ def _dispatch_pending_rework_locked(
             conn, claimed.id, f"workspace: {exc}",
             failure_limit=failure_limit,
         ))
+        _reserve_rework_task(conn, task_id)
         if on_failure is not None:
             try:
                 on_failure(claimed, "workspace_resolve_failed")
@@ -6426,10 +6725,18 @@ def _dispatch_pending_rework_locked(
         pid = spawn(claimed, str(workspace), board=board)
         if pid:
             kanban_db._set_worker_pid(conn, claimed.id, int(pid))
+        _append_rework_dispatch_provenance(
+            conn,
+            claimed,
+            context=context if isinstance(context, Mapping) else None,
+            phase="spawned",
+            pid=int(pid) if pid else None,
+        )
     except Exception as exc:
         auto_blocked = bool(kanban_db._record_spawn_failure(
             conn, claimed.id, str(exc), failure_limit=failure_limit,
         ))
+        _reserve_rework_task(conn, task_id)
         if on_failure is not None:
             try:
                 on_failure(claimed, "spawn_failed")

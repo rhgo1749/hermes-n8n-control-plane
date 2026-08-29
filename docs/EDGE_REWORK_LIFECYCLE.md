@@ -48,6 +48,10 @@ Rules:
 - `agent-rework` is only removed when the edge dispatcher's `claim_task`
   succeeds and the PR labels are atomically swapped to `agent-working`
   (claim-first; a claim or label failure leaves the request intake-visible).
+- A pending rework round is reserved from the generic/core dispatcher until
+  that edge claim succeeds. The edge-owned claim, spawn, task run, and
+  completion evidence carry the round identity and claim lock; an ordinary
+  core run can never satisfy the current-round delivery gate.
 - `agent-working` is kept for the whole worker lifetime. It is **not**
   removed when the worker simply exits; it is removed only by the delivery
   or recovery transitions below.
@@ -75,6 +79,7 @@ Rules:
 | `agent-working` → `agent-review-ready` | delivery evidence complete (marker + head + validation) | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
+| `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, restore `agent-rework`, and never project `agent-review-ready` or completion |
 | `agent-working` → `agent-rework` (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | task requeued `→ ready`, `github_pr_rework_retry` event, failure counted against `kanban.failure_limit` (circuit breaker preserved); head-binding rejection additionally posts idempotent reason-aware PR feedback without changing routing |
 | `agent-rework` restored (BLOCKED or operator-recovered REVIEW attention hold) → new round | explicit trusted exact `AGENT_REWORK_RETRY` whole-comment after the current round's attention, Issue open + `agent-ready`, comment id never consumed | the existing `apply_rework` transaction opens READY from the actual prior status and records one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`); the label stays until the existing dispatch claim (see “Explicit maintainer retry”) |
 | `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | labels restored, idempotent `HERMES_KANBAN_REWORK_ATTENTION` comment on the PR + Kanban `github_pr_rework_attention` event (per task + reason); the PR comment body carries the exact regeneration/`AGENT_REWORK_RETRY` instructions and reason-specific head-binding guidance where applicable |
@@ -136,6 +141,10 @@ Rules:
     never spin in the same tick.
 12. Head-binding feedback is observational only. Posting failure is logged and
     the canonical retry/hold result is returned unchanged.
+13. A label-only rework request records `request_comment_id: null`; it never
+    inherits a completion/request comment from an earlier round. A delivery
+    from an earlier round is rejected even when its full PR head is identical
+    to the current round's requested head.
 
 ## Machine-readable completion handoff
 
