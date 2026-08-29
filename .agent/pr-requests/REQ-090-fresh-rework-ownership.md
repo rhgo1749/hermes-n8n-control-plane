@@ -1,6 +1,6 @@
 # REQ-090: 신선한 PR rework 라운드의 edge 소유권·delivery fail-closed
 
-- Status: Implementation handoff
+- Status: Rework round 4 implementation handoff
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`
@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#90`
 - Source issue URL: `https://github.com/rhgo1749/hermes-n8n-control-plane/issues/90`
-- Kanban task ID: `t_cb91d055`
+- Kanban task ID: `t_f469a6d5`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:90`
 - Planning/lead owner: `kanban-main`
 - Implementation owner: `kanban-developer`
@@ -49,6 +49,11 @@ PR` state must never produce current-round delivery or
 - A delivery requires the current-round edge run, trusted completion marker,
   exact task/request identity, matching live full head, and
   `validation=passed`; a durable delivery event is round-bound.
+- The required same-head regression uses a production-valid
+  `maintainer_retry` governing event (`repository`, `issue_number`, positive
+  `pr_number`, full `head_sha`, `rework_round=2`, and matching
+  `request_comment_id`/`retry_comment_id=42`) and the production call shape;
+  a later same-head round-1 delivery must be rejected by the round comparison.
 - `DONE + OPEN PR` without current-round delivery is repaired to `REVIEW`,
   records bounded `github_pr_rework_attention`/retry-visible state, and never
   projects `agent-review-ready`.
@@ -93,7 +98,9 @@ PR` state must never produce current-round delivery or
    `agent-rework` and bounded human-attention feedback.
 4. Add the five named edge regressions and update positive fixtures to model
    production edge provenance.
-5. Maintain this shortened request as the repository-owned Issue #90 contract.
+5. Repair the false-positive same-head delivery regression fixture only; no
+   production behavior change is expected from this round.
+6. Maintain this shortened request as the repository-owned Issue #90 contract.
 
 ## 4. Explicit non-goals
 
@@ -149,8 +156,8 @@ human-readable completion comment on that PR containing exactly:
 
 ```text
 AGENT_REWORK_COMPLETE
-task=t_cb91d055
-request_comment=none
+task=t_f469a6d5
+request_comment=5463162327
 head=<full 40-character PR head SHA>
 validation=passed
 ```

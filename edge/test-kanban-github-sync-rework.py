@@ -5278,9 +5278,13 @@ def test_prior_same_head_delivery_is_not_current_round_delivery():
     with connect_closing() as conn:
         now = int(time.time())
         current_payload = {
+            "repository": REPO,
+            "issue_number": ISSUE_N,
+            "pr_number": PR_N,
             "trigger": "maintainer_retry",
             "rework_round": 2,
             "request_comment_id": 42,
+            "retry_comment_id": 42,
             "head_sha": head,
         }
         conn.execute(
@@ -5300,7 +5304,21 @@ def test_prior_same_head_delivery_is_not_current_round_delivery():
         )
         conn.commit()
         current_event = (current_payload, now, "github_pr_rework_retry")
-        current_delivery = mod._current_round_delivery(conn, tid, current_event)
+        ref = mod.GithubTaskRef(REPO, ISSUE_N)
+        check("same-head: governing event is production-valid",
+              mod._validate_rework_event(
+                  current_event,
+                  ref=ref,
+                  expected_pr_number=PR_N,
+              ) is None,
+              str(current_payload))
+        current_delivery = mod._current_round_delivery(
+            conn,
+            tid,
+            current_event,
+            ref=ref,
+            expected_pr_number=PR_N,
+        )
     check("same-head: late prior-round delivery rejected", current_delivery is None,
           str(current_delivery))
     check("same-head: round identity differs", current_payload["rework_round"] == 2,
