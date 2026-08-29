@@ -29,6 +29,9 @@ REPO = "rhgo1749/H4V3-DJ"
 ISSUE_N = 49
 PR_N = 78
 PR2_N = 82
+VALID_DEFAULT_HEAD = "0123456789abcdef0123456789abcdef00000000"
+VALID_REWORK_HEAD = "0123456789abcdef0123456789abcdef00000001"
+VALID_CHANGES_REQUESTED_HEAD = "0123456789abcdef0123456789abcdef00000002"
 LABEL_ADDED_OLD = "2026-08-10T00:00:00Z"   # consumed round
 LABEL_ADDED_NEW = "2026-08-11T00:00:00Z"   # new round (after any old event)
 
@@ -61,7 +64,7 @@ from hermes_cli.kanban_db import connect_closing, init_db  # type: ignore  # noq
 # Fake GitHub client
 # ---------------------------------------------------------------------------
 
-def make_pr(number, state="open", merged=False, base="main", head_sha="sha-abc123",
+def make_pr(number, state="open", merged=False, base="main", head_sha=VALID_DEFAULT_HEAD,
             title="PR title", author="rhgo1749", body="PR body text", draft=False):
     return {
         "number": number, "state": state, "merged": merged, "draft": draft,
@@ -291,7 +294,7 @@ class FakeGitHub:
 
 def rework_scenario(fake: FakeGitHub, *, label_ts=LABEL_ADDED_OLD):
     """Default single-PR rework scenario: PR #78 open with agent-rework."""
-    fake.prs[PR_N] = make_pr(PR_N, state="open", head_sha="sha-rework-1",
+    fake.prs[PR_N] = make_pr(PR_N, state="open", head_sha=VALID_REWORK_HEAD,
                              title="Meowcore talking-state contract",
                              body="Implements the talking-state event contract.")
     fake.pr_labels[PR_N] = ["agent-rework"]
@@ -486,7 +489,7 @@ def test_1_rework_full_flow():
     body = task_row(tid)["body"]
     check("context markers present", body.count(mod.SYNC_CONTEXT_BEGIN) == 1
           and body.count(mod.SYNC_CONTEXT_END) == 1)
-    check("PR context in body", "PR #78" in body and "sha-rework-1" in body)
+    check("PR context in body", "PR #78" in body and VALID_REWORK_HEAD in body)
     check("trusted feedback in body", "Fix the marker nesting." in body
           and "please rework the payload" in body)
     check("provenance intact", "## Canonical Issue body" in body
@@ -499,7 +502,7 @@ def test_1_rework_full_flow():
         check("event evidence", (p.get("previous_status") == "review"
               and p.get("new_status") == "ready"
               and p.get("pr_number") == PR_N
-              and p.get("head_sha") == "sha-rework-1"
+              and p.get("head_sha") == VALID_REWORK_HEAD
               and p.get("reason") == "agent_rework"
               and p.get("rework_round") == 1
               and p.get("trusted_actor_policy") == ["rhgo1749"]
@@ -636,7 +639,12 @@ def test_8_already_ready_lingering_label():
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, NULL, 'github_pr_rework', ?, ?)",
-            (tid, "{}", 1786323600),
+            (tid, json.dumps({
+                "repository": REPO, "issue_number": ISSUE_N,
+                "pr_number": PR_N, "head_sha": VALID_REWORK_HEAD,
+                "rework_round": 1, "request_comment_id": None,
+                "reason": "agent_rework",
+            }), 1786323600),
         )
         conn.commit()
     results = run_sync(fake)
@@ -1457,7 +1465,9 @@ def test_54_same_pr_running_task_blocks_spawn():
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, NULL, 'github_pr_rework', ?, ?)",
             (tid_b, json.dumps({
-                "pr_number": PR_N, "head_sha": "sha-rework-1",
+                "repository": REPO, "issue_number": ISSUE_N,
+                "pr_number": PR_N, "head_sha": VALID_REWORK_HEAD,
+                "rework_round": 1, "request_comment_id": None,
                 "reason": "agent_rework",
             }), int(time.time())),
         )
@@ -1746,7 +1756,9 @@ def test_62_merged_pr_done_and_labels_cleared():
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, NULL, 'github_pr_rework', ?, ?)",
             (tid, json.dumps({
-                "pr_number": PR_N, "head_sha": "sha-rework-1",
+                "repository": REPO, "issue_number": ISSUE_N,
+                "pr_number": PR_N, "head_sha": VALID_REWORK_HEAD,
+                "rework_round": 1, "request_comment_id": None,
                 "reason": "agent_rework",
             }), int(time.time())),
         )
@@ -3197,7 +3209,11 @@ def test_117_operator_recovered_review_retry_rejections_fail_closed():
             ).fetchone()
             assert row is not None
             payload = json.loads(row["payload"] or "{}")
-            payload.update({"trigger": "maintainer_retry", "retry_comment_id": retry_id})
+            payload.update({
+                "trigger": "maintainer_retry",
+                "retry_comment_id": retry_id,
+                "request_comment_id": retry_id,
+            })
             conn.execute(
                 "UPDATE task_events SET payload=? WHERE id=?",
                 (json.dumps(payload), row["id"]),
@@ -3312,7 +3328,7 @@ def _changes_requested_ready_task(
             PR_N,
             state="open",
             base=base,
-            head_sha="sha-changes-requested-1",
+            head_sha=VALID_CHANGES_REQUESTED_HEAD,
             title="Existing PR for changes-requested rework",
         )
         fake.pr_labels[PR_N] = []
@@ -3650,7 +3666,7 @@ def test_46_changes_requested_canonical_pr_dispatch():
                   payload.get("trigger") == "changes_requested"
                   and payload.get("canonical_open_pr") is True
                   and payload.get("pr_number") == PR_N
-                  and payload.get("head_sha") == "sha-changes-requested-1",
+                  and payload.get("head_sha") == VALID_CHANGES_REQUESTED_HEAD,
                   str(payload))
         check("no PR body/comment mutation", fake.post_calls == [], str(fake.post_calls))
         label_patches = [p for p, _ in fake.patch_calls
@@ -4888,6 +4904,89 @@ def test_126_claim_readback_failure_is_durable_and_retries_once():
           str(task_events(tid)))
 
 
+def _mutate_current_rework_event(tid: str, updates: dict[str, Any]) -> None:
+    """Apply one controlled malformed-payload mutation to a disposable round."""
+    with connect_closing() as conn:
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? "
+            "AND kind='github_pr_rework' ORDER BY created_at DESC, id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert row is not None, "current rework event is missing"
+        payload = json.loads(row["payload"] or "{}")
+        payload.update(updates)
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), row["id"]),
+        )
+        conn.commit()
+
+
+def _assert_malformed_governing_rework_event_case(
+    label: str,
+    updates: dict[str, Any],
+    *,
+    expect_attention: bool = True,
+) -> None:
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    _mutate_current_rework_event(tid, updates)
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws-malformed-rework-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    results = _run_sync_with_dispatch(fake, stub)
+    entries = [item for item in results if item.get("task_id") == tid]
+    events = task_events(tid)
+    check(f"{label}: no claim/spawn", stub.calls == [] and not any(
+        item.get("reason") == "rework_worker_spawned" for item in entries
+    ), str({"entries": entries, "calls": stub.calls}))
+    check(f"{label}: no delivery event", not any(
+        event["kind"] == "github_pr_rework_delivery" for event in events
+    ), str(events))
+    check(f"{label}: no review-ready projection", not any(
+        item.get("reason") == "agent_review_ready" for item in entries
+    ) and "agent-review-ready" not in fake.pr_labels.get(PR_N, []),
+        str({"entries": entries, "labels": fake.pr_labels}))
+    attention_recorded = any(
+        event["kind"] == "github_operator_attention"
+        and event["payload"].get("reason") == "rework_context_failed"
+        for event in events
+    )
+    check(f"{label}: attention/retry-visible state retained",
+          task_row(tid)["status"] == "ready"
+          and fake.pr_labels.get(PR_N) == ["agent-rework"]
+          and attention_recorded is expect_attention,
+          str({"row": task_row(tid), "labels": fake.pr_labels, "events": events}))
+    check(f"{label}: invalid context surfaced",
+          any(item.get("reason") in {
+              "rework_context_failed", "rework_context_unavailable",
+          } for item in entries), str(entries))
+
+
+def test_malformed_governing_rework_event_fails_closed():
+    """Incomplete governing events cannot authorize claim or review-ready."""
+    print("malformed governing rework event -> fail closed, attention, retry-visible")
+    cases = [
+        ("missing-head", {"head_sha": None}),
+        ("missing-round", {"rework_round": None}),
+        ("bool-round", {"rework_round": True}),
+        ("zero-round", {"rework_round": 0}),
+        ("negative-round", {"rework_round": -1}),
+        ("short-head", {"head_sha": "0123456789abcdef"}),
+        ("truncated-head", {"head_sha": VALID_REWORK_HEAD[:-1]}),
+        ("repository-mismatch", {"repository": "other/repository"}),
+        ("issue-mismatch", {"issue_number": ISSUE_N + 1}),
+        ("pr-mismatch", {"pr_number": PR2_N}),
+        ("request-comment-type", {"request_comment_id": "42"}),
+    ]
+    for label, updates in cases:
+        _assert_malformed_governing_rework_event_case(
+            label,
+            updates,
+            expect_attention=label != "pr-mismatch",
+        )
+
+
 def test_fresh_rework_after_stale_review_ready_dispatches_round_two():
     """A fresh request opens and dispatches its round in one authoritative wake."""
     fake = fresh_env()
@@ -5387,6 +5486,7 @@ def main() -> int:
         test_124_done_open_pr_self_heal_without_any_labels,
         test_125_claim_patch_failure_is_durable_and_retries_once,
         test_126_claim_readback_failure_is_durable_and_retries_once,
+        test_malformed_governing_rework_event_fails_closed,
         test_fresh_rework_after_stale_review_ready_dispatches_round_two,
         test_done_open_conflicting_rework_labels_missing_delivery_attention,
         test_done_open_without_current_round_delivery_never_projects_review_ready,

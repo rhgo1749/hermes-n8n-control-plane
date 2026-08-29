@@ -72,7 +72,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -3745,11 +3745,85 @@ def _latest_rework_event(
         payload = json.loads(row["payload"] or "{}")
     except (TypeError, ValueError):
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload = cast(dict[str, object], payload)
     return (
-        payload if isinstance(payload, dict) else {},
+        payload,
         int(row["created_at"] or 0),
         str(row["kind"]),
     )
+
+
+def _positive_rework_int(value: object) -> bool:
+    """Return whether ``value`` is a strict positive JSON integer."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _validate_rework_event(
+    event: object,
+    *,
+    ref: GithubTaskRef | None = None,
+    expected_pr_number: int | None = None,
+    decision: GithubCompletionDecision | None = None,
+) -> str | None:
+    """Validate the governing event before it can authorize rework work.
+
+    Governing event payloads are durable authorization evidence, not optional
+    context.  Missing or malformed fields must therefore fail closed instead
+    of being coerced to a wildcard/legacy value.  ``ref`` and ``decision`` are
+    supplied at live reconciliation boundaries to bind repository, Issue, and
+    canonical PR identity; callers that only have an event still receive the
+    strict round/head/comment validation.
+    """
+    if not isinstance(event, tuple):
+        return "rework_event_invalid_shape"
+    typed_event = cast(tuple[object, object, object], event)
+    if len(typed_event) != 3:
+        return "rework_event_invalid_shape"
+    if (
+        not isinstance(typed_event[0], dict)
+        or typed_event[2] not in {"github_pr_rework", "github_pr_rework_retry"}
+    ):
+        return "rework_event_invalid_shape"
+    payload = cast(dict[str, object], typed_event[0])
+
+    if ref is not None:
+        if payload.get("repository") != ref.repository:
+            return "rework_event_repository_mismatch"
+        if payload.get("issue_number") != ref.issue_number:
+            return "rework_event_issue_mismatch"
+
+    pr_number = payload.get("pr_number")
+    if not _positive_rework_int(pr_number):
+        return "rework_event_pr_invalid"
+    if expected_pr_number is not None and pr_number != expected_pr_number:
+        return "rework_event_pr_mismatch"
+    if decision is not None:
+        matching_prs = tuple(pr for pr in decision.pull_requests if pr.number == pr_number)
+        if len(matching_prs) != 1:
+            return "rework_event_pr_unresolved"
+
+    rework_round = payload.get("rework_round")
+    if not _positive_rework_int(rework_round):
+        return "rework_event_round_invalid"
+    head_sha = payload.get("head_sha")
+    if not isinstance(head_sha, str) or _FULL_SHA_RE.fullmatch(head_sha) is None:
+        return "rework_event_head_invalid"
+
+    request_comment_id = payload.get("request_comment_id")
+    if request_comment_id is not None and not _positive_rework_int(request_comment_id):
+        return "rework_event_request_comment_invalid"
+
+    retry_comment_id = payload.get("retry_comment_id")
+    if retry_comment_id is not None:
+        if not _positive_rework_int(retry_comment_id):
+            return "rework_event_retry_comment_invalid"
+        if request_comment_id != retry_comment_id:
+            return "rework_event_retry_comment_mismatch"
+    if payload.get("trigger") == "maintainer_retry" and retry_comment_id is None:
+        return "rework_event_retry_comment_missing"
+    return None
 
 
 def _same_rework_event(
@@ -3792,7 +3866,7 @@ def _task_run_after_rework(
     task_id: str,
     rework_at: int,
     *,
-    rework_round: Any = None,
+    rework_round: object = None,
 ) -> sqlite3.Row | None:
     """Return the newest run claimed by this edge rework round.
 
@@ -3809,12 +3883,9 @@ def _task_run_after_rework(
         "ORDER BY id DESC",
         (task_id, max(0, rework_at - 1)),
     ).fetchall()
-    expected_round = rework_round
-    if expected_round is not None:
-        try:
-            expected_round = int(expected_round)
-        except (TypeError, ValueError):
-            return None
+    if not _positive_rework_int(rework_round):
+        return None
+    expected_round = cast(int, rework_round)
     for run in runs:
         run_id = int(str(run["id"]))
         provenance_rows = conn.execute(
@@ -4141,6 +4212,13 @@ def _rework_delivery_evidence(
     event: tuple[dict[str, Any], int, str],
 ) -> tuple[bool, str, dict[str, Any]]:
     """Check the complete remote-delivery contract without mutating state."""
+    invalid_event = _validate_rework_event(
+        event,
+        ref=ref,
+        expected_pr_number=pr.number,
+    )
+    if invalid_event is not None:
+        return False, invalid_event, {}
     payload, rework_at, _ = event
     # A pending newer rework request (a trusted agent-rework label addition
     # postdating this round's governing event) means this round is spent:
@@ -4409,6 +4487,15 @@ def _rework_context(
     """Build the exact PR/label context used by lifecycle and dispatch."""
     if event is None:
         return None
+    invalid_event = _validate_rework_event(
+        event,
+        ref=ref,
+    )
+    if invalid_event is not None:
+        return {
+            "_error": invalid_event,
+            "event": event,
+        }
     payload, event_at, event_kind = event
     raw_pr_number = payload.get("pr_number")
     try:
@@ -4905,6 +4992,9 @@ def _current_round_delivery(
     conn: sqlite3.Connection,
     task_id: str,
     event: tuple[dict[str, Any], int, str],
+    *,
+    ref: GithubTaskRef | None = None,
+    expected_pr_number: int | None = None,
 ) -> Optional[dict[str, Any]]:
     """Newest delivery event bound to the CURRENT rework round.
 
@@ -4928,6 +5018,12 @@ def _current_round_delivery(
     qualify, so an active current-round worker keeps ``agent-working``
     and a past delivery can never justify ``agent-review-ready``.
     """
+    if _validate_rework_event(
+        event,
+        ref=ref,
+        expected_pr_number=expected_pr_number,
+    ) is not None:
+        return None
     payload, event_at, _ = event
     rows = conn.execute(
         "SELECT payload FROM task_events "
@@ -4937,13 +5033,7 @@ def _current_round_delivery(
     ).fetchall()
     if not rows:
         return None
-    round_number = payload.get("rework_round")
-    expected_round: int | None = None
-    if round_number is not None:
-        try:
-            expected_round = int(round_number)
-        except (TypeError, ValueError):
-            return None
+    expected_round = cast(int, payload["rework_round"])
 
     def request_identity(value: Any) -> str | None:
         if value is None or str(value).casefold() == "none":
@@ -5846,6 +5936,8 @@ def _reconcile_rework_lifecycle(
         # agent-working, which takes precedence over any past delivery.
         current_delivery = _current_round_delivery(
             conn, task_id, context["event"],
+            ref=ref,
+            expected_pr_number=cast(GithubPullRequest, context["pr"]).number,
         )
         if current_delivery is not None:
             if dry_run:
@@ -6589,6 +6681,43 @@ def _dispatch_pending_rework_locked(
         )
         if not isinstance(claim_event, tuple) or len(claim_event) != 3:
             claim_event = latest_event
+    if not normalized_dry_run:
+        event_ref: GithubTaskRef | None = None
+        expected_pr_number: int | None = None
+        if isinstance(context, Mapping):
+            typed_context = cast(Mapping[str, object], context)
+            try:
+                repository = typed_context["repository"]
+                issue_number = typed_context["issue_number"]
+                pr_number = typed_context["pr_number"]
+                if (
+                    not isinstance(repository, str)
+                    or not _positive_rework_int(issue_number)
+                    or not _positive_rework_int(pr_number)
+                ):
+                    raise ValueError("invalid rework context identity")
+                event_ref = GithubTaskRef(repository, cast(int, issue_number))
+                expected_pr_number = cast(int, pr_number)
+            except (KeyError, TypeError, ValueError):
+                event_ref = None
+        if event_ref is None:
+            body_row = cast(sqlite3.Row | None, conn.execute(
+                "SELECT body FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone())
+            if body_row is not None:
+                body_value = cast(object, body_row["body"])
+                event_ref = parse_task_ref(str(body_value or ""))
+        invalid_event = _validate_rework_event(
+            cast(object, claim_event),
+            ref=event_ref,
+            expected_pr_number=expected_pr_number,
+        )
+        if invalid_event is not None:
+            return [{
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "rework_context_unavailable",
+                "diagnostic": invalid_event,
+            }]
     claim_lock = _rework_dispatch_claim_lock(task_id, claim_event)
 
     # Duplicate-ownership guards (GitHub label + Kanban PR owner), applied
