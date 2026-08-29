@@ -6,7 +6,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import pytest
 
@@ -78,7 +78,7 @@ class _RedirectPair:
     threads: list[Thread]
     source_base: str
 
-    def __enter__(self) -> _RedirectPair:
+    def __enter__(self) -> Self:
         self.target = _RedirectServer(("127.0.0.1", 0), _RedirectHandler)
         self.target.role = "target"
         self.target.location = ""
