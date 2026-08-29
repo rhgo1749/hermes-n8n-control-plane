@@ -99,6 +99,11 @@ Rules:
    - after the worker run ends, remove stale `agent-working`, preserve the
      newer `agent-rework`, and let the normal `REVIEW -> READY` intake consume
      it;
+   - a false-terminal `DONE + OPEN PR` carrying `agent-rework` (including
+     a simultaneous `agent-review-ready`) enters the strict current-round
+     delivery/attention gate first; without current edge delivery it repairs
+     to `REVIEW`, restores `agent-rework`, and never projects
+     `agent-review-ready`;
    - any other ambiguous lifecycle combination still skips with a diagnostic
      (`lifecycle_label_conflict`) and never spawns.
 5. Classic intake (`REVIEW/BLOCKED` + fresh `agent-rework` label), plus a

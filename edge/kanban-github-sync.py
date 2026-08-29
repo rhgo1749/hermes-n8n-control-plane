@@ -3752,6 +3752,21 @@ def _latest_rework_event(
     )
 
 
+def _same_rework_event(
+    left: Any,
+    right: Any,
+) -> bool:
+    """Return whether two rework-event snapshots identify the same event."""
+    if (
+        not isinstance(left, tuple)
+        or len(left) != 3
+        or not isinstance(right, tuple)
+        or len(right) != 3
+    ):
+        return False
+    return left[0] == right[0] and left[1] == right[1] and left[2] == right[2]
+
+
 def _claim_projection_failure_is_retryable(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4423,6 +4438,23 @@ def _rework_context(
         "event_at": event_at,
         "implicit_request": payload.get("trigger") == "changes_requested",
     }
+
+
+def _fresh_rework_context(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    task_id: str,
+) -> dict[str, Any] | None:
+    """Reload the context after a same-wake rework state transition."""
+    event = _latest_rework_event(conn, task_id)
+    if event is None:
+        return None
+    try:
+        return _rework_context(client, ref, decision, task_id, event)
+    except GithubCompletionError as exc:
+        return {"_error": str(exc)}
 
 
 def _task_has_active_rework_claim(
@@ -5548,7 +5580,15 @@ def _reconcile_rework_lifecycle(
             # None`` here hands the task to the classic intake / dispatch
             # lane in the same tick.
 
-    if len(labels & lifecycle) > 1:
+    # DONE + OPEN + agent-rework must use the strict current-round delivery
+    # gate below.  Generic conflict repair would otherwise project
+    # agent-review-ready before delivery provenance is proven.
+    if len(labels & lifecycle) > 1 and not (
+        status == "done"
+        and context["pr"].state == "open"
+        and REWORK_LABEL in labels
+        and REVIEW_READY_LABEL in labels
+    ):
         # RC3 (t_aff9017c incident): an ACTIVE worker legitimately owns
         # agent-working while a fresh trusted agent-rework request arrives
         # mid-round.  Fail-closed here would strand the pending round behind
@@ -6515,13 +6555,40 @@ def _dispatch_pending_rework_locked(
         if isinstance(rework_contexts, Mapping)
         else None
     )
-    claim_event = (
-        context.get("event")
-        if isinstance(context, Mapping)
-        else None
+    latest_event = _latest_rework_event(conn, task_id)
+    normalized_dry_run = bool(
+        dry_run
+        and normalized_task_ids is not None
+        and task_id in normalized_task_ids
     )
-    if not isinstance(claim_event, tuple) or len(claim_event) != 3:
-        claim_event = _latest_rework_event(conn, task_id)
+    if isinstance(rework_contexts, Mapping) and not normalized_dry_run:
+        # The context map is a same-wake snapshot.  Do not claim a task when
+        # a direct rework transition replaced the governing event after that
+        # snapshot was built; using the old event would mis-bind provenance.
+        if not isinstance(context, Mapping) or "_error" in context:
+            return [{
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "rework_context_unavailable",
+            }]
+        context_event = context.get("event")
+        if not _same_rework_event(context_event, latest_event):
+            latest_payload = (
+                latest_event[0] if isinstance(latest_event, tuple) else {}
+            )
+            return [{
+                "task_id": task_id, "status": "ready", "changed": False,
+                "reason": "stale_rework_context",
+                "rework_round": latest_payload.get("rework_round"),
+            }]
+        claim_event = latest_event
+    else:
+        claim_event = (
+            context.get("event")
+            if isinstance(context, Mapping)
+            else None
+        )
+        if not isinstance(claim_event, tuple) or len(claim_event) != 3:
+            claim_event = latest_event
     claim_lock = _rework_dispatch_claim_lock(task_id, claim_event)
 
     # Duplicate-ownership guards (GitHub label + Kanban PR owner), applied
@@ -6915,6 +6982,21 @@ def sync_board(
         results: list[dict[str, Any]] = []
         normalized_rework_ids: set[str] = set()
         lifecycle_contexts_by_task: dict[str, Optional[dict[str, Any]]] = {}
+
+        def _refresh_context_after_rework(
+            task_id: str,
+            ref: GithubTaskRef,
+            decision: GithubCompletionDecision,
+            entry: Mapping[str, Any],
+        ) -> None:
+            if not entry.get("changed") or entry.get("reason") not in {
+                "agent_rework", "maintainer_retry_consumed",
+            }:
+                return
+            lifecycle_contexts_by_task[task_id] = _fresh_rework_context(
+                conn, client, ref, decision, task_id,
+            )
+
         for row in rows:
             task_id = str(row["id"])
             if requested is not None and task_id not in requested:
@@ -7129,6 +7211,9 @@ def sync_board(
                     failure_limit=_retry_failure_limit(),
                 )
                 if lifecycle_entry is not None:
+                    _refresh_context_after_rework(
+                        task_id, ref, decision, lifecycle_entry,
+                    )
                     results.append(_annotate(lifecycle_entry, row, ref))
                     continue
 
@@ -7163,20 +7248,18 @@ def sync_board(
                 continue
 
             if row["status"] == "blocked":
-                results.append(
-                    _annotate(
-                        _reconcile_blocked(
-                            conn,
-                            client,
-                            ref,
-                            decision,
-                            row,
-                            dry_run=dry_run,
-                        ),
-                        row,
-                        ref,
-                    )
+                blocked_entry = _reconcile_blocked(
+                    conn,
+                    client,
+                    ref,
+                    decision,
+                    row,
+                    dry_run=dry_run,
                 )
+                _refresh_context_after_rework(
+                    task_id, ref, decision, blocked_entry,
+                )
+                results.append(_annotate(blocked_entry, row, ref))
                 continue
 
             # Worker-owned lifecycle reconciliation (running/ready/review/done
@@ -7195,6 +7278,9 @@ def sync_board(
                     failure_limit=_retry_failure_limit(),
                 )
                 if lifecycle_entry is not None:
+                    _refresh_context_after_rework(
+                        task_id, ref, decision, lifecycle_entry,
+                    )
                     results.append(_annotate(lifecycle_entry, row, ref))
                     continue
 
@@ -7253,11 +7339,11 @@ def sync_board(
                         )
                     )
                     continue
-                if result.get("changed"):
-                    # The agent-rework label intentionally stays on the PR
-                    # until the edge dispatcher claims the Kanban task and
-                    # atomically swaps it for agent-working.
-                    pass
+                # The agent-rework label intentionally stays on the PR until
+                # the edge dispatcher claims the Kanban task and atomically
+                # swaps it for agent-working.  Refresh the in-memory context
+                # first so this same wake cannot claim the prior round.
+                _refresh_context_after_rework(task_id, ref, decision, result)
                 results.append(_annotate(result, row, ref))
                 continue
 

@@ -4889,7 +4889,7 @@ def test_126_claim_readback_failure_is_durable_and_retries_once():
 
 
 def test_fresh_rework_after_stale_review_ready_dispatches_round_two():
-    """A fresh request owns a stale review-ready surface and dispatches once."""
+    """A fresh request opens and dispatches its round in one authoritative wake."""
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     head1 = "0123456789abcdef0123456789abcdef00000901"
@@ -4911,36 +4911,13 @@ def test_fresh_rework_after_stale_review_ready_dispatches_round_two():
     fake.reviews[PR_N].append(review(
         "rhgo1749", "CHANGES_REQUESTED", "round two feedback", label_at,
     ))
-    run_sync(fake)  # normalize the fresh round without dispatching it
-    core_stub = StubSpawn()
-    with connect_closing() as conn:
-        core_dispatch = kanban_db.dispatch_once(
-            conn,
-            spawn_fn=core_stub,
-            board="default",
-            default_assignee="kanban-main",
-            max_spawn=1,
-            max_in_progress=1,
-            reconcile_orphans=False,
-        )
-    check("fresh-round: core dispatcher cannot steal pending round",
-          tid in core_dispatch.skipped_nonspawnable and core_stub.calls == [],
-          str(core_dispatch))
     _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws-fresh-round-"))
     _make_profile_dir()
     stub = StubSpawn()
-    with connect_closing() as conn:
-        results = mod._dispatch_pending_rework(
-            conn,
-            kanban_db,
-            "default",
-            spawn_fn=stub,
-            cfg={
-                "max_in_progress": 1,
-                "default_assignee": "kanban-main",
-                "failure_limit": 5,
-            },
-        )
+    # The rework request, round opening, and edge dispatch all happen in this
+    # ONE authoritative sync wake.  A second wake would hide stale context
+    # captured before apply_rework and would not reproduce the production race.
+    results = _run_sync_with_dispatch(fake, stub)
     events = [event for event in task_events(tid)
               if event["kind"] == "github_pr_rework"]
     provenance = [event for event in task_events(tid)
@@ -4950,10 +4927,16 @@ def test_fresh_rework_after_stale_review_ready_dispatches_round_two():
           str(events))
     check("fresh-round: round two recorded", events[-1]["payload"].get(
         "rework_round") == 2, str(events[-1] if events else events))
+    round_two = events[-1] if events else None
+    round_two_at = round_two["created_at"] if round_two is not None else None
+    round_two_provenance = [
+        event for event in provenance
+        if event["payload"].get("rework_round") == 2
+    ]
     check("fresh-round: worker dispatched once", len([
         item for item in results if item.get("reason") == "rework_worker_spawned"
     ]) == 1 and len(stub.calls) == 1 and
-          {item["payload"].get("phase") for item in provenance} == {
+          {item["payload"].get("phase") for item in round_two_provenance} == {
               "claimed", "spawned",
           }, str(results))
     check("fresh-round: task owned by running edge worker",
@@ -4961,6 +4944,102 @@ def test_fresh_rework_after_stale_review_ready_dispatches_round_two():
               mod.REWORK_DISPATCH_CLAIM_PREFIX
           ) and "agent-review-ready" not in fake.pr_labels.get(PR_N, []),
           str(row))
+    check("fresh-round: round-two provenance uses current event and run",
+          round_two is not None
+          and len(round_two_provenance) == 2
+          and all(
+              item["payload"].get("rework_event_at") == round_two_at
+              and item["payload"].get("run_id") == row["current_run_id"]
+              and item["payload"].get("claim_lock") == row["claim_lock"]
+              for item in round_two_provenance
+          ), str(round_two_provenance))
+    strict_run = None
+    if round_two is not None and round_two_at is not None:
+        with connect_closing() as conn:
+            strict_run = mod._task_run_after_rework(
+                conn,
+                tid,
+                int(round_two_at),
+                rework_round=round_two["payload"].get("rework_round"),
+            )
+    check("fresh-round: strict current-round delivery lookup accepts run",
+          strict_run is not None
+          and int(strict_run["id"]) == int(row["current_run_id"]),
+          str(strict_run))
+
+
+def test_done_open_conflicting_rework_labels_missing_delivery_attention():
+    """DONE+OPEN with review-ready/rework labels enters the strict hold gate."""
+    print("DONE+OPEN conflicting lifecycle labels -> attention, retry-visible rework")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000908"
+    fake.prs[PR_N]["head"]["sha"] = head
+    fake.pr_labels[PR_N] = ["agent-review-ready", "agent-rework"]
+    # Model a provisional ordinary/core completion with matching head data but
+    # no edge claim/spawn provenance and no current-round delivery event.
+    with connect_closing() as conn:
+        rework = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid, "github_pr_rework"),
+        ).fetchone()
+        assert rework is not None
+        started = int(rework["created_at"]) + 1
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, "
+            "outcome, summary, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tid,
+                "kanban-main",
+                "done",
+                started,
+                started + 60,
+                "completed",
+                "ordinary core completion",
+                json.dumps({"head_sha": head, "pull_request": {"head_sha": head}}),
+            ),
+        )
+        run_id = cur.lastrowid
+        assert run_id is not None
+        conn.execute(
+            "UPDATE tasks SET status=?, current_run_id=?, completed_at=? WHERE id=?",
+            ("done", int(run_id), started + 60, tid),
+        )
+        conn.commit()
+
+    results = run_sync(fake)
+    entries = [item for item in results if item.get("task_id") == tid]
+    events = task_events(tid)
+    attention_posts = [
+        payload for path, payload in fake.post_calls
+        if path.endswith("/comments")
+        and mod.REWORK_ATTENTION_MARKER in str(payload.get("body") or "")
+    ]
+    check("conflict-shape: DONE repaired to REVIEW",
+          task_row(tid)["status"] == "review"
+          and task_row(tid)["completed_at"] is None,
+          str(entries))
+    check("conflict-shape: bounded attention recorded", any(
+        event["kind"] == "github_pr_rework_attention"
+        and event["payload"].get("diagnostic") == "delivery_run_missing"
+        for event in events
+    ), str(events))
+    check("conflict-shape: retry-visible labels restored",
+          fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+    check("conflict-shape: GitHub attention feedback posted", len(attention_posts) == 1
+          and f"{mod.REWORK_ATTENTION_MARKER} task={tid} "
+          "reason=delivery_run_missing" in str(attention_posts[0].get("body")),
+          str(attention_posts))
+    check("conflict-shape: no forged delivery or review-ready",
+          not any(event["kind"] == "github_pr_rework_delivery" for event in events)
+          and not any(item.get("reason") == "agent_review_ready" for item in entries),
+          str(entries))
+    check("conflict-shape: operator attention projected", any(
+        event["kind"] == "github_operator_attention"
+        and event["payload"].get("reason") == "rework_human_attention"
+        for event in events
+    ), str(events))
 
 
 def test_done_open_without_current_round_delivery_never_projects_review_ready():
@@ -5309,6 +5388,7 @@ def main() -> int:
         test_125_claim_patch_failure_is_durable_and_retries_once,
         test_126_claim_readback_failure_is_durable_and_retries_once,
         test_fresh_rework_after_stale_review_ready_dispatches_round_two,
+        test_done_open_conflicting_rework_labels_missing_delivery_attention,
         test_done_open_without_current_round_delivery_never_projects_review_ready,
         test_task_run_after_rework_requires_edge_rework_provenance,
         test_label_only_rework_does_not_inherit_prior_completion_comment,
