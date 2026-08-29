@@ -13,7 +13,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#87`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/87
-- Kanban task ID: `t_14dfe9ee` (implementation/rework); prior implementation card: `t_1631db5d`
+- Kanban task ID: `t_577aa06e` (final safety/provenance rework); prior implementation/rework card: `t_14dfe9ee`; original implementation card: `t_1631db5d`
 - Design provenance: `t_d26a81e2`, completed DESIGN handoff/comment `227`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:87`
 - Planning/lead owner: `kanban-main`
@@ -44,15 +44,15 @@ repository policy상 로컬 PASS를 대신하지 않으며, host/App 검증은 �
 
 | Gate | Result | Evidence |
 |---|---|---|
-| Focused implementation/regression suites | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q tests/test_repository_onboarding.py tests/test_onboarding_diagnostics.py tests/test_github_router.py tests/test_github_intake_actuator.py tests/test_repo_scoped_intake.py tests/test_repository_registry.py tests/test_repository_registry_bootstrap.py tests/test_intake_lease_controller.py tests/test_n8n_import_contract.py tests/test_intake_merged_pr_guard.py` — 184 passed |
-| Focused onboarding safety subset | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q tests/test_repository_onboarding.py tests/test_repo_scoped_intake.py tests/test_repository_registry.py tests/test_onboarding_diagnostics.py` — 94 passed |
-| Full local suite excluding known baseline modules | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q --ignore=tests/test_board_identity_migration.py --ignore=tests/test_completion_wake_contention_retry.py` — 244 passed |
-| Full local suite | FAIL (baseline) | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q` — 1 failed, 247 passed, 23 errors; failures/errors are in the known baseline modules `test_completion_wake_contention_retry.py` and `test_board_identity_migration.py` and were not introduced by this change. |
+| Focused implementation/regression suites | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q tests/test_repository_onboarding.py tests/test_onboarding_diagnostics.py tests/test_github_router.py tests/test_github_intake_actuator.py tests/test_repo_scoped_intake.py tests/test_repository_registry.py tests/test_repository_registry_bootstrap.py tests/test_intake_lease_controller.py tests/test_n8n_import_contract.py tests/test_intake_merged_pr_guard.py tests/test_github_redirect_safety.py` — 191 passed |
+| Focused onboarding safety subset | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q tests/test_repository_onboarding.py tests/test_repo_scoped_intake.py tests/test_repository_registry.py tests/test_onboarding_diagnostics.py` — 96 passed |
+| Full local suite excluding known baseline modules | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q --ignore=tests/test_board_identity_migration.py --ignore=tests/test_completion_wake_contention_retry.py` — 251 passed |
+| Full local suite | FAIL (baseline) | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q` — 1 failed, 254 passed, 23 errors; failures/errors are in the known baseline modules `test_completion_wake_contention_retry.py` and `test_board_identity_migration.py` and were not introduced by this change. |
 | `N8N_VALIDATE` | PASS | `python3 automation/n8n/scripts/validate.py` — exit 0 (`schedule_workflows=0`, `edge_sync_workflows=1`) |
-| Python compile / shell syntax / diff check | PASS | `python3 -m compileall -q automation/hermes/scripts automation/n8n tests`, `bash -n automation/n8n/scripts/diagnose-github-onboarding.sh`, and `git diff --check` — exit 0 |
-| LSP/type diagnostics | PASS | bundled Pyright 1.1.412 with repository Python typeshed fallback on changed production sources — `0 errors, 0 warnings, 0 informations`; existing dynamic-module monkeypatch diagnostics remain confined to test files |
-| Ruff changed-code gate | PASS | `ruff check --select E4,E7,E9,F` on changed Python sources/tests — `All checks passed!`; default Ruff baseline-only rule IDs remain unchanged |
-| Shellcheck | PASS | `shellcheck automation/n8n/scripts/diagnose-github-onboarding.sh` — exit 0 |
+| Python compile / shell syntax / diff check | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q automation/hermes/scripts/github-agent-ready-kanban-intake.py automation/n8n/scripts/repository_registry.py automation/n8n/github-router/router.py tests/test_repository_onboarding.py tests/test_repo_scoped_intake.py tests/test_github_redirect_safety.py`, `bash -n automation/n8n/scripts/diagnose-github-onboarding.sh`, and `git diff --check` — exit 0 |
+| LSP/type diagnostics | PASS (production); BASELINE-EQUIVALENT (all touched) | bundled Pyright 1.1.412 with repository Python typeshed fallback: 3 changed production sources — `0 errors, 0 warnings, 0 informations`; all 6 touched Python files — 60 existing `reportAttributeAccessIssue` diagnostics confined to dynamic-module assignments in `tests/test_repo_scoped_intake.py`, with 0 diagnostics in the new redirect fixture |
+| Ruff changed-code gate | PASS | `python3 -m ruff check --select E4,E7,E9,F` on all 6 touched Python files — `All checks passed!`; default Ruff reports only the 11 pre-existing `EXE001`/`FURB188`/`BLE001` findings in already-touched files |
+| Shellcheck | PASS (unchanged shell path) | prior same-branch evidence: `shellcheck automation/n8n/scripts/diagnose-github-onboarding.sh` — exit 0; no shell file changed in this rework |
 | Host/App/network canary | NOT RUN — USER VALIDATION REQUIRED | GitHub App installation, protected secrets, public HTTPS route, host checkout root, production Hermes job, and signed delivery remain operator-owned |
 
 The new-repository router regression was also run with `_has_app_installation_context()` temporarily
@@ -61,7 +61,9 @@ it pass. Additional pre-fix sabotage against the prior rework head failed the sc
 branch-component, metadata-before-filesystem, and clone-environment regressions; the restored
 implementation passed. The read-only onboarding diagnostic passes against a synthetic authoritative-job
 fixture and fails closed on this host because `default:bf431b2a6ba6` is not installed in the active Hermes
-profile.
+profile. The staged-index, foreign-workdir scope, and bearer-redirect regressions each failed against
+the pre-fix implementation and passed after restoration; the final focused run includes all seven new
+regression cases.
 
 ## Operator handoff / recovery
 
@@ -75,7 +77,8 @@ Live acceptance must prove an active personal-owner GitHub App webhook, protecte
 
 - Base SHA: `dd7f6ad6c6fe39108d87a821c635046ab1fb88e1`
 - Branch: `issue87/onboarding-checkout-webhook`
-- Commits: `0fe9a431161b26b1e0cc2ec25f613fb17d056a72`, `99334584fb297db105f975d0c527521c7d286a33`, `110bcb907d3a774b56004b7849bb8f80b4dd3845`, `f4cad8f739d9c16c229dd160cbaba4ac50b4872d`, `b044ea831e175a07a14df74c757988a71e31788e`, `1707128ce6501b2e521ad8edb5c3b95a5cd95e93`
+- Commits: `0fe9a431161b26b1e0cc2ec25f613fb17d056a72`, `99334584fb297db105f975d0c527521c7d286a33`, `110bcb907d3a774b56004b7849bb8f80b4dd3845`, `f4cad8f739d9c16c229dd160cbaba4ac50b4872d`, `b044ea831e175a07a14df74c757988a71e31788e`, `1707128ce6501b2e521ad8edb5c3b95a5cd95e93`, `8be40ad80d2bb538ea0123c50abcb79ffb08c6e2`, `8b5c96b83ae8ba918f4b26d792174f15a5290d69`, `8d188042fe72209aa498fcacabf2beea32c07e17`
+- Implementation/validation head for this rework: `8d188042fe72209aa498fcacabf2beea32c07e17`
 - PR number/title/URL: PR #88 — `Issue #87: 신규 hermes-agent 저장소 webhook 온보딩` — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/88
 - Working tree: clean after final commit; PR #88 open and verified by REST/GraphQL read-back
 - Merge performed: NO
