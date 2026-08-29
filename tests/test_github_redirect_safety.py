@@ -37,10 +37,12 @@ router = _load_module(
 
 
 class _RedirectServer(ThreadingHTTPServer):
-    role: str
-    location: str
-    authorization: list[str | None]
-    bodies: list[bytes]
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.role = ""
+        self.location = ""
+        self.authorization: list[str | None] = []
+        self.bodies: list[bytes] = []
 
 
 class _RedirectHandler(BaseHTTPRequestHandler):
@@ -73,31 +75,23 @@ class _RedirectHandler(BaseHTTPRequestHandler):
 
 
 class _RedirectPair:
-    source: _RedirectServer
-    target: _RedirectServer
-    threads: list[Thread]
-    source_base: str
-
-    def __enter__(self) -> Self:
+    def __init__(self) -> None:
         self.target = _RedirectServer(("127.0.0.1", 0), _RedirectHandler)
         self.target.role = "target"
-        self.target.location = ""
-        self.target.authorization = []
-        self.target.bodies = []
         self.source = _RedirectServer(("127.0.0.1", 0), _RedirectHandler)
         self.source.role = "source"
         self.source.location = (
             f"http://127.0.0.1:{self.target.server_port}/redirect-target"
         )
-        self.source.authorization = []
-        self.source.bodies = []
         self.threads = [
             Thread(target=server.serve_forever, daemon=True)
             for server in (self.source, self.target)
         ]
+        self.source_base = f"http://127.0.0.1:{self.source.server_port}"
+
+    def __enter__(self) -> Self:
         for thread in self.threads:
             thread.start()
-        self.source_base = f"http://127.0.0.1:{self.source.server_port}"
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:

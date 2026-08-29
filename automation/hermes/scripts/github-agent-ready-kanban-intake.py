@@ -3172,7 +3172,7 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
             file=sys.stderr,
         )
         return False
-    except Exception as exc:  # observer: never fail the reconciliation
+    except Exception as exc:  # noqa: BLE001 - observer must never fail reconciliation
         print(
             f"kanban-intake: Hermes send skipped (warning only): {type(exc).__name__}",
             file=sys.stderr,

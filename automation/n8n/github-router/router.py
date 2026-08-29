@@ -1336,7 +1336,7 @@ def _delayed_pause(lease: str, token: str) -> None:
             f"reason={body.get('reason', '')}",
             flush=True,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - delayed pause must not affect wake
         print(
             "github-router delayed pause warning: "
             f"{type(exc).__name__}",

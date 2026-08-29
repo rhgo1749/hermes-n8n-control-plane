@@ -55,7 +55,7 @@ def _api_fake(
     def fake(
         token: str,
         path: str,
-        params: dict | None = None,
+        params: dict[str, Any] | None = None,
         *,
         allow_not_found: bool = False,
     ):

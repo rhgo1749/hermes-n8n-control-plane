@@ -1445,8 +1445,9 @@ def test_stale_scope_claim_token_cannot_ack_reclaimed_scope() -> None:
         original = _install_temp_paths(Path(td))
         try:
             now = int(time.time())
+            scope_id = "scope-fenced"
             item = {
-                "id": "scope-fenced",
+                "id": scope_id,
                 "mode": "event",
                 "repositories": ["rhgo1749/ctrl-hangul"],
                 "created_at": now - 100,
@@ -1459,7 +1460,7 @@ def test_stale_scope_claim_token_cannot_ack_reclaimed_scope() -> None:
                 {
                     "scope_queue": [],
                     "scope_claims": {
-                        item["id"]: {
+                        scope_id: {
                             **item,
                             "claim_expires_at": now - 1,
                             "claim_token": stale_token,
@@ -1471,12 +1472,12 @@ def test_stale_scope_claim_token_cannot_ack_reclaimed_scope() -> None:
             assert reclaimed["id"] == item["id"]
             assert reclaimed["claim_token"] != stale_token
             with pytest.raises(router.RouterError, match="claim token mismatch"):
-                router._ack_scope(item["id"], stale_token)
+                router._ack_scope(scope_id, stale_token)
             state = router._load_state_unlocked()
-            assert state["scope_claims"][item["id"]]["claim_token"] == reclaimed[
+            assert state["scope_claims"][scope_id]["claim_token"] == reclaimed[
                 "claim_token"
             ]
-            assert router._ack_scope(item["id"], reclaimed["claim_token"])["ok"] is True
+            assert router._ack_scope(scope_id, reclaimed["claim_token"])["ok"] is True
         finally:
             _restore(original)
 

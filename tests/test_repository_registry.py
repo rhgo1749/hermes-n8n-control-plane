@@ -526,32 +526,33 @@ def test_live_registry_snapshot_composes_existing_authorities() -> None:
         assert entry["ready"] is True
 
 
-def test_live_registry_status_validation_precedes_board_filesystem(monkeypatch) -> None:
-    repository = _repo("rhgo1749/status-check", 42)
-    repository["disabled"] = "false"
-    board_read = False
+def test_live_registry_status_validation_precedes_board_filesystem() -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        repository = _repo("rhgo1749/status-check", 42)
+        repository["disabled"] = "false"
+        board_read = False
 
-    monkeypatch.setattr(
-        registry,
-        "discover_repositories",
-        lambda token, owner, topic: [repository],
-    )
-
-    def forbidden_board_read(root):
-        nonlocal board_read
-        board_read = True
-        raise AssertionError("invalid provider metadata must fail before board I/O")
-
-    monkeypatch.setattr(registry, "_kanban_board_repository_evidence", forbidden_board_read)
-    with pytest.raises(registry.RegistryError, match="archive/disabled"):
-        registry.live_registry_snapshot(
-            "token",
-            "rhgo1749",
-            "hermes-agent",
-            Path("/tmp/projects"),
-            Path("/tmp/boards"),
+        monkeypatch.setattr(
+            registry,
+            "discover_repositories",
+            lambda token, owner, topic: [repository],
         )
-    assert board_read is False
+
+        def forbidden_board_read(root):
+            nonlocal board_read
+            board_read = True
+            raise AssertionError("invalid provider metadata must fail before board I/O")
+
+        monkeypatch.setattr(registry, "_kanban_board_repository_evidence", forbidden_board_read)
+        with pytest.raises(registry.RegistryError, match="archive/disabled"):
+            registry.live_registry_snapshot(
+                "token",
+                "rhgo1749",
+                "hermes-agent",
+                Path("/tmp/projects"),
+                Path("/tmp/boards"),
+            )
+        assert board_read is False
 
 
 def test_verified_checkout_missing_board_declares_bootstrap_intent() -> None:

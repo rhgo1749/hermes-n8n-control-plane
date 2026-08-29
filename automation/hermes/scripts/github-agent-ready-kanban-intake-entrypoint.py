@@ -20,7 +20,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 
 _OLD_COMPLETION_CONTRACT = """## GitHub completion contract (authoritative)
@@ -146,9 +146,10 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
             1,
         )
 
-    patched_task_body._github_completion_overlay_installed = True  # type: ignore[attr-defined]
-    patched_task_body._github_completion_overlay_original = original  # type: ignore[attr-defined]
-    setattr(module, "_task_body", patched_task_body)
+    dynamic_task_body = cast(Any, patched_task_body)
+    dynamic_task_body._github_completion_overlay_installed = True
+    dynamic_task_body._github_completion_overlay_original = original
+    module.__dict__["_task_body"] = patched_task_body
 
 
 def _load_core() -> ModuleType:
