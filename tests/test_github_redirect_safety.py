@@ -51,7 +51,7 @@ class _RedirectHandler(BaseHTTPRequestHandler):
         server.authorization.append(self.headers.get("Authorization"))
         server.bodies.append(body)
         if server.role == "source":
-            self.send_response(302)
+            self.send_response(307)
             self.send_header("Location", server.location)
             self.end_headers()
             return
@@ -111,7 +111,7 @@ class _RedirectPair:
 def test_intake_get_does_not_forward_bearer_to_redirect_target(monkeypatch):
     with _RedirectPair() as pair:
         monkeypatch.setattr(intake, "GITHUB_API", pair.source_base)
-        with pytest.raises(intake.IntakeError, match="GitHub API 302"):
+        with pytest.raises(intake.IntakeError, match="GitHub API 307"):
             intake._github_get_json(
                 "redirect-secret",
                 "/repos/example/project",
@@ -130,7 +130,7 @@ def test_intake_patch_does_not_forward_bearer_to_redirect_target(monkeypatch):
             "/repos/example/project/issues/1",
             {"labels": ["agent-ready"]},
         )
-        assert (status, body) == (302, None)
+        assert (status, body) == (307, None)
         assert pair.source.authorization == ["Bearer redirect-secret"]
         assert pair.target.authorization == []
         assert pair.target.bodies == []
@@ -139,7 +139,7 @@ def test_intake_patch_does_not_forward_bearer_to_redirect_target(monkeypatch):
 def test_registry_get_does_not_forward_bearer_to_redirect_target(monkeypatch):
     with _RedirectPair() as pair:
         monkeypatch.setattr(registry, "GITHUB_API", pair.source_base)
-        with pytest.raises(registry.RegistryError, match="HTTP 302"):
+        with pytest.raises(registry.RegistryError, match="HTTP 307"):
             registry._github_json("redirect-secret", "/repos/example/project")
         assert pair.source.authorization == ["Bearer redirect-secret"]
         assert pair.target.authorization == []
@@ -149,7 +149,7 @@ def test_registry_get_does_not_forward_bearer_to_redirect_target(monkeypatch):
 def test_router_get_does_not_forward_bearer_to_redirect_target(monkeypatch):
     with _RedirectPair() as pair:
         monkeypatch.setattr(router, "GITHUB_API", pair.source_base)
-        with pytest.raises(router.RouterError, match="returned HTTP 302"):
+        with pytest.raises(router.RouterError, match="returned HTTP 307"):
             router._github_request(
                 "GET",
                 "/repos/example/project",
@@ -163,7 +163,7 @@ def test_router_get_does_not_forward_bearer_to_redirect_target(monkeypatch):
 def test_router_patch_does_not_forward_bearer_to_redirect_target(monkeypatch):
     with _RedirectPair() as pair:
         monkeypatch.setattr(router, "GITHUB_API", pair.source_base)
-        with pytest.raises(router.RouterError, match="returned HTTP 302"):
+        with pytest.raises(router.RouterError, match="returned HTTP 307"):
             router._github_request(
                 "PATCH",
                 "/repos/example/project/hooks/1",
