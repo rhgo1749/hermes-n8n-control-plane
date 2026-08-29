@@ -4983,9 +4983,11 @@ def test_done_open_without_current_round_delivery_never_projects_review_ready():
             (tid, started, started + 60,
              json.dumps({"head_sha": head, "pull_request": {"head_sha": head}})),
         )
+        run_id = cur.lastrowid
+        assert run_id is not None
         conn.execute(
             "UPDATE tasks SET status='done', current_run_id=?, completed_at=? "
-            "WHERE id=?", (int(cur.lastrowid), started + 60, tid),
+            "WHERE id=?", (int(run_id), started + 60, tid),
         )
         conn.commit()
     _post_completion_marker(fake, tid, head)
@@ -5030,9 +5032,11 @@ def test_task_run_after_rework_requires_edge_rework_provenance():
             (tid, started, started + 60,
              json.dumps({"head_sha": head, "pull_request": {"head_sha": head}})),
         )
+        run_id = cur.lastrowid
+        assert run_id is not None
         conn.execute(
             "UPDATE tasks SET status='done', current_run_id=?, completed_at=? "
-            "WHERE id=?", (int(cur.lastrowid), started + 60, tid),
+            "WHERE id=?", (int(run_id), started + 60, tid),
         )
         conn.commit()
         payload = json.loads(rework["payload"] or "{}")
