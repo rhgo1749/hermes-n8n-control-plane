@@ -146,8 +146,16 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
             1,
         )
 
-    setattr(patched_task_body, "_github_completion_overlay_installed", True)
-    setattr(patched_task_body, "_github_completion_overlay_original", original)
+    setattr(  # noqa: B010 - dynamic marker controls idempotent overlay install
+        patched_task_body,
+        "_github_completion_overlay_installed",
+        True,
+    )
+    setattr(  # noqa: B010 - dynamic marker preserves the wrapped task body
+        patched_task_body,
+        "_github_completion_overlay_original",
+        original,
+    )
     module.__dict__["_task_body"] = patched_task_body
 
 
