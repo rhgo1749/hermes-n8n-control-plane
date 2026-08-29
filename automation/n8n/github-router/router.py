@@ -17,7 +17,22 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler())
+
+
+def _urlopen_without_redirect(request: Request, *, timeout: float):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+urlopen = _urlopen_without_redirect
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("GITHUB_ROUTER_LISTEN_PORT", "5681"))

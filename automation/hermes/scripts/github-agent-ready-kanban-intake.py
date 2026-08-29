@@ -38,7 +38,24 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler())
+
+
+def _urlopen_without_redirect(request: Request, *, timeout: float):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+# Keep the module-level transport seam used by focused tests while making the
+# no-redirect policy unavoidable for every GitHub request in this module.
+urlopen = _urlopen_without_redirect
 
 DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
 DEFAULT_HERMES_BIN = "/home/hermes/.local/bin/hermes"
@@ -634,6 +651,8 @@ def _load_registry_snapshot(token: str) -> dict[str, Any]:
 def _repository_configs_from_registry(
     snapshot: dict[str, Any],
     repository: str | None,
+    *,
+    validated_checkouts: dict[str, str] | None = None,
 ) -> tuple[tuple[RepositoryConfig, ...], list[dict[str, str]]]:
     entries = snapshot.get("repositories")
     if not isinstance(entries, list):
@@ -732,6 +751,18 @@ def _repository_configs_from_registry(
                 f"registry display_name for {name} is not repository-derived: "
                 f"{display_name!r}"
             )
+
+        # An event-scoped checkout was freshly validated before this
+        # read-only registry snapshot.  Never let its board/workdir metadata
+        # substitute another path after that trust boundary; the exact path
+        # returned by the validator is the only checkout this tick may use.
+        expected_checkout = (
+            validated_checkouts.get(name_key)
+            if validated_checkouts is not None
+            else None
+        )
+        if expected_checkout is not None and checkout != expected_checkout:
+            raise _onboarding_error("checkout_path_conflict")
 
         configs.append(
             RepositoryConfig(
@@ -1740,6 +1771,19 @@ def _git_onboarding_bytes(
 
 def _onboarding_checkout_is_clean(checkout: Path) -> bool:
     """Check index/worktree bytes without invoking repository filters."""
+    # Comparing the index with HEAD is separate from hashing worktree bytes:
+    # staged-only changes can make those bytes agree while still replacing the
+    # validated tree that HEAD (and the validated remote ref) identifies.
+    code, _, _ = _git_onboarding_bytes(
+        checkout,
+        "diff",
+        "--cached",
+        "--quiet",
+        "HEAD",
+        "--",
+    )
+    if code != 0:
+        return False
     code, raw_index, _ = _git_onboarding_bytes(checkout, "ls-files", "--stage", "-z")
     if code != 0:
         return False
@@ -3412,6 +3456,25 @@ def _run_once(args: argparse.Namespace) -> int:
             # checkout and can declare board bootstrap.
             registry_snapshot = _load_registry_snapshot(token)
 
+        validated_checkouts = (
+            {
+                item["repository"].casefold(): item["checkout"]
+                for item in checkout_provisioning
+            }
+            if args.repository
+            or (wake_scope is not None and wake_scope.mode == "event")
+            else None
+        )
+        if validated_checkouts:
+            # Validate the registry's ready entries before any board bootstrap
+            # mutation. Unready entries are intentionally skipped here so the
+            # canonical bootstrap path can make them ready in this tick.
+            _repository_configs_from_registry(
+                registry_snapshot,
+                None,
+                validated_checkouts=validated_checkouts,
+            )
+
         if args.repository:
 
             # The registry remains read-only; the intake owns canonical board
@@ -3420,10 +3483,7 @@ def _run_once(args: argparse.Namespace) -> int:
                 registry_snapshot,
                 dry_run=bool(args.dry_run),
                 scope=(args.repository,),
-                validated_checkouts={
-                    item["repository"].casefold(): item["checkout"]
-                    for item in checkout_provisioning
-                },
+                validated_checkouts=validated_checkouts,
                 token=token,
             )
             _active_scope_progress["board_provisioning"] = board_provisioning
@@ -3435,6 +3495,7 @@ def _run_once(args: argparse.Namespace) -> int:
             available_configs, registry_unready = _repository_configs_from_registry(
                 registry_snapshot,
                 args.repository,
+                validated_checkouts=validated_checkouts,
             )
             selected_configs = _select_repositories(
                 available_configs,
@@ -3456,10 +3517,7 @@ def _run_once(args: argparse.Namespace) -> int:
                     registry_snapshot,
                     dry_run=bool(args.dry_run),
                     scope=provision_scope,
-                    validated_checkouts={
-                        item["repository"].casefold(): item["checkout"]
-                        for item in checkout_provisioning
-                    },
+                    validated_checkouts=validated_checkouts,
                     token=token,
                 )
             else:

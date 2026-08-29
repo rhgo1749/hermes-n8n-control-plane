@@ -326,6 +326,27 @@ def test_ensure_checkout_reuses_clean_existing_checkout_and_rejects_dirty(
     assert (checkout / "untracked.txt").read_text(encoding="utf-8") == "do not overwrite\n"
 
 
+def test_onboarding_checkout_rejects_staged_index_only_change(tmp_path: Path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _run_git("init", cwd=checkout)
+    _run_git("config", "user.email", "unit@example.test", cwd=checkout)
+    _run_git("config", "user.name", "Unit Test", cwd=checkout)
+    contract = checkout / "AGENTS.md"
+    contract.write_text("# original\n", encoding="utf-8")
+    _run_git("add", "AGENTS.md", cwd=checkout)
+    _run_git("commit", "-m", "contract", cwd=checkout)
+
+    assert intake._onboarding_checkout_is_clean(checkout) is True
+
+    contract.write_text("# staged only\n", encoding="utf-8")
+    _run_git("add", "AGENTS.md", cwd=checkout)
+    status = _run_git("status", "--porcelain", cwd=checkout)
+    assert status == "M  AGENTS.md"
+
+    assert intake._onboarding_checkout_is_clean(checkout) is False
+
+
 def test_issue_intake_github_get_uses_shared_bounded_retry(monkeypatch):
     calls = 0
 

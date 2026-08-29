@@ -21,7 +21,22 @@ from pathlib import Path
 from typing import Any, Self
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler())
+
+
+def _urlopen_without_redirect(request: Request, *, timeout: float):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+urlopen = _urlopen_without_redirect
 
 GITHUB_API = "https://api.github.com"
 DEFAULT_TOPIC = "hermes-agent"

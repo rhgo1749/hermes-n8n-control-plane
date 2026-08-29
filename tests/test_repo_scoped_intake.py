@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
     ROOT
@@ -729,6 +731,91 @@ def test_event_scope_validates_checkout_before_registry_read() -> None:
         with contextlib.redirect_stdout(stdout):
             assert intake._run(args) == 0
         assert events == ["checkout_validation", "registry"]
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_event_scope_rejects_foreign_registry_checkout_before_mutation():
+    repository = "rhgo1749/ctrl-hangul"
+    canonical_checkout = "/ws/projects/ctrl-hangul"
+    foreign_checkout = "/tmp/foreign-board-workdir"
+    snapshot = _snapshot(
+        [
+            _entry(
+                repository,
+                board="ctrlhangul",
+                checkout=foreign_checkout,
+            )
+        ]
+    )
+    mutations: list[str] = []
+
+    names = (
+        "_github_token",
+        "_claim_wake_scope",
+        "_load_registry_snapshot",
+        "_provision_scoped_checkouts",
+        "_provision_bootstrap_boards",
+        "_run_closed_issue_cleanup",
+        "_issue_candidates",
+        "_create_task",
+        "_sync_board",
+        "_telegram_config",
+    )
+    originals = {name: getattr(intake, name) for name in names}
+    try:
+        intake.__dict__["_github_token"] = lambda: "token"
+        intake.__dict__["_claim_wake_scope"] = lambda: intake.WakeScope(
+            mode="event",
+            repositories=(repository,),
+            expires_at=9999999999,
+        )
+        intake.__dict__["_load_registry_snapshot"] = lambda token: snapshot
+        intake.__dict__["_provision_scoped_checkouts"] = (
+            lambda token, repositories, snapshot_arg, *, dry_run: (
+                [
+                    {
+                        "repository": repository,
+                        "checkout": canonical_checkout,
+                        "action": "reused",
+                    }
+                ],
+                [],
+                False,
+            )
+        )
+
+        def fake_board(*args, **kwargs):
+            mutations.append("board")
+            return []
+
+        def fake_cleanup(*args, **kwargs):
+            mutations.append("cleanup")
+            return []
+
+        def fake_candidates(*args, **kwargs):
+            mutations.append("candidate")
+            return []
+
+        intake.__dict__["_provision_bootstrap_boards"] = fake_board
+        intake.__dict__["_run_closed_issue_cleanup"] = fake_cleanup
+        intake.__dict__["_issue_candidates"] = fake_candidates
+        intake.__dict__["_create_task"] = (
+            lambda *args, **kwargs: mutations.append("task") or {}
+        )
+        intake.__dict__["_sync_board"] = lambda *args, **kwargs: []
+        intake.__dict__["_telegram_config"] = lambda: None
+
+        args = argparse.Namespace(
+            dry_run=False,
+            fixture_json=None,
+            repository=None,
+        )
+        with pytest.raises(intake.IntakeError, match="checkout_path_conflict"):
+            intake._run(args)
+
+        assert mutations == []
     finally:
         for name, value in originals.items():
             setattr(intake, name, value)
