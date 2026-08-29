@@ -14,7 +14,7 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -23,6 +23,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("GITHUB_ROUTER_LISTEN_PORT", "5681"))
 
 GITHUB_API = "https://api.github.com"
+HTTP_TIMEOUT_SECONDS = 30
 GITHUB_OWNER = os.environ.get("GITHUB_ROUTER_OWNER", "rhgo1749").strip()
 GITHUB_OWNER_TYPE = os.environ.get("GITHUB_ROUTER_OWNER_TYPE", "personal").strip().casefold()
 GITHUB_TOPIC = os.environ.get("GITHUB_ROUTER_TOPIC", "hermes-agent").strip()
@@ -38,6 +39,7 @@ N8N_EDGE_SYNC_URL = os.environ.get(
 N8N_EDGE_SYNC_TIMEOUT_SECONDS = float(
     os.environ.get("GITHUB_ROUTER_N8N_EDGE_SYNC_TIMEOUT_SECONDS", "130")
 )
+GITHUB_GET_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 N8N_EDGE_SYNC_MAX_RESPONSE_BYTES = 64 * 1024
 WAIT_SECONDS = int(os.environ.get("GITHUB_ROUTER_WAIT_SECONDS", "75"))
 SCOPE_TTL_SECONDS = int(
@@ -45,6 +47,23 @@ SCOPE_TTL_SECONDS = int(
         "GITHUB_ROUTER_SCOPE_TTL_SECONDS",
         str(max(WAIT_SECONDS + 120, 300)),
     )
+)
+SCOPE_CLAIM_LEASE_SECONDS = int(
+    os.environ.get(
+        "GITHUB_ROUTER_SCOPE_CLAIM_LEASE_SECONDS",
+        str(max(SCOPE_TTL_SECONDS, 1200)),
+    )
+)
+SCOPE_MAX_ATTEMPTS = int(
+    os.environ.get("GITHUB_ROUTER_SCOPE_MAX_ATTEMPTS", "3")
+)
+SCOPE_MAX_PENDING = max(
+    1,
+    int(os.environ.get("GITHUB_ROUTER_SCOPE_MAX_PENDING", "4096")),
+)
+SCOPE_RETRY_BACKOFF_SECONDS = (
+    1,
+    5,
 )
 DELIVERY_TTL_SECONDS = int(
     os.environ.get("GITHUB_ROUTER_DELIVERY_TTL_SECONDS", "3600")
@@ -84,12 +103,24 @@ SUPPORTED_EVENTS = {
     "public",
     "repository",
 }
-_REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+_REPOSITORY_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
+)
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_SCOPE_ID_RE = _DELIVERY_ID_RE
+_CLAIM_TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
+_SCOPE_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _ACTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_SCOPE_REPOSITORIES = 100
 _N8N_EDGE_SYNC_PATH = "/webhook/hermes-github-edge-sync"
 _STATE_LOCK = threading.Lock()
+
+
+def _safe_scope_reason(value: object) -> str:
+    if isinstance(value, str) and _SCOPE_REASON_RE.fullmatch(value):
+        return value
+    return "scope_retryable"
 
 
 class RouterError(RuntimeError):
@@ -132,6 +163,15 @@ def _json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
 def _read_secret(path: Path, label: str) -> str:
     try:
         value = path.read_text(encoding="utf-8").strip()
@@ -144,14 +184,21 @@ def _read_secret(path: Path, label: str) -> str:
 
 def _load_state_unlocked() -> dict[str, Any]:
     try:
-        raw = STATE_PATH.read_text(encoding="utf-8")
+        with STATE_PATH.open("rb") as handle:
+            raw_bytes = handle.read(8 * 1024 * 1024 + 1)
     except FileNotFoundError:
         return {}
     except OSError as exc:
         raise RouterError(f"cannot read router state: {exc}") from exc
+    if len(raw_bytes) > 8 * 1024 * 1024:
+        raise RouterError("router state is too large")
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RouterError("router state is not UTF-8") from exc
+    try:
+        value = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise RouterError("router state is invalid JSON") from exc
     if not isinstance(value, dict):
         raise RouterError("router state must be an object")
@@ -176,45 +223,251 @@ def _write_state_unlocked(value: dict[str, Any]) -> None:
             pass
 
 
+def _normalise_scope_item(
+    raw: object,
+    now: int,
+    *,
+    allow_expired: bool = False,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    raw_scope_id = raw.get("id")
+    if not isinstance(raw_scope_id, str):
+        return None
+    scope_id = raw_scope_id.strip()
+    if scope_id != raw_scope_id or not _SCOPE_ID_RE.fullmatch(scope_id):
+        return None
+    fields = ("created_at", "expires_at", "attempts", "not_before")
+    values = tuple(raw.get(field) for field in fields)
+    if any(type(value) is not int for value in values):
+        return None
+    created_at = cast(int, values[0])
+    expires_at = cast(int, values[1])
+    attempts = cast(int, values[2])
+    not_before = cast(int, values[3])
+    if (
+        created_at <= 0
+        or expires_at <= created_at
+        or attempts < 0
+        or attempts > SCOPE_MAX_ATTEMPTS
+        or not_before < 0
+        or not_before > expires_at
+    ):
+        return None
+    if not allow_expired and expires_at <= now:
+        return None
+    mode = raw.get("mode")
+    if not isinstance(mode, str):
+        return None
+    if mode not in {"event", "full"}:
+        return None
+    raw_repositories = raw.get("repositories", [])
+    if not isinstance(raw_repositories, list):
+        return None
+    repositories: list[str] = []
+    seen: set[str] = set()
+    for raw_repository in raw_repositories:
+        if not isinstance(raw_repository, str):
+            return None
+        repository = raw_repository.strip()
+        if (
+            repository != raw_repository
+            or len(repository) > 256
+            or not _REPOSITORY_RE.fullmatch(repository)
+            or repository.casefold() in seen
+        ):
+            return None
+        seen.add(repository.casefold())
+        repositories.append(repository)
+    if len(repositories) > _MAX_SCOPE_REPOSITORIES:
+        return None
+    repositories.sort(key=str.casefold)
+    if mode == "event" and not repositories:
+        return None
+    if mode == "full" and repositories:
+        return None
+    raw_delivery = raw.get("delivery")
+    if raw_delivery is not None and (
+        not isinstance(raw_delivery, str)
+        or raw_delivery != raw_delivery.strip()
+        or not _DELIVERY_ID_RE.fullmatch(raw_delivery)
+    ):
+        return None
+    result = {
+        "id": scope_id,
+        "mode": mode,
+        "repositories": repositories,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "attempts": attempts,
+        "not_before": not_before,
+    }
+    if raw_delivery is not None:
+        result["delivery"] = raw_delivery
+    return result
+
+
+def _prune_pending_scopes(raw_pending: object, now: int | None = None) -> list[dict[str, Any]]:
+    now = int(time.time()) if now is None else now
+    if not isinstance(raw_pending, list):
+        return []
+    kept: list[dict[str, Any]] = []
+    for raw in raw_pending:
+        if not isinstance(raw, dict):
+            continue
+        item = _normalise_scope_item(raw, now, allow_expired=True)
+        pending_at = raw.get("pending_at")
+        reason = _safe_scope_reason(raw.get("reason"))
+        if (
+            item is None
+            or type(pending_at) is not int
+            or pending_at <= 0
+        ):
+            continue
+        kept.append(
+            {
+                **item,
+                "pending_at": pending_at,
+                "reason": reason,
+            }
+        )
+    return kept[-SCOPE_MAX_PENDING:]
+
+
+def _append_pending_scope(
+    state: dict[str, Any],
+    item: dict[str, Any],
+    *,
+    now: int,
+    reason: str,
+) -> None:
+    pending = _prune_pending_scopes(state.get("pending_scopes"), now)
+    pending = [existing for existing in pending if existing.get("id") != item.get("id")]
+    pending.append(
+        {
+            **item,
+            "pending_at": now,
+            "reason": _safe_scope_reason(reason),
+        }
+    )
+    state["pending_scopes"] = pending[-SCOPE_MAX_PENDING:]
+
+
+def _recover_queued_scopes_unlocked(
+    state: dict[str, Any],
+    now: int,
+) -> None:
+    """Keep expired queued work durable instead of silently dropping it."""
+    raw_queue = state.get("scope_queue")
+    if not isinstance(raw_queue, list):
+        state["scope_queue"] = []
+        return
+    queue: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_queue:
+        item = _normalise_scope_item(raw, now, allow_expired=True)
+        if item is None or item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        if item["expires_at"] > now:
+            queue.append(item)
+            continue
+        next_attempt = item["attempts"] + 1
+        if next_attempt >= SCOPE_MAX_ATTEMPTS:
+            _append_pending_scope(
+                state,
+                {**item, "attempts": next_attempt},
+                now=now,
+                reason="scope_expired",
+            )
+            continue
+        queue.append(
+            {
+                **item,
+                "attempts": next_attempt,
+                "expires_at": now + SCOPE_TTL_SECONDS,
+                "not_before": now,
+            }
+        )
+    state["scope_queue"] = queue
+
+
+def _recover_scope_claims_unlocked(
+    state: dict[str, Any],
+    now: int,
+) -> None:
+    """Move expired in-flight scopes back to durable retry state."""
+    raw_claims = state.get("scope_claims")
+    if not isinstance(raw_claims, dict):
+        state["scope_claims"] = {}
+        state["pending_scopes"] = _prune_pending_scopes(
+            state.get("pending_scopes"), now
+        )
+        _recover_queued_scopes_unlocked(state, now)
+        return
+    claims: dict[str, dict[str, Any]] = {}
+    state["pending_scopes"] = _prune_pending_scopes(state.get("pending_scopes"), now)
+    _recover_queued_scopes_unlocked(state, now)
+    queue = state["scope_queue"]
+    for raw_id, raw_claim in raw_claims.items():
+        if not isinstance(raw_id, str) or not _SCOPE_ID_RE.fullmatch(raw_id):
+            continue
+        scope_id = raw_id
+        if not isinstance(raw_claim, dict):
+            continue
+        if raw_claim.get("id") != scope_id:
+            continue
+        claim_expires_at = raw_claim.get("claim_expires_at")
+        if type(claim_expires_at) is not int or claim_expires_at <= 0:
+            continue
+        item = _normalise_scope_item(raw_claim, now, allow_expired=True)
+        if item is None:
+            continue
+        raw_claim_token = raw_claim.get("claim_token")
+        claim_token = (
+            raw_claim_token
+            if isinstance(raw_claim_token, str)
+            and _CLAIM_TOKEN_RE.fullmatch(raw_claim_token)
+            else uuid.uuid4().hex
+        )
+        queue = [queued for queued in queue if queued.get("id") != scope_id]
+        if claim_expires_at > now:
+            claims[scope_id] = {
+                **item,
+                "claim_expires_at": claim_expires_at,
+                "claim_token": claim_token,
+            }
+            continue
+        next_attempt = item["attempts"] + 1
+        if next_attempt >= SCOPE_MAX_ATTEMPTS:
+            _append_pending_scope(
+                state,
+                {**item, "attempts": next_attempt},
+                now=now,
+                reason="claim_lease_expired",
+            )
+            continue
+        queue.append(
+            {
+                **item,
+                "attempts": next_attempt,
+                "expires_at": now + SCOPE_TTL_SECONDS,
+                "not_before": now,
+            }
+        )
+    state["scope_claims"] = claims
+    state["scope_queue"] = queue
+
+
 def _prune_queue(raw_queue: object, now: int | None = None) -> list[dict[str, Any]]:
     now = int(time.time()) if now is None else now
     if not isinstance(raw_queue, list):
         return []
     queue: list[dict[str, Any]] = []
     for raw in raw_queue:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            expires_at = int(raw.get("expires_at") or 0)
-        except (TypeError, ValueError):
-            continue
-        if expires_at <= now:
-            continue
-        mode = str(raw.get("mode") or "")
-        if mode not in {"event", "full"}:
-            continue
-        raw_repositories = raw.get("repositories", [])
-        if not isinstance(raw_repositories, list):
-            continue
-        repositories = sorted(
-            {
-                str(repository).strip()
-                for repository in raw_repositories
-                if _REPOSITORY_RE.match(str(repository).strip())
-            },
-            key=str.casefold,
-        )[:_MAX_SCOPE_REPOSITORIES]
-        if mode == "event" and not repositories:
-            continue
-        queue.append(
-            {
-                "id": str(raw.get("id") or uuid.uuid4()),
-                "mode": mode,
-                "repositories": repositories,
-                "created_at": int(raw.get("created_at") or now),
-                "expires_at": expires_at,
-            }
-        )
+        item = _normalise_scope_item(raw, now)
+        if item is not None:
+            queue.append(item)
     return queue
 
 
@@ -223,6 +476,7 @@ def _enqueue_scope(
     full: bool,
     repository: str | None = None,
     repositories: list[str] | tuple[str, ...] | None = None,
+    delivery_id: str | None = None,
 ) -> dict[str, Any]:
     now = int(time.time())
     if full:
@@ -236,8 +490,14 @@ def _enqueue_scope(
         scoped_repositories = []
         seen: set[str] = set()
         for raw_repository in raw_repositories:
-            candidate = str(raw_repository).strip()
-            if not _REPOSITORY_RE.match(candidate):
+            if not isinstance(raw_repository, str):
+                raise RouterError("invalid repository identity")
+            candidate = raw_repository.strip()
+            if (
+                candidate != raw_repository
+                or len(candidate) > 256
+                or not _REPOSITORY_RE.fullmatch(candidate)
+            ):
                 raise RouterError(f"invalid repository identity: {candidate!r}")
             key = candidate.casefold()
             if key not in seen:
@@ -245,16 +505,52 @@ def _enqueue_scope(
                 seen.add(key)
         if not scoped_repositories or len(scoped_repositories) > _MAX_SCOPE_REPOSITORIES:
             raise RouterError("invalid repository scope")
+    if delivery_id is not None and (
+        not isinstance(delivery_id, str)
+        or delivery_id != delivery_id.strip()
+        or not _DELIVERY_ID_RE.fullmatch(delivery_id)
+    ):
+        raise RouterError("invalid delivery id")
     item = {
         "id": str(uuid.uuid4()),
         "mode": "full" if full else "event",
         "repositories": scoped_repositories,
         "created_at": now,
         "expires_at": now + SCOPE_TTL_SECONDS,
+        "attempts": 0,
+        "not_before": now,
     }
+    if delivery_id is not None:
+        item["delivery"] = delivery_id
     with _STATE_LOCK:
         state = _load_state_unlocked()
-        queue = _prune_queue(state.get("scope_queue"), now)
+        _recover_scope_claims_unlocked(state, now)
+        if delivery_id is not None:
+            queue = state["scope_queue"]
+            for existing in queue:
+                if isinstance(existing, dict) and existing.get("delivery") == delivery_id:
+                    _write_state_unlocked(state)
+                    return {**existing, "existing": True}
+            pending = state.get("pending_scopes")
+            if isinstance(pending, list):
+                for existing in pending:
+                    if isinstance(existing, dict) and existing.get("delivery") == delivery_id:
+                        _write_state_unlocked(state)
+                        return {**existing, "existing": True, "pending": True}
+            claims = state.get("scope_claims")
+            if isinstance(claims, dict):
+                for existing in claims.values():
+                    if (
+                        isinstance(existing, dict)
+                        and existing.get("delivery") == delivery_id
+                    ):
+                        _write_state_unlocked(state)
+                        return {
+                            key: value
+                            for key, value in existing.items()
+                            if key != "claim_token"
+                        } | {"existing": True, "in_flight": True}
+        queue = state["scope_queue"]
         queue.append(item)
         state["scope_queue"] = queue
         _write_state_unlocked(state)
@@ -265,14 +561,39 @@ def _claim_scope() -> dict[str, Any]:
     now = int(time.time())
     with _STATE_LOCK:
         state = _load_state_unlocked()
-        queue = _prune_queue(state.get("scope_queue"), now)
-        if queue:
-            item = queue.pop(0)
+        _recover_scope_claims_unlocked(state, now)
+        queue = state["scope_queue"]
+        claim_index = next(
+            (
+                index
+                for index, item in enumerate(queue)
+                if int(item.get("not_before") or 0) <= now
+            ),
+            None,
+        )
+        if claim_index is not None:
+            item = queue.pop(claim_index)
+            claims = state.get("scope_claims")
+            if not isinstance(claims, dict):
+                claims = {}
+            claim_token = uuid.uuid4().hex
+            claims[item["id"]] = {
+                **item,
+                "claim_expires_at": now + SCOPE_CLAIM_LEASE_SECONDS,
+                "claim_token": claim_token,
+            }
             state["scope_queue"] = queue
-            state["last_claimed_scope"] = item
+            state["scope_claims"] = claims
+            state["last_claimed_scope"] = {
+                **item,
+                "claim_token": claim_token,
+            }
             _write_state_unlocked(state)
-            return item
-        state["scope_queue"] = []
+            return {
+                **item,
+                "claim_token": claim_token,
+            }
+        state["scope_queue"] = queue
         _write_state_unlocked(state)
     return {
         "id": "",
@@ -280,6 +601,165 @@ def _claim_scope() -> dict[str, Any]:
         "repositories": [],
         "created_at": now,
         "expires_at": 0,
+        "attempts": 0,
+        "not_before": 0,
+    }
+
+
+def _claim_token_matches(claim: object, claim_token: object) -> bool:
+    if not isinstance(claim, dict) or not isinstance(claim_token, str):
+        return False
+    stored = claim.get("claim_token")
+    return (
+        isinstance(stored, str)
+        and _CLAIM_TOKEN_RE.fullmatch(stored) is not None
+        and _CLAIM_TOKEN_RE.fullmatch(claim_token) is not None
+        and hmac.compare_digest(stored, claim_token)
+    )
+
+
+def _ack_scope(scope_id: str, claim_token: str) -> dict[str, Any]:
+    """Remove one in-flight scope after the intake worker completed it."""
+    if not isinstance(scope_id, str):
+        raise RouterError("invalid scope id")
+    if not isinstance(claim_token, str) or not _CLAIM_TOKEN_RE.fullmatch(claim_token):
+        raise RouterError("invalid scope claim token")
+    raw_scope_id = scope_id
+    scope_id = raw_scope_id.strip()
+    if scope_id != raw_scope_id or not _SCOPE_ID_RE.fullmatch(scope_id):
+        raise RouterError("invalid scope id")
+    now = int(time.time())
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        _recover_scope_claims_unlocked(state, now)
+        claims = state.get("scope_claims")
+        if not isinstance(claims, dict):
+            claims = {}
+        claim = claims.get(scope_id)
+        if claim is None:
+            last = state.get("last_scope_transition")
+            if isinstance(last, dict) and last.get("id") == scope_id:
+                if (
+                    last.get("status") == "acknowledged"
+                    and _claim_token_matches(last, claim_token)
+                ):
+                    _write_state_unlocked(state)
+                    return {"ok": True, "id": scope_id, "status": "already_acknowledged"}
+                if (
+                    last.get("status") in {"requeued", "pending"}
+                    and _claim_token_matches(last, claim_token)
+                ):
+                    _write_state_unlocked(state)
+                    return {"ok": True, "id": scope_id, "status": "already_requeued"}
+            raise RouterError("scope claim token mismatch")
+        if not _claim_token_matches(claim, claim_token):
+            raise RouterError("scope claim token mismatch")
+        del claims[scope_id]
+        state["scope_claims"] = claims
+        state["last_scope_transition"] = {
+            "id": scope_id,
+            "status": "acknowledged",
+            "at": now,
+            "claim_token": claim_token,
+        }
+        _write_state_unlocked(state)
+    return {"ok": True, "id": scope_id, "status": "acknowledged"}
+
+
+def _requeue_scope(
+    scope_id: str,
+    reason: str,
+    claim_token: str,
+) -> dict[str, Any]:
+    """Requeue a failed scope or retain it in durable pending state."""
+    if not isinstance(scope_id, str):
+        raise RouterError("invalid scope id")
+    if not isinstance(reason, str):
+        raise RouterError("invalid scope reason")
+    safe_reason = _safe_scope_reason(reason)
+    if not isinstance(claim_token, str) or not _CLAIM_TOKEN_RE.fullmatch(claim_token):
+        raise RouterError("invalid scope claim token")
+    raw_scope_id = scope_id
+    scope_id = raw_scope_id.strip()
+    if scope_id != raw_scope_id or not _SCOPE_ID_RE.fullmatch(scope_id):
+        raise RouterError("invalid scope id")
+    now = int(time.time())
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        _recover_scope_claims_unlocked(state, now)
+        claims = state.get("scope_claims")
+        claim = claims.get(scope_id) if isinstance(claims, dict) else None
+        if claim is None:
+            last = state.get("last_scope_transition")
+            if (
+                isinstance(last, dict)
+                and last.get("id") == scope_id
+                and _claim_token_matches(last, claim_token)
+            ):
+                if last.get("status") == "requeued":
+                    _write_state_unlocked(state)
+                    return {
+                        "ok": True,
+                        "id": scope_id,
+                        "status": "already_requeued",
+                        "attempts": last.get("attempts", 0),
+                    }
+                if last.get("status") == "pending":
+                    _write_state_unlocked(state)
+                    return {
+                        "ok": True,
+                        "id": scope_id,
+                        "status": "pending",
+                        "attempts": last.get("attempts", 0),
+                    }
+            raise RouterError("scope claim token mismatch")
+        if not _claim_token_matches(claim, claim_token):
+            raise RouterError("scope claim token mismatch")
+        assert isinstance(claims, dict)
+        item = _normalise_scope_item(claim, now, allow_expired=True)
+        if item is None:
+            raise RouterError("scope claim is invalid")
+        claims.pop(scope_id)
+        next_attempt = item["attempts"] + 1
+        if next_attempt >= SCOPE_MAX_ATTEMPTS:
+            _append_pending_scope(
+                state,
+                {**item, "attempts": next_attempt},
+                now=now,
+                reason=safe_reason,
+            )
+            status = "pending"
+        else:
+            backoff_index = min(
+                next_attempt - 1,
+                len(SCOPE_RETRY_BACKOFF_SECONDS) - 1,
+            )
+            queue = state["scope_queue"]
+            queue.append(
+                {
+                    **item,
+                    "attempts": next_attempt,
+                    "expires_at": now + SCOPE_TTL_SECONDS,
+                    "not_before": now + SCOPE_RETRY_BACKOFF_SECONDS[backoff_index],
+                }
+            )
+            state["scope_queue"] = queue
+            status = "requeued"
+        state["scope_claims"] = claims
+        state["last_scope_transition"] = {
+            "id": scope_id,
+            "status": status,
+            "at": now,
+            "attempts": next_attempt,
+            "reason": safe_reason,
+            "claim_token": claim_token,
+        }
+        _write_state_unlocked(state)
+    return {
+        "ok": True,
+        "id": scope_id,
+        "status": status,
+        "attempts": next_attempt,
     }
 
 
@@ -287,13 +767,19 @@ def _queue_status() -> dict[str, Any]:
     now = int(time.time())
     with _STATE_LOCK:
         state = _load_state_unlocked()
-        queue = _prune_queue(state.get("scope_queue"), now)
-        if queue != state.get("scope_queue"):
-            state["scope_queue"] = queue
-            _write_state_unlocked(state)
+        _recover_scope_claims_unlocked(state, now)
+        queue = state["scope_queue"]
+        claims = state.get("scope_claims")
+        pending = state.get("pending_scopes")
+        in_flight_count = len(claims) if isinstance(claims, dict) else 0
+        pending_count = len(pending) if isinstance(pending, list) else 0
         managed = [str(item) for item in state.get("managed_repositories", [])]
+        state["scope_queue"] = queue
+        _write_state_unlocked(state)
     return {
         "queued_scopes": len(queue),
+        "in_flight_scopes": in_flight_count,
+        "pending_scopes": pending_count,
         "managed_count": len(managed),
     }
 
@@ -305,7 +791,7 @@ def _prune_deliveries(raw_map: object, now: int | None = None) -> dict[str, dict
     kept: dict[str, dict[str, int]] = {}
     for raw_id, raw_entry in raw_map.items():
         delivery_id = str(raw_id).strip()
-        if not _DELIVERY_ID_RE.match(delivery_id):
+        if not _DELIVERY_ID_RE.fullmatch(delivery_id):
             continue
         if not isinstance(raw_entry, dict):
             continue
@@ -443,30 +929,59 @@ def _github_request(
         headers=headers,
         method=method,
     )
-    try:
-        with urlopen(request, timeout=30) as response:
-            raw = response.read()
-            if not raw:
-                return None
-            return json.loads(raw)
-    except HTTPError as exc:
-        # Never relay a provider response body: proxies can echo credentials
-        # or credential-bearing URLs in an error payload.
-        raise RouterError(
-            f"GitHub API {method} {path} returned HTTP {exc.code}"
-        ) from exc
-    except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise RouterError(
-            f"GitHub API {method} {path} failed: {type(exc).__name__}"
-        ) from exc
+    attempts = 2 if method.upper() == "GET" else 1
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                raw = response.read(GITHUB_GET_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > GITHUB_GET_MAX_RESPONSE_BYTES:
+                    raise RouterError("GitHub API response is too large")
+                if not raw:
+                    return None
+                return json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+        except HTTPError as exc:
+            if method.upper() == "GET" and 500 <= exc.code < 600 and attempt == 0:
+                exc.close()
+                continue
+            if method.upper() == "GET" and 500 <= exc.code < 600:
+                exc.close()
+                raise RouterError(
+                    f"GitHub API {method} {path} retry exhausted"
+                ) from exc
+            # Never relay a provider response body: proxies can echo credentials
+            # or credential-bearing URLs in an error payload.
+            exc.close()
+            raise RouterError(
+                f"GitHub API {method} {path} returned HTTP {exc.code}"
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            if method.upper() == "GET" and attempt == 0:
+                continue
+            if method.upper() == "GET":
+                raise RouterError(
+                    f"GitHub API {method} {path} retry exhausted"
+                ) from exc
+            raise RouterError(
+                f"GitHub API {method} {path} failed: {type(exc).__name__}"
+            ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise RouterError(
+                f"GitHub API {method} {path} returned invalid JSON"
+            ) from exc
+    raise RouterError(f"GitHub API {method} {path} retry exhausted")
 
 
 def _validated_public_url() -> str:
     value = PUBLIC_URL.strip()
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise RouterError("GITHUB_ROUTER_PUBLIC_URL is malformed") from exc
     if (
         parsed.scheme != "https"
         or not parsed.netloc
+        or not hostname
         or parsed.username
         or parsed.password
         or parsed.query
@@ -585,7 +1100,7 @@ def _reconcile_webhooks() -> dict[str, Any]:
             str(repository.get("full_name") or "").strip()
             for repository in repositories
             if isinstance(repository, dict)
-            and _REPOSITORY_RE.match(
+            and _REPOSITORY_RE.fullmatch(
                 str(repository.get("full_name") or "").strip()
             )
         },
@@ -596,7 +1111,7 @@ def _reconcile_webhooks() -> dict[str, Any]:
         previous = {
             str(repository)
             for repository in state.get("managed_repositories", [])
-            if _REPOSITORY_RE.match(str(repository))
+            if _REPOSITORY_RE.fullmatch(str(repository))
         }
     created = 0
     updated = 0
@@ -630,9 +1145,35 @@ def _reconcile_webhooks() -> dict[str, Any]:
     }
 
 
+def _validated_lease_base_url() -> str:
+    value = LEASE_BASE_URL.strip()
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise RouterError("lease-controller URL is malformed") from exc
+    if (
+        parsed.scheme != "http"
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise RouterError("lease-controller URL must be a loopback URL")
+    if port is not None and not 1 <= port <= 65535:
+        raise RouterError("lease-controller URL has an invalid port")
+    return value.rstrip("/")
+
+
 def _lease_request(path: str, token: str) -> tuple[int, dict[str, Any]]:
+    if path != "/trigger" and not path.startswith("/pause?lease="):
+        raise RouterError("lease-controller path is invalid")
+    base_url = _validated_lease_base_url()
     request = Request(
-        f"{LEASE_BASE_URL}{path}",
+        f"{base_url}{path}",
         method="POST",
         headers={
             "Authorization": f"Bearer {token}",
@@ -642,17 +1183,24 @@ def _lease_request(path: str, token: str) -> tuple[int, dict[str, Any]]:
     )
     try:
         with urlopen(request, timeout=65) as response:
-            raw = response.read()
-            payload = json.loads(raw) if raw else {}
+            raw = response.read(N8N_EDGE_SYNC_MAX_RESPONSE_BYTES + 1)
+            if len(raw) > N8N_EDGE_SYNC_MAX_RESPONSE_BYTES:
+                raise RouterError("lease-controller response is too large")
+            try:
+                payload = (
+                    json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+                    if raw
+                    else {}
+                )
+            except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+                raise RouterError("lease-controller response is invalid JSON") from exc
+            if not isinstance(payload, dict):
+                raise RouterError("lease-controller response is not an object")
             return int(response.status), payload
     except HTTPError as exc:
-        raw = exc.read()
-        try:
-            payload = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            payload = {}
-        return int(exc.code), payload
-    except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        exc.close()
+        return int(exc.code), {}
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
         raise RouterError(
             f"lease-controller request failed: {type(exc).__name__}"
         ) from exc
@@ -660,7 +1208,12 @@ def _lease_request(path: str, token: str) -> tuple[int, dict[str, Any]]:
 
 def _validated_n8n_edge_sync_url() -> str:
     value = N8N_EDGE_SYNC_URL
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise RouterError("n8n edge-sync URL is malformed") from exc
     if (
         parsed.scheme != "http"
         or not parsed.netloc
@@ -669,13 +1222,9 @@ def _validated_n8n_edge_sync_url() -> str:
         or parsed.query
         or parsed.fragment
         or parsed.path != _N8N_EDGE_SYNC_PATH
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
     ):
         raise RouterError("n8n edge-sync URL must be a loopback Webhook URL")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise RouterError("n8n edge-sync URL has an invalid port") from exc
     if port is not None and not 1 <= port <= 65535:
         raise RouterError("n8n edge-sync URL has an invalid port")
     return value
@@ -741,13 +1290,17 @@ def _n8n_edge_sync(event: dict[str, Any]) -> dict[str, Any]:
             if not raw:
                 raise RouterError("n8n edge-sync response is empty")
             try:
-                body = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                body = json.loads(
+                    raw,
+                    object_pairs_hook=_reject_duplicate_pairs,
+                )
+            except (json.JSONDecodeError, RecursionError, ValueError) as exc:
                 raise RouterError("n8n edge-sync response is invalid JSON") from exc
             if not isinstance(body, dict):
                 raise RouterError("n8n edge-sync response is not an object")
             return {"status": int(response.status), "body": body}
     except HTTPError as exc:
+        exc.close()
         raise RouterError(f"n8n edge-sync returned HTTP {exc.code}") from exc
     except (URLError, TimeoutError, OSError) as exc:
         raise RouterError(
@@ -783,9 +1336,10 @@ def _wake() -> dict[str, Any]:
         raise RouterError(
             f"lease-controller trigger rejected with HTTP {status}"
         )
-    lease = str(payload.get("lease") or "").strip()
-    if not lease:
+    raw_lease = payload.get("lease")
+    if not isinstance(raw_lease, str) or raw_lease != raw_lease.strip() or not raw_lease:
         raise RouterError("lease-controller trigger returned no lease")
+    lease = raw_lease
     threading.Thread(
         target=_delayed_pause,
         args=(lease, token),
@@ -814,10 +1368,13 @@ def _installation_account(payload: dict[str, Any]) -> tuple[str, str]:
     account = installation.get("account")
     if not isinstance(account, dict):
         return "", ""
-    return (
-        str(account.get("login") or "").strip(),
-        str(account.get("type") or "").strip(),
-    )
+    login = account.get("login")
+    account_type = account.get("type")
+    if not isinstance(login, str) or not isinstance(account_type, str):
+        return "", ""
+    if login != login.strip() or account_type != account_type.strip():
+        return "", ""
+    return login, account_type
 
 
 def _owner_scope_matches(payload: dict[str, Any], repositories: list[str]) -> bool:
@@ -829,6 +1386,8 @@ def _owner_scope_matches(payload: dict[str, Any], repositories: list[str]) -> bo
         if owner.casefold() != configured_owner:
             return False
     account_login, account_type = _installation_account(payload)
+    if "installation" in payload and (not account_login or not account_type):
+        return False
     if account_login and account_login.casefold() != configured_owner:
         return False
     if account_type:
@@ -836,6 +1395,16 @@ def _owner_scope_matches(payload: dict[str, Any], repositories: list[str]) -> bo
         if account_type.casefold() != expected_type.casefold():
             return False
     return True
+
+
+def _installation_context_matches(payload: dict[str, Any]) -> bool:
+    account_login, account_type = _installation_account(payload)
+    expected_type = "User" if GITHUB_OWNER_TYPE == "personal" else "Organization"
+    return (
+        bool(account_login)
+        and account_login.casefold() == GITHUB_OWNER.casefold()
+        and account_type.casefold() == expected_type.casefold()
+    )
 
 
 def _has_app_installation_context(payload: dict[str, Any]) -> bool:
@@ -846,8 +1415,12 @@ def _has_app_installation_context(payload: dict[str, Any]) -> bool:
 def _repository_from_event_item(item: object) -> str:
     if not isinstance(item, dict):
         raise RouterError("repository_missing")
-    repository = str(item.get("full_name") or "").strip()
-    if not _REPOSITORY_RE.fullmatch(repository):
+    repository = item.get("full_name")
+    if (
+        not isinstance(repository, str)
+        or repository != repository.strip()
+        or not _REPOSITORY_RE.fullmatch(repository)
+    ):
         raise RouterError("repository_missing")
     return repository
 
@@ -919,6 +1492,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_scope_control_body(self) -> dict[str, Any]:
+        raw_length = self.headers.get("Content-Length", "0")
+        if not raw_length.isascii() or not raw_length.isdigit():
+            raise RouterError("invalid_scope_control_body")
+        length = int(raw_length)
+        if length <= 0 or length > 4096:
+            raise RouterError("invalid_scope_control_body")
+        try:
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise RouterError("invalid_scope_control_body")
+            payload = json.loads(
+                body,
+                object_pairs_hook=_reject_duplicate_pairs,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise RouterError("invalid_scope_control_body") from exc
+        if not isinstance(payload, dict):
+            raise RouterError("invalid_scope_control_body")
+        return payload
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
@@ -968,6 +1562,14 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/github/hermes-intake":
             try:
                 self._github_event()
+            except RouterError as exc:
+                try:
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"ok": False, "error": str(exc)},
+                    )
+                except Exception:
+                    self.close_connection = True
             except UnicodeEncodeError:
                 # A header value (e.g. X-GitHub-Delivery) is not ASCII: the
                 # signed-ingress surface must fail closed instead of killing
@@ -997,6 +1599,34 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(HTTPStatus.OK, {"ok": True, **item})
+            return
+        if parsed.path in {"/scope/ack", "/scope/requeue"}:
+            try:
+                payload = self._read_scope_control_body()
+                scope_id = payload.get("id")
+                if not isinstance(scope_id, str):
+                    raise RouterError("invalid scope id")
+                claim_token = payload.get("claim_token")
+                if not isinstance(claim_token, str):
+                    raise RouterError("invalid scope claim token")
+                if parsed.path == "/scope/ack":
+                    result = _ack_scope(scope_id, claim_token)
+                else:
+                    reason = payload.get("reason", "")
+                    if not isinstance(reason, str):
+                        raise RouterError("invalid scope reason")
+                    result = _requeue_scope(scope_id, reason, claim_token)
+            except RouterError as exc:
+                status = (
+                    HTTPStatus.CONFLICT
+                    if "not in flight" in str(exc) or "claim token mismatch" in str(exc)
+                    else HTTPStatus.BAD_REQUEST
+                    if str(exc).startswith("invalid")
+                    else HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                self._send_json(status, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, result)
             return
         if parsed.path == "/reconcile":
             try:
@@ -1045,10 +1675,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _github_event(self) -> None:
         raw_length = self.headers.get("Content-Length", "0")
-        try:
-            length = int(raw_length)
-        except ValueError:
-            length = 0
+        if not raw_length.isascii() or not raw_length.isdigit():
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_body_length"},
+            )
+            return
+        length = int(raw_length)
         if length <= 0 or length > MAX_BODY_BYTES:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -1056,6 +1689,12 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         body = self.rfile.read(length)
+        if len(body) != length:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "truncated_body"},
+            )
+            return
         signature = self.headers.get("X-Hub-Signature-256", "").strip()
         if not _github_signature_valid(body, signature):
             self._send_json(
@@ -1064,7 +1703,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         delivery_id = self.headers.get("X-GitHub-Delivery", "").strip()
-        if not _DELIVERY_ID_RE.match(delivery_id):
+        if not _DELIVERY_ID_RE.fullmatch(delivery_id):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {"ok": False, "error": "invalid_delivery_id"},
@@ -1114,8 +1753,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
+            payload = json.loads(body, object_pairs_hook=_reject_duplicate_pairs)
+        except (json.JSONDecodeError, RecursionError, ValueError):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {"ok": False, "error": "invalid_json"},
@@ -1135,7 +1774,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": str(exc)},
             )
             return
-        if not _owner_scope_matches(payload, repositories):
+        if (
+            event in {"installation", "installation_repositories"}
+            and not _installation_context_matches(payload)
+        ) or not _owner_scope_matches(payload, repositories):
             self._send_json(
                 HTTPStatus.ACCEPTED,
                 _ignored_event_response(
@@ -1230,8 +1872,18 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         try:
-            scope = _enqueue_scope(full=False, repositories=repositories)
-            wake = _wake()
+            scope = _enqueue_scope(
+                full=False,
+                repositories=repositories,
+                delivery_id=delivery_id,
+            )
+            if scope.get("in_flight") or scope.get("pending"):
+                wake = {
+                    "skipped": True,
+                    "reason": "scope_already_active_or_pending",
+                }
+            else:
+                wake = _wake()
         except RouterError as exc:
             # A failed dispatch (lease-controller/GitHub error) must not
             # suppress the delivery: release the claim so the GitHub 5xx

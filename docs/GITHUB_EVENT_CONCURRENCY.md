@@ -49,14 +49,26 @@ job and the latest lease alone may pause it again.
 
 Each non-PR intake event, including a first App delivery for an unknown
 repository, enqueues its repository scope before triggering Hermes.
-Each intake invocation claims exactly one queued scope. Expired unclaimed
-scopes are pruned. A PR event is sent only as bounded normalized data to the
-private n8n Webhook; n8n never receives the external signature boundary or a
-caller-controlled command. The persisted lease-controller remains the stale
-delayed-pause correctness guard for the Hermes path; n8n's
-`N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a load limiter.
+Each intake invocation claims exactly one queued scope. Expired unclaimed scopes are
+recovered with a bounded attempt/backoff or retained in the durable pending list
+when the retry limit is reached; they are never silently dropped. Claimed scopes
+carry a restart-safe lease and a fencing token. A worker must acknowledge with
+that token only after onboarding, board bootstrap, and task work complete; a
+stale worker cannot acknowledge a scope reclaimed by a later worker. Retryable
+API/clone/lock/registry/board failures are requeued, while permanent repository
+validation skips are acknowledged with structured skip evidence. A PR event is
+sent only as bounded normalized data to the private n8n Webhook; n8n never
+receives the external signature boundary or a caller-controlled command. The
+persisted lease-controller remains the stale delayed-pause correctness guard
+for the Hermes path; n8n's `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a
+load limiter.
 
-The n8n edge workflow accepts only:
+The router exposes the worker control contract only through authenticated POST
+requests: `/scope/claim` returns one scope plus `claim_token`, `/scope/ack`
+releases that exact claim, and `/scope/requeue` records the bounded retry reason.
+The acknowledgment and requeue endpoints are not safe GET operations; a stale or
+mismatched token is rejected without changing queue state.
+
 
 - `pull_request` + `action=closed` + `merged=true`;
 - `pull_request` + `action=labeled` + `label=agent-rework`.

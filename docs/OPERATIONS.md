@@ -16,8 +16,10 @@ automation/n8n/scripts/diagnose-github-onboarding.sh --hermes-home "$HOME/.herme
 ```
 
 The command verifies that `default:bf431b2a6ba6` exists exactly once in the
-`default` profile, that the deployed intake script is present, and that the
-loopback router, lease-controller, and intake-actuator health endpoints answer.
+`default` profile, matches the preserved name/script/profile/schedule/lifecycle/
+`no_agent`/delivery contract, and that the deployed intake wrapper/core expose
+all required onboarding entrypoints. It also checks the loopback router,
+lease-controller, and intake-actuator health endpoints.
 It does not create, edit, pause, or trigger a Hermes job. `--skip-network`
 checks only the local job/script boundary.
 

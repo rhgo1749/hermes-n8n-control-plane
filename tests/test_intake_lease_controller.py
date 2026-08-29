@@ -11,7 +11,6 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
     ROOT
@@ -158,6 +157,30 @@ def test_trigger_returns_before_slow_actuator_completion() -> None:
             release.set()
             controller._call_actuator = original_call
             _restore_runtime(original_state, original_token)
+
+
+def test_trigger_options_contract_is_read_only() -> None:
+    original_call = controller._call_actuator
+    calls = 0
+
+    def unexpected_call(authorization: str) -> tuple[int, bytes]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("OPTIONS must not trigger the actuator")
+
+    controller.__dict__["_call_actuator"] = unexpected_call
+    try:
+        with RunningServer() as server:
+            request = Request(
+                f"{server.base_url}/trigger?profile=default",
+                method="OPTIONS",
+            )
+            with urlopen(request, timeout=5) as response:
+                assert response.status == 204
+                assert response.headers["Allow"] == "POST, OPTIONS"
+    finally:
+        assert calls == 0
+        controller.__dict__["_call_actuator"] = original_call
 
 
 def test_pause_queues_while_actuator_pending() -> None:

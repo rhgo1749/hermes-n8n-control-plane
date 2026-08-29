@@ -1,6 +1,6 @@
 # REQ-087: 신규 hermes-agent 저장소 checkout·실시간 webhook 자동 온보딩
 
-- Status: Implementation
+- Status: Implementation complete; host validation required
 - Project: `hermes-n8n-control-plane`
 - Product type: `CONTROL_PLANE_AUTOMATION` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `N8N_VALIDATE`, `HOST_NETWORKING`
@@ -13,7 +13,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#87`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/87
-- Kanban task ID: `t_1631db5d`
+- Kanban task ID: `t_14dfe9ee` (implementation/rework); prior implementation card: `t_1631db5d`
 - Design provenance: `t_d26a81e2`, completed DESIGN handoff/comment `227`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:87`
 - Planning/lead owner: `kanban-main`
@@ -44,13 +44,14 @@ repository policy상 로컬 PASS를 대신하지 않으며, host/App 검증은 �
 
 | Gate | Result | Evidence |
 |---|---|---|
-| Focused implementation/regression suites | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_repository_onboarding.py tests/test_onboarding_diagnostics.py tests/test_github_router.py tests/test_github_intake_actuator.py tests/test_repo_scoped_intake.py tests/test_repository_registry.py tests/test_repository_registry_bootstrap.py tests/test_intake_lease_controller.py tests/test_n8n_import_contract.py` — 132 passed |
-| Full local suite excluding known baseline modules | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q --ignore=tests/test_board_identity_migration.py --ignore=tests/test_completion_wake_contention_retry.py` — 197 passed |
-| Full local suite | FAIL (baseline) | 1 failed, 200 passed, 23 errors; the exact failure/error identities also occur on clean `origin/main` (1 failed, 185 passed, 23 errors). |
-| `N8N_VALIDATE` | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 automation/n8n/scripts/validate.py` — exit 0 |
-| Python compile / shell syntax / diff check | PASS | `python3 -m py_compile` for changed Python sources, `bash -n automation/n8n/scripts/diagnose-github-onboarding.sh`, and `git diff --check` — exit 0 |
-| LSP/type diagnostics | PASS | repository Pyright runner — `0 errors, 0 warnings, 0 informations` |
-| Ruff changed-code check | PASS | `ruff check --ignore EXE001,FURB188,BLE001,F401` on changed Python sources — all checks passed; unignored findings are pre-existing baseline rules in touched files |
+| Focused implementation/regression suites | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_repository_onboarding.py tests/test_onboarding_diagnostics.py tests/test_github_router.py tests/test_github_intake_actuator.py tests/test_repo_scoped_intake.py tests/test_repository_registry.py tests/test_repository_registry_bootstrap.py tests/test_intake_lease_controller.py tests/test_n8n_import_contract.py tests/test_intake_merged_pr_guard.py` — 177 passed |
+| Full local suite excluding known baseline modules | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q --ignore=tests/test_board_identity_migration.py --ignore=tests/test_completion_wake_contention_retry.py` — 237 passed |
+| Full local suite | FAIL (baseline) | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q` — 1 failed, 240 passed, 23 errors; failures/errors are in the known baseline modules `test_completion_wake_contention_retry.py` and `test_board_identity_migration.py` and were not introduced by this change. |
+| `N8N_VALIDATE` | PASS | `python3 automation/n8n/scripts/validate.py` — exit 0 (`schedule_workflows=0`, `edge_sync_workflows=1`) |
+| Python compile / shell syntax / diff check | PASS | `python3 -m compileall -q automation/hermes/scripts automation/n8n tests`, `bash -n automation/n8n/scripts/diagnose-github-onboarding.sh`, and `git diff --check` — exit 0 |
+| LSP/type diagnostics | PASS | profile Pyright runner on changed production sources plus onboarding/router/registry/diagnostic/merged-PR tests — `0 errors, 0 warnings, 0 informations` |
+| Ruff import/undefined-name check | PASS | `ruff check --select F,I` on changed Python sources/tests — `All checks passed!` |
+| Shellcheck | PASS | `shellcheck automation/n8n/scripts/diagnose-github-onboarding.sh` — exit 0 |
 | Host/App/network canary | NOT RUN — USER VALIDATION REQUIRED | GitHub App installation, protected secrets, public HTTPS route, host checkout root, production Hermes job, and signed delivery remain operator-owned |
 
 The new-repository router regression was also run with `_has_app_installation_context()` temporarily
@@ -70,7 +71,7 @@ Live acceptance must prove an active personal-owner GitHub App webhook, protecte
 
 - Base SHA: `dd7f6ad6c6fe39108d87a821c635046ab1fb88e1`
 - Branch: `issue87/onboarding-checkout-webhook`
-- Commits: implementation commit (final SHA recorded in delivery handoff)
+- Commits: final implementation commit SHA recorded in delivery handoff
 - PR number/title/URL: PR #88 — `Issue #87: 신규 hermes-agent 저장소 webhook 온보딩` — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/88
-- Working tree: clean; PR #88 open and verified by REST/GraphQL read-back
+- Working tree: clean after final commit; PR #88 open and verified by REST/GraphQL read-back
 - Merge performed: NO

@@ -29,6 +29,15 @@ DEFAULT_CHECKOUT_ROOT = Path("/ws/projects")
 DEFAULT_KANBAN_BOARDS_ROOT = Path("/home/hermes/.hermes/kanban/boards")
 HTTP_TIMEOUT_SECONDS = 30
 MAX_PAGES = 20
+MAX_GITHUB_RESPONSE_BYTES = 4 * 1024 * 1024
+REPOSITORY_IDENTITY = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
+)
+BRANCH_IDENTITY = re.compile(
+    r"^(?!.*(?:\.\.|//|@\{))[A-Za-z0-9][A-Za-z0-9._/-]{0,254}(?<![./])$"
+)
+BOARD_IDENTITY = re.compile(r"^[^/\s]{1,255}$")
 GITHUB_ISSUE_KEY = re.compile(r"^github:([^:]+/[^:]+):issue:\d+$", re.IGNORECASE)
 CONTRACT_CANDIDATES: tuple[str, ...] = (
     "AGENTS.md",
@@ -41,6 +50,29 @@ CONTRACT_CANDIDATES: tuple[str, ...] = (
 
 class RegistryError(RuntimeError):
     """Discovery or normalization failed closed."""
+
+
+def _valid_branch(value: object) -> bool:
+    if not isinstance(value, str) or not BRANCH_IDENTITY.fullmatch(value):
+        return False
+    return not (
+        value in {".", ".."}
+        or value.startswith(("-", ".", "/"))
+        or value.endswith((".", "/", ".lock"))
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or any(character in value for character in "~^:?*[\\")
+    )
+
+
+def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
 
 
 class BoardRepositoryEvidence(tuple[str, ...]):
@@ -116,20 +148,44 @@ def _github_json(
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "hermes-n8n-control-plane/repository-registry",
         },
+        method="GET",
     )
-    try:
-        with urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            return json.load(response)
-    except HTTPError as exc:
-        if allow_not_found and exc.code == 404:
-            return None
-        # Do not copy GitHub's response body into diagnostics: a proxy or
-        # upstream error can echo an Authorization header or credential URL.
-        raise RegistryError(f"GitHub API HTTP {exc.code}") from exc
-    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RegistryError(
-            f"GitHub API request failed: {type(exc).__name__}"
-        ) from exc
+    last_transport_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                raw = response.read(MAX_GITHUB_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_GITHUB_RESPONSE_BYTES:
+                raise RegistryError("GitHub API response exceeded size limit")
+            return json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_pairs,
+            )
+        except HTTPError as exc:
+            if allow_not_found and exc.code == 404:
+                exc.close()
+                return None
+            if 500 <= exc.code <= 599 and attempt == 0:
+                exc.close()
+                continue
+            # Do not copy GitHub's response body into diagnostics: a proxy or
+            # upstream error can echo an Authorization header or credential URL.
+            exc.close()
+            if 500 <= exc.code <= 599:
+                raise RegistryError(
+                    f"GitHub API HTTP {exc.code}: retry_exhausted"
+                ) from exc
+            raise RegistryError(f"GitHub API HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            last_transport_error = exc
+            if attempt == 0:
+                continue
+            break
+        except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise RegistryError("GitHub API returned invalid JSON") from exc
+
+    error_type = type(last_transport_error).__name__ if last_transport_error else "unknown"
+    raise RegistryError(f"GitHub API request failed: {error_type}") from last_transport_error
 
 
 def discover_repositories(
@@ -167,17 +223,37 @@ def discover_repositories(
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for repo in found:
-        full_name = str(repo.get("full_name") or "").strip()
-        repo_owner = str((repo.get("owner") or {}).get("login") or "").strip()
+        full_name_value = repo.get("full_name")
+        owner_payload = repo.get("owner")
+        repo_owner_value = (
+            owner_payload.get("login")
+            if isinstance(owner_payload, dict)
+            else None
+        )
+        repo_owner_type = (
+            owner_payload.get("type")
+            if isinstance(owner_payload, dict)
+            else None
+        )
+        if not isinstance(full_name_value, str) or not isinstance(
+            repo_owner_value, str
+        ) or not isinstance(repo_owner_type, str):
+            continue
+        full_name = full_name_value.strip()
+        repo_owner = repo_owner_value.strip()
         full_name_owner, separator, _repo_name = full_name.partition("/")
         if (
-            not full_name
+            not REPOSITORY_IDENTITY.fullmatch(full_name)
             or not separator
             or full_name_owner.casefold() != owner.casefold()
             or repo_owner.casefold() != owner.casefold()
+            or repo_owner_type.casefold()
+            != ("organization" if owner_type == "organization" else "user")
         ):
             continue
-        if bool(repo.get("archived")):
+        if type(repo.get("archived")) is not bool or type(repo.get("disabled")) is not bool:
+            continue
+        if repo.get("archived") is not False or repo.get("disabled") is not False:
             continue
         key = full_name.casefold()
         if key in seen:
@@ -235,6 +311,56 @@ def _normalise_remote(value: str) -> str:
     return raw.strip("/")
 
 
+def _path_has_symlink_component(path: Path) -> bool:
+    """Return whether an absolute lexical path traverses a symlink."""
+    if not path.is_absolute():
+        return True
+    if any(part in {"", ".", ".."} for part in path.parts[1:]):
+        return True
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if os.path.lexists(current) and current.is_symlink():
+            return True
+    return False
+
+
+def _safe_git_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for variable in (
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_ASKPASS",
+        "GIT_CREDENTIAL_HELPER",
+        "GIT_SSH_COMMAND",
+        "GIT_PROXY_COMMAND",
+    ):
+        env.pop(variable, None)
+    for variable in tuple(env):
+        if variable.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            env.pop(variable, None)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_TRACE": "0",
+            "GIT_TRACE_CURL": "0",
+            "GIT_CURL_VERBOSE": "0",
+        }
+    )
+    return env
+
+
 def _git_origin(checkout: Path) -> str | None:
     try:
         proc = subprocess.run(
@@ -243,6 +369,7 @@ def _git_origin(checkout: Path) -> str | None:
             text=True,
             timeout=10,
             check=False,
+            env=_safe_git_environment(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -260,9 +387,13 @@ def _kanban_board_repository_evidence(
         return {}
     if not boards_root.is_dir():
         raise RegistryError(f"Kanban boards root is not a directory: {boards_root}")
+    if _path_has_symlink_component(boards_root):
+        raise RegistryError(f"Kanban boards root path is unsafe: {boards_root}")
 
     evidence: dict[str, BoardRepositoryEvidence] = {}
     for db in sorted(boards_root.glob("*/kanban.db")):
+        if _path_has_symlink_component(db):
+            raise RegistryError(f"Kanban board database path is unsafe: {db}")
         board = db.parent.name
         if board.startswith("_"):
             continue
@@ -281,7 +412,7 @@ def _kanban_board_repository_evidence(
             raise RegistryError(f"could not read Kanban provenance for board {board}: {exc}") from exc
 
         for (raw_key,) in rows:
-            match = GITHUB_ISSUE_KEY.match(str(raw_key or ""))
+            match = GITHUB_ISSUE_KEY.fullmatch(str(raw_key or ""))
             if match:
                 repositories.add(match.group(1).casefold())
             else:
@@ -309,6 +440,8 @@ def _board_default_workdir(boards_root: Path, board: str | None) -> Path | None:
     if board is None:
         return None
     metadata = boards_root / board / "board.json"
+    if metadata.is_symlink() or _path_has_symlink_component(metadata):
+        raise RegistryError(f"Kanban board metadata path is unsafe: {metadata}")
     if not metadata.exists():
         return None
     if not metadata.is_file():
@@ -319,18 +452,39 @@ def _board_default_workdir(boards_root: Path, board: str | None) -> Path | None:
         raise RegistryError(f"invalid Kanban board metadata for {board}: {exc}") from exc
     if not isinstance(payload, dict):
         raise RegistryError(f"invalid Kanban board metadata for {board}: expected object")
-    declared_slug = str(payload.get("slug") or "").strip()
-    if declared_slug and declared_slug.casefold() != board.casefold():
+    declared_slug_value = payload.get("slug")
+    if declared_slug_value is not None and not isinstance(declared_slug_value, str):
+        raise RegistryError(f"invalid Kanban board metadata slug for {board}")
+    declared_slug = (
+        declared_slug_value
+        if isinstance(declared_slug_value, str)
+        else ""
+    )
+    if declared_slug and (
+        declared_slug != declared_slug.strip()
+        or declared_slug.casefold() != board.casefold()
+    ):
         raise RegistryError(
             f"Kanban board metadata slug mismatch: directory={board} metadata={declared_slug}"
         )
-    raw_workdir = str(payload.get("default_workdir") or "").strip()
+    raw_workdir_value = payload.get("default_workdir")
+    if raw_workdir_value is None:
+        return None
+    if not isinstance(raw_workdir_value, str):
+        raise RegistryError(
+            f"Kanban board default_workdir is invalid for {board}"
+        )
+    raw_workdir = raw_workdir_value.strip()
     if not raw_workdir:
         return None
     workdir = Path(raw_workdir)
     if not workdir.is_absolute():
         raise RegistryError(
             f"Kanban board default_workdir must be absolute for {board}: {raw_workdir}"
+        )
+    if _path_has_symlink_component(workdir):
+        raise RegistryError(
+            f"Kanban board default_workdir path is unsafe for {board}: {raw_workdir}"
         )
     return workdir
 
@@ -407,23 +561,37 @@ def build_entry(
     checkout_path: Path | None = None,
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> RegistryEntry:
-    full_name = str(repo.get("full_name") or "").strip()
-    if "/" not in full_name:
+    full_name_value = repo.get("full_name")
+    if not isinstance(full_name_value, str):
+        raise RegistryError("repository full_name is invalid")
+    full_name = full_name_value.strip()
+    if (
+        full_name != full_name_value
+        or not REPOSITORY_IDENTITY.fullmatch(full_name)
+    ):
         raise RegistryError(f"repository full_name is invalid: {full_name!r}")
-    try:
-        repository_id = int(repo["id"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RegistryError(f"repository id is invalid for {full_name}") from exc
-    default_branch = str(repo.get("default_branch") or "").strip()
-    if not default_branch:
-        raise RegistryError(f"repository default_branch is missing for {full_name}")
+    repository_id_value = repo.get("id")
+    if type(repository_id_value) is not int or repository_id_value <= 0:
+        raise RegistryError(f"repository id is invalid for {full_name}")
+    repository_id = repository_id_value
+    default_branch_value = repo.get("default_branch")
+    if not isinstance(default_branch_value, str):
+        raise RegistryError(f"repository default_branch is invalid for {full_name}")
+    default_branch = default_branch_value.strip()
+    if default_branch != default_branch_value or not _valid_branch(default_branch):
+        raise RegistryError(f"repository default_branch is invalid for {full_name}")
 
-    unknown_contracts = set(contract_paths) - set(CONTRACT_CANDIDATES)
+    raw_contracts = tuple(contract_paths)
+    if any(not isinstance(path, str) for path in raw_contracts):
+        raise RegistryError(f"contract paths are invalid for {full_name}")
+    if len(set(raw_contracts)) != len(raw_contracts):
+        raise RegistryError(f"duplicate contract paths for {full_name}")
+    unknown_contracts = set(raw_contracts) - set(CONTRACT_CANDIDATES)
     if unknown_contracts:
         raise RegistryError(
             f"unknown contract paths for {full_name}: {', '.join(sorted(unknown_contracts))}"
         )
-    contract_set = set(contract_paths)
+    contract_set = set(raw_contracts)
     contracts = tuple(path for path in CONTRACT_CANDIDATES if path in contract_set)
 
     repo_name = full_name.split("/", 1)[1]
@@ -431,9 +599,18 @@ def build_entry(
     display_name = repo_name
     checkout = checkout_path if checkout_path is not None else checkout_root / slug
     read_origin = origin_reader or _git_origin
-    origin = read_origin(checkout) if checkout.is_dir() else None
+    checkout_safe = (
+        checkout.is_absolute()
+        and not _path_has_symlink_component(checkout)
+        and not checkout.is_symlink()
+    )
+    origin = read_origin(checkout) if checkout_safe and checkout.is_dir() else None
 
-    if not checkout.exists():
+    if not checkout_safe:
+        checkout_status = "unsafe_path"
+        ready = False
+        reason = "checkout_path_unsafe"
+    elif not checkout.exists():
         checkout_status = "missing"
         ready = False
         reason = "checkout_missing"
@@ -497,9 +674,9 @@ def _fixture_repositories(path: Path) -> list[dict[str, Any]]:
         raise RegistryError(f"invalid fixture JSON: {path}") from exc
     if isinstance(payload, dict):
         payload = payload.get("items")
-    if not isinstance(payload, list):
-        raise RegistryError("fixture must be a repository list or search payload with items")
-    return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+        raise RegistryError("fixture must contain only repository objects")
+    return payload
 
 
 def _fixture_contract_reader(
@@ -507,10 +684,15 @@ def _fixture_contract_reader(
 ) -> Callable[[str, str], tuple[str, ...]]:
     by_name: dict[str, tuple[str, ...]] = {}
     for repo in repositories:
-        full_name = str(repo.get("full_name") or "").strip()
+        raw_full_name = repo.get("full_name")
+        if not isinstance(raw_full_name, str) or raw_full_name != raw_full_name.strip():
+            raise RegistryError("fixture full_name must be a canonical string")
+        full_name = raw_full_name
         raw = repo.get("contract_paths", [])
         if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
             raise RegistryError(f"fixture contract_paths must be a string list for {full_name}")
+        if len(set(raw)) != len(raw):
+            raise RegistryError(f"fixture contract_paths contains duplicates for {full_name}")
         unknown = set(raw) - set(CONTRACT_CANDIDATES)
         if unknown:
             raise RegistryError(
@@ -537,10 +719,35 @@ def registry_snapshot(
 ) -> dict[str, Any]:
     entries: list[RegistryEntry] = []
     for repo in repositories:
-        full_name = str(repo.get("full_name") or "").strip()
-        default_branch = str(repo.get("default_branch") or "").strip()
+        raw_full_name = repo.get("full_name")
+        raw_default_branch = repo.get("default_branch")
+        if (
+            not isinstance(raw_full_name, str)
+            or raw_full_name != raw_full_name.strip()
+            or not isinstance(raw_default_branch, str)
+            or raw_default_branch != raw_default_branch.strip()
+            or not _valid_branch(raw_default_branch)
+        ):
+            raise RegistryError("repository metadata contains invalid identity fields")
+        full_name = raw_full_name
+        default_branch = raw_default_branch
         contracts = contract_reader(full_name, default_branch)
         board, board_status = board_resolver(full_name)
+        if (
+            board is not None
+            and (
+                not isinstance(board, str)
+                or board != board.strip()
+                or not BOARD_IDENTITY.fullmatch(board)
+            )
+        ):
+            raise RegistryError(f"board identity is invalid for {full_name}")
+        if (
+            not isinstance(board_status, str)
+            or board_status != board_status.strip()
+            or not board_status
+        ):
+            raise RegistryError(f"board status is invalid for {full_name}")
         checkout_path = (
             checkout_resolver(full_name, board)
             if checkout_resolver is not None

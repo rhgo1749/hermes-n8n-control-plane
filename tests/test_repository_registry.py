@@ -7,7 +7,8 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "automation" / "n8n" / "scripts" / "repository_registry.py"
@@ -32,7 +33,11 @@ def _repo(
         "full_name": full_name,
         "default_branch": branch,
         "archived": False,
-        "owner": {"login": owner},
+        "disabled": False,
+        "owner": {
+            "login": owner,
+            "type": "Organization" if owner == "acme" else "User",
+        },
     }
     if contract_paths is not None:
         result["contract_paths"] = contract_paths
@@ -45,10 +50,74 @@ def _create_board_db(root: Path, board: str, keys: list[str]) -> None:
     con = sqlite3.connect(board_dir / "kanban.db")
     try:
         con.execute("CREATE TABLE tasks (idempotency_key TEXT)")
-        con.executemany("INSERT INTO tasks(idempotency_key) VALUES (?)", [(key,) for key in keys])
+        con.executemany(
+            "INSERT INTO tasks(idempotency_key) VALUES (?)",
+            [(key,) for key in keys],
+        )
         con.commit()
     finally:
         con.close()
+
+
+def test_github_get_retries_one_server_error_and_bounds_timeout() -> None:
+    calls = 0
+    original = registry.urlopen
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit=-1):
+            assert limit == registry.MAX_GITHUB_RESPONSE_BYTES + 1
+            return b'{"items": []}'
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        assert request.method == "GET"
+        assert timeout == registry.HTTP_TIMEOUT_SECONDS
+        if calls == 1:
+            raise HTTPError(
+                request.full_url,
+                503,
+                "temporary",
+                hdrs=cast(Any, None),
+                fp=None,
+            )
+        return Response()
+
+    registry.urlopen = fake_urlopen
+    try:
+        assert registry._github_json("unit-token", "/repos") == {"items": []}
+    finally:
+        registry.urlopen = original
+    assert calls == 2
+
+
+def test_github_get_does_not_retry_client_error() -> None:
+    calls = 0
+    original = registry.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise HTTPError(
+            request.full_url,
+            404,
+            "not found",
+            hdrs=cast(Any, None),
+            fp=None,
+        )
+
+    registry.urlopen = fake_urlopen
+    try:
+        assert registry._github_json("unit-token", "/repos", allow_not_found=True) is None
+    finally:
+        registry.urlopen = original
+    assert calls == 1
 
 
 def test_remote_normalization() -> None:
@@ -91,6 +160,35 @@ def test_discovery_uses_explicit_organization_scope_and_full_name_filter() -> No
 
     assert [item["full_name"] for item in result] == ["acme/valid"]
     assert calls[0][2]["q"] == "org:acme topic:hermes-agent"
+
+
+def test_discovery_rejects_non_boolean_repository_lifecycle_metadata() -> None:
+    original = registry._github_json
+
+    def fake_github_json(token, path, params=None, *, allow_not_found=False):
+        del token, path, params, allow_not_found
+        return {
+            "items": [
+                _repo("acme/valid", repo_id=11),
+                {**_repo("acme/string"), "disabled": "false"},
+                {**_repo("acme/missing"), "disabled": None},
+                {**_repo("acme/archived"), "archived": "false"},
+                {**_repo("acme/disabled"), "disabled": True},
+            ]
+        }
+
+    registry._github_json = fake_github_json
+    try:
+        result = registry.discover_repositories(
+            "unit-token",
+            "acme",
+            "hermes-agent",
+            "organization",
+        )
+    finally:
+        registry._github_json = original
+
+    assert [item["full_name"] for item in result] == ["acme/valid"]
 
 
 def test_verified_checkout_and_resolved_board_is_ready() -> None:
@@ -485,6 +583,104 @@ def test_snapshot_surfaces_bootstrap_intent_field() -> None:
             "board": "brand-new",
             "checkout": str(root / "brand-new"),
         }
+
+
+def test_github_get_retries_one_transport_failure() -> None:
+    calls = 0
+    original_urlopen = registry.urlopen
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit=-1):
+            return b'{"items": []}'
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise registry.URLError("temporary")
+        return Response()
+
+    try:
+        registry.urlopen = fake_urlopen
+        assert registry._github_json("token", "/search/repositories") == {"items": []}
+        assert calls == 2
+    finally:
+        registry.urlopen = original_urlopen
+
+
+def test_github_get_retry_exhaustion_is_bounded() -> None:
+    calls = 0
+    original_urlopen = registry.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise registry.URLError("temporary")
+
+    try:
+        registry.urlopen = fake_urlopen
+        try:
+            registry._github_json("token", "/search/repositories")
+        except registry.RegistryError as exc:
+            assert str(exc) == "GitHub API request failed: URLError"
+        else:
+            raise AssertionError("expected bounded retry failure")
+        assert calls == 2
+    finally:
+        registry.urlopen = original_urlopen
+
+
+def test_github_get_does_not_retry_forbidden() -> None:
+    calls = 0
+    original_urlopen = registry.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise registry.HTTPError(
+            request.full_url,
+            403,
+            "forbidden",
+            hdrs=None,
+            fp=None,
+        )
+
+    try:
+        registry.urlopen = fake_urlopen
+        try:
+            registry._github_json("token", "/search/repositories")
+        except registry.RegistryError as exc:
+            assert str(exc) == "GitHub API HTTP 403"
+        else:
+            raise AssertionError("expected HTTP 403")
+        assert calls == 1
+    finally:
+        registry.urlopen = original_urlopen
+
+
+def test_discover_repositories_rejects_non_boolean_status_fields() -> None:
+    payload = {
+        "items": [
+            {**_repo("acme/string"), "archived": "false"},
+            {**_repo("acme/missing"), "disabled": None},
+            _repo("acme/valid"),
+        ]
+    }
+    original_github_json = registry._github_json
+    try:
+        registry._github_json = lambda *args, **kwargs: payload
+        result = registry.discover_repositories(
+            "token", "acme", "hermes-agent", "organization"
+        )
+        assert [item["full_name"] for item in result] == ["acme/valid"]
+    finally:
+        registry._github_json = original_github_json
 
 
 def main() -> int:
