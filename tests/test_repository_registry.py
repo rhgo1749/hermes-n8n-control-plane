@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.error import HTTPError
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "automation" / "n8n" / "scripts" / "repository_registry.py"
 
@@ -324,6 +326,49 @@ def test_default_branch_is_repository_metadata() -> None:
         assert entry.canonical_slug == "project-x"
 
 
+def test_branch_component_rules_fail_closed() -> None:
+    for branch in ("feature/.hidden", "feature/release.lock", "@"):
+        try:
+            registry.build_entry(
+                _repo("rhgo1749/project-x", branch=branch),
+                Path("/tmp"),
+                origin_reader=lambda _: None,
+            )
+        except registry.RegistryError as exc:
+            assert "default_branch" in str(exc)
+        else:
+            raise AssertionError(f"invalid branch component accepted: {branch}")
+
+
+def test_registry_status_metadata_is_strict_before_callbacks() -> None:
+    callbacks: list[str] = []
+    for field, value in (
+        ("archived", None),
+        ("archived", "false"),
+        ("archived", True),
+        ("disabled", None),
+        ("disabled", 0),
+        ("disabled", True),
+    ):
+        repo = _repo("rhgo1749/status-check")
+        repo[field] = value
+        callbacks.clear()
+        try:
+            registry.registry_snapshot(
+                [repo],
+                Path("/tmp"),
+                contract_reader=lambda _r, _b: callbacks.append("contracts") or (),
+                board_resolver=lambda _r: callbacks.append("board") or (None, "missing"),
+                checkout_resolver=lambda _r, _b: callbacks.append("checkout") or None,
+                origin_reader=lambda _p: callbacks.append("origin") or None,
+            )
+        except registry.RegistryError:
+            pass
+        else:
+            raise AssertionError(f"invalid {field} metadata accepted: {value!r}")
+        assert callbacks == []
+
+
 def test_snapshot_is_deterministic_and_has_no_repository_inventory() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -479,6 +524,34 @@ def test_live_registry_snapshot_composes_existing_authorities() -> None:
         assert entry["default_branch"] == "main"
         assert entry["contract_paths"] == ["AGENTS.md"]
         assert entry["ready"] is True
+
+
+def test_live_registry_status_validation_precedes_board_filesystem(monkeypatch) -> None:
+    repository = _repo("rhgo1749/status-check", 42)
+    repository["disabled"] = "false"
+    board_read = False
+
+    monkeypatch.setattr(
+        registry,
+        "discover_repositories",
+        lambda token, owner, topic: [repository],
+    )
+
+    def forbidden_board_read(root):
+        nonlocal board_read
+        board_read = True
+        raise AssertionError("invalid provider metadata must fail before board I/O")
+
+    monkeypatch.setattr(registry, "_kanban_board_repository_evidence", forbidden_board_read)
+    with pytest.raises(registry.RegistryError, match="archive/disabled"):
+        registry.live_registry_snapshot(
+            "token",
+            "rhgo1749",
+            "hermes-agent",
+            Path("/tmp/projects"),
+            Path("/tmp/boards"),
+        )
+    assert board_read is False
 
 
 def test_verified_checkout_missing_board_declares_bootstrap_intent() -> None:

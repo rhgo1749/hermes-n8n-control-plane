@@ -670,6 +670,70 @@ def test_event_router_claim_limits_live_run() -> None:
 
 
 
+def test_event_scope_validates_checkout_before_registry_read() -> None:
+    events: list[str] = []
+    snapshot = _snapshot([_entry("rhgo1749/ctrl-hangul", board="ctrlhangul")])
+    names = (
+        "_github_token",
+        "_claim_wake_scope",
+        "_provision_scoped_checkouts",
+        "_load_registry_snapshot",
+        "_telegram_config",
+        "_run_closed_issue_cleanup",
+        "_issue_candidates",
+        "_sync_board",
+    )
+    originals = {name: getattr(intake, name) for name in names}
+    try:
+        intake.__dict__["_github_token"] = lambda: "token"
+        intake.__dict__["_claim_wake_scope"] = lambda: intake.WakeScope(
+            mode="event",
+            repositories=("rhgo1749/ctrl-hangul",),
+            expires_at=9999999999,
+        )
+
+        def fake_provision(token, repositories, snapshot_arg, *, dry_run):
+            del token, snapshot_arg, dry_run
+            events.append("checkout_validation")
+            assert tuple(repositories) == ("rhgo1749/ctrl-hangul",)
+            return (
+                [
+                    {
+                        "repository": "rhgo1749/ctrl-hangul",
+                        "checkout": "/ws/projects/ctrl-hangul",
+                        "action": "reused",
+                    }
+                ],
+                [],
+                False,
+            )
+
+        def fake_load(token):
+            del token
+            events.append("registry")
+            return snapshot
+
+        intake.__dict__["_provision_scoped_checkouts"] = fake_provision
+        intake.__dict__["_load_registry_snapshot"] = fake_load
+        intake.__dict__["_telegram_config"] = lambda: None
+        intake.__dict__["_run_closed_issue_cleanup"] = lambda token, configs, *, dry_run: []
+        intake.__dict__["_issue_candidates"] = lambda token, fixture_path, configs: []
+        intake.__dict__["_sync_board"] = lambda config, token, *, dry_run=False: []
+
+        args = argparse.Namespace(
+            dry_run=True,
+            fixture_json=None,
+            repository=None,
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert intake._run(args) == 0
+        assert events == ["checkout_validation", "registry"]
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
 def _bootstrap_entry(repository: str, board: str, checkout: str) -> dict:
     entry = _entry(repository, ready=False, reason="board_not_found_task_provenance")
     entry["bootstrap"] = {"board": board, "checkout": checkout}

@@ -55,13 +55,18 @@ class RegistryError(RuntimeError):
 def _valid_branch(value: object) -> bool:
     if not isinstance(value, str) or not BRANCH_IDENTITY.fullmatch(value):
         return False
+    components = value.split("/")
     return not (
-        value in {".", ".."}
+        value in {".", "..", "@"}
         or value.startswith(("-", ".", "/"))
         or value.endswith((".", "/", ".lock"))
         or ".." in value
         or "//" in value
         or "@{" in value
+        or any(
+            component.startswith(".") or component.endswith(".lock")
+            for component in components
+        )
         or any(character in value for character in "~^:?*[\\")
     )
 
@@ -413,7 +418,7 @@ def _kanban_board_repository_evidence(
 
         for (raw_key,) in rows:
             match = GITHUB_ISSUE_KEY.fullmatch(str(raw_key or ""))
-            if match:
+            if match and REPOSITORY_IDENTITY.fullmatch(match.group(1)):
                 repositories.add(match.group(1).casefold())
             else:
                 non_github_task_count += 1
@@ -561,6 +566,14 @@ def build_entry(
     checkout_path: Path | None = None,
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> RegistryEntry:
+    if not isinstance(repo, dict):
+        raise RegistryError("repository metadata is not an object")
+    archived = repo.get("archived")
+    disabled = repo.get("disabled")
+    if type(archived) is not bool or type(disabled) is not bool:
+        raise RegistryError("repository archive/disabled metadata is invalid")
+    if archived is not False or disabled is not False:
+        raise RegistryError("repository is archived or disabled")
     full_name_value = repo.get("full_name")
     if not isinstance(full_name_value, str):
         raise RegistryError("repository full_name is invalid")
@@ -708,6 +721,19 @@ def _fixture_contract_reader(
     return _read
 
 
+def _validate_repository_status_metadata(repositories: Iterable[object]) -> None:
+    """Reject ambiguous provider status before any repository-side I/O."""
+    for repo in repositories:
+        if not isinstance(repo, dict):
+            raise RegistryError("repository metadata contains a non-object entry")
+        archived = repo.get("archived")
+        disabled = repo.get("disabled")
+        if type(archived) is not bool or type(disabled) is not bool:
+            raise RegistryError("repository metadata contains invalid archive/disabled fields")
+        if archived is not False or disabled is not False:
+            raise RegistryError("repository metadata is archived or disabled")
+
+
 def registry_snapshot(
     repositories: Iterable[dict[str, Any]],
     checkout_root: Path,
@@ -717,6 +743,8 @@ def registry_snapshot(
     checkout_resolver: Callable[[str, str | None], Path | None] | None = None,
     origin_reader: Callable[[Path], str | None] | None = None,
 ) -> dict[str, Any]:
+    repositories = tuple(repositories)
+    _validate_repository_status_metadata(repositories)
     entries: list[RegistryEntry] = []
     for repo in repositories:
         raw_full_name = repo.get("full_name")
@@ -791,6 +819,10 @@ def live_registry_snapshot(
         repositories = discover_repositories(token, owner, topic)
     else:
         repositories = discover_repositories(token, owner, topic, owner_type)
+    # Validate provider status before inspecting any checkout or Kanban
+    # filesystem state.  ``discover_repositories`` already filters the live
+    # GitHub response, but this guard also protects injected adapters/tests.
+    _validate_repository_status_metadata(repositories)
     board_evidence = _kanban_board_repository_evidence(kanban_root)
 
     return registry_snapshot(
@@ -830,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.fixture_json:
             repositories = _fixture_repositories(args.fixture_json)
+            _validate_repository_status_metadata(repositories)
             contract_reader = _fixture_contract_reader(repositories)
             board_evidence = _kanban_board_repository_evidence(args.kanban_root)
             snapshot = registry_snapshot(

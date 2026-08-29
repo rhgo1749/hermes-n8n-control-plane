@@ -1207,13 +1207,18 @@ def _onboarding_error(code: str) -> IntakeError:
 def _valid_onboarding_branch(value: object) -> bool:
     if not isinstance(value, str) or not _ONBOARDING_BRANCH.fullmatch(value):
         return False
+    components = value.split("/")
     return not (
-        value in {".", ".."}
+        value in {".", "..", "@"}
         or value.startswith(("-", ".", "/"))
         or value.endswith((".", "/", ".lock"))
         or ".." in value
         or "//" in value
         or "@{" in value
+        or any(
+            component.startswith(".") or component.endswith(".lock")
+            for component in components
+        )
         or any(character in value for character in "~^:?*[\\")
     )
 
@@ -1368,6 +1373,8 @@ def _onboarding_repository_metadata(
 
 
 def _onboarding_lock_path(repository: str) -> Path:
+    if not isinstance(repository, str) or not _ONBOARDING_REPOSITORY.fullmatch(repository):
+        raise _onboarding_error("repository_identity_invalid")
     owner, _, name = repository.partition("/")
     return (
         _hermes_home()
@@ -1526,6 +1533,10 @@ def _safe_git_environment(
         "GIT_CONFIG_PARAMETERS",
         "GIT_SSH_COMMAND",
         "GIT_PROXY_COMMAND",
+        "GIT_TEMPLATE_DIR",
+        "GIT_SSL_NO_VERIFY",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
     ):
         env.pop(variable, None)
     for variable in tuple(env):
@@ -1536,9 +1547,13 @@ def _safe_git_environment(
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "2",
             "GIT_CONFIG_KEY_0": "core.hooksPath",
             "GIT_CONFIG_VALUE_0": os.devnull,
+            # A local core.fsmonitor hook is another repository-controlled
+            # executable path; disable it alongside ordinary hooks.
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_1": "false",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_TRACE": "0",
             "GIT_TRACE_CURL": "0",
@@ -1558,6 +1573,11 @@ def _validate_onboarding_checkout(
     checkout: Path,
 ) -> None:
     """Validate a checkout without fetching, resetting, or executing code."""
+    if (
+        not _ONBOARDING_REPOSITORY.fullmatch(metadata.repository)
+        or not _valid_onboarding_branch(metadata.default_branch)
+    ):
+        raise _onboarding_error("repository_metadata_invalid")
     if (
         not checkout.is_absolute()
         or _path_has_symlink_component(checkout)
@@ -2205,7 +2225,7 @@ def _provision_scoped_checkouts(
     return results, skipped, reload_required
 
 
-def _repo_snapshot(config: RepositoryConfig) -> RepoSnapshot:
+def _repo_snapshot_unlocked(config: RepositoryConfig) -> RepoSnapshot:
     checkout = Path(config.checkout)
     if (
         not checkout.is_absolute()
@@ -2287,6 +2307,12 @@ def _repo_snapshot(config: RepositoryConfig) -> RepoSnapshot:
         remote=remote,
         contract_paths=config.contract_paths,
     )
+
+
+def _repo_snapshot(config: RepositoryConfig) -> RepoSnapshot:
+    """Read the task snapshot while excluding concurrent checkout mutation."""
+    with _repository_onboarding_lock(config.name):
+        return _repo_snapshot_unlocked(config)
 
 
 def _json_from_stdout(stdout: str) -> Any:
@@ -2383,6 +2409,8 @@ def _strict_validate_bootstrap_checkout(
     checkout: str,
 ) -> Path:
     """Freshly validate a scoped checkout while holding its repository lock."""
+    if not isinstance(repository, str) or not _ONBOARDING_REPOSITORY.fullmatch(repository):
+        raise _onboarding_error("repository_identity_invalid")
     path = Path(checkout)
     with _repository_onboarding_lock(repository):
         expected = _checkout_path_for_onboarding(repository, _checkout_root())
@@ -2399,8 +2427,14 @@ def _strict_validate_bootstrap_checkout(
 
 def _board_repository_owners(board: str) -> BoardOwnership:
     """Read provenance and occupancy for a candidate board before reuse/create."""
+    if not isinstance(board, str) or not _ONBOARDING_BOARD.fullmatch(board):
+        raise _onboarding_error("canonical_board_conflict")
     db = _kanban_boards_root() / board / "kanban.db"
-    if not db.is_file():
+    if (
+        _path_has_symlink_component(db)
+        or db.is_symlink()
+        or not db.is_file()
+    ):
         raise IntakeError(f"cannot verify ownership of existing board {board}")
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -2413,8 +2447,8 @@ def _board_repository_owners(board: str) -> BoardOwnership:
     owners: set[str] = set()
     non_github_task_count = 0
     for (raw_key,) in rows:
-        match = _GITHUB_ISSUE_KEY.match(str(raw_key or ""))
-        if match:
+        match = _GITHUB_ISSUE_KEY.fullmatch(str(raw_key or ""))
+        if match and _ONBOARDING_REPOSITORY.fullmatch(match.group(1)):
             owners.add(match.group(1).casefold())
         else:
             non_github_task_count += 1
@@ -3310,37 +3344,75 @@ def _run_once(args: argparse.Namespace) -> int:
         )
     else:
         assert token is not None
-        if not args.repository:
+        if args.repository:
+            # Targeted operator scope: the fresh metadata and locked checkout
+            # validator must run before the registry is consulted for board
+            # intent. This is the manual equivalent of an event-scoped wake.
+            scoped_repositories: tuple[str, ...] | None = (args.repository,)
+        else:
             wake_scope = _claim_wake_scope()
             _active_wake_scope = wake_scope
-        registry_snapshot = _load_registry_snapshot(token)
+            scoped_repositories = (
+                wake_scope.repositories
+                if wake_scope is not None and wake_scope.mode == "event"
+                else None
+            )
 
-        if args.repository:
-            # Targeted operator scope: a missing/unknown checkout is
-            # provisioned before the registry is consulted for board intent.
-            # This is the manual equivalent of an event-scoped wake.
+        checkout_reload = False
+        if scoped_repositories is not None:
             (
                 checkout_result,
                 checkout_skipped,
                 checkout_reload,
             ) = _provision_scoped_checkouts(
                 token,
-                (args.repository,),
-                registry_snapshot,
+                scoped_repositories,
+                {},
                 dry_run=bool(args.dry_run),
             )
             checkout_provisioning = checkout_result
             _active_scope_progress = {
                 "checkout_provisioning": checkout_provisioning,
-                "scope_skipped": checkout_skipped,
+                "scope_skipped": (
+                    checkout_skipped
+                    if args.repository
+                    else scope_skipped
+                ),
             }
-            if checkout_skipped:
+            if args.repository and checkout_skipped:
                 reason = checkout_skipped[0]["reason"]
                 raise IntakeError(
                     f"repository onboarding failed for {args.repository}: {reason}"
                 )
-            if checkout_reload and not args.dry_run:
-                registry_snapshot = _load_registry_snapshot(token)
+
+            if not args.repository:
+                scope_skipped.extend(checkout_skipped)
+                _active_scope_progress["scope_skipped"] = scope_skipped
+                retryable = [
+                    item
+                    for item in checkout_skipped
+                    if not _is_permanent_scope_reason(item["reason"])
+                ]
+                if retryable:
+                    raise _scoped_onboarding_error(
+                        phase="checkout_provisioning",
+                        skipped=scope_skipped,
+                        checkout_provisioning=checkout_provisioning,
+                        board_provisioning=board_provisioning,
+                        error="scoped_checkout_retryable",
+                    )
+
+        # The registry is read-only, but its board/workdir intent must only be
+        # consumed after every scoped candidate has passed fresh metadata and
+        # locked checkout validation. Full fallback scans retain the historical
+        # registry-first behavior because they have no event-scoped candidates.
+        registry_snapshot = _load_registry_snapshot(token)
+        if checkout_reload and not args.dry_run:
+            # Same-tick reload: the registry now sees a freshly registered
+            # checkout and can declare board bootstrap.
+            registry_snapshot = _load_registry_snapshot(token)
+
+        if args.repository:
 
             # The registry remains read-only; the intake owns canonical board
             # bootstrap after the checkout has been verified.
@@ -3371,39 +3443,6 @@ def _run_once(args: argparse.Namespace) -> int:
             wake_scope_mode = "manual"
             wake_scope_repositories = (args.repository,)
         else:
-            if wake_scope is not None and wake_scope.mode == "event":
-                (
-                    checkout_provisioning,
-                    checkout_skipped,
-                    checkout_reload,
-                ) = _provision_scoped_checkouts(
-                    token,
-                    wake_scope.repositories,
-                    registry_snapshot,
-                    dry_run=bool(args.dry_run),
-                )
-                scope_skipped.extend(checkout_skipped)
-                _active_scope_progress = {
-                    "checkout_provisioning": checkout_provisioning,
-                    "scope_skipped": scope_skipped,
-                }
-                retryable = [
-                    item
-                    for item in checkout_skipped
-                    if not _is_permanent_scope_reason(item["reason"])
-                ]
-                if retryable:
-                    raise _scoped_onboarding_error(
-                        phase="checkout_provisioning",
-                        skipped=scope_skipped,
-                        checkout_provisioning=checkout_provisioning,
-                        board_provisioning=board_provisioning,
-                        error="scoped_checkout_retryable",
-                    )
-                if checkout_reload and not args.dry_run:
-                    # Same-tick reload: the registry now sees a freshly
-                    # registered checkout and can declare board bootstrap.
-                    registry_snapshot = _load_registry_snapshot(token)
             # Board provisioning is scope-limited to the same repositories the
             # tick will process: the woken set in event mode, every
             # bootstrap-intent entry in a full fallback sweep.

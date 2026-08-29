@@ -267,6 +267,7 @@ def _fixture_repos() -> list[dict]:
             "full_name": full_name,
             "default_branch": "main",
             "archived": False,
+            "disabled": False,
             "owner": {"login": full_name.split("/")[0]},
             "contract_paths": ["AGENTS.md"],
         }
@@ -535,6 +536,7 @@ def test_churn_prevention_after_cutover(tmp: Path) -> None:
             "full_name": repo,
             "default_branch": "main",
             "archived": False,
+            "disabled": False,
             "owner": {"login": "rhgo1749"},
         }
     ]

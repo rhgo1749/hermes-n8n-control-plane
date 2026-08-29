@@ -374,6 +374,11 @@ def test_metadata_rejects_noncanonical_repository_identity_before_api(monkeypatc
     assert called is False
 
 
+def test_onboarding_branch_component_rules_fail_closed():
+    for branch in ("feature/.hidden", "feature/release.lock", "@"):
+        assert intake._valid_onboarding_branch(branch) is False
+
+
 def test_existing_checkout_validator_rejects_wrong_branch_stale_head_and_missing_contract(
     monkeypatch, tmp_path: Path
 ):
@@ -739,12 +744,14 @@ def test_clone_materialization_does_not_execute_repository_filter(
     )
 
     original_run = intake.subprocess.run
+    clone_env: dict[str, str] = {}
 
     def run(command, *args, **kwargs):
         command = list(command)
         is_clone = len(command) >= 2 and command[:2] == ["git", "clone"]
         if is_clone:
             command[5] = str(source)
+            clone_env.update(kwargs["env"])
         completed = original_run(command, *args, **kwargs)
         if is_clone and completed.returncode == 0:
             original_run(
@@ -789,4 +796,10 @@ def test_clone_materialization_does_not_execute_repository_filter(
     assert outcome.action == "registered"
     assert not sentinel.exists()
     assert not hook_sentinel.exists()
+    assert clone_env["GIT_CONFIG_COUNT"] == "2"
+    assert clone_env["GIT_CONFIG_KEY_0"] == "core.hooksPath"
+    assert clone_env["GIT_CONFIG_KEY_1"] == "core.fsmonitor"
+    assert clone_env["GIT_CONFIG_VALUE_1"] == "false"
+    assert "GIT_TEMPLATE_DIR" not in clone_env
+    assert "GIT_SSL_NO_VERIFY" not in clone_env
     assert (checkout_root / "new-agent" / "link").is_symlink()

@@ -51,7 +51,29 @@ expected_id = "bf431b2a6ba6"
 expected_name = "GitHub agent-ready Issue intake"
 expected_script = "github-agent-ready-kanban-intake.py"
 max_metadata_bytes = 1 * 1024 * 1024
-stores = [("default", home / "cron" / "jobs.json")]
+canonical_store = home / "cron" / "jobs.json"
+
+
+def has_symlink_component(path: Path) -> bool:
+    if not path.is_absolute():
+        return True
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+if has_symlink_component(canonical_store):
+    fail_reason = "store_symlink"
+    print(
+        f"authoritative_job_metadata_invalid reason={fail_reason}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+stores = [("default", canonical_store)]
 profiles = home / "profiles"
 if profiles.is_dir():
     stores.extend(
@@ -97,6 +119,8 @@ def load_jobs(profile: str, path: Path) -> list[object]:
 
 matches: list[tuple[str, Path, dict[str, object]]] = []
 for profile, path in stores:
+    if path.is_symlink():
+        fail("authoritative_job_metadata_invalid", profile=profile, reason="store_symlink")
     if not path.is_file():
         continue
     for job in load_jobs(profile, path):
@@ -123,7 +147,12 @@ if job.get("name") != expected_name:
     fail("authoritative_job_metadata_invalid", reason="name_mismatch")
 if job.get("script") != expected_script:
     fail("authoritative_job_metadata_invalid", reason="script_mismatch")
-if not (home / "scripts" / expected_script).is_file():
+script_path = home / "scripts" / expected_script
+if (
+    has_symlink_component(script_path)
+    or script_path.is_symlink()
+    or not script_path.is_file()
+):
     fail("authoritative_job_metadata_invalid", reason="script_missing")
 if job.get("profile") != "default":
     fail("authoritative_job_metadata_invalid", reason="profile_mismatch")
@@ -144,10 +173,15 @@ if not isinstance(schedule, dict):
 schedule_kind = schedule.get("kind")
 schedule_display = job.get("schedule_display", schedule.get("display"))
 if schedule_kind == "interval":
-    schedule_ok = schedule.get("minutes") == 5 and schedule_display == "every 5m"
+    schedule_ok = (
+        type(schedule.get("minutes")) is int
+        and schedule.get("minutes") == 5
+        and schedule_display == "every 5m"
+    )
 elif schedule_kind == "cron":
     schedule_ok = (
-        schedule.get("expr") == "*/5 * * * *"
+        type(schedule.get("expr")) is str
+        and schedule.get("expr") == "*/5 * * * *"
         and schedule_display == "*/5 * * * *"
     )
 else:
@@ -168,7 +202,7 @@ elif state == "scheduled" and enabled is True:
 else:
     fail("authoritative_job_metadata_invalid", reason="lifecycle_invalid")
 repeat = job.get("repeat")
-if repeat is not None and (
+if (
     not isinstance(repeat, dict)
     or "times" not in repeat
     or repeat.get("times") is not None

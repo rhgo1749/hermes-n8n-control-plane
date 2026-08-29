@@ -35,9 +35,10 @@ deduplication, HMAC verification, owner/install admission, and a 100-repository
 batch limit remain at the router boundary.
 
 For each event-scoped repository, the intake performs fresh GitHub checks before
-touching the filesystem: exact owner identity, non-archived/non-disabled
-status, the opt-in `hermes-agent` topic, a valid default branch and branch SHA,
-and visibility of at least one current contract candidate. Failures are
+consulting registry board intent or touching the checkout filesystem: exact owner
+identity, non-archived/non-disabled status, the opt-in `hermes-agent` topic, a
+valid default branch and branch SHA, and visibility of at least one current
+contract candidate. Failures are
 reported as bounded semantic reasons such as `owner_scope_mismatch`,
 `repository_archived`, `repository_not_opted_in`, `default_branch_invalid`, or
 `contract_visibility_invalid`; provider response bodies and credentials are
@@ -194,18 +195,20 @@ checkout also carries no intent.
 The production intake is the only mutation owner. On a tick whose scope covers
 the repository, it:
 
-1. validates the owner/name repository syntax and confirms that the requested
+1. performs fresh metadata and locked checkout validation before reading the
+   registry snapshot, even when a prior snapshot says the repository is ready;
+2. validates the owner/name repository syntax and confirms that the requested
    board is exactly the repository-derived case-folded slug;
-2. independently verifies the checkout is an absolute Git root whose
+3. independently verifies the checkout is an absolute Git root whose
    `origin` matches the repository before admitting any create attempt;
-3. checks the live board list under the shared migration/intake lease; if the
+4. checks the live board list under the shared migration/intake lease; if the
    canonical board already exists, it reads its durable task provenance and
    refuses a foreign owner (same-repository ownership remains idempotent);
-4. otherwise provisions it exactly once through the existing
+5. otherwise provisions it exactly once through the existing
    `hermes kanban boards create <canonical-slug> --default-workdir
    <verified-checkout>` surface and verifies the board actually landed
    (fail-closed otherwise);
-5. reloads the registry snapshot so the freshly created empty canonical board
+6. reloads the registry snapshot so the freshly created empty canonical board
    resolves through the empty-canonical-board rule in the same tick, letting
    the first `agent-ready` task be created immediately.
 

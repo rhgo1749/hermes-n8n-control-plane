@@ -5,7 +5,8 @@
 The first supported GitHub App delivery is acknowledged by the router and
 placed in the existing durable scope queue. The existing intake authority then
 revalidates the owner, archive state, `hermes-agent` topic, default branch, and
-contract visibility before it touches `/ws/projects/<repository-name.casefold()>`.
+contract visibility before reading registry board intent or touching
+`/ws/projects/<repository-name.casefold()>`.
 It never relies on a manual webhook reconciliation for first discovery.
 
 Run the read-only diagnostic from the repository root when investigating a

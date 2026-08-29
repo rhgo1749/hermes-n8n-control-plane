@@ -108,6 +108,43 @@ def test_diagnostic_rejects_malformed_authoritative_metadata(tmp_path: Path):
     assert "authoritative_job_metadata_invalid" in completed.stderr
 
 
+def test_diagnostic_rejects_symlinked_authoritative_store(tmp_path: Path):
+    home = _runtime_home(tmp_path, ["bf431b2a6ba6"])
+    store = home / "cron" / "jobs.json"
+    target = tmp_path / "redirected-jobs.json"
+    target.write_bytes(store.read_bytes())
+    store.unlink()
+    store.symlink_to(target)
+
+    completed = subprocess.run(
+        [str(SCRIPT), "--hermes-home", str(home), "--skip-network"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "authoritative_job_metadata_invalid" in completed.stderr
+
+
+def test_diagnostic_rejects_non_integer_interval(tmp_path: Path):
+    home = _runtime_home(tmp_path, ["bf431b2a6ba6"])
+    jobs = home / "cron" / "jobs.json"
+    payload = json.loads(jobs.read_text(encoding="utf-8"))
+    payload["jobs"][0]["schedule"]["minutes"] = 5.0
+    jobs.write_text(json.dumps(payload), encoding="utf-8")
+
+    completed = subprocess.run(
+        [str(SCRIPT), "--hermes-home", str(home), "--skip-network"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "authoritative_job_metadata_invalid" in completed.stderr
+
+
 def test_diagnostic_reports_unavailable_lease_trigger(tmp_path: Path):
     home = _runtime_home(tmp_path, ["bf431b2a6ba6"])
     completed = subprocess.run(
