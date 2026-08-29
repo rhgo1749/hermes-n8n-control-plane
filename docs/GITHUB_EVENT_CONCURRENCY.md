@@ -41,6 +41,11 @@ The router never installs or changes a GitHub App, webhook, token, or
 permission. The operator must configure the App's signed webhook and HTTPS
 ingress separately. `GITHUB_ROUTER_OWNER_TYPE` is explicitly `personal` or
 `organization`; organization mode is never inferred from the owner name.
+`GITHUB_ROUTER_INSTALLATION_ID` is a required positive decimal configuration
+value matching the installed App's `installation.id`. Every payload containing
+`installation` must carry that same numeric identity; an optional nested
+`installation.account` is checked for owner/type strengthening when present,
+but is not required for repository-bearing events.
 
 The Hermes job itself is preserved. Its stored job ID, name, script, schedule,
 and ownership are not migrated into n8n. Between event-driven invocations the

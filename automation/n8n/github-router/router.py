@@ -20,6 +20,24 @@ from urllib.parse import quote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
+def _parse_installation_id(value: object) -> int | None:
+    if type(value) is int:
+        return value if value > 0 else None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not value.isascii()
+        or not value.isdigit()
+    ):
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
 class _NoRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -41,6 +59,9 @@ GITHUB_API = "https://api.github.com"
 HTTP_TIMEOUT_SECONDS = 30
 GITHUB_OWNER = os.environ.get("GITHUB_ROUTER_OWNER", "rhgo1749").strip()
 GITHUB_OWNER_TYPE = os.environ.get("GITHUB_ROUTER_OWNER_TYPE", "personal").strip().casefold()
+GITHUB_INSTALLATION_ID = _parse_installation_id(
+    os.environ.get("GITHUB_ROUTER_INSTALLATION_ID", "")
+)
 GITHUB_TOPIC = os.environ.get("GITHUB_ROUTER_TOPIC", "hermes-agent").strip()
 PUBLIC_URL = os.environ.get("GITHUB_ROUTER_PUBLIC_URL", "").strip()
 LEASE_BASE_URL = os.environ.get(
@@ -1376,10 +1397,37 @@ def _managed_repository(repository: str) -> bool:
     }
 
 
-def _installation_account(payload: dict[str, Any]) -> tuple[str, str]:
+def _installation_id(payload: dict[str, Any]) -> int | None:
     installation = payload.get("installation")
     if not isinstance(installation, dict):
-        return "", ""
+        return None
+    installation_id = _parse_installation_id(installation.get("id"))
+    if installation_id is None:
+        return None
+    if "node_id" in installation:
+        node_id = installation.get("node_id")
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or node_id != node_id.strip()
+        ):
+            return None
+    return installation_id
+
+
+def _configured_installation_matches(payload: dict[str, Any]) -> bool:
+    return (
+        GITHUB_INSTALLATION_ID is not None
+        and _installation_id(payload) == GITHUB_INSTALLATION_ID
+    )
+
+
+def _installation_account(payload: dict[str, Any]) -> tuple[str, str] | None:
+    installation = payload.get("installation")
+    if not isinstance(installation, dict):
+        return None
+    if "account" not in installation:
+        return None
     account = installation.get("account")
     if not isinstance(account, dict):
         return "", ""
@@ -1400,20 +1448,29 @@ def _owner_scope_matches(payload: dict[str, Any], repositories: list[str]) -> bo
         owner, _, _ = repository.partition("/")
         if owner.casefold() != configured_owner:
             return False
-    account_login, account_type = _installation_account(payload)
-    if "installation" in payload and (not account_login or not account_type):
+    if "installation" not in payload:
+        return True
+    if not _configured_installation_matches(payload):
         return False
-    if account_login and account_login.casefold() != configured_owner:
+    account = _installation_account(payload)
+    if account is None:
+        return True
+    account_login, account_type = account
+    if not account_login or not account_type:
         return False
-    if account_type:
-        expected_type = "User" if GITHUB_OWNER_TYPE == "personal" else "Organization"
-        if account_type.casefold() != expected_type.casefold():
-            return False
-    return True
+    expected_type = "User" if GITHUB_OWNER_TYPE == "personal" else "Organization"
+    if account_login.casefold() != configured_owner:
+        return False
+    return account_type.casefold() == expected_type.casefold()
 
 
 def _installation_context_matches(payload: dict[str, Any]) -> bool:
-    account_login, account_type = _installation_account(payload)
+    if not _configured_installation_matches(payload):
+        return False
+    account = _installation_account(payload)
+    if account is None:
+        return True
+    account_login, account_type = account
     expected_type = "User" if GITHUB_OWNER_TYPE == "personal" else "Organization"
     return (
         bool(account_login)
@@ -1423,8 +1480,18 @@ def _installation_context_matches(payload: dict[str, Any]) -> bool:
 
 
 def _has_app_installation_context(payload: dict[str, Any]) -> bool:
-    account_login, _ = _installation_account(payload)
-    return bool(account_login) and account_login.casefold() == GITHUB_OWNER.casefold()
+    if not _configured_installation_matches(payload):
+        return False
+    account = _installation_account(payload)
+    if account is None:
+        return True
+    account_login, account_type = account
+    expected_type = "User" if GITHUB_OWNER_TYPE == "personal" else "Organization"
+    return (
+        bool(account_login)
+        and account_login.casefold() == GITHUB_OWNER.casefold()
+        and account_type.casefold() == expected_type.casefold()
+    )
 
 
 def _repository_from_event_item(item: object) -> str:
@@ -1930,10 +1997,11 @@ def main() -> int:
         not GITHUB_OWNER
         or not GITHUB_TOPIC
         or GITHUB_OWNER_TYPE not in {"personal", "organization"}
+        or GITHUB_INSTALLATION_ID is None
     ):
         raise SystemExit(
-            "GITHUB_ROUTER_OWNER/TOPIC are required and OWNER_TYPE must be "
-            "personal or organization"
+            "GITHUB_ROUTER_OWNER/TOPIC/INSTALLATION_ID are required and "
+            "OWNER_TYPE must be personal or organization"
         )
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(

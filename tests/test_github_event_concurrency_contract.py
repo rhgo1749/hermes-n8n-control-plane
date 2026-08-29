@@ -26,6 +26,10 @@ def main() -> int:
     router = compose["services"]["github-router"]
     router_env = router["environment"]
     assert router_env["GITHUB_ROUTER_LISTEN_PORT"] == "5681"
+    assert (
+        router_env["GITHUB_ROUTER_INSTALLATION_ID"]
+        == "${GITHUB_ROUTER_INSTALLATION_ID:?set GitHub App installation ID}"
+    )
     assert router_env["GITHUB_ROUTER_LEASE_BASE_URL"] == "http://127.0.0.1:5680"
     assert (
         router_env["GITHUB_ROUTER_N8N_EDGE_SYNC_URL"]
@@ -62,6 +66,7 @@ def main() -> int:
     assert "X-GitHub-Delivery" in router_source
     assert "_claim_delivery" in router_source
     assert "delivery_dedupe" in router_source
+    assert "GITHUB_ROUTER_INSTALLATION_ID" in router_source
     assert '"/github/hermes-intake"' in router_source
     assert '"/webhook/hermes-github-edge-sync"' in router_source
     assert "_normalise_pull_request_event" in router_source

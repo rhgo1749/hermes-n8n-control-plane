@@ -25,6 +25,7 @@ assert spec and spec.loader
 router: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = router
 spec.loader.exec_module(router)
+TEST_INSTALLATION_ID = 987654
 
 
 def _request(
@@ -80,6 +81,7 @@ def _install_temp_paths(root: Path):
         "PUBLIC_URL": router.PUBLIC_URL,
         "DELIVERY_TTL_SECONDS": router.DELIVERY_TTL_SECONDS,
         "DELIVERY_MAX_ENTRIES": router.DELIVERY_MAX_ENTRIES,
+        "GITHUB_INSTALLATION_ID": getattr(router, "GITHUB_INSTALLATION_ID", None),
     }
     secret_dir = root / "secrets"
     secret_dir.mkdir()
@@ -88,6 +90,9 @@ def _install_temp_paths(root: Path):
     router.WEBHOOK_SECRET_FILE = secret_dir / "github-webhook-secret"
     router.INTAKE_TOKEN_FILE = secret_dir / "hermes-intake-control-token"
     router.PUBLIC_URL = "https://example.test/github/hermes-intake"
+    # Bind App fixtures to one configured installation.  getattr keeps the
+    # pre-fix bite run compatible before production adds this setting.
+    router.GITHUB_INSTALLATION_ID = TEST_INSTALLATION_ID
     router.GITHUB_TOKEN_FILE.write_text("github-token", encoding="utf-8")
     router.WEBHOOK_SECRET_FILE.write_text("webhook-secret", encoding="utf-8")
     router.INTAKE_TOKEN_FILE.write_text("hermes-token", encoding="utf-8")
@@ -114,6 +119,20 @@ def _signed_headers(
         "X-GitHub-Delivery": delivery if delivery is not None else str(uuid.uuid4()),
         "X-Hub-Signature-256": signature,
     }
+
+
+def _installation(
+    *,
+    installation_id: object = TEST_INSTALLATION_ID,
+    account: dict[str, str] | None = None,
+) -> dict[str, object]:
+    installation: dict[str, object] = {
+        "id": installation_id,
+        "node_id": "MDIzOlRlc3RJbnN0YWxsYXRpb24=",
+    }
+    if account is not None:
+        installation["account"] = account
+    return installation
 
 
 def test_invalid_signature_is_rejected() -> None:
@@ -1167,9 +1186,9 @@ def test_app_event_discovers_unknown_repository_and_wakes_once() -> None:
             body = json.dumps(
                 {
                     "action": "opened",
-                    "installation": {
-                        "account": {"login": "rhgo1749", "type": "User"}
-                    },
+                    "installation": _installation(
+                        account={"login": "rhgo1749", "type": "User"}
+                    ),
                     "repository": {"full_name": "rhgo1749/new-agent"},
                 }
             ).encode()
@@ -1211,9 +1230,9 @@ def test_app_event_queues_unknown_pull_request_without_edge_sync() -> None:
             body = json.dumps(
                 {
                     "action": "closed",
-                    "installation": {
-                        "account": {"login": "rhgo1749", "type": "User"}
-                    },
+                    "installation": _installation(
+                        account={"login": "rhgo1749", "type": "User"}
+                    ),
                     "repository": {"full_name": "rhgo1749/new-agent"},
                     "pull_request": {"merged": False},
                 }
@@ -1241,6 +1260,237 @@ def test_app_event_queues_unknown_pull_request_without_edge_sync() -> None:
             _restore(original)
 
 
+def test_ordinary_app_issues_payload_queues_unknown_repository_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "action": "opened",
+                    "installation": _installation(),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                    "issue": {"number": 1},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, event="issues", delivery="ordinary-issues-1"),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["repositories"] == ["rhgo1749/ordinary-agent"]
+            assert wakes == [True]
+            state = router._load_state_unlocked()
+            assert len(state["scope_queue"]) == 1
+            assert state["scope_queue"][0]["repositories"] == [
+                "rhgo1749/ordinary-agent"
+            ]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_ordinary_app_pull_request_queues_unknown_repository_without_edge_sync() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        original_edge = router._n8n_edge_sync
+        wakes: list[bool] = []
+        edge_calls: list[dict[str, object]] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            router._n8n_edge_sync = lambda event: edge_calls.append(event)
+            body = json.dumps(
+                {
+                    "action": "closed",
+                    "installation": _installation(),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                    "pull_request": {"merged": True},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="ordinary-pull-request-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["repositories"] == ["rhgo1749/ordinary-agent"]
+            assert wakes == [True]
+            assert edge_calls == []
+            state = router._load_state_unlocked()
+            assert len(state["scope_queue"]) == 1
+        finally:
+            router._wake = original_wake
+            router._n8n_edge_sync = original_edge
+            _restore(original)
+
+
+def test_app_event_rejects_wrong_installation_id_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(
+                        installation_id=TEST_INSTALLATION_ID + 1
+                    ),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, event="issues", delivery="wrong-install-1"),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_rejects_when_installation_configuration_is_missing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router.GITHUB_INSTALLATION_ID = None
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="issues",
+                        delivery="missing-config-install-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_rejects_missing_installation_id_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": {
+                        "node_id": "MDIzOlRlc3RJbnN0YWxsYXRpb24=",
+                    },
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, event="issues", delivery="missing-install-1"),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_rejects_malformed_installation_id_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(installation_id="not-a-number"),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="issues",
+                        delivery="malformed-install-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
 def test_installation_repository_batch_is_deduplicated_and_queued() -> None:
     with tempfile.TemporaryDirectory() as td:
         original = _install_temp_paths(Path(td))
@@ -1254,9 +1504,9 @@ def test_installation_repository_batch_is_deduplicated_and_queued() -> None:
             body = json.dumps(
                 {
                     "action": "created",
-                    "installation": {
-                        "account": {"login": "rhgo1749", "type": "User"}
-                    },
+                    "installation": _installation(
+                        account={"login": "rhgo1749", "type": "User"}
+                    ),
                     "repositories": [
                         {"full_name": "rhgo1749/one"},
                         {"full_name": "rhgo1749/two"},
@@ -1301,9 +1551,9 @@ def test_foreign_app_installation_is_rejected_without_queueing() -> None:
             router._wake = lambda: wakes.append(True)
             body = json.dumps(
                 {
-                    "installation": {
-                        "account": {"login": "other-owner", "type": "User"}
-                    },
+                    "installation": _installation(
+                        account={"login": "other-owner", "type": "User"}
+                    ),
                     "repository": {"full_name": "other-owner/private"},
                 }
             ).encode()

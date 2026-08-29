@@ -176,6 +176,8 @@ Set the reviewed public HTTPS endpoint for the router in the runtime `.env`:
 
 ```dotenv
 GITHUB_ROUTER_PUBLIC_URL=https://<reviewed-host>/github/hermes-intake
+# Positive decimal installation.id for the configured GitHub App installation.
+GITHUB_ROUTER_INSTALLATION_ID=<installation-id>
 ```
 
 Expose only that reviewed HTTPS path through the reverse proxy/Funnel. Do not
