@@ -97,7 +97,7 @@ def _snapshot(entries: list[dict]) -> dict:
 def _strict_provisioning_stub(
     token: str,
     repositories,
-    snapshot: dict,
+    snapshot: object,
     *,
     dry_run: bool,
 ):

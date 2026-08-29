@@ -1,6 +1,6 @@
 # REQ-087: 신규 hermes-agent 저장소 checkout·실시간 webhook 자동 온보딩
 
-- Status: Rework implementation complete; fresh review and host validation required
+- Status: Rework round 3 implementation complete; fresh review and host validation required
 - Project: `hermes-n8n-control-plane`
 - Product type: `CONTROL_PLANE_AUTOMATION` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `N8N_VALIDATE`, `HOST_NETWORKING`
@@ -13,7 +13,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#87`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/87
-- Kanban task ID: `t_577aa06e` (final safety/provenance rework); prior implementation/rework card: `t_14dfe9ee`; original implementation card: `t_1631db5d`
+- Kanban task ID: `t_c55ea2fa` (round 3 standalone/provenance/analyzer rework); prior safety/provenance rework: `t_577aa06e`; prior implementation/rework card: `t_14dfe9ee`; original implementation card: `t_1631db5d`
 - Design provenance: `t_d26a81e2`, completed DESIGN handoff/comment `227`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:87`
 - Planning/lead owner: `kanban-main`
@@ -50,12 +50,16 @@ repository policy상 로컬 PASS를 대신하지 않으며, host/App 검증은 �
 | Full local suite | FAIL (baseline) | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q` — 1 failed, 254 passed, 23 errors; failures/errors are in the known baseline modules `test_completion_wake_contention_retry.py` and `test_board_identity_migration.py` and were not introduced by this change. |
 | `N8N_VALIDATE` | PASS | `python3 automation/n8n/scripts/validate.py` — exit 0 (`schedule_workflows=0`, `edge_sync_workflows=1`) |
 | Python compile / shell syntax / diff check | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q automation/hermes/scripts/github-agent-ready-kanban-intake.py automation/n8n/scripts/repository_registry.py automation/n8n/github-router/router.py tests/test_repository_onboarding.py tests/test_repo_scoped_intake.py tests/test_github_redirect_safety.py`, `bash -n automation/n8n/scripts/diagnose-github-onboarding.sh`, and `git diff --check` — exit 0 |
-| LSP/type diagnostics | PASS (production); BASELINE-EQUIVALENT (all touched) | bundled Pyright 1.1.412 with repository Python typeshed fallback: 3 changed production sources — `0 errors, 0 warnings, 0 informations`; all 6 touched Python files — 60 existing `reportAttributeAccessIssue` diagnostics confined to dynamic-module assignments in `tests/test_repo_scoped_intake.py`, with 0 diagnostics in the new redirect fixture |
-| Ruff changed-code gate | PASS | `python3 -m ruff check --select E4,E7,E9,F` on all 6 touched Python files — `All checks passed!`; default Ruff reports only the 11 pre-existing `EXE001`/`FURB188`/`BLE001` findings in already-touched files |
-| Shellcheck | PASS (unchanged shell path) | prior same-branch evidence: `shellcheck automation/n8n/scripts/diagnose-github-onboarding.sh` — exit 0; no shell file changed in this rework |
+| LSP/type diagnostics | BASELINE-EQUIVALENT (all-touched error set; production clean) | `basedpyright 1.39.10` / Pyright `1.1.412` with repository Python typeshed fallback over all 17 touched Python files: candidate `107 errors, 3656 warnings, 0 informations`; matching `origin/main` baseline over the 14 common files: `141 errors, 2278 warnings, 0 informations`; normalized candidate-only errors `0`, candidate production errors `0`; the nonzero diagnostics are existing test-harness/source findings, and the warning total includes three files absent from the baseline |
+| Touched Python scope | PASS | The final analyzer scope is 17 Python files, computed from the complete `origin/main...HEAD` changed-file set; the prior six-file claim is removed |
+| Ruff changed-code gate | PASS | Default Ruff over all 17 touched Python files: candidate `21` diagnostics vs baseline `27`, normalized candidate-only diagnostics `0`; selected `python3 -m ruff check --select E4,E7,E9,F` over the same set — `All checks passed!` |
+| Pyflakes | PASS | Pyflakes over all 17 touched Python files — exit 0 |
+| Shellcheck | PASS | `shellcheck automation/n8n/scripts/diagnose-github-onboarding.sh` — exit 0 |
 | Host/App/network canary | NOT RUN — USER VALIDATION REQUIRED | GitHub App installation, protected secrets, public HTTPS route, host checkout root, production Hermes job, and signed delivery remain operator-owned |
 
-The new-repository router regression was also run with `_has_app_installation_context()` temporarily
+The standalone registry runner regression was proven to bite: the pre-fix function signature made
+`PYTHONDONTWRITEBYTECODE=1 python3 tests/test_repository_registry.py` exit 1 with the expected missing
+`monkeypatch` argument, while the restored standalone test passed. The new-repository router regression was also run with `_has_app_installation_context()` temporarily
 forced to its pre-onboarding false behavior: it failed as expected; restoring the implementation made
 it pass. Additional pre-fix sabotage against the prior rework head failed the scoped preflight-order,
 branch-component, metadata-before-filesystem, and clone-environment regressions; the restored
@@ -77,8 +81,10 @@ Live acceptance must prove an active personal-owner GitHub App webhook, protecte
 
 - Base SHA: `dd7f6ad6c6fe39108d87a821c635046ab1fb88e1`
 - Branch: `issue87/onboarding-checkout-webhook`
-- Commits: `0fe9a431161b26b1e0cc2ec25f613fb17d056a72`, `99334584fb297db105f975d0c527521c7d286a33`, `110bcb907d3a774b56004b7849bb8f80b4dd3845`, `f4cad8f739d9c16c229dd160cbaba4ac50b4872d`, `b044ea831e175a07a14df74c757988a71e31788e`, `1707128ce6501b2e521ad8edb5c3b95a5cd95e93`, `8be40ad80d2bb538ea0123c50abcb79ffb08c6e2`, `8b5c96b83ae8ba918f4b26d792174f15a5290d69`, `8d188042fe72209aa498fcacabf2beea32c07e17`, `ef34614232e44835295cf8c72b385da51e1919ce`, `2c7b56aa1162a8d2898fbd6b025a43d5c8a7679c`, `da5406a88f6f6e81a3a0dbf1337060599bf21023`
-- Implementation/validation head for this rework: `2c7b56aa1162a8d2898fbd6b025a43d5c8a7679c`
+- Commits through the last non-provenance head: `0fe9a431161b26b1e0cc2ec25f613fb17d056a72`, `99334584fb297db105f975d0c527521c7d286a33`, `110bcb907d3a774b56004b7849bb8f80b4dd3845`, `f4cad8f739d9c16c229dd160cbaba4ac50b4872d`, `b044ea831e175a07a14df74c757988a71e31788e`, `1707128ce6501b2e521ad8edb5c3b95a5cd95e93`, `8be40ad80d2bb538ea0123c50abcb79ffb08c6e2`, `8b5c96b83ae8ba918f4b26d792174f15a5290d69`, `8d188042fe72209aa498fcacabf2beea32c07e17`, `ef34614232e44835295cf8c72b385da51e1919ce`, `2c7b56aa1162a8d2898fbd6b025a43d5c8a7679c`, `da5406a88f6f6e81a3a0dbf1337060599bf21023`, `11dea2df308fa570efbb3fe37837e11342d79021`, `12820fcf1854f213be4e8f389ef2d3d1ee0fa0f2`, `b7027b8213bdfec8267dc1aacccef791d47fbcbc`, `8b79ddf216677fe9cc906683fa4e01ec06a5d864`
+- Round 3 provenance chain: implementation/test evidence head `8b79ddf216677fe9cc906683fa4e01ec06a5d864` → this REQ refresh commit. The request's own commit SHA is intentionally not self-referenced; the exact final PR head is independently recorded by the post-push branch/PR read-back and Kanban handoff.
+- Last non-self-referential implementation/validation head: `8b79ddf216677fe9cc906683fa4e01ec06a5d864`
+- Final PR head: exact full OID is the post-push REST/GraphQL and remote-branch read-back recorded in the live PR body and Kanban handoff; no stale round-2 head is used here.
 - PR number/title/URL: PR #88 — `Issue #87: 신규 hermes-agent 저장소 webhook 온보딩` — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/88
 - Working tree: clean after final commit; PR #88 open and verified by REST/GraphQL read-back
 - Merge performed: NO
