@@ -5286,7 +5286,7 @@ def _current_rework_attention_at(
     pr_number = event_payload.get("pr_number")
     rows = conn.execute(
         "SELECT payload, created_at FROM task_events "
-        "WHERE task_id = ? AND kind = 'github_pr_rework_attention' "
+        "WHERE task_id = ? AND kind IN ('github_pr_rework_attention', 'github_operator_attention') "
         "ORDER BY created_at DESC, id DESC",
         (task_id,),
     ).fetchall()
@@ -5407,7 +5407,9 @@ def _has_fresh_retry_comment(
         _last_rework_attention_at(conn, task_id) or 0,
     )
     row_completed_at = (
-        row.get("completed_at") if "completed_at" in row.keys() else None
+        row["completed_at"]
+        if isinstance(row, sqlite3.Row) and "completed_at" in row.keys()
+        else (row.get("completed_at") if isinstance(row, dict) else None)
     )
     if row_completed_at:
         try:
@@ -5452,7 +5454,11 @@ def _consume_explicit_rework_retry(
     """
     event = context["event"]
     _, event_at, _ = event
-    row_completed_at = row.get("completed_at") if "completed_at" in row.keys() else None
+    row_completed_at = (
+        row["completed_at"]
+        if isinstance(row, sqlite3.Row) and "completed_at" in row.keys()
+        else (row.get("completed_at") if isinstance(row, dict) else None)
+    )
     baseline_at = max(
         int(event_at or 0),
         _last_rework_attention_at(conn, task_id) or 0,
@@ -5779,7 +5785,7 @@ def _reconcile_rework_lifecycle(
             None if status == "done"
             else _current_rework_attention_at(conn, task_id, context["event"])
         )
-        if (status == "done" and has_retry_signal) or (
+        if (has_retry_signal) or (
             status == "review" and attention_at is not None
         ):
             retry_result = _consume_explicit_rework_retry(
