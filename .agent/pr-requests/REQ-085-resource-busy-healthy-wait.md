@@ -1,12 +1,12 @@
 # REQ-085: resource-busy READY 대기와 worker reclaim health 통합
 
-- Status: Rework round 3 implementation complete; review handoff pending
+- Status: Rework round 4 latest-main sync and exact-head validation complete; review handoff pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
 - Integration target branch: `main`
 - Required work branch: `issue85/resource-busy-healthy-wait`
-- Source-of-truth base: `origin/main` at `dd7f6ad6c6fe39108d87a821c635046ab1fb88e1`
+- Source-of-truth base: `origin/main` at `1469711039c272351e246d3c7a7bd05b3d36250f`
 - Source issue: `rhgo1749/hermes-n8n-control-plane#85`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/85
 - Kanban implementation task: `t_9378b599`
@@ -138,6 +138,25 @@ Focused regression: one capacity-1 resource with READY A and REVIEW B under
   READY-peer busy assertions.
 - GitHub Actions: intentionally disabled by repository policy; local gates are
   authoritative.
+
+## Round 4 latest-main sync and validation record
+
+- Fetched `origin/main` at `1469711039c272351e246d3c7a7bd05b3d36250f` and
+  merged it into `issue85/resource-busy-healthy-wait` without rebasing or
+  rewriting the six existing PR commits.
+- Latest-main merge commit: `fec4d8c7d3cea0cfe75c7418a056628f6fb838e4`.
+  The merge completed without conflicts; the #91 files and the #86 overlay
+  files have zero path overlap.
+- The combined merge tree passed every required local gate: resource admission
+  18, dynamic resource 10, focused resource-busy health 40, and full GitHub
+  sync/rework 855 checks, all with zero failures; py_compile, Pyright (0 errors,
+  0 warnings, 0 informations), Ruff import selector, `git diff --check`, and
+  installer `bash -n` plus isolated temporary-target `--dry-run` also passed.
+- Final pushed PR head is the provenance-only commit immediately following the
+  merge; its exact full SHA and the same 855-check evidence are recorded in the
+  PR #86 validation body and final read-back.
+- GitHub Actions remain intentionally disabled by repository policy; local gates
+  are authoritative. Merge and auto-merge remain human-only operations.
 
 ## Delivery contract
 
