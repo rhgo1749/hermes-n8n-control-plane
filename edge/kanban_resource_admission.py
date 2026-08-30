@@ -39,14 +39,80 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
-
+from typing import Any, Mapping, Optional, cast
 
 RESOURCE_CONFIG_KEY = "worker_resources"
 DEFAULT_STALE_WORKER_GRACE_SECONDS = 5.0
+RESOURCE_BUSY = "resource_busy"
+RESOURCE_OUTCOME_LIMIT = 128
+
+# Claim admission returns the core's existing ``None`` sentinel, so keep a
+# small process-local diagnostic trail for operators and health probes.  The
+# trail is intentionally bounded and contains no command lines or secrets.
+_resource_outcome_lock = threading.Lock()
+_resource_outcomes: deque[dict[str, Any]] = deque(maxlen=RESOURCE_OUTCOME_LIMIT)
+
+
+def record_resource_admission_outcome(
+    *,
+    task_id: Optional[str],
+    board: Optional[str],
+    resource_group: Optional[str],
+    reason: str,
+    lane: Optional[str] = None,
+    resource_active: Optional[int] = None,
+    resource_capacity: Optional[int] = None,
+) -> dict[str, Any]:
+    """Record one bounded resource-admission diagnostic and return its copy."""
+    outcome: dict[str, Any] = {
+        "task_id": str(task_id) if task_id is not None else None,
+        "board": str(board) if board is not None else None,
+        "resource_group": (
+            str(resource_group) if resource_group is not None else None
+        ),
+        "reason": str(reason),
+    }
+    if lane:
+        outcome["lane"] = str(lane)
+    if resource_active is not None:
+        outcome["resource_active"] = int(resource_active)
+    if resource_capacity is not None:
+        outcome["resource_capacity"] = int(resource_capacity)
+    with _resource_outcome_lock:
+        _resource_outcomes.append(dict(outcome))
+    return outcome
+
+
+def resource_admission_outcomes(
+    *,
+    task_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    limit: int = RESOURCE_OUTCOME_LIMIT,
+) -> list[dict[str, Any]]:
+    """Return the newest bounded admission diagnostics matching the filters."""
+    with _resource_outcome_lock:
+        items = list(_resource_outcomes)
+    if task_id is not None:
+        items = [item for item in items if item.get("task_id") == str(task_id)]
+    if reason is not None:
+        items = [item for item in items if item.get("reason") == str(reason)]
+    try:
+        count = max(0, int(limit))
+    except (TypeError, ValueError):
+        count = RESOURCE_OUTCOME_LIMIT
+    selected = items[-count:] if count else []
+    return [dict(item) for item in selected]
+
+
+def clear_resource_admission_outcomes() -> None:
+    """Clear bounded diagnostics (a test/diagnostic reset, never DB state)."""
+    with _resource_outcome_lock:
+        _resource_outcomes.clear()
 
 
 class ResourceAdmissionError(RuntimeError):
@@ -85,7 +151,7 @@ def _resource_policies(cfg: Mapping[str, Any]) -> tuple[WorkerResource, ...]:
         if raw_spec.get("enabled", True) is False:
             continue
         try:
-            capacity = int(raw_spec.get("capacity"))
+            capacity = int(cast(Any, raw_spec.get("capacity")))
         except (TypeError, ValueError) as exc:
             raise ResourceAdmissionError(
                 f"worker resource {name!r} capacity must be a positive integer"
@@ -223,7 +289,7 @@ def _terminate_verified_worker(pid: int, grace_seconds: float) -> bool:
             # group leaders, but do not assume that contract forever.  Only
             # signal the group when its PGID is exactly the verified PID.
             pgid = os.getpgid(target) if hasattr(os, "getpgid") else None
-            if pgid == target and hasattr(os, "killpg"):
+            if pgid is not None and pgid == target and hasattr(os, "killpg"):
                 os.killpg(pgid, sig)
             else:
                 os.kill(target, sig)
@@ -482,6 +548,19 @@ def _entry(
         "resource_capacity": resource.capacity,
     }
     value.update(extra)
+    record_resource_admission_outcome(
+        task_id=task_id,
+        board=board,
+        resource_group=resource.name,
+        reason=reason,
+        lane=str(extra.get("lane") or "rework"),
+        resource_active=(
+            int(extra["resource_active"])
+            if extra.get("resource_active") is not None
+            else None
+        ),
+        resource_capacity=resource.capacity,
+    )
     return [value]
 
 
@@ -521,9 +600,9 @@ def install_resource_admission(edge_module: Any) -> None:
         except Exception:
             # Preserve the original edge's own error/empty handling when the
             # admission overlay cannot even identify a candidate.
-            return original(conn, kanban_db, board, *args, **kwargs)
+            return cast(list[dict[str, Any]], original(conn, kanban_db, board, *args, **kwargs))
         if not pending:
-            return original(conn, kanban_db, board, *args, **kwargs)
+            return cast(list[dict[str, Any]], original(conn, kanban_db, board, *args, **kwargs))
 
         candidate = pending[0]
         task_id = str(candidate["id"])
@@ -545,7 +624,7 @@ def install_resource_admission(edge_module: Any) -> None:
         if resource is None:
             # Critical backwards-compatibility path: no matching resource
             # means exactly the existing edge dispatch semantics.
-            return original(conn, kanban_db, board, *args, **kwargs)
+            return cast(list[dict[str, Any]], original(conn, kanban_db, board, *args, **kwargs))
 
         try:
             with _resource_lock(kanban_db, board, resource.name) as held:
@@ -591,12 +670,15 @@ def install_resource_admission(edge_module: Any) -> None:
                 # through to a different pending task with another resource.
                 delegated_kwargs = dict(kwargs)
                 delegated_kwargs["task_ids"] = [task_id]
-                result = original(
-                    conn,
-                    kanban_db,
-                    board,
-                    *args,
-                    **delegated_kwargs,
+                result = cast(
+                    list[dict[str, Any]],
+                    original(
+                        conn,
+                        kanban_db,
+                        board,
+                        *args,
+                        **delegated_kwargs,
+                    ),
                 )
                 for item in result:
                     if not isinstance(item, dict):

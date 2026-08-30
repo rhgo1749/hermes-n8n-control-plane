@@ -105,6 +105,41 @@ For a rework-pending READY task whose assignee matches a resource group:
    (or declined) the task.  Durable task/run state then represents occupancy
    for the next admission check.
 
+## Core claim and health integration
+
+The enabled `h4v3-resource-scheduler` plugin installs the same resource gate at
+both core claim boundaries: `claim_task` for READY work and
+`claim_review_task` for autonomous REVIEW work. A full matched resource returns
+the core sentinel (`None`) without changing the task or failure counter, and
+records a bounded in-process `resource_busy` diagnostic. A verified terminal
+same-task worker may be reaped before replacement admission; active or
+unverifiable PIDs remain fail-closed, and PID reuse is never signalled.
+
+The plugin also wraps the module attributes used by the dispatcher health
+probes (`has_spawnable_ready` and `has_spawnable_review`). When every eligible
+candidate is resource-busy, those probes report no spawnable work, so the
+legacy six-tick `dispatcher stuck` warning is reserved for genuine spawn
+failures. A queue containing any non-resource or available-resource candidate
+continues to report spawnable work. Configuration or worker-inspection failures
+remain health-visible and emit an explicit admission diagnostic; they are not
+treated as healthy capacity waits. The runtime dispatch result and CLI
+`dispatch --dry-run` output expose `resource_busy` entries and do not present a
+capacity-blocked candidate as a predicted spawn. Dry-run first delegates to core
+and treats the ordered `result.spawned` list as authoritative: core owns READY /
+REVIEW lane order, max-spawn, the reserved review slot, per-profile caps,
+respawn guards, and default-assignee resolution. Only those selected candidates
+consume virtual reservations in their returned order; the overlay performs no
+claim, reap, or database write. It may report other pending rows as
+`resource_busy` after a selected candidate consumes their shared resource, but
+those diagnostics never filter or reorder core's result. A real tick removes
+pre-tick busy evidence when that same task is successfully spawned after a holder
+is reaped, so one task cannot appear as both `spawned` and `resource_busy` in one
+result.
+
+No resource configuration, empty configuration, or unmatched assignee keeps
+the original core probe and dispatch behavior unchanged. Core source remains
+untouched; all integrations are idempotent runtime overlays.
+
 ## Backwards compatibility
 
 The overlay deliberately has three no-op paths:
@@ -161,6 +196,7 @@ Repository test added by this change:
 
 ```bash
 python3 edge/test-kanban-resource-admission.py
+python3 edge/test-kanban-resource-busy-health.py
 ```
 
 It covers:
@@ -168,6 +204,12 @@ It covers:
 - configuration absent -> legacy dispatcher delegates unchanged;
 - unmatched/parallel profile -> delegates unchanged;
 - capacity 1 blocks a matching live worker on a sibling board;
+- core-first capacity 1 dry-run keeps a native REVIEW selection as the predicted
+  spawn and reports its READY peer as `resource_busy`;
+- policy-resolution and active-worker inspection failures remain visible to
+  health rather than suppressing the stuck warning;
+- pre-tick busy evidence is removed after same-task terminal-worker reap and
+  successful spawn;
 - capacity 2 admits the second worker;
 - terminal same-task live worker is reaped before replacement admission;
 - active same-task run is never killed;
