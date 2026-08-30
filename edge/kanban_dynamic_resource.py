@@ -54,6 +54,7 @@ _LOCAL_PROVIDER_HINTS = frozenset({
     "vllm",
     "sglang",
     "local",
+    "ornith",
 })
 _LOCAL_HOST_ALIASES = frozenset({
     "localhost",
@@ -61,6 +62,16 @@ _LOCAL_HOST_ALIASES = frozenset({
     "::1",
     "host.docker.internal",
 })
+
+
+def _provider_is_local(provider: str) -> bool:
+    norm = _normalized_provider(provider)
+    if not norm:
+        return False
+    if norm in _LOCAL_PROVIDER_HINTS:
+        return True
+    tokens = ("local", "llamacpp", "llama-cpp", "llama.cpp", "ornith", "ollama", "vllm", "sglang", "lmstudio")
+    return any(token in norm for token in tokens)
 
 
 @dataclass(frozen=True)
@@ -178,7 +189,7 @@ def resolve_profile_backend(profile_name: str) -> ProfileBackend:
 
     if base_url:
         kind = "local" if _base_url_is_local(base_url) else "cloud"
-    elif provider in _LOCAL_PROVIDER_HINTS:
+    elif _provider_is_local(provider):
         kind = "local"
     elif provider:
         kind = "cloud"
