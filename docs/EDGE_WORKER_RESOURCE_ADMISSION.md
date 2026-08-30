@@ -124,11 +124,17 @@ continues to report spawnable work. Configuration or worker-inspection failures
 remain health-visible and emit an explicit admission diagnostic; they are not
 treated as healthy capacity waits. The runtime dispatch result and CLI
 `dispatch --dry-run` output expose `resource_busy` entries and do not present a
-capacity-blocked candidate as a predicted spawn. Dry-run consumes virtual
-reservations in candidate order, including across READY and REVIEW lanes, but
-performs no claim, reap, or database write. A real tick removes pre-tick busy
-evidence when that same task is successfully spawned after a holder is reaped,
-so one task cannot appear as both `spawned` and `resource_busy` in one result.
+capacity-blocked candidate as a predicted spawn. Dry-run first delegates to core
+and treats the ordered `result.spawned` list as authoritative: core owns READY /
+REVIEW lane order, max-spawn, the reserved review slot, per-profile caps,
+respawn guards, and default-assignee resolution. Only those selected candidates
+consume virtual reservations in their returned order; the overlay performs no
+claim, reap, or database write. It may report other pending rows as
+`resource_busy` after a selected candidate consumes their shared resource, but
+those diagnostics never filter or reorder core's result. A real tick removes
+pre-tick busy evidence when that same task is successfully spawned after a holder
+is reaped, so one task cannot appear as both `spawned` and `resource_busy` in one
+result.
 
 No resource configuration, empty configuration, or unmatched assignee keeps
 the original core probe and dispatch behavior unchanged. Core source remains
@@ -198,8 +204,8 @@ It covers:
 - configuration absent -> legacy dispatcher delegates unchanged;
 - unmatched/parallel profile -> delegates unchanged;
 - capacity 1 blocks a matching live worker on a sibling board;
-- capacity 1 dry-run reserves the first candidate and reports the next one as
-  `resource_busy`;
+- core-first capacity 1 dry-run keeps a native REVIEW selection as the predicted
+  spawn and reports its READY peer as `resource_busy`;
 - policy-resolution and active-worker inspection failures remain visible to
   health rather than suppressing the stuck warning;
 - pre-tick busy evidence is removed after same-task terminal-worker reap and

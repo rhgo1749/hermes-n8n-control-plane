@@ -332,6 +332,76 @@ def test_dry_run_filters_busy_without_claim() -> None:
         conn_holder.close()
 
 
+def test_dry_run_respects_core_review_selection() -> None:
+    root = Path(tempfile.mkdtemp(prefix="resource-busy-dry-run-review-selection-"))
+    kb = FakeKanban(root)
+    install_fake_claims(kb)
+    conn = make_db(kb.kanban_db_path(board="default"))
+    conn.executemany(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        [
+            ("t-ready", "kanban-developer", "ready", None, None),
+            ("t-review", "kanban-reviewer", "review", None, None),
+        ],
+    )
+    conn.commit()
+
+    call_order: list[str] = []
+
+    def dispatch_once(conn, **kwargs):
+        call_order.append("core")
+        check("core receives max_spawn=1", kwargs.get("max_spawn") == 1, str(kwargs))
+        del conn
+        return types.SimpleNamespace(
+            # This is the native core result for READY+REVIEW with max_spawn=1:
+            # the reserved REVIEW slot selects t-review.
+            spawned=[("t-review", "kanban-reviewer", "")],
+        )
+
+    kb.dispatch_once = dispatch_once
+    old_seams = install_test_seams()
+    old_active_workers = admission._active_resource_workers
+
+    def active_workers(*args, **kwargs):
+        call_order.append("overlay")
+        return old_active_workers(*args, **kwargs)
+
+    admission._active_resource_workers = active_workers
+    try:
+        dynamic.install_core_claim_admission(kb, admission)
+        result = kb.dispatch_once(conn, dry_run=True, max_spawn=1)
+        busy_ids = {
+            item.get("task_id")
+            for item in getattr(result, "resource_busy", [])
+        }
+        check(
+            "dry-run runs core before resource replay",
+            call_order == ["core", "overlay"],
+            str(call_order),
+        )
+        check(
+            "core REVIEW candidate remains predicted spawn",
+            result.spawned == [("t-review", "kanban-reviewer", "")],
+            str(result),
+        )
+        check(
+            "READY peer is reported busy after REVIEW reservation",
+            busy_ids == {"t-ready"},
+            str(getattr(result, "resource_busy", [])),
+        )
+        check(
+            "core-first dry-run leaves both lanes unchanged",
+            [tuple(row) for row in conn.execute(
+                "SELECT id, status FROM tasks ORDER BY id"
+            ).fetchall()]
+            == [("t-ready", "ready"), ("t-review", "review")],
+        )
+    finally:
+        admission._active_resource_workers = old_active_workers
+        restore_test_seams(old_seams)
+        conn.close()
+
+
 def test_dry_run_consumes_virtual_reservations() -> None:
     root = Path(tempfile.mkdtemp(prefix="resource-busy-dry-run-reservation-"))
     kb = FakeKanban(root)
@@ -691,6 +761,7 @@ def main() -> int:
     test_ready_and_review_busy_then_release()
     test_no_resource_config_preserves_legacy_probe()
     test_dry_run_filters_busy_without_claim()
+    test_dry_run_respects_core_review_selection()
     test_dry_run_consumes_virtual_reservations()
     test_health_failure_stays_visible()
     test_dispatch_normalizes_reaped_busy_spawn()

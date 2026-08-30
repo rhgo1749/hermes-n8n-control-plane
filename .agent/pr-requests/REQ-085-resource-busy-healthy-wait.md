@@ -1,6 +1,6 @@
 # REQ-085: resource-busy READY 대기와 worker reclaim health 통합
 
-- Status: Rework round 1 implementation complete; review handoff pending
+- Status: Rework round 3 implementation in progress; exact-head validation pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
@@ -10,7 +10,7 @@
 - Source issue: `rhgo1749/hermes-n8n-control-plane#85`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/85
 - Kanban implementation task: `t_9378b599`
-- Kanban rework task: `t_89a3c0a8`
+- Kanban rework tasks: `t_89a3c0a8`, `t_2d3f1adf`
 - Intake root provenance: `t_7494ffd8`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:85`
 - Planning/lead owner: `kanban-main`
@@ -26,6 +26,21 @@ preserving the existing Hermes core state machine. The enabled resource plugin
 must expose bounded `resource_busy` diagnostics for normal READY and autonomous
 REVIEW claims, safely release/reclaim dead or terminal workers, and make
 `dispatch --dry-run` report capacity backpressure instead of a predicted spawn.
+
+## Round 3 scheduling-parity change
+
+The dry-run resource overlay now calls core `dispatch_once(..., dry_run=True)`
+first and treats its ordered `result.spawned` entries as the authoritative
+native-gate candidates. Resource capacity replay consumes only those entries in
+that returned order; it does not reimplement READY/REVIEW order, max-spawn, the
+reserved review slot, per-profile caps, respawn guards, or default-assignee
+resolution. Pending peers that become full after a selected candidate's virtual
+reservation may receive bounded `resource_busy` telemetry, but they never filter
+or reorder the core result.
+
+Focused regression: one capacity-1 resource with READY A and REVIEW B under
+`max_spawn=1` keeps REVIEW B as the final predicted spawn and reports READY A as
+`resource_busy`, with both database rows unchanged.
 
 ## Confirmed boundary
 

@@ -692,6 +692,170 @@ def _spawned_task_ids(result: Any) -> set[str]:
     return task_ids
 
 
+def _spawned_candidates(result: Any) -> list[tuple[str, str]]:
+    """Return core's ordered dry-run candidates without changing their order."""
+    spawned = getattr(result, "spawned", None)
+    if not isinstance(spawned, (list, tuple)):
+        return []
+    candidates: list[tuple[str, str]] = []
+    for item in spawned:
+        if isinstance(item, (tuple, list)) and item:
+            task_id = item[0]
+            assignee = item[1] if len(item) > 1 else ""
+        elif isinstance(item, Mapping):
+            task_id = item.get("task_id")
+            assignee = item.get("assignee")
+        else:
+            continue
+        if task_id is None:
+            continue
+        candidates.append((str(task_id), str(assignee or "").strip()))
+    return candidates
+
+
+def _dry_run_resource_diagnostics(
+    kanban_db: Any,
+    admission_module: Any,
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any],
+    result: Any,
+) -> list[dict[str, Any]]:
+    """Replay resources after core has selected its authoritative candidates.
+
+    Core owns lane order, spawn caps, review reservation, profile caps, the
+    respawn guard, and default-assignee resolution. This helper therefore
+    consumes only the ordered ``result.spawned`` entries from that completed
+    core dry-run. The second pass emits capacity telemetry for other pending
+    rows sharing a resource already consumed by those candidates; it never
+    changes the candidate list and cannot preempt a core scheduling decision.
+    """
+    raw = cfg.get(getattr(admission_module, "RESOURCE_CONFIG_KEY", "worker_resources"))
+    if raw in (None, {}):
+        return []
+    candidates = _spawned_candidates(result)
+    if not candidates:
+        return []
+
+    board = _board_for_connection(kanban_db, conn)
+    virtual_reservations: dict[str, int] = {}
+    consumed_resources: set[str] = set()
+    candidate_ids: set[str] = set()
+    diagnostics: list[dict[str, Any]] = []
+
+    for task_id, assignee in candidates:
+        candidate_ids.add(task_id)
+        if not assignee:
+            continue
+        exists = _profile_exists(assignee)
+        if exists is None:
+            # Preserve core's result when profile discovery is unavailable.
+            return []
+        if not exists:
+            continue
+        try:
+            resource = admission_module.resource_for_assignee(cfg, assignee)
+        except Exception as exc:
+            diagnostics.append({
+                "task_id": task_id,
+                "lane": "dispatch",
+                "reason": "resource_config_invalid",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            continue
+        if resource is None:
+            continue
+
+        consumed_resources.add(resource.name)
+        if resource.name in virtual_reservations:
+            active_count = virtual_reservations[resource.name]
+        else:
+            try:
+                active = admission_module._active_resource_workers(
+                    kanban_db, board, resource
+                )
+            except Exception as exc:
+                diagnostics.append({
+                    "task_id": task_id,
+                    "lane": "dispatch",
+                    "reason": "resource_admission_failed",
+                    "resource_group": resource.name,
+                    "resource_capacity": int(resource.capacity),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            active_count = len(active)
+            virtual_reservations[resource.name] = active_count
+
+        if active_count >= int(resource.capacity):
+            diagnostics.append({
+                "task_id": task_id,
+                "lane": "dispatch",
+                "reason": "resource_busy",
+                "resource_group": resource.name,
+                "resource_active": active_count,
+                "resource_capacity": int(resource.capacity),
+            })
+        else:
+            virtual_reservations[resource.name] = active_count + 1
+
+    # Report other rows that are now capacity-blocked by an authoritative core
+    # candidate. This is telemetry only: these rows never enter the replay and
+    # cannot filter or reorder the core result.
+    if consumed_resources:
+        statuses_to_check = [("ready",)]
+        if bool(cfg.get("review_dispatch", True)):
+            statuses_to_check.append(("review",))
+        for statuses in statuses_to_check:
+            for row in _pending_rows(conn, statuses):
+                task_id = str(row["id"])
+                if task_id in candidate_ids:
+                    continue
+                assignee = str(row["assignee"] or "").strip()
+                if not assignee or _profile_exists(assignee) is not True:
+                    continue
+                try:
+                    resource = admission_module.resource_for_assignee(cfg, assignee)
+                except Exception:
+                    continue
+                if (
+                    resource is None
+                    or resource.name not in consumed_resources
+                    or virtual_reservations.get(resource.name, 0)
+                    < int(resource.capacity)
+                ):
+                    continue
+                diagnostics.append({
+                    "task_id": task_id,
+                    "lane": str(statuses[0]),
+                    "reason": "resource_busy",
+                    "resource_group": resource.name,
+                    "resource_active": virtual_reservations[resource.name],
+                    "resource_capacity": int(resource.capacity),
+                })
+
+    return diagnostics[:_diagnostic_limit(admission_module)]
+
+
+def _safe_dry_run_resource_diagnostics(
+    kanban_db: Any,
+    admission_module: Any,
+    conn: sqlite3.Connection,
+    cfg: Mapping[str, Any],
+    result: Any,
+) -> list[dict[str, Any]]:
+    try:
+        return _dry_run_resource_diagnostics(
+            kanban_db, admission_module, conn, cfg, result
+        )
+    except Exception as exc:
+        return [{
+            "task_id": None,
+            "lane": "dispatch",
+            "reason": "resource_admission_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }]
+
+
 def _normalize_dispatch_diagnostics(
     result: Any,
     diagnostics: list[dict[str, Any]],
@@ -862,6 +1026,32 @@ def _install_dispatch_overlay(kanban_db: Any, admission_module: Any) -> None:
     ):
         global _last_resource_diagnostics
         dry_run = bool(kwargs.get("dry_run"))
+        if dry_run:
+            # Core must select candidates first. Its ordered result already
+            # reflects READY/REVIEW lane order, max_spawn, the reserved review
+            # slot, profile caps, respawn guards, and default-assignee policy.
+            # Resource replay below is deliberately downstream of those gates.
+            result = original(conn, *args, **kwargs)
+            try:
+                cfg = _load_kanban_cfg()
+            except Exception:
+                cfg = {}
+            if not isinstance(cfg, Mapping):
+                cfg = {}
+            diagnostics = _safe_dry_run_resource_diagnostics(
+                kanban_db, admission_module, conn, cfg, result
+            )
+            _last_resource_diagnostics = []
+            board = None
+            try:
+                board = _board_for_connection(kanban_db, conn)
+            except Exception:
+                pass
+            _record_resource_diagnostics(admission_module, diagnostics, board=board)
+            _last_resource_diagnostics = list(diagnostics)
+            _attach_dispatch_diagnostics(result, diagnostics, dry_run=True)
+            return result
+
         try:
             cfg = _load_kanban_cfg()
         except Exception:
@@ -873,7 +1063,7 @@ def _install_dispatch_overlay(kanban_db: Any, admission_module: Any) -> None:
             admission_module,
             conn,
             cfg,
-            dry_run=dry_run,
+            dry_run=False,
         )
         _last_resource_diagnostics = []
         result = original(conn, *args, **kwargs)
