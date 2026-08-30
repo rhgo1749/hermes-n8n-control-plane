@@ -1,6 +1,6 @@
 # REQ-085: resource-busy READY 대기와 worker reclaim health 통합
 
-- Status: Rework round 3 implementation in progress; exact-head validation pending
+- Status: Rework round 3 implementation complete; review handoff pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
@@ -119,6 +119,23 @@ Focused regression: one capacity-1 resource with READY A and REVIEW B under
   with the new focused regressions exited non-zero as expected (29 passed, 6
   failed); virtual reservation, health failure visibility, and stale busy
   normalization checks each failed.
+- GitHub Actions: intentionally disabled by repository policy; local gates are
+  authoritative.
+
+## Round 3 validation record
+
+- Implementation commit: `6813626d8f5d4d91b268c2836e5776e54ee07af6`
+- Core-first regression at the pushed head: `python3 edge/test-kanban-resource-busy-health.py` —
+  PASS (40 passed, 0 failed); core REVIEW selection remains spawned, READY peer
+  is `resource_busy`, and both rows remain unchanged.
+- Required local gates at the pushed head: resource admission PASS (18), dynamic
+  resource PASS (10), focused resource-busy health PASS (40), GitHub sync/rework
+  PASS (769), py_compile PASS, Pyright PASS (0 errors, 0 warnings, 0
+  informations), Ruff import selector PASS, and `git diff --check` PASS.
+- Sabotage: the focused regression was run with the exact pre-fix source at
+  `92d358d6b7eef57388d56d63e4b219e62d748a69`; it exited non-zero as expected
+  (37 passed, 3 failed), including the core-first ordering, REVIEW spawn, and
+  READY-peer busy assertions.
 - GitHub Actions: intentionally disabled by repository policy; local gates are
   authoritative.
 
