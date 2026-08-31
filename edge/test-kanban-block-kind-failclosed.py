@@ -224,6 +224,69 @@ def test_terminal_matcher_only_intercepts_hermes_block(board_db):
     assert explicit.returncode == 0
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -lc 'hermes kanban block {child} waiting'",
+        "sh -c 'hermes kanban block {child} waiting'",
+        "bash -c \"sh -c 'hermes kanban block {child} waiting'\"",
+        "bash -lc 'git status && hermes kanban block {child} waiting'",
+        "HERMES_KANBAN_BOARD=x bash -lc 'hermes kanban block {child} waiting'",
+    ],
+)
+def test_omitted_kind_through_shell_wrappers_is_blocked(board_db, command):
+    """A shell wrapper must not bypass the fail-closed gate (Issue #92 rework).
+
+    ``hermes kanban block`` hidden behind a supported ``sh``/``bash`` ``-c``/``-lc``
+    wrapper is unwrapped and classified, so an omitted ``kind`` still fails closed
+    instead of reaching the legacy ``kind=None`` durable block path.
+    """
+    path, _, child = board_db
+    result = _run_guard(
+        path,
+        {"tool_name": "terminal", "tool_input": {"command": command.format(child=child)}},
+    )
+    _assert_blocked(result, "explicit kind")
+
+
+def test_explicit_kind_through_shell_wrapper_passes(board_db):
+    path, _, child = board_db
+    result = _run_guard(
+        path,
+        {
+            "tool_name": "terminal",
+            "tool_input": {
+                "command": f"bash -lc 'hermes kanban block {child} waiting --kind=capability'"
+            },
+        },
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -lc 'printf hello'",
+        "sh -c 'ls -la'",
+        "dash -x 'hermes kanban block t_nonexistent waiting'",
+        "/tmp/w.sh 'hermes kanban block t_nonexistent waiting'",
+    ],
+)
+def test_unrelated_or_unsupported_wrappers_fail_open(board_db, command):
+    """Wrappers the gate does not recognize must not be falsely blocked.
+
+    ``sh``/``bash`` ``-c``/``-lc`` unwrapping is intentionally narrow; an unknown
+    binary, a bare script path, or an unrecognized flag keeps the previous fail-open
+    behavior rather than guessing at a hidden ``kind``.
+    """
+    path = board_db[0]
+    result = _run_guard(
+        path,
+        {"tool_name": "terminal", "tool_input": {"command": command}},
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
 def test_block_projection_and_sync_context_keep_kind_and_parent_provenance(board_db):
     path, parent, child = board_db
     with kanban_db.connect_closing(path) as conn:

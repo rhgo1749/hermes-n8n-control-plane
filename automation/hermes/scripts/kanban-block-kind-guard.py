@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sqlite3
 import sys
@@ -33,6 +34,9 @@ _LOG_PATH = Path(
     )
 )
 _COMMAND_SEPARATORS = frozenset({";", "|", "&"})
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+_SHELL_BINARIES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+_MAX_UNWRAP_DEPTH = 8
 
 
 class GuardError(RuntimeError):
@@ -217,9 +221,51 @@ def _split_command(command: str) -> list[str]:
         raise GuardError(f"could not parse hermes kanban command: {exc}") from exc
 
 
-def _terminal_call(command: str) -> tuple[str | None, str, str, str] | None:
-    """Return one parsed block command, or None for unrelated terminal input."""
+def _unwrap_shell_command(tokens: list[str]) -> str | None:
+    """Return the inline command of a supported ``sh``/``bash`` ``-c``/``-lc`` wrapper.
+
+    Only the common runtime wrappers are recognized.  Any other shape (an unknown
+    binary, a bare script path, or an unrecognized flag) returns ``None`` so the caller
+    keeps the previous fail-open behavior.  This only exposes an inner command to the
+    same classification; it never infers or repairs a ``kind``.
+    """
+    index = 0
+    while index < len(tokens) and _ENV_ASSIGN_RE.fullmatch(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return None
+    if Path(tokens[index]).name not in _SHELL_BINARIES:
+        return None
+    rest = tokens[index + 1 :]
+    if not rest:
+        return None
+    first = rest[0]
+    if first in ("-c", "-lc"):
+        if len(rest) < 2:
+            return None
+        inner = rest[1]
+        return inner if inner else None
+    if first == "-l" and len(rest) >= 3 and rest[1] == "-c":
+        inner = rest[2]
+        return inner if inner else None
+    return None
+
+
+def _terminal_call(
+    command: str, depth: int = 0
+) -> tuple[str | None, str, str, str] | None:
+    """Return one parsed block command, or None for unrelated terminal input.
+
+    A supported inline shell wrapper (``sh -c``, ``bash -lc``, ...) is unwrapped first
+    so a ``hermes kanban block`` call hidden behind a shell cannot bypass the gate.
+    Commands that are not a supported wrapper keep the previous fail-open behavior.
+    """
     tokens = _split_command(command)
+    inner = _unwrap_shell_command(tokens)
+    if inner is not None:
+        if depth >= _MAX_UNWRAP_DEPTH:
+            return None
+        return _terminal_call(inner, depth + 1)
     for start, token in enumerate(tokens):
         if Path(token).name != "hermes":
             continue
