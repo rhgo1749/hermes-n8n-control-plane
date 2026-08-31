@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -261,6 +262,72 @@ def test_explicit_kind_through_shell_wrapper_passes(board_db):
         },
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -i FOO=bar bash --login -c 'hermes kanban block {child} waiting'",
+        "env --ignore-environment --unset=FOO bash -l -c 'hermes kanban block {child} waiting'",
+        "command -- bash -cl 'hermes kanban block {child} waiting'",
+        "builtin bash -c 'hermes kanban block {child} waiting'",
+        "exec -a issue92 bash -lc 'hermes kanban block {child} waiting'",
+        "nohup -- bash -c 'hermes kanban block {child} waiting'",
+        "env -i command -p bash --login -c 'hermes kanban block {child} waiting'",
+        "FOO=bar env -i -u FOO bash -lc 'hermes kanban block {child} waiting'",
+    ],
+)
+def test_launcher_prefixes_and_shell_options_are_unwrapped(board_db, command):
+    path, _, child = board_db
+    result = _run_guard(
+        path,
+        {"tool_name": "terminal", "tool_input": {"command": command.format(child=child)}},
+    )
+    _assert_blocked(result, "explicit kind")
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        "env -i FOO=bar",
+        "command --",
+        "builtin",
+        "exec -a issue92",
+        "nohup --",
+    ],
+)
+def test_explicit_kind_through_launcher_prefixes_passes(board_db, launcher):
+    path, _, child = board_db
+    result = _run_guard(
+        path,
+        {
+            "tool_name": "terminal",
+            "tool_input": {
+                "command": (
+                    f"{launcher} bash --login -c "
+                    f"'hermes kanban block {child} waiting --kind=capability'"
+                )
+            },
+        },
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+def test_shell_wrapper_depth_limit_fails_closed_without_mutation(board_db):
+    path, _, child = board_db
+    command = f"hermes kanban block {child} waiting"
+    for _ in range(9):
+        command = f"bash -lc {shlex.quote(command)}"
+    result = _run_guard(
+        path,
+        {"tool_name": "terminal", "tool_input": {"command": command}},
+    )
+    _assert_blocked(result, "maximum depth")
+    with kanban_db.connect_closing(path) as conn:
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+        ).fetchone()
+    assert tuple(row) == ("ready", None)
 
 
 @pytest.mark.parametrize(

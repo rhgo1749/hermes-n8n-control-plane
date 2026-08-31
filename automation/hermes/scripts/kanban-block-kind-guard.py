@@ -36,6 +36,7 @@ _LOG_PATH = Path(
 _COMMAND_SEPARATORS = frozenset({";", "|", "&"})
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _SHELL_BINARIES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+_LAUNCHER_BINARIES = frozenset({"command", "builtin", "exec", "nohup"})
 _MAX_UNWRAP_DEPTH = 8
 
 
@@ -221,34 +222,151 @@ def _split_command(command: str) -> list[str]:
         raise GuardError(f"could not parse hermes kanban command: {exc}") from exc
 
 
-def _unwrap_shell_command(tokens: list[str]) -> str | None:
-    """Return the inline command of a supported ``sh``/``bash`` ``-c``/``-lc`` wrapper.
+def _consume_env_prefix(tokens: list[str], index: int) -> int | None:
+    """Consume a conservative, invocation-only subset of ``env`` options."""
+    index += 1
+    while index < len(tokens):
+        value = tokens[index]
+        if value == "--":
+            return index + 1
+        if _ENV_ASSIGN_RE.fullmatch(value):
+            index += 1
+            continue
+        if value in ("-i", "--ignore-environment", "-0", "--null"):
+            index += 1
+            continue
+        if value in ("-u", "--unset", "-C", "--chdir"):
+            if index + 1 >= len(tokens):
+                return None
+            index += 2
+            continue
+        if value.startswith(("--unset=", "--chdir=")):
+            if value.partition("=")[2] == "":
+                return None
+            index += 1
+            continue
+        if value.startswith("-u") and len(value) > 2:
+            index += 1
+            continue
+        if value.startswith("-C") and len(value) > 2:
+            index += 1
+            continue
+        if not value.startswith("-"):
+            return index
+        # ``env -S`` and unknown options can reinterpret the remaining tokens;
+        # do not guess at their command shape.
+        return None
+    return index
 
-    Only the common runtime wrappers are recognized.  Any other shape (an unknown
-    binary, a bare script path, or an unrecognized flag) returns ``None`` so the caller
-    keeps the previous fail-open behavior.  This only exposes an inner command to the
-    same classification; it never infers or repairs a ``kind``.
-    """
+
+def _consume_launcher_prefix(tokens: list[str], index: int) -> int | None:
+    """Consume one supported launcher and return the next executable index."""
+    name = Path(tokens[index]).name
+    if name == "env":
+        return _consume_env_prefix(tokens, index)
+
+    index += 1
+    if name == "command":
+        while index < len(tokens):
+            value = tokens[index]
+            if value == "--":
+                return index + 1
+            if value == "-p":
+                index += 1
+                continue
+            if value.startswith("-"):
+                return None
+            return index
+        return index
+
+    if name == "builtin":
+        if index < len(tokens) and tokens[index] == "--":
+            index += 1
+        return index if index < len(tokens) and not tokens[index].startswith("-") else None
+
+    if name == "exec":
+        while index < len(tokens):
+            value = tokens[index]
+            if value == "--":
+                return index + 1
+            if value in ("-c", "-l", "-cl", "-lc"):
+                index += 1
+                continue
+            if value == "-a":
+                if index + 1 >= len(tokens):
+                    return None
+                index += 2
+                continue
+            if value.startswith("-a") and len(value) > 2:
+                index += 1
+                continue
+            if value.startswith("-"):
+                return None
+            return index
+        return index
+
+    if name == "nohup":
+        if index < len(tokens) and tokens[index] == "--":
+            index += 1
+        if index >= len(tokens) or tokens[index].startswith("-"):
+            return None
+        return index
+
+    return None
+
+
+def _launcher_shell_index(tokens: list[str]) -> int | None:
+    """Return the shell index after safe assignments and launcher prefixes."""
     index = 0
     while index < len(tokens) and _ENV_ASSIGN_RE.fullmatch(tokens[index]):
         index += 1
-    if index >= len(tokens):
+    while index < len(tokens):
+        name = Path(tokens[index]).name
+        if name == "env" or name in _LAUNCHER_BINARIES:
+            next_index = _consume_launcher_prefix(tokens, index)
+            if next_index is None or next_index == index:
+                return None
+            index = next_index
+            continue
+        return index
+    return None
+
+
+def _shell_inline_command(tokens: list[str], index: int) -> str | None:
+    """Return the command string for a supported shell option spelling."""
+    rest = tokens[index + 1 :]
+    position = 0
+    while position < len(rest):
+        value = rest[position]
+        if value in ("--login", "-l"):
+            position += 1
+            continue
+        if value in ("-c", "-lc", "-cl"):
+            if position + 1 >= len(rest):
+                return None
+            inner = rest[position + 1]
+            return inner if inner else None
+        # A shell option not explicitly covered above could change how the
+        # remaining arguments are interpreted; leave it fail-open.
+        return None
+    return None
+
+
+def _unwrap_shell_command(tokens: list[str]) -> str | None:
+    """Return a safely unwrapped supported shell ``-c`` command.
+
+    Common launchers are handled only for known invocation options.  Any other
+    shape (an unknown binary, a bare script path, or an unrecognized flag)
+    returns ``None`` so the caller keeps the previous fail-open behavior.  This
+    only exposes an inner command to the same classification; it never infers or
+    repairs a ``kind``.
+    """
+    index = _launcher_shell_index(tokens)
+    if index is None or index >= len(tokens):
         return None
     if Path(tokens[index]).name not in _SHELL_BINARIES:
         return None
-    rest = tokens[index + 1 :]
-    if not rest:
-        return None
-    first = rest[0]
-    if first in ("-c", "-lc"):
-        if len(rest) < 2:
-            return None
-        inner = rest[1]
-        return inner if inner else None
-    if first == "-l" and len(rest) >= 3 and rest[1] == "-c":
-        inner = rest[2]
-        return inner if inner else None
-    return None
+    return _shell_inline_command(tokens, index)
 
 
 def _terminal_call(
@@ -264,7 +382,10 @@ def _terminal_call(
     inner = _unwrap_shell_command(tokens)
     if inner is not None:
         if depth >= _MAX_UNWRAP_DEPTH:
-            return None
+            raise GuardError(
+                "supported shell wrapper nesting exceeds the maximum "
+                f"depth of {_MAX_UNWRAP_DEPTH}; command classification failed closed"
+            )
         return _terminal_call(inner, depth + 1)
     for start, token in enumerate(tokens):
         if Path(token).name != "hermes":
