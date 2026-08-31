@@ -22,7 +22,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,7 +118,7 @@ class FakeGitHub:
         self.patch_calls.append((path, dict(payload)))
         return 200, None
 
-    def install(self) -> "FakeGitHub":
+    def install(self) -> FakeGitHub:
         intake._github_json = self.get
         intake._github_graphql = self.graphql
         intake._github_patch_json = self.patch
@@ -150,7 +150,7 @@ def _stub_provisioning() -> None:
     )
     intake._select_repositories = lambda configs, repository: configs
     intake._load_registry_snapshot = lambda token: {"repositories": []}
-    intake._provision_bootstrap_boards = lambda snapshot, *, dry_run, scope=None: []
+    intake._provision_bootstrap_boards = lambda snapshot, **kwargs: []
     intake._claim_wake_scope = lambda: None
 
 

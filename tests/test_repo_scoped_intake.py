@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
     ROOT
@@ -75,7 +77,9 @@ def _entry(
         "checkout": checkout or f"/ws/projects/{slug}",
         "checkout_status": "verified" if ready else "missing",
         "checkout_remote": f"https://github.com/{repository}.git",
-        "contract_paths": contract_paths or [],
+        "contract_paths": (
+            contract_paths if contract_paths is not None else ["AGENTS.md"]
+        ),
         "ready": ready,
         "reason": reason if not ready else None,
     }
@@ -88,6 +92,31 @@ def _snapshot(entries: list[dict]) -> dict:
         "board_authority": "tasks.idempotency_key",
         "repositories": entries,
     }
+
+
+def _strict_provisioning_stub(
+    token: str,
+    repositories,
+    snapshot: object,
+    *,
+    dry_run: bool,
+):
+    del token, snapshot, dry_run
+    results = []
+    seen = set()
+    for repository in repositories:
+        key = repository.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(
+            {
+                "repository": repository,
+                "checkout": f"/ws/projects/{repository.rsplit('/', 1)[1].casefold()}",
+                "action": "reused",
+            }
+        )
+    return results, [], False
 
 
 def test_default_scope_keeps_all_ready_registry_configs() -> None:
@@ -229,6 +258,7 @@ def test_fixture_repository_config_is_offline_metadata() -> None:
 def test_default_branch_drives_repo_snapshot() -> None:
     with tempfile.TemporaryDirectory() as td:
         checkout = Path(td)
+        (checkout / "AGENTS.md").write_text("# contract\n", encoding="utf-8")
         config = _config(
             "rhgo1749/project-x",
             checkout=str(checkout),
@@ -237,6 +267,7 @@ def test_default_branch_drives_repo_snapshot() -> None:
         )
         calls: list[tuple[str, ...]] = []
         original = intake._run_git
+        original_clean = intake._onboarding_checkout_is_clean
 
         def fake_run_git(_checkout: str, *args: str):
             calls.append(args)
@@ -249,11 +280,31 @@ def test_default_branch_drives_repo_snapshot() -> None:
                     "",
                 )
             if args == (
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ):
+                return 0, "develop", ""
+            if args == (
                 "rev-parse",
                 "--verify",
                 "origin/develop",
             ):
-                return 0, "abc123", ""
+                return 0, "a" * 40, ""
+            if args == (
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ):
+                return 0, "a" * 40, ""
+            if args == (
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ):
+                return 0, "", ""
             if args == (
                 "cat-file",
                 "-e",
@@ -264,11 +315,13 @@ def test_default_branch_drives_repo_snapshot() -> None:
 
         try:
             intake._run_git = fake_run_git
+            intake.__dict__["_onboarding_checkout_is_clean"] = lambda checkout: True
             snapshot = intake._repo_snapshot(config)
         finally:
             intake._run_git = original
+            intake.__dict__["_onboarding_checkout_is_clean"] = original_clean
 
-        assert snapshot.origin_sha == "abc123"
+        assert snapshot.origin_sha == "a" * 40
         assert (
             "rev-parse",
             "--verify",
@@ -341,7 +394,7 @@ def test_fixture_run_bypasses_github_and_live_registry() -> None:
                         "board": "project-x",
                         "checkout": "/ws/projects/project-x",
                         "default_branch": "develop",
-                        "contract_paths": [],
+                        "contract_paths": ["AGENTS.md"],
                     },
                     "issues": [],
                 }
@@ -405,12 +458,14 @@ def test_live_run_threads_repository_scope_through_cleanup_and_sync() -> None:
         "_run_closed_issue_cleanup",
         "_issue_candidates",
         "_sync_board",
+        "_provision_scoped_checkouts",
     )
     originals = {name: getattr(intake, name) for name in names}
 
     try:
         intake._github_token = lambda: "token"
         intake._load_registry_snapshot = lambda token: snapshot
+        intake.__dict__["_provision_scoped_checkouts"] = _strict_provisioning_stub
         intake._telegram_config = lambda: None
 
         def fake_cleanup(token, configs, *, dry_run):
@@ -481,12 +536,14 @@ def test_full_fallback_uses_ready_registry_and_reports_unready() -> None:
         "_run_closed_issue_cleanup",
         "_issue_candidates",
         "_sync_board",
+        "_provision_scoped_checkouts",
     )
     originals = {name: getattr(intake, name) for name in names}
 
     try:
         intake._github_token = lambda: "token"
         intake._load_registry_snapshot = lambda token: snapshot
+        intake.__dict__["_provision_scoped_checkouts"] = _strict_provisioning_stub
         intake._claim_wake_scope = lambda: None
         intake._telegram_config = lambda: None
 
@@ -564,11 +621,13 @@ def test_event_router_claim_limits_live_run() -> None:
         "_run_closed_issue_cleanup",
         "_issue_candidates",
         "_sync_board",
+        "_provision_scoped_checkouts",
     )
     originals = {name: getattr(intake, name) for name in names}
     try:
         intake._github_token = lambda: "token"
         intake._load_registry_snapshot = lambda token: snapshot
+        intake.__dict__["_provision_scoped_checkouts"] = _strict_provisioning_stub
         intake._claim_wake_scope = lambda: intake.WakeScope(
             mode="event",
             repositories=("rhgo1749/ctrl-hangul",),
@@ -611,6 +670,155 @@ def test_event_router_claim_limits_live_run() -> None:
             setattr(intake, name, value)
 
 
+
+
+def test_event_scope_validates_checkout_before_registry_read() -> None:
+    events: list[str] = []
+    snapshot = _snapshot([_entry("rhgo1749/ctrl-hangul", board="ctrlhangul")])
+    names = (
+        "_github_token",
+        "_claim_wake_scope",
+        "_provision_scoped_checkouts",
+        "_load_registry_snapshot",
+        "_telegram_config",
+        "_run_closed_issue_cleanup",
+        "_issue_candidates",
+        "_sync_board",
+    )
+    originals = {name: getattr(intake, name) for name in names}
+    try:
+        intake.__dict__["_github_token"] = lambda: "token"
+        intake.__dict__["_claim_wake_scope"] = lambda: intake.WakeScope(
+            mode="event",
+            repositories=("rhgo1749/ctrl-hangul",),
+            expires_at=9999999999,
+        )
+
+        def fake_provision(token, repositories, snapshot_arg, *, dry_run):
+            del token, snapshot_arg, dry_run
+            events.append("checkout_validation")
+            assert tuple(repositories) == ("rhgo1749/ctrl-hangul",)
+            return (
+                [
+                    {
+                        "repository": "rhgo1749/ctrl-hangul",
+                        "checkout": "/ws/projects/ctrl-hangul",
+                        "action": "reused",
+                    }
+                ],
+                [],
+                False,
+            )
+
+        def fake_load(token):
+            del token
+            events.append("registry")
+            return snapshot
+
+        intake.__dict__["_provision_scoped_checkouts"] = fake_provision
+        intake.__dict__["_load_registry_snapshot"] = fake_load
+        intake.__dict__["_telegram_config"] = lambda: None
+        intake.__dict__["_run_closed_issue_cleanup"] = lambda token, configs, *, dry_run: []
+        intake.__dict__["_issue_candidates"] = lambda token, fixture_path, configs: []
+        intake.__dict__["_sync_board"] = lambda config, token, *, dry_run=False: []
+
+        args = argparse.Namespace(
+            dry_run=True,
+            fixture_json=None,
+            repository=None,
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert intake._run(args) == 0
+        assert events == ["checkout_validation", "registry"]
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
+
+
+def test_event_scope_rejects_foreign_registry_checkout_before_mutation():
+    repository = "rhgo1749/ctrl-hangul"
+    canonical_checkout = "/ws/projects/ctrl-hangul"
+    foreign_checkout = "/tmp/foreign-board-workdir"
+    snapshot = _snapshot(
+        [
+            _entry(
+                repository,
+                board="ctrlhangul",
+                checkout=foreign_checkout,
+            )
+        ]
+    )
+    mutations: list[str] = []
+
+    names = (
+        "_github_token",
+        "_claim_wake_scope",
+        "_load_registry_snapshot",
+        "_provision_scoped_checkouts",
+        "_provision_bootstrap_boards",
+        "_run_closed_issue_cleanup",
+        "_issue_candidates",
+        "_create_task",
+        "_sync_board",
+        "_telegram_config",
+    )
+    originals = {name: getattr(intake, name) for name in names}
+    try:
+        intake.__dict__["_github_token"] = lambda: "token"
+        intake.__dict__["_claim_wake_scope"] = lambda: intake.WakeScope(
+            mode="event",
+            repositories=(repository,),
+            expires_at=9999999999,
+        )
+        intake.__dict__["_load_registry_snapshot"] = lambda token: snapshot
+        intake.__dict__["_provision_scoped_checkouts"] = (
+            lambda token, repositories, snapshot_arg, *, dry_run: (
+                [
+                    {
+                        "repository": repository,
+                        "checkout": canonical_checkout,
+                        "action": "reused",
+                    }
+                ],
+                [],
+                False,
+            )
+        )
+
+        def fake_board(*args, **kwargs):
+            mutations.append("board")
+            return []
+
+        def fake_cleanup(*args, **kwargs):
+            mutations.append("cleanup")
+            return []
+
+        def fake_candidates(*args, **kwargs):
+            mutations.append("candidate")
+            return []
+
+        intake.__dict__["_provision_bootstrap_boards"] = fake_board
+        intake.__dict__["_run_closed_issue_cleanup"] = fake_cleanup
+        intake.__dict__["_issue_candidates"] = fake_candidates
+        intake.__dict__["_create_task"] = (
+            lambda *args, **kwargs: mutations.append("task") or {}
+        )
+        intake.__dict__["_sync_board"] = lambda *args, **kwargs: []
+        intake.__dict__["_telegram_config"] = lambda: None
+
+        args = argparse.Namespace(
+            dry_run=False,
+            fixture_json=None,
+            repository=None,
+        )
+        with pytest.raises(intake.IntakeError, match="checkout_path_conflict"):
+            intake._run(args)
+
+        assert mutations == []
+    finally:
+        for name, value in originals.items():
+            setattr(intake, name, value)
 
 
 def _bootstrap_entry(repository: str, board: str, checkout: str) -> dict:
@@ -712,9 +920,11 @@ def test_override_boards_root_honored_end_to_end_same_tick() -> None:
                 "_repo_snapshot",
                 "_create_task",
                 "_sync_board",
+                "_provision_scoped_checkouts",
                 "_board_slugs",
                 "_run_hermes",
                 "_verify_bootstrap_checkout",
+                "_strict_validate_bootstrap_checkout",
                 "_board_repository_owners",
             )
         }
@@ -790,12 +1000,14 @@ def test_override_boards_root_honored_end_to_end_same_tick() -> None:
             assert ownership.task_count == 1
 
             intake._load_registry_snapshot = fake_load_registry_snapshot
+            intake.__dict__["_provision_scoped_checkouts"] = _strict_provisioning_stub
             intake._claim_wake_scope = lambda: None
             intake._telegram_config = lambda: None
             intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
             intake._board_slugs = lambda: set(existing_boards)
             intake._run_hermes = fake_run_hermes
             intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+            intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
             intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
             intake._board_repository_owners = fake_board_repository_owners
             intake._issue_candidates = lambda token, fixture_path, configs: [
@@ -858,6 +1070,7 @@ def test_provision_creates_missing_board_with_checkout_workdir() -> None:
         "_board_slugs": intake._board_slugs,
         "_run_hermes": intake._run_hermes,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_intake_mutation_lease": intake._intake_mutation_lease,
         "_board_repository_owners": intake._board_repository_owners,
     }
@@ -865,10 +1078,11 @@ def test_provision_creates_missing_board_with_checkout_workdir() -> None:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
-        report = intake._provision_bootstrap_boards(snapshot, dry_run=False)
+        report = intake._provision_bootstrap_boards(snapshot, dry_run=False, token="test-token")
         assert report == [
             {"repository": "rhgo1749/brand-new", "board": "brand-new", "action": "provisioned"}
         ]
@@ -888,6 +1102,7 @@ def test_provision_skips_existing_board_idempotently() -> None:
         "_board_slugs": intake._board_slugs,
         "_run_hermes": intake._run_hermes,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_intake_mutation_lease": intake._intake_mutation_lease,
         "_board_repository_owners": intake._board_repository_owners,
     }
@@ -895,10 +1110,11 @@ def test_provision_skips_existing_board_idempotently() -> None:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = forbidden
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
-        assert intake._provision_bootstrap_boards(snapshot, dry_run=False) == []
+        assert intake._provision_bootstrap_boards(snapshot, dry_run=False, token="test-token") == []
     finally:
         for name, value in originals.items():
             setattr(intake, name, value)
@@ -914,6 +1130,7 @@ def test_provision_dry_run_never_mutates() -> None:
         "_board_slugs": intake._board_slugs,
         "_run_hermes": intake._run_hermes,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_intake_mutation_lease": intake._intake_mutation_lease,
         "_board_repository_owners": intake._board_repository_owners,
     }
@@ -921,6 +1138,7 @@ def test_provision_dry_run_never_mutates() -> None:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = forbidden
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
@@ -948,6 +1166,7 @@ def test_provision_scope_restricts_provisioning() -> None:
         "_board_slugs": intake._board_slugs,
         "_run_hermes": intake._run_hermes,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_intake_mutation_lease": intake._intake_mutation_lease,
         "_board_repository_owners": intake._board_repository_owners,
     }
@@ -955,6 +1174,7 @@ def test_provision_scope_restricts_provisioning() -> None:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot(
@@ -966,6 +1186,7 @@ def test_provision_scope_restricts_provisioning() -> None:
         report = intake._provision_bootstrap_boards(
             snapshot,
             dry_run=False,
+            token="test-token",
             scope=("RHGO1749/BRAND-NEW",),
         )
         assert [item["board"] for item in report] == ["brand-new"]
@@ -985,6 +1206,7 @@ def test_provision_fails_closed_if_board_does_not_land() -> None:
         "_board_slugs": intake._board_slugs,
         "_run_hermes": intake._run_hermes,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_intake_mutation_lease": intake._intake_mutation_lease,
         "_board_repository_owners": intake._board_repository_owners,
     }
@@ -992,13 +1214,14 @@ def test_provision_fails_closed_if_board_does_not_land() -> None:
         intake._board_slugs = lambda: set(existing)
         intake._run_hermes = fake_run_hermes
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_bootstrap_entry("rhgo1749/brand-new", "brand-new", "/ws/projects/brand-new")])
         try:
-            intake._provision_bootstrap_boards(snapshot, dry_run=False)
+            intake._provision_bootstrap_boards(snapshot, dry_run=False, token="test-token")
         except intake.IntakeError as exc:
-            assert "did not land" in str(exc)
+            assert str(exc) == "board_provisioning_unavailable"
         else:
             raise AssertionError("provisioning that did not land must fail closed")
     finally:
@@ -1013,7 +1236,7 @@ def test_provision_malformed_intent_fails_closed() -> None:
     try:
         intake._provision_bootstrap_boards(snapshot, dry_run=True)
     except intake.IntakeError as exc:
-        assert "malformed" in str(exc)
+        assert str(exc) == "repository_metadata_invalid"
     else:
         raise AssertionError("malformed bootstrap intent must fail closed")
 
@@ -1027,7 +1250,7 @@ def test_provision_rejects_repository_derived_slug_mismatch() -> None:
     try:
         intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
     except intake.IntakeError as exc:
-        assert "repository-derived" in str(exc)
+        assert str(exc) == "canonical_board_conflict"
     else:
         raise AssertionError("repository-derived slug mismatch must fail closed")
 
@@ -1071,6 +1294,7 @@ def test_provision_rejects_foreign_existing_board_owner() -> None:
         "_board_slugs": intake._board_slugs,
         "_board_repository_owners": intake._board_repository_owners,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_run_hermes": intake._run_hermes,
         "_intake_mutation_lease": intake._intake_mutation_lease,
     }
@@ -1080,14 +1304,15 @@ def test_provision_rejects_foreign_existing_board_owner() -> None:
             "rhgo1749/other-repo"
         }
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_run_hermes"] = lambda *args, **kwargs: (
             (_ for _ in ()).throw(AssertionError("foreign owner must block create"))
         )
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         try:
-            intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=False)
+            intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=False, token="test-token")
         except intake.IntakeError as exc:
-            assert "ownership" in str(exc)
+            assert str(exc) == "canonical_board_conflict"
         else:
             raise AssertionError("foreign board ownership must fail closed")
     finally:
@@ -1105,6 +1330,7 @@ def test_provision_rejects_occupied_unmanaged_existing_board() -> None:
         "_board_slugs": intake._board_slugs,
         "_board_repository_owners": intake._board_repository_owners,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_run_hermes": intake._run_hermes,
     }
     try:
@@ -1114,13 +1340,14 @@ def test_provision_rejects_occupied_unmanaged_existing_board() -> None:
             non_github_task_count=1,
         )
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_run_hermes"] = lambda *args, **kwargs: (
             (_ for _ in ()).throw(AssertionError("occupied board must not create"))
         )
         try:
             intake._provision_bootstrap_boards(_snapshot([entry]), dry_run=True)
         except intake.IntakeError as exc:
-            assert "occupied" in str(exc)
+            assert str(exc) == "canonical_board_conflict"
         else:
             raise AssertionError("occupied unmanaged board must fail closed")
     finally:
@@ -1136,6 +1363,7 @@ def test_provision_without_intents_makes_no_board_calls() -> None:
         "_board_slugs": intake._board_slugs,
         "_run_hermes": intake._run_hermes,
         "_verify_bootstrap_checkout": intake._verify_bootstrap_checkout,
+        "_strict_validate_bootstrap_checkout": intake._strict_validate_bootstrap_checkout,
         "_intake_mutation_lease": intake._intake_mutation_lease,
         "_board_repository_owners": intake._board_repository_owners,
     }
@@ -1143,6 +1371,7 @@ def test_provision_without_intents_makes_no_board_calls() -> None:
         intake._board_slugs = forbidden
         intake._run_hermes = forbidden
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         snapshot = _snapshot([_entry("rhgo1749/ctrl-hangul")])
@@ -1199,9 +1428,11 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
         "_repo_snapshot",
         "_create_task",
         "_sync_board",
+        "_provision_scoped_checkouts",
         "_board_slugs",
         "_run_hermes",
         "_verify_bootstrap_checkout",
+        "_strict_validate_bootstrap_checkout",
         "_intake_mutation_lease",
         "_board_repository_owners",
     )
@@ -1210,12 +1441,14 @@ def test_live_run_provisions_then_intakes_first_task_same_tick() -> None:
     try:
         intake._github_token = lambda: "token"
         intake._load_registry_snapshot = fake_load_registry_snapshot
+        intake.__dict__["_provision_scoped_checkouts"] = _strict_provisioning_stub
         intake._claim_wake_scope = lambda: None
         intake._telegram_config = lambda: None
         intake._run_closed_issue_cleanup = lambda token, configs, *, dry_run: []
         intake._board_slugs = fake_board_slugs
         intake._run_hermes = fake_run_hermes
         intake.__dict__["_verify_bootstrap_checkout"] = lambda repository, checkout: Path(checkout)
+        intake.__dict__["_strict_validate_bootstrap_checkout"] = lambda token, repository, checkout: Path(checkout)
         intake.__dict__["_intake_mutation_lease"] = lambda: contextlib.nullcontext()
         intake.__dict__["_board_repository_owners"] = lambda board: set()
         intake._issue_candidates = lambda token, fixture_path, configs: [(configs[0], issue)]

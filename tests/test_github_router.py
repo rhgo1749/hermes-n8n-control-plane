@@ -6,23 +6,26 @@ import hmac
 import http.client
 import importlib.util
 import json
-import socket
 import sys
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "automation" / "n8n" / "github-router" / "router.py"
 spec = importlib.util.spec_from_file_location("github_router", MODULE_PATH)
 assert spec and spec.loader
-router = importlib.util.module_from_spec(spec)
+router: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = router
 spec.loader.exec_module(router)
+TEST_INSTALLATION_ID = 987654
 
 
 def _request(
@@ -78,6 +81,7 @@ def _install_temp_paths(root: Path):
         "PUBLIC_URL": router.PUBLIC_URL,
         "DELIVERY_TTL_SECONDS": router.DELIVERY_TTL_SECONDS,
         "DELIVERY_MAX_ENTRIES": router.DELIVERY_MAX_ENTRIES,
+        "GITHUB_INSTALLATION_ID": getattr(router, "GITHUB_INSTALLATION_ID", None),
     }
     secret_dir = root / "secrets"
     secret_dir.mkdir()
@@ -86,6 +90,9 @@ def _install_temp_paths(root: Path):
     router.WEBHOOK_SECRET_FILE = secret_dir / "github-webhook-secret"
     router.INTAKE_TOKEN_FILE = secret_dir / "hermes-intake-control-token"
     router.PUBLIC_URL = "https://example.test/github/hermes-intake"
+    # Bind App fixtures to one configured installation.  getattr keeps the
+    # pre-fix bite run compatible before production adds this setting.
+    router.GITHUB_INSTALLATION_ID = TEST_INSTALLATION_ID
     router.GITHUB_TOKEN_FILE.write_text("github-token", encoding="utf-8")
     router.WEBHOOK_SECRET_FILE.write_text("webhook-secret", encoding="utf-8")
     router.INTAKE_TOKEN_FILE.write_text("hermes-token", encoding="utf-8")
@@ -112,6 +119,20 @@ def _signed_headers(
         "X-GitHub-Delivery": delivery if delivery is not None else str(uuid.uuid4()),
         "X-Hub-Signature-256": signature,
     }
+
+
+def _installation(
+    *,
+    installation_id: object = TEST_INSTALLATION_ID,
+    account: dict[str, str] | None = None,
+) -> dict[str, object]:
+    installation: dict[str, object] = {
+        "id": installation_id,
+        "node_id": "MDIzOlRlc3RJbnN0YWxsYXRpb24=",
+    }
+    if account is not None:
+        installation["account"] = account
+    return installation
 
 
 def test_invalid_signature_is_rejected() -> None:
@@ -575,6 +596,45 @@ def test_duplicate_delivery_is_noop_single_wake() -> None:
                 assert payload2["reason"] == "duplicate_delivery"
                 assert "queued" not in payload2
                 assert len(wakes) == 1
+        finally:
+            router.__dict__["_wake"] = original_wake
+            _restore(original)
+
+
+def test_dispatch_retry_reuses_durable_scope_after_wake_failure() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wake_calls = 0
+        try:
+            router._write_state_unlocked(
+                {"managed_repositories": ["rhgo1749/ctrl-hangul"]}
+            )
+
+            def wake():
+                nonlocal wake_calls
+                wake_calls += 1
+                if wake_calls == 1:
+                    raise router.RouterError("lease unavailable")
+                return {"lease": "lease-retry", "upstream_status": 200}
+
+            router.__dict__["_wake"] = wake
+            body = _event_body()
+            headers = _signed_headers(body, delivery="delivery-wake-retry")
+            with RunningServer() as server:
+                failed_status, _ = _post_event(server.base_url, body, headers)
+                first_queue = router._queue_status()
+                retried_status, retried = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, delivery="delivery-wake-retry"),
+                )
+            assert failed_status == 502
+            assert first_queue["queued_scopes"] == 1
+            assert retried_status == 202
+            assert retried["queued"] is True
+            assert wake_calls == 2
+            assert router._queue_status()["queued_scopes"] == 1
         finally:
             router.__dict__["_wake"] = original_wake
             _restore(original)
@@ -1111,3 +1171,744 @@ def test_unknown_get_path_is_not_found() -> None:
             assert payload["error"] == "not_found"
         finally:
             _restore(original)
+
+
+def test_app_event_discovers_unknown_repository_and_wakes_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "action": "opened",
+                    "installation": _installation(
+                        account={"login": "rhgo1749", "type": "User"}
+                    ),
+                    "repository": {"full_name": "rhgo1749/new-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(body, event="issues", delivery="app-1"),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["repositories"] == ["rhgo1749/new-agent"]
+            assert wakes == [True]
+            state = router._load_state_unlocked()
+            assert state["scope_queue"][0]["repositories"] == ["rhgo1749/new-agent"]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_queues_unknown_pull_request_without_edge_sync() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        original_edge = router._n8n_edge_sync
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            router._n8n_edge_sync = lambda event: (_ for _ in ()).throw(
+                AssertionError("unknown repository must not edge-sync")
+            )
+            body = json.dumps(
+                {
+                    "action": "closed",
+                    "installation": _installation(
+                        account={"login": "rhgo1749", "type": "User"}
+                    ),
+                    "repository": {"full_name": "rhgo1749/new-agent"},
+                    "pull_request": {"merged": False},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="app-pr-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert wakes == [True]
+        finally:
+            router._wake = original_wake
+            router._n8n_edge_sync = original_edge
+            _restore(original)
+
+
+def test_ordinary_app_issues_payload_queues_unknown_repository_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "action": "opened",
+                    "installation": _installation(),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                    "issue": {"number": 1},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, event="issues", delivery="ordinary-issues-1"),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["repositories"] == ["rhgo1749/ordinary-agent"]
+            assert wakes == [True]
+            state = router._load_state_unlocked()
+            assert len(state["scope_queue"]) == 1
+            assert state["scope_queue"][0]["repositories"] == [
+                "rhgo1749/ordinary-agent"
+            ]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_ordinary_app_pull_request_queues_unknown_repository_without_edge_sync() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        original_edge = router._n8n_edge_sync
+        wakes: list[bool] = []
+        edge_calls: list[dict[str, object]] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            router._n8n_edge_sync = lambda event: edge_calls.append(event)
+            body = json.dumps(
+                {
+                    "action": "closed",
+                    "installation": _installation(),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                    "pull_request": {"merged": True},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="pull_request",
+                        delivery="ordinary-pull-request-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["queued"] is True
+            assert payload["repositories"] == ["rhgo1749/ordinary-agent"]
+            assert wakes == [True]
+            assert edge_calls == []
+            state = router._load_state_unlocked()
+            assert len(state["scope_queue"]) == 1
+        finally:
+            router._wake = original_wake
+            router._n8n_edge_sync = original_edge
+            _restore(original)
+
+
+def test_app_event_rejects_wrong_installation_id_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(
+                        installation_id=TEST_INSTALLATION_ID + 1
+                    ),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, event="issues", delivery="wrong-install-1"),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_rejects_when_installation_configuration_is_missing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router.GITHUB_INSTALLATION_ID = None
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="issues",
+                        delivery="missing-config-install-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_rejects_missing_installation_id_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": {
+                        "node_id": "MDIzOlRlc3RJbnN0YWxsYXRpb24=",
+                    },
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(body, event="issues", delivery="missing-install-1"),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_app_event_rejects_malformed_installation_id_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes: list[bool] = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(installation_id="not-a-number"),
+                    "repository": {"full_name": "rhgo1749/ordinary-agent"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _post_event(
+                    server.base_url,
+                    body,
+                    _signed_headers(
+                        body,
+                        event="issues",
+                        delivery="malformed-install-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scope_queue", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_installation_repository_batch_is_deduplicated_and_queued() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "action": "created",
+                    "installation": _installation(
+                        account={"login": "rhgo1749", "type": "User"}
+                    ),
+                    "repositories": [
+                        {"full_name": "rhgo1749/one"},
+                        {"full_name": "rhgo1749/two"},
+                        {"full_name": "rhgo1749/ONE"},
+                    ],
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(
+                        body,
+                        event="installation",
+                        delivery="install-1",
+                    ),
+                )
+
+            assert status == 202
+            assert payload["repositories"] == [
+                "rhgo1749/one",
+                "rhgo1749/two",
+            ]
+            assert wakes == [True]
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_foreign_app_installation_is_rejected_without_queueing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        original_wake = router._wake
+        wakes = []
+        try:
+            router.GITHUB_OWNER = "rhgo1749"
+            router.GITHUB_OWNER_TYPE = "personal"
+            router._write_state_unlocked({"managed_repositories": []})
+            router._wake = lambda: wakes.append(True)
+            body = json.dumps(
+                {
+                    "installation": _installation(
+                        account={"login": "other-owner", "type": "User"}
+                    ),
+                    "repository": {"full_name": "other-owner/private"},
+                }
+            ).encode()
+
+            with RunningServer() as server:
+                status, payload = _request(
+                    server.base_url,
+                    "POST",
+                    "/github/hermes-intake",
+                    body=body,
+                    headers=_signed_headers(body, event="issues", delivery="foreign-1"),
+                )
+
+            assert status == 202
+            assert payload["reason"] == "owner_scope_mismatch"
+            assert wakes == []
+            assert router._load_state_unlocked().get("scopes", []) == []
+        finally:
+            router._wake = original_wake
+            _restore(original)
+
+
+def test_scope_requeue_persists_attempt_and_backoff() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            queued = router._enqueue_scope(
+                full=False,
+                repository="rhgo1749/ctrl-hangul",
+            )
+            claimed = router._claim_scope()
+            assert claimed["id"] == queued["id"]
+
+            result = router._requeue_scope(
+                claimed["id"],
+                "checkout_retryable",
+                claimed["claim_token"],
+            )
+            assert result["status"] == "requeued"
+            state = router._load_state_unlocked()
+            assert state["scope_claims"] == {}
+            assert state["scope_queue"][0]["attempts"] == 1
+            assert state["scope_queue"][0]["not_before"] > int(time.time())
+            assert router._claim_scope()["mode"] == "none"
+        finally:
+            _restore(original)
+
+
+def test_expired_scope_claim_is_recovered_after_state_reload() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            now = int(time.time())
+            item = {
+                "id": "scope-expired",
+                "mode": "event",
+                "repositories": ["rhgo1749/ctrl-hangul"],
+                "created_at": now - 100,
+                "expires_at": now + 100,
+                "attempts": 0,
+                "not_before": now,
+            }
+            router._write_state_unlocked(
+                {
+                    "scope_queue": [],
+                    "scope_claims": {
+                        "scope-expired": {
+                            **item,
+                            "claim_expires_at": now - 1,
+                        }
+                    },
+                }
+            )
+            status = router._queue_status()
+            assert status["in_flight_scopes"] == 0
+            assert status["queued_scopes"] == 1
+            state = router._load_state_unlocked()
+            assert state["scope_queue"][0]["attempts"] == 1
+        finally:
+            _restore(original)
+
+
+def test_scope_record_rejects_coerced_types() -> None:
+    now = int(time.time())
+    valid = {
+        "id": "scope-valid",
+        "mode": "event",
+        "repositories": ["rhgo1749/ctrl-hangul"],
+        "created_at": now,
+        "expires_at": now + 100,
+        "attempts": 0,
+        "not_before": now,
+    }
+    assert router._normalise_scope_item(valid, now) == valid
+    for key, value in {
+        "id": 123,
+        "created_at": str(now),
+        "attempts": True,
+        "repositories": [123],
+    }.items():
+        malformed = {**valid, key: value}
+        assert router._normalise_scope_item(malformed, now) is None
+
+
+def test_expired_queued_scope_is_recovered_without_being_dropped() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            now = int(time.time())
+            router._write_state_unlocked(
+                {
+                    "scope_queue": [
+                        {
+                            "id": "scope-queued-expired",
+                            "mode": "event",
+                            "repositories": ["rhgo1749/ctrl-hangul"],
+                            "created_at": now - 100,
+                            "expires_at": now - 1,
+                            "attempts": 0,
+                            "not_before": now - 100,
+                        }
+                    ],
+                    "scope_claims": {},
+                }
+            )
+            status = router._queue_status()
+            assert status["queued_scopes"] == 1
+            assert status["pending_scopes"] == 0
+            recovered = router._load_state_unlocked()["scope_queue"][0]
+            assert recovered["id"] == "scope-queued-expired"
+            assert recovered["attempts"] == 1
+            assert recovered["expires_at"] > now
+        finally:
+            _restore(original)
+
+
+def test_stale_scope_claim_token_cannot_ack_reclaimed_scope() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            now = int(time.time())
+            scope_id = "scope-fenced"
+            item = {
+                "id": scope_id,
+                "mode": "event",
+                "repositories": ["rhgo1749/ctrl-hangul"],
+                "created_at": now - 100,
+                "expires_at": now + 100,
+                "attempts": 0,
+                "not_before": now,
+            }
+            stale_token = "a" * 32
+            router._write_state_unlocked(
+                {
+                    "scope_queue": [],
+                    "scope_claims": {
+                        scope_id: {
+                            **item,
+                            "claim_expires_at": now - 1,
+                            "claim_token": stale_token,
+                        }
+                    },
+                }
+            )
+            reclaimed = router._claim_scope()
+            assert reclaimed["id"] == item["id"]
+            assert reclaimed["claim_token"] != stale_token
+            with pytest.raises(router.RouterError, match="claim token mismatch"):
+                router._ack_scope(scope_id, stale_token)
+            state = router._load_state_unlocked()
+            assert state["scope_claims"][scope_id]["claim_token"] == reclaimed[
+                "claim_token"
+            ]
+            assert router._ack_scope(scope_id, reclaimed["claim_token"])["ok"] is True
+        finally:
+            _restore(original)
+
+
+def test_scope_ack_endpoint_persists_release() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            router._enqueue_scope(
+                full=False,
+                repository="rhgo1749/ctrl-hangul",
+            )
+            with RunningServer() as server:
+                status, claim = _request(
+                    server.base_url,
+                    "POST",
+                    "/scope/claim",
+                    headers={"Authorization": "Bearer hermes-token"},
+                )
+                get_status, get_payload = _request(
+                    server.base_url,
+                    "GET",
+                    "/scope/ack",
+                )
+                ack_status, ack = _request(
+                    server.base_url,
+                    "POST",
+                    "/scope/ack",
+                    body=json.dumps(
+                        {
+                            "id": claim["id"],
+                            "claim_token": claim["claim_token"],
+                        }
+                    ).encode(),
+                    headers={"Authorization": "Bearer hermes-token"},
+                )
+            assert status == 200
+            assert get_status == 404
+            assert get_payload["ok"] is False
+            assert ack_status == 200
+            assert ack["status"] == "acknowledged"
+            assert router._queue_status()["in_flight_scopes"] == 0
+        finally:
+            _restore(original)
+
+
+def test_scope_reason_is_sanitized_before_persistence() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            queued = router._enqueue_scope(
+                full=False,
+                repository="rhgo1749/ctrl-hangul",
+            )
+            claimed = router._claim_scope()
+            secret_reason = "Authorization=Bearer unit-test-secret"
+            result = router._requeue_scope(
+                queued["id"],
+                secret_reason,
+                claimed["claim_token"],
+            )
+            assert result["status"] == "requeued"
+            state = router._load_state_unlocked()
+            assert secret_reason not in json.dumps(state)
+            assert state["last_scope_transition"]["reason"] == "scope_retryable"
+        finally:
+            _restore(original)
+
+
+def test_scope_requeue_moves_to_durable_pending_after_bounded_attempts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        original = _install_temp_paths(Path(td))
+        try:
+            queued = router._enqueue_scope(
+                full=False,
+                repository="rhgo1749/ctrl-hangul",
+            )
+            for attempt in range(router.SCOPE_MAX_ATTEMPTS):
+                claimed = router._claim_scope()
+                assert claimed["id"] == queued["id"]
+                result = router._requeue_scope(
+                    claimed["id"],
+                    "checkout_retryable",
+                    claimed["claim_token"],
+                )
+                if attempt + 1 < router.SCOPE_MAX_ATTEMPTS:
+                    state = router._load_state_unlocked()
+                    state["scope_queue"][0]["not_before"] = int(time.time())
+                    router._write_state_unlocked(state)
+                else:
+                    assert result["status"] == "pending"
+            state = router._load_state_unlocked()
+            assert state["scope_queue"] == []
+            assert len(state["pending_scopes"]) == 1
+            assert state["pending_scopes"][0]["attempts"] == router.SCOPE_MAX_ATTEMPTS
+        finally:
+            _restore(original)
+
+
+def test_scope_enqueue_rejects_whitespace_repository_without_normalizing() -> None:
+    with pytest.raises(router.RouterError, match="invalid repository identity"):
+        router._enqueue_scope(
+            full=False,
+            repository=" rhgo1749/ctrl-hangul",
+        )
+
+
+def test_router_github_get_retries_one_5xx() -> None:
+    calls = 0
+    original_request = router.urlopen
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit=-1):
+            return b'{"ok": true}'
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise HTTPError(
+                request.full_url,
+                503,
+                "temporary",
+                hdrs=cast(Any, None),
+                fp=None,
+            )
+        return Response()
+
+    try:
+        router.urlopen = fake_urlopen
+        assert router._github_request("GET", "/repos/acme/repo", "token") == {"ok": True}
+        assert calls == 2
+    finally:
+        router.urlopen = original_request
+
+
+def test_router_github_get_exhaustion_is_bounded() -> None:
+    calls = 0
+    original_request = router.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise URLError("temporary")
+
+    try:
+        router.urlopen = fake_urlopen
+        with pytest.raises(router.RouterError, match="retry exhausted"):
+            router._github_request("GET", "/repos/acme/repo", "unit-token")
+        assert calls == 2
+    finally:
+        router.urlopen = original_request
+
+
+def test_router_github_get_does_not_retry_client_error() -> None:
+    calls = 0
+    original_request = router.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise HTTPError(
+            request.full_url,
+            403,
+            "forbidden",
+            hdrs=cast(Any, None),
+            fp=None,
+        )
+
+    try:
+        router.urlopen = fake_urlopen
+        with pytest.raises(router.RouterError, match="HTTP 403"):
+            router._github_request("GET", "/repos/acme/repo", "unit-token")
+        assert calls == 1
+    finally:
+        router.urlopen = original_request

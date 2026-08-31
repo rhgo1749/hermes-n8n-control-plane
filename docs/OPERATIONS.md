@@ -1,5 +1,46 @@
 # Operations runbook — async-only GitHub intake
 
+## Issue #87 onboarding diagnostics
+
+The first supported GitHub App delivery is acknowledged by the router and
+placed in the existing durable scope queue. The existing intake authority then
+revalidates the owner, archive state, `hermes-agent` topic, default branch, and
+contract visibility before reading registry board intent or touching
+`/ws/projects/<repository-name.casefold()>`.
+It never relies on a manual webhook reconciliation for first discovery.
+
+Run the read-only diagnostic from the repository root when investigating a
+canary or a partial onboarding:
+
+```bash
+automation/n8n/scripts/diagnose-github-onboarding.sh --hermes-home "$HOME/.hermes"
+```
+
+The command verifies that `default:bf431b2a6ba6` exists exactly once in the
+`default` profile, matches the preserved name/script/profile/schedule/lifecycle/
+`no_agent`/delivery contract, and that the deployed intake wrapper/core expose
+all required onboarding entrypoints. It also checks the loopback router,
+lease-controller, and intake-actuator health endpoints.
+It does not create, edit, pause, or trigger a Hermes job. `--skip-network`
+checks only the local job/script boundary.
+
+Interpret bounded failures as follows: `invalid_signature` or
+`authorization_required` means the protected ingress boundary rejected the
+request; `repository_not_opted_in`, `repository_archived`,
+`owner_scope_mismatch`, or `contract_visibility_invalid` means the fresh
+GitHub metadata gate rejected the repository; `checkout_path_conflict`,
+`checkout_origin_mismatch`, `checkout_dirty`, `repository_lock_busy`, or
+`clone_failed` means no existing checkout was overwritten and only the
+current attempt's temporary path is eligible for cleanup. A newly registered
+checkout is intentionally retained when a later registry or board step fails;
+rerun the operator recovery after fixing the reported boundary. A missing
+authoritative job is an operator stop, not permission to create a replacement.
+
+GitHub App installation, permissions, public HTTPS/Funnel routing, protected
+secret provisioning, host `/ws/projects` ownership, production canary, and
+post-merge edge reconciliation are host-owned validation gates. They are not
+proven by repository-local tests.
+
 ## 1. Durable Hermes job ownership
 
 The GitHub agent-ready intake continues to execute through the existing Hermes
@@ -135,6 +176,8 @@ Set the reviewed public HTTPS endpoint for the router in the runtime `.env`:
 
 ```dotenv
 GITHUB_ROUTER_PUBLIC_URL=https://<reviewed-host>/github/hermes-intake
+# Positive decimal installation.id for the configured GitHub App installation.
+GITHUB_ROUTER_INSTALLATION_ID=<installation-id>
 ```
 
 Expose only that reviewed HTTPS path through the reverse proxy/Funnel. Do not

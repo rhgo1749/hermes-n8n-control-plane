@@ -27,6 +27,7 @@ def _repo(full_name: str = "rhgo1749/H4V3-Meowcore") -> dict:
         "full_name": full_name,
         "default_branch": "main",
         "archived": False,
+        "disabled": False,
         "owner": {"login": owner},
     }
 

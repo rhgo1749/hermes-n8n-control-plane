@@ -7,13 +7,17 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, cast
+from urllib.error import HTTPError
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "automation" / "n8n" / "scripts" / "repository_registry.py"
 
 spec = importlib.util.spec_from_file_location("repository_registry", MODULE_PATH)
 assert spec and spec.loader
-registry = importlib.util.module_from_spec(spec)
+registry: Any = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = registry
 spec.loader.exec_module(registry)
 
@@ -31,7 +35,11 @@ def _repo(
         "full_name": full_name,
         "default_branch": branch,
         "archived": False,
-        "owner": {"login": owner},
+        "disabled": False,
+        "owner": {
+            "login": owner,
+            "type": "Organization" if owner == "acme" else "User",
+        },
     }
     if contract_paths is not None:
         result["contract_paths"] = contract_paths
@@ -44,10 +52,74 @@ def _create_board_db(root: Path, board: str, keys: list[str]) -> None:
     con = sqlite3.connect(board_dir / "kanban.db")
     try:
         con.execute("CREATE TABLE tasks (idempotency_key TEXT)")
-        con.executemany("INSERT INTO tasks(idempotency_key) VALUES (?)", [(key,) for key in keys])
+        con.executemany(
+            "INSERT INTO tasks(idempotency_key) VALUES (?)",
+            [(key,) for key in keys],
+        )
         con.commit()
     finally:
         con.close()
+
+
+def test_github_get_retries_one_server_error_and_bounds_timeout() -> None:
+    calls = 0
+    original = registry.urlopen
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit=-1):
+            assert limit == registry.MAX_GITHUB_RESPONSE_BYTES + 1
+            return b'{"items": []}'
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        assert request.method == "GET"
+        assert timeout == registry.HTTP_TIMEOUT_SECONDS
+        if calls == 1:
+            raise HTTPError(
+                request.full_url,
+                503,
+                "temporary",
+                hdrs=cast(Any, None),
+                fp=None,
+            )
+        return Response()
+
+    registry.urlopen = fake_urlopen
+    try:
+        assert registry._github_json("unit-token", "/repos") == {"items": []}
+    finally:
+        registry.urlopen = original
+    assert calls == 2
+
+
+def test_github_get_does_not_retry_client_error() -> None:
+    calls = 0
+    original = registry.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise HTTPError(
+            request.full_url,
+            404,
+            "not found",
+            hdrs=cast(Any, None),
+            fp=None,
+        )
+
+    registry.urlopen = fake_urlopen
+    try:
+        assert registry._github_json("unit-token", "/repos", allow_not_found=True) is None
+    finally:
+        registry.urlopen = original
+    assert calls == 1
 
 
 def test_remote_normalization() -> None:
@@ -59,6 +131,66 @@ def test_remote_normalization() -> None:
         "git://github.com/rhgo1749/ctrl-hangul.git",
     ):
         assert registry._normalise_remote(value) == expected
+
+
+def test_discovery_uses_explicit_organization_scope_and_full_name_filter() -> None:
+    calls = []
+    original = registry._github_json
+
+    def fake_github_json(token, path, params=None, *, allow_not_found=False):
+        calls.append((token, path, params, allow_not_found))
+        return {
+            "items": [
+                _repo("acme/valid", repo_id=11),
+                {
+                    **_repo("acme/valid", repo_id=12),
+                    "full_name": "other-owner/forged",
+                },
+            ]
+        }
+
+    registry._github_json = fake_github_json
+    try:
+        result = registry.discover_repositories(
+            "unit-token",
+            "acme",
+            "hermes-agent",
+            "organization",
+        )
+    finally:
+        registry._github_json = original
+
+    assert [item["full_name"] for item in result] == ["acme/valid"]
+    assert calls[0][2]["q"] == "org:acme topic:hermes-agent"
+
+
+def test_discovery_rejects_non_boolean_repository_lifecycle_metadata() -> None:
+    original = registry._github_json
+
+    def fake_github_json(token, path, params=None, *, allow_not_found=False):
+        del token, path, params, allow_not_found
+        return {
+            "items": [
+                _repo("acme/valid", repo_id=11),
+                {**_repo("acme/string"), "disabled": "false"},
+                {**_repo("acme/missing"), "disabled": None},
+                {**_repo("acme/archived"), "archived": "false"},
+                {**_repo("acme/disabled"), "disabled": True},
+            ]
+        }
+
+    registry._github_json = fake_github_json
+    try:
+        result = registry.discover_repositories(
+            "unit-token",
+            "acme",
+            "hermes-agent",
+            "organization",
+        )
+    finally:
+        registry._github_json = original
+
+    assert [item["full_name"] for item in result] == ["acme/valid"]
 
 
 def test_verified_checkout_and_resolved_board_is_ready() -> None:
@@ -192,6 +324,49 @@ def test_default_branch_is_repository_metadata() -> None:
         )
         assert entry.default_branch == "develop"
         assert entry.canonical_slug == "project-x"
+
+
+def test_branch_component_rules_fail_closed() -> None:
+    for branch in ("feature/.hidden", "feature/release.lock", "@"):
+        try:
+            registry.build_entry(
+                _repo("rhgo1749/project-x", branch=branch),
+                Path("/tmp"),
+                origin_reader=lambda _: None,
+            )
+        except registry.RegistryError as exc:
+            assert "default_branch" in str(exc)
+        else:
+            raise AssertionError(f"invalid branch component accepted: {branch}")
+
+
+def test_registry_status_metadata_is_strict_before_callbacks() -> None:
+    callbacks: list[str] = []
+    for field, value in (
+        ("archived", None),
+        ("archived", "false"),
+        ("archived", True),
+        ("disabled", None),
+        ("disabled", 0),
+        ("disabled", True),
+    ):
+        repo = _repo("rhgo1749/status-check")
+        repo[field] = value
+        callbacks.clear()
+        try:
+            registry.registry_snapshot(
+                [repo],
+                Path("/tmp"),
+                contract_reader=lambda _r, _b: callbacks.append("contracts") or (),
+                board_resolver=lambda _r: callbacks.append("board") or (None, "missing"),
+                checkout_resolver=lambda _r, _b: callbacks.append("checkout") or None,
+                origin_reader=lambda _p: callbacks.append("origin") or None,
+            )
+        except registry.RegistryError:
+            pass
+        else:
+            raise AssertionError(f"invalid {field} metadata accepted: {value!r}")
+        assert callbacks == []
 
 
 def test_snapshot_is_deterministic_and_has_no_repository_inventory() -> None:
@@ -351,6 +526,35 @@ def test_live_registry_snapshot_composes_existing_authorities() -> None:
         assert entry["ready"] is True
 
 
+def test_live_registry_status_validation_precedes_board_filesystem() -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        repository = _repo("rhgo1749/status-check", 42)
+        repository["disabled"] = "false"
+        board_read = False
+
+        monkeypatch.setattr(
+            registry,
+            "discover_repositories",
+            lambda token, owner, topic: [repository],
+        )
+
+        def forbidden_board_read(root):
+            nonlocal board_read
+            board_read = True
+            raise AssertionError("invalid provider metadata must fail before board I/O")
+
+        monkeypatch.setattr(registry, "_kanban_board_repository_evidence", forbidden_board_read)
+        with pytest.raises(registry.RegistryError, match="archive/disabled"):
+            registry.live_registry_snapshot(
+                "token",
+                "rhgo1749",
+                "hermes-agent",
+                Path("/tmp/projects"),
+                Path("/tmp/boards"),
+            )
+        assert board_read is False
+
+
 def test_verified_checkout_missing_board_declares_bootstrap_intent() -> None:
     """A verified checkout with no provenance and no canonical board gets an
     explicit read-only bootstrap intent (the missing-board signal)."""
@@ -453,6 +657,104 @@ def test_snapshot_surfaces_bootstrap_intent_field() -> None:
             "board": "brand-new",
             "checkout": str(root / "brand-new"),
         }
+
+
+def test_github_get_retries_one_transport_failure() -> None:
+    calls = 0
+    original_urlopen = registry.urlopen
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit=-1):
+            return b'{"items": []}'
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise registry.URLError("temporary")
+        return Response()
+
+    try:
+        registry.urlopen = fake_urlopen
+        assert registry._github_json("token", "/search/repositories") == {"items": []}
+        assert calls == 2
+    finally:
+        registry.urlopen = original_urlopen
+
+
+def test_github_get_retry_exhaustion_is_bounded() -> None:
+    calls = 0
+    original_urlopen = registry.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise registry.URLError("temporary")
+
+    try:
+        registry.urlopen = fake_urlopen
+        try:
+            registry._github_json("token", "/search/repositories")
+        except registry.RegistryError as exc:
+            assert str(exc) == "GitHub API request failed: URLError"
+        else:
+            raise AssertionError("expected bounded retry failure")
+        assert calls == 2
+    finally:
+        registry.urlopen = original_urlopen
+
+
+def test_github_get_does_not_retry_forbidden() -> None:
+    calls = 0
+    original_urlopen = registry.urlopen
+
+    def fake_urlopen(request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise registry.HTTPError(
+            request.full_url,
+            403,
+            "forbidden",
+            hdrs=None,
+            fp=None,
+        )
+
+    try:
+        registry.urlopen = fake_urlopen
+        try:
+            registry._github_json("token", "/search/repositories")
+        except registry.RegistryError as exc:
+            assert str(exc) == "GitHub API HTTP 403"
+        else:
+            raise AssertionError("expected HTTP 403")
+        assert calls == 1
+    finally:
+        registry.urlopen = original_urlopen
+
+
+def test_discover_repositories_rejects_non_boolean_status_fields() -> None:
+    payload = {
+        "items": [
+            {**_repo("acme/string"), "archived": "false"},
+            {**_repo("acme/missing"), "disabled": None},
+            _repo("acme/valid"),
+        ]
+    }
+    original_github_json = registry._github_json
+    try:
+        registry._github_json = lambda *args, **kwargs: payload
+        result = registry.discover_repositories(
+            "token", "acme", "hermes-agent", "organization"
+        )
+        assert [item["full_name"] for item in result] == ["acme/valid"]
+    finally:
+        registry._github_json = original_github_json
 
 
 def main() -> int:

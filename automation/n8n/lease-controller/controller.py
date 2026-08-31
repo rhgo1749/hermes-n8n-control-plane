@@ -13,7 +13,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("LEASE_LISTEN_PORT", "5680"))
 
@@ -25,6 +24,7 @@ ACTUATOR_BASE_URL = os.environ.get(
 ACTUATOR_TIMEOUT_SECONDS = float(
     os.environ.get("LEASE_ACTUATOR_TIMEOUT_SECONDS", "920")
 )
+ACTUATOR_MAX_RESPONSE_BYTES = 64 * 1024
 
 TOKEN_FILE = Path(
     os.environ.get(
@@ -42,6 +42,28 @@ STATE_PATH = Path(
 
 _REQUEST_LOCK = threading.Lock()
 _TRIGGER_LOCK = threading.Lock()
+
+
+def _validated_actuator_base_url() -> str:
+    try:
+        parsed = urlparse(ACTUATOR_BASE_URL)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("LEASE_ACTUATOR_BASE_URL is malformed") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise RuntimeError("LEASE_ACTUATOR_BASE_URL must be a loopback URL")
+    if port is not None and not 1 <= port <= 65535:
+        raise RuntimeError("LEASE_ACTUATOR_BASE_URL has an invalid port")
+    return ACTUATOR_BASE_URL.rstrip("/")
 
 
 def _json_bytes(value: object) -> bytes:
@@ -116,8 +138,9 @@ def _authorized(header: str) -> bool:
 
 
 def _call_actuator(authorization: str) -> tuple[int, bytes]:
+    base_url = _validated_actuator_base_url()
     request = Request(
-        f"{ACTUATOR_BASE_URL}/v1/intake",
+        f"{base_url}/v1/intake",
         method="POST",
         headers={
             "Authorization": authorization,
@@ -131,10 +154,14 @@ def _call_actuator(authorization: str) -> tuple[int, bytes]:
             request,
             timeout=ACTUATOR_TIMEOUT_SECONDS,
         ) as response:
-            return response.status, response.read()
+            raw = response.read(ACTUATOR_MAX_RESPONSE_BYTES + 1)
+            if len(raw) > ACTUATOR_MAX_RESPONSE_BYTES:
+                raise RuntimeError("intake actuator response is too large")
+            return response.status, raw
     except HTTPError as exc:
-        return exc.code, exc.read()
-    except (URLError, TimeoutError, OSError) as exc:
+        exc.close()
+        return exc.code, b""
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
         raise RuntimeError(
             f"intake actuator request failed: {exc}"
         ) from exc
@@ -199,11 +226,11 @@ def _trigger_intake_in_background(
 class Handler(BaseHTTPRequestHandler):
     server_version = "HermesIntakeLeaseController/3"
 
-    def log_message(self, fmt: str, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         print(
             f"{self.address_string()} "
             f"[{self.log_date_time_string()}] "
-            f"{fmt % args}",
+            f"{format % args}",
             flush=True,
         )
 
@@ -258,7 +285,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/trigger":
-            self._trigger(authorization)
+            try:
+                self._trigger(authorization)
+            except RuntimeError as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
             return
 
         if parsed.path == "/pause":
@@ -274,13 +307,32 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            self._pause(lease)
+            try:
+                self._pause(lease)
+            except RuntimeError as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
             return
 
         self._send_json(
             HTTPStatus.NOT_FOUND,
             {"ok": False, "error": "not_found"},
         )
+
+    def do_OPTIONS(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/trigger":
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"ok": False, "error": "not_found"},
+            )
+            return
+
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", "POST, OPTIONS")
+        self.end_headers()
 
     def _trigger(self, authorization: str) -> None:
         lease = str(uuid.uuid4())
@@ -384,9 +436,11 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     if not ACTUATOR_BASE_URL:
         raise SystemExit("LEASE_ACTUATOR_BASE_URL is required")
-
-    # Fail closed before listening if the shared service credential is absent.
-    _read_token()
+    try:
+        _validated_actuator_base_url()
+        _read_token()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
     server = ThreadingHTTPServer(
         (LISTEN_HOST, LISTEN_PORT),
