@@ -1,6 +1,6 @@
 # REQ-096: closed-unmerged PR을 명시적으로 supersede하고 agent-ready Issue를 새 round로 재투입
 
-- Status: Draft
+- Status: Implementation complete; review pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `EDGE_REWORK`, `STATIC_UNIT`
@@ -162,17 +162,79 @@ git diff --check
 
 ## 10. Completion criteria
 
-- [ ] Source Issue / Kanban / idempotency provenance 기록
-- [ ] Latest fetched `origin/main` base 사용
-- [ ] dedicated branch/worktree 사용
-- [ ] Objective 완료, non-goals 준수
-- [ ] 8가지 테스트 요구 커버 + pre-fix bite proof
-- [ ] required local validation truthfully 실행 (`NOT RUN != PASS`)
-- [ ] durable contract 변경 시 canonical 문서 갱신
-- [ ] work branch push + exactly one Korean PR(opened/updated)
-- [ ] PR에 `Closes #96.` plain-text closing line (backtick/fence 밖) + GraphQL closingIssuesReferences 검증
-- [ ] PR not merged without human/user authorization
+- [x] Source Issue / Kanban / idempotency provenance 기록
+- [x] Latest fetched `origin/main` base 사용 (`d3992a5a3adc3ac70165d26b82f2ef45ed82e6cf`)
+- [x] dedicated branch/worktree 사용
+- [x] Objective 완료, non-goals 준수
+- [x] 8가지 테스트 요구 커버 + pre-fix bite proof
+- [x] required local validation truthfully 실행 (`NOT RUN != PASS`)
+- [x] durable contract 변경 시 canonical 문서 갱신
+- [x] work branch push + exactly one Korean PR(opened/updated), PR #97
+- [x] PR에 `Closes #96.` plain-text closing line + REST/GraphQL closingIssuesReferences 검증
+- [x] PR not merged without human/user authorization
 
 ## 11. Final report
 
-(개발/리뷰 후 채움 — 템플릿 §11 형식 유지.)
+### Summary
+- Implemented: trusted exact PR supersede signal, fresh Issue/PR guards, one-shot durable evidence, completion exclusion, and REVIEW/BLOCKED -> READY reintake.
+- Intentionally not implemented: bare PR-close inference, merge/auto-merge, GitHub Actions, Hermes core changes, host/runtime cutover, and second dispatchers.
+
+### Provenance
+- Source issue: Issue #96 — https://github.com/rhgo1749/hermes-n8n-control-plane/issues/96
+- Kanban task: `t_0eb29732`
+- Idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:96`
+- Request path: `.agent/pr-requests/REQ-096-closed-unmerged-supersede-reintake.md`
+- Lead/delegated workers: lead `kanban-main`; implementation `kanban-developer`
+- Automation stop state: `NONE` (review/merge remains external human authority)
+
+### Repository findings
+- Selected route: `docs/EDGE_REWORK_LIFECYCLE.md` -> edge sync and strict signal guard
+- Canonical owners: edge owns GitHub <-> Kanban reconciliation; Kanban owns active dispatch state; GitHub owns Issue/PR history
+- Request assumptions differing from repository/runtime evidence: none identified
+
+### Cross-cutting impact
+- Security: trusted maintainer actor and exact whole-comment parsing; fail-closed on ambiguity and lookup failures
+- Auth/permission/secrets: existing `TRUSTED_GITHUB_ACTORS` policy reused; no secret or credential changes
+- Host/network exposure: none; host/runtime validation not required
+- External API/platform policy: read-only GitHub evidence; no GitHub Actions changes
+- Follow-up / residual risk: reviewer should independently verify the diff and local evidence; merge remains human-only
+
+### Files changed
+- `.agent/pr-requests/REQ-096-closed-unmerged-supersede-reintake.md`: request provenance, completion criteria, and final evidence
+- `edge/kanban-github-sync.py`: supersede signal validation, durable transition, evaluator exclusion, and sync integration
+- `edge/kanban_retry_signal_guard.py`: deployment overlay for strict supersede signal parsing
+- `edge/kanban-github-sync-entrypoint.py`: install the supersede guard in deployed edge
+- `edge/test-kanban-github-sync-rework.py`: eight deterministic Issue #96 regressions and evaluator replay assertion
+- `edge/test-kanban-retry-signal-guard.py`: overlay trust/freshness/identity/one-shot regressions
+- `docs/EDGE_REWORK_LIFECYCLE.md`: explicit supersede contract and fail-closed rules
+
+### Validation
+| Validation | Result | Notes |
+|---|---|---|
+| Static/unit | PASS | `py_compile`, critical Ruff (`E9,F401,F821`), `git diff --check`; basedpyright re-run found no new errors in the added implementation (repository has pre-existing unresolved-import/type diagnostics) |
+| n8n validation | SKIPPED | No n8n workflow surface changed |
+| Edge rework | PASS | `edge/test-kanban-github-sync-rework.py`: `876 passed, 0 failed`; pre-fix bite: `870 passed, 4 failed` on the eight added-case harness before implementation |
+| Hermes plugin | SKIPPED | No Hermes plugin surface changed |
+| Host dashboard/network | SKIPPED | Not in scope; no runtime/host acceptance required |
+| Telegram E2E | SKIPPED | No notification/transport surface changed |
+| Signal overlay | PASS | `edge/test-kanban-retry-signal-guard.py`: `8 passed` |
+| Related edge harnesses | PASS | completion, terminal-convergence, parking-comment, dependency-gate, and race-gate harnesses passed |
+
+### Operator acceptance
+- Required only when automation stop state is `HOST_VALIDATION_REQUIRED`.
+- Copy-paste command: not applicable
+- PASS conditions: not applicable
+- If validation fails / recovery: reviewer returns actionable changes on PR #97
+- After PASS merge-ready: YES, pending human review and merge authorization
+- Additional human judgment required: YES — review and merge
+
+### Remaining risks / owner
+- Reviewer owns independent verification of the current PR head and evidence. Human owner retains merge/auto-merge authority.
+
+### Git / PR
+- Base SHA: `d3992a5a3adc3ac70165d26b82f2ef45ed82e6cf`
+- Branch: `issue96/closed-unmerged-supersede-reintake`
+- Commits: `7d38a9b` (REQ), `e8afa9d` (implementation/tests/docs)
+- PR number/title/URL: PR #97 — `fix(edge): closed-unmerged PR supersede 재투입 지원` — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/97
+- Working tree: clean after final REQ update and push
+- Merge performed: NO
