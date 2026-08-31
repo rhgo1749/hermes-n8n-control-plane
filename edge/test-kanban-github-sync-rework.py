@@ -5601,6 +5601,85 @@ def test_135_supersede_lookup_failure_preserves_state():
     )
 
 
+def test_136_authoritative_done_preserved_when_graphql_empty() -> None:
+    """An authoritative DONE card never regresses to REVIEW when subsequent GraphQL relationships are empty."""
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="closed", merged=True)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("review")
+
+    # 1. Establish prior authoritative done via real sync
+    run_sync(fake)
+    with connect_closing() as conn:
+        task = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        check("136: task starts done", task["status"] == "done", str(task["status"]))
+
+    # 2. Simulate subsequent query where GraphQL closing relationship is empty
+    def empty_graphql(query, variables):
+        number = int(variables["number"])
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": number,
+                    "closingIssuesReferences": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                },
+            },
+        }
+    fake.graphql = empty_graphql
+
+    results = run_sync(fake)
+    with connect_closing() as conn:
+        task_after = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        check("136: status remains done", task_after["status"] == "done", str(task_after["status"]))
+        check(
+            "136: decision reason is authoritative_done_preserved",
+            any(r.get("reason") in {"authoritative_done_preserved", "all_linked_prs_merged"} for r in results),
+            str(results),
+        )
+
+
+def test_137_specialist_graph_provenance_inheritance_accepted() -> None:
+    """Lead task inherits delivery provenance from completed specialist graph with verified reviewer PASS."""
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000999"
+    fake.prs[PR_N]["head"]["sha"] = head
+    rework_at = int(time.time())
+
+    with connect_closing() as conn:
+        # Lead run (generic core run)
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, started_at, ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-main', 'done', NULL, ?, ?, 'completed', 'Lead routed specialist graph', ?)",
+            (tid, rework_at, rework_at + 10, json.dumps({"head_sha": head})),
+        )
+        lead_run_id = cur.lastrowid
+
+        # Child Reviewer task completed with PASS at exact head
+        rev_id = "t_reviewer_child_01"
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, created_at, completed_at, workspace_kind) VALUES (?, ?, 'done', 'kanban-reviewer', ?, ?, 'dir')",
+            (rev_id, "Reviewer task for exact head", rework_at, rework_at + 20),
+        )
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (rev_id, tid),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, started_at, ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-reviewer', 'done', NULL, ?, ?, 'completed', ?, ?)",
+            (rev_id, rework_at + 12, rework_at + 19, f"Independent review PASS at exact head {head}", json.dumps({"head_sha": head})),
+        )
+
+        inherited_run = mod._task_run_after_rework(conn, tid, rework_at, rework_round=1)
+        check("137: inherited run found from specialist graph", inherited_run is not None)
+        check("137: inherited run is lead run id", inherited_run is not None and int(inherited_run["id"]) == lead_run_id)
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -5733,6 +5812,8 @@ def main() -> int:
         test_133_merged_pr_completion_precedes_supersede,
         test_134_multiple_linked_prs_fail_closed,
         test_135_supersede_lookup_failure_preserves_state,
+        test_136_authoritative_done_preserved_when_graphql_empty,
+        test_137_specialist_graph_provenance_inheritance_accepted,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

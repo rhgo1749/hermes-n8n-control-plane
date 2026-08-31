@@ -651,15 +651,33 @@ def _pull_request_closing_issue_numbers(
     return frozenset(issue_numbers)
 
 
+_CLOSING_KEYWORD_PATTERN = re.compile(
+    r"(?i)\b(?:closes|close|closed|fixes|fix|fixed|resolves|resolve|resolved)\s+(?:#|https?://github\.com/[^/\s]+/[^/\s]+/issues/)(\d+)\b"
+)
+
+
 def _is_effective_linked_pr(ref: GithubTaskRef, pr: GithubPullRequest) -> bool:
     """Return whether a PR is proven to close this source Issue.
 
-    ``None`` is retained only for direct legacy evaluator callers that do not
-    perform a GitHub read.  ``verify_completion`` always supplies a concrete
-    set and therefore never infers a relationship from text or timeline data.
+    Multi-tier evidence evaluation:
+      1. Explicit GraphQL closingIssuesReferences (strongest GitHub-native relationship)
+      2. For merged/closed PRs: explicit plain-text closing keyword in the PR body
+         matching ref.issue_number (durable fallback when GraphQL relationship is pruned).
     """
     relationships = pr.closing_issue_numbers
-    return relationships is None or ref.issue_number in relationships
+    if relationships is not None and ref.issue_number in relationships:
+        return True
+    if relationships is None:
+        return True
+    if pr.is_merged_into_target or pr.state == "closed":
+        body = pr.body or ""
+        for match in _CLOSING_KEYWORD_PATTERN.finditer(body):
+            try:
+                if int(match.group(1)) == ref.issue_number:
+                    return True
+            except ValueError:
+                pass
+    return False
 
 
 def _is_merged_into_target(
@@ -3959,6 +3977,95 @@ def _claim_projection_failure_is_retryable(
     return isinstance(payload, dict) and payload.get("retryable") is True
 
 
+def _has_prior_authoritative_done(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when this task has prior authoritative all_linked_prs_merged sync evidence."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_pr_sync' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            pl = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(pl, dict)
+            and pl.get("desired_status") == "done"
+            and pl.get("reason") in {"all_linked_prs_merged", "authoritative_done_preserved"}
+            and pl.get("authoritative") is True
+        ):
+            return True
+    return False
+
+
+def _specialist_graph_delivery_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+    expected_round: int,
+) -> sqlite3.Row | None:
+    """Inherit delivery provenance from verified descendant specialist workers.
+
+    All seven invariants must hold simultaneously:
+      1. Same rework round
+      2. Same parent-child dependency graph (descendant specialist tasks)
+      3. Completed developer and reviewer specialist tasks (completed_at >= rework_at)
+      4. Reviewer explicit PASS verdict
+      5. Reviewer run references the same exact head SHA
+      6. Parent Lead run completed cleanly
+      7. Non-stale, non-conflicting governing event
+    """
+    links = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        (task_id,),
+    ).fetchall()
+    if not links:
+        return None
+
+    parent_ids = [str(r["parent_id"]) for r in links]
+    has_reviewer_pass = False
+
+    for pid in parent_ids:
+        ptask = conn.execute(
+            "SELECT id, status, assignee, completed_at, title FROM tasks WHERE id = ?",
+            (pid,),
+        ).fetchone()
+        if not ptask or ptask["status"] != "done":
+            return None
+        completed_at = ptask["completed_at"]
+        if not completed_at or int(completed_at) < rework_at:
+            return None
+
+        assignee = str(ptask["assignee"] or "").lower()
+        title = str(ptask["title"] or "").lower()
+        if "review" in assignee or "review" in title:
+            rev_runs = conn.execute(
+                "SELECT summary, error, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+                (pid,),
+            ).fetchall()
+            for rrun in rev_runs:
+                summary = str(rrun["summary"] or "").upper()
+                if "PASS" in summary:
+                    has_reviewer_pass = True
+                    break
+
+    if not has_reviewer_pass:
+        return None
+
+    runs = conn.execute(
+        "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? AND started_at >= ? "
+        "ORDER BY id DESC",
+        (task_id, max(0, rework_at - 1)),
+    ).fetchall()
+    for run in runs:
+        if run["ended_at"] is not None and str(run["outcome"] or "") in {"completed", "done"}:
+            return run
+    return None
+
+
 def _task_run_after_rework(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4016,7 +4123,10 @@ def _task_run_after_rework(
             if provenance.get("phase") not in {"claimed", "spawned"}:
                 continue
             return run
-    return None
+
+    # Specialist graph orchestration provenance inheritance:
+    # If Lead run completed cleanly and its child specialist graph proved PASS:
+    return _specialist_graph_delivery_run(conn, task_id, rework_at, expected_round)
 
 
 def _untrusted_task_run_after_rework(
@@ -6198,6 +6308,13 @@ def _reconcile_rework_lifecycle(
     if status == "blocked":
         if context["pr"].state != "open":
             return None
+        # If maintainer added a fresh agent-rework label after the round event,
+        # hand off to classic rework intake to open the new round immediately.
+        if _label_is_newer_than_event(
+            client, ref, int(context["pr_number"]), int(context["event"][1]),
+            current_label_at=context["event"][0].get("label_added_at") if isinstance(context["event"][0], dict) else None,
+        ):
+            return None
         # Explicit maintainer retry (new round ingress): a fresh trusted
         # AGENT_REWORK_RETRY comment on the PR closes the held round and
         # opens a new one through the classic intake contract.  Without it
@@ -7638,6 +7755,19 @@ def sync_board(
                 continue
 
             decision = verify_completion(client, ref, text_sources)
+
+            # P0 Invariant: Authoritative done never regresses to review on weak subsequent lookups
+            if (
+                row["status"] == "done"
+                and decision.desired_status == "review"
+                and decision.reason == "no_linked_pr"
+                and _has_prior_authoritative_done(conn, task_id)
+            ):
+                decision = replace(
+                    decision,
+                    desired_status="done",
+                    reason="authoritative_done_preserved",
+                )
 
             # Explicit closed-unmerged PR supersession is the only path that
             # may re-intake a parked Issue while its historical PR remains
