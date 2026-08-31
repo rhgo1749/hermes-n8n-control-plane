@@ -131,6 +131,11 @@ REWORK_ATTENTION_MARKER = "HERMES_KANBAN_REWORK_ATTENTION"
 # presence alone is never retry evidence — the edge restores ``agent-rework``
 # during self-heal).
 REWORK_RETRY_MARKER = "AGENT_REWORK_RETRY"
+# Machine-readable explicit abandonment of one closed-unmerged PR.  Unlike a
+# plain PR close, this trusted, one-shot signal is the only authorization for
+# returning an Issue to a fresh implementation round.
+SUPERSEDE_MARKER = "AGENT_PR_SUPERSEDE"
+SUPERSEDE_EVENT_KIND = "github_pr_superseded"
 
 # Sync-owned body region.  Between these markers the whole block is
 # REPLACED on every refresh — never appended — so the body cannot grow.
@@ -710,8 +715,19 @@ def evaluate_completion(
     *,
     linked_pr_numbers: Optional[Iterable[int]] = None,
     issue_state: Optional[str] = None,
+    superseded_pr_numbers: Optional[Iterable[int]] = None,
 ) -> GithubCompletionDecision:
+    """Evaluate completion, excluding only explicitly superseded PRs.
+
+    ``superseded_pr_numbers`` is durable edge evidence recorded by the
+    trusted maintainer transition.  It is intentionally separate from the
+    existing same-head automatic supersession rule: a closed-unmerged PR is
+    never excluded merely because it was closed.
+    """
     prs = tuple(sorted(pull_requests, key=lambda item: item.number))
+    explicitly_superseded = {
+        int(number) for number in (superseded_pr_numbers or ())
+    }
     numbers = tuple(
         sorted(
             set(int(number) for number in (linked_pr_numbers or ()))
@@ -728,7 +744,11 @@ def evaluate_completion(
         )
 
     effective_prs = tuple(
-        pr for pr in prs if _is_effective_linked_pr(ref, pr)
+        pr for pr in prs
+        if (
+            pr.number not in explicitly_superseded
+            and _is_effective_linked_pr(ref, pr)
+        )
     )
     if not effective_prs:
         return GithubCompletionDecision(
@@ -3288,6 +3308,83 @@ def _last_rework_event_at(conn: sqlite3.Connection, task_id: str) -> Optional[in
     return int(value) if value is not None else None
 
 
+
+def apply_supersede(
+    conn: sqlite3.Connection,
+    task_id: str,
+    ref: GithubTaskRef,
+    signal: Mapping[str, Any],
+    pr: GithubPullRequest,
+) -> dict[str, Any]:
+    """Move a parked GitHub Issue card to READY after explicit supersession.
+
+    This is deliberately a separate transition from PR rework.  The closed
+    PR is abandoned, not reworked, so the normal Kanban dispatcher owns the
+    fresh Issue round and no edge rework worker is spawned.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return {"task_id": task_id, "changed": False, "reason": "task_missing"}
+    previous_status = str(row["status"])
+    if previous_status not in {"review", "blocked"}:
+        return {
+            "task_id": task_id,
+            "status": previous_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'ready', completed_at = NULL, assignee = NULL,
+               claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+               block_kind = NULL, block_recurrences = 0,
+               last_heartbeat_at = NULL
+         WHERE id = ? AND status = ?
+        """,
+        (task_id, previous_status),
+    )
+    if cur.rowcount != 1:
+        return {
+            "task_id": task_id,
+            "status": previous_status,
+            "changed": False,
+            "reason": "state_changed_during_sync",
+        }
+    _append_sync_event(
+        conn,
+        task_id,
+        {
+            "previous_status": previous_status,
+            "new_status": "ready",
+            "repository": ref.repository,
+            "issue_number": ref.issue_number,
+            "pr_number": pr.number,
+            "head_sha": pr.head_sha,
+            "signal_comment_id": int(signal["comment_id"]),
+            "signal_author": str(signal["author"]),
+            "signal_created_at": int(signal["created_at"]),
+            "reason": "explicit_pr_superseded",
+            "superseded": True,
+            "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
+            "merge_authority": "human",
+            "auto_merge": False,
+            "source": "github",
+        },
+        kind=SUPERSEDE_EVENT_KIND,
+    )
+    return {
+        "task_id": task_id,
+        "status": "ready",
+        "changed": True,
+        "reason": "explicit_pr_superseded",
+        "pr_number": pr.number,
+        "signal_comment_id": int(signal["comment_id"]),
+    }
+
+
 def apply_rework(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3699,6 +3796,7 @@ REWORK_DISPATCH_PROVENANCE_SOURCE = "github_edge_rework_dispatch"
 _REWORK_GOVERNING_KINDS = frozenset({
     "created", "changes_requested", "github_pr_rework", "github_pr_sync",
     "github_pr_rework_retry", "github_pr_rework_projection_failure",
+    SUPERSEDE_EVENT_KIND,
     "github_blocked_resolved", "github_blocked_projection",
     "blocked", "completed", "status", "promoted", "unblocked",
     "reclaimed", "scheduled", "archived",
@@ -5308,6 +5406,125 @@ def _current_rework_attention_at(
     return None
 
 
+
+def _last_task_event_at(conn: sqlite3.Connection, task_id: str) -> int:
+    """Return the latest durable task-event timestamp for signal freshness."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(created_at), 0) FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(row[0] or 0) if row is not None else 0
+
+
+def _consumed_supersede_comment_ids(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> set[int]:
+    """Return supersede signal ids consumed by prior edge transitions."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('github_pr_superseded', 'github_pr_supersede')",
+        (task_id,),
+    ).fetchall()
+    consumed: set[int] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("signal_comment_id")
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            consumed.add(raw)
+    return consumed
+
+
+def _explicit_superseded_pr_numbers(
+    conn: sqlite3.Connection,
+    task_id: str,
+    ref: GithubTaskRef,
+) -> frozenset[int]:
+    """Read valid durable supersede evidence for this Issue task."""
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('github_pr_superseded', 'github_pr_supersede')",
+        (task_id,),
+    ).fetchall()
+    numbers: set[int] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        pr_number = payload.get("pr_number")
+        signal_id = payload.get("signal_comment_id")
+        if (
+            payload.get("repository") != ref.repository
+            or payload.get("issue_number") != ref.issue_number
+            or payload.get("new_status") != "ready"
+            or payload.get("reason") != "explicit_pr_superseded"
+            or payload.get("superseded") is not True
+            or not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number <= 0
+            or not _positive_rework_int(signal_id)
+        ):
+            continue
+        numbers.add(pr_number)
+    return frozenset(numbers)
+
+
+def _find_pr_supersede_signal(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+    task_id: str,
+    *,
+    baseline_at: int,
+    consumed_ids: set[int],
+) -> Optional[dict[str, Any]]:
+    """Find the newest trusted exact two-line PR supersede signal."""
+    comments = client.get_paginated(
+        f"/repos/{ref.repository}/issues/{pr_number}/comments",
+        {"per_page": 100},
+    )
+    expected_lines = [SUPERSEDE_MARKER, f"pr={pr_number} task={task_id}"]
+    for comment in reversed(comments):
+        if not isinstance(comment, dict):
+            continue
+        author = str((comment.get("user") or {}).get("login") or "")
+        if author not in TRUSTED_GITHUB_ACTORS:
+            continue
+        created_at = _parse_iso_ts(comment.get("created_at"))
+        if created_at is None or created_at < baseline_at:
+            continue
+        comment_id = comment.get("id")
+        if (
+            not isinstance(comment_id, int)
+            or isinstance(comment_id, bool)
+            or comment_id <= 0
+            or comment_id in consumed_ids
+        ):
+            continue
+        lines = [
+            line.strip()
+            for line in str(comment.get("body") or "").splitlines()
+            if line.strip()
+        ]
+        if lines != expected_lines:
+            continue
+        return {
+            "comment_id": comment_id,
+            "author": author,
+            "created_at": created_at,
+            "pr_number": pr_number,
+        }
+    return None
+
+
 def _consumed_retry_comment_ids(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5592,6 +5809,174 @@ def _consume_explicit_rework_retry(
     result["reason"] = "maintainer_retry_consumed"
     result["retry_comment_id"] = retry_comment_id
     result["retry_comment_author"] = retry_comment["author"]
+    return result
+
+
+
+def _consume_explicit_pr_supersede(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    task_id: str,
+    row: Mapping[str, Any],
+    *,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    """Admit one trusted signal for one closed-unmerged linked PR.
+
+    The signal is intentionally considered before the normal completion
+    decision is filtered by prior supersede evidence.  Every external fact is
+    fresh in this pass; any failed or ambiguous lookup returns a no-mutation
+    diagnostic instead of allowing the ordinary blocked/review lanes to infer
+    a new round.
+    """
+    if not decision.authoritative or str(row["status"]) not in {"review", "blocked"}:
+        return None
+    effective_prs = tuple(
+        pr for pr in decision.pull_requests
+        if _is_effective_linked_pr(ref, pr)
+    )
+    closed_unmerged = tuple(
+        pr for pr in effective_prs
+        if pr.state == "closed" and not _is_merged_into_target(ref, pr)
+    )
+    if not closed_unmerged:
+        return None
+
+    consumed_ids = _consumed_supersede_comment_ids(conn, task_id)
+    signals: list[dict[str, Any]] = []
+    for candidate in closed_unmerged:
+        try:
+            signal = _find_pr_supersede_signal(
+                client,
+                ref,
+                candidate.number,
+                task_id,
+                baseline_at=_last_task_event_at(conn, task_id),
+                consumed_ids=consumed_ids,
+            )
+        except GithubCompletionError as exc:
+            return {
+                "task_id": task_id,
+                "status": str(row["status"]),
+                "changed": False,
+                "reason": "supersede_signal_query_failed",
+                "error": str(exc),
+            }
+        if signal is not None:
+            signals.append(signal)
+
+    # A signal cannot choose among multiple effective PRs, even if only one
+    # of the comments looks valid.  In particular an open replacement must
+    # prevent a closed historical PR from being abandoned in isolation.
+    if len(effective_prs) != 1:
+        if signals:
+            return {
+                "task_id": task_id,
+                "status": str(row["status"]),
+                "changed": False,
+                "reason": "supersede_ambiguous_linked_prs",
+                "signal_comment_id": signals[-1]["comment_id"],
+            }
+        return None
+    pr = effective_prs[0]
+    if len(closed_unmerged) != 1 or not signals:
+        return None
+    if pr.number in _explicit_superseded_pr_numbers(conn, task_id, ref):
+        return None
+    signal = signals[-1]
+
+    # A second rework lineage on another PR makes the requested transition
+    # ambiguous.  Malformed durable provenance is equally unsafe.
+    rework_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('github_pr_rework', 'github_pr_rework_retry')",
+        (task_id,),
+    ).fetchall()
+    for event_row in rework_rows:
+        try:
+            payload = json.loads(event_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return {
+                "task_id": task_id, "status": str(row["status"]),
+                "changed": False, "reason": "supersede_rework_ambiguous",
+            }
+        if not isinstance(payload, dict):
+            return {
+                "task_id": task_id, "status": str(row["status"]),
+                "changed": False, "reason": "supersede_rework_ambiguous",
+            }
+        if (
+            payload.get("repository") != ref.repository
+            or payload.get("issue_number") != ref.issue_number
+            or payload.get("pr_number") != pr.number
+        ):
+            return {
+                "task_id": task_id, "status": str(row["status"]),
+                "changed": False, "reason": "supersede_rework_ambiguous",
+            }
+
+    try:
+        issue_payload, _ = client.get(
+            f"/repos/{ref.repository}/issues/{ref.issue_number}"
+        )
+    except GithubCompletionError as exc:
+        return {
+            "task_id": task_id, "status": str(row["status"]),
+            "changed": False, "reason": "supersede_issue_lookup_failed",
+            "error": str(exc),
+        }
+    if not isinstance(issue_payload, dict):
+        return {
+            "task_id": task_id, "status": str(row["status"]),
+            "changed": False, "reason": "supersede_issue_lookup_failed",
+            "error": "invalid issue payload",
+        }
+    issue_state = str(issue_payload.get("state", "")).casefold()
+    raw_labels = issue_payload.get("labels")
+    if issue_state not in {"open", "closed"} or not isinstance(raw_labels, list):
+        return {
+            "task_id": task_id, "status": str(row["status"]),
+            "changed": False, "reason": "supersede_issue_lookup_failed",
+            "error": "incomplete issue payload",
+        }
+    issue_labels = {
+        str(item.get("name")) for item in raw_labels if isinstance(item, dict)
+    }
+    if issue_state != "open" or AGENT_READY_LABEL not in issue_labels:
+        return {
+            "task_id": task_id,
+            "status": str(row["status"]),
+            "changed": False,
+            "reason": "supersede_issue_not_agent_ready",
+            "issue_state": issue_state,
+            "issue_agent_ready": AGENT_READY_LABEL in issue_labels,
+        }
+    if _task_has_active_rework_claim(conn, row):
+        return {
+            "task_id": task_id, "status": str(row["status"]),
+            "changed": False, "reason": "supersede_active_worker",
+        }
+    if dry_run:
+        return {
+            "task_id": task_id,
+            "status": "ready",
+            "changed": False,
+            "reason": "explicit_pr_supersede_predicted",
+            "pr_number": pr.number,
+            "signal_comment_id": signal["comment_id"],
+        }
+    try:
+        with conn:
+            result = apply_supersede(conn, task_id, ref, signal, pr)
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return {
+            "task_id": task_id, "status": str(row["status"]),
+            "changed": False, "reason": "supersede_db_write_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     return result
 
 
@@ -7253,6 +7638,30 @@ def sync_board(
                 continue
 
             decision = verify_completion(client, ref, text_sources)
+
+            # Explicit closed-unmerged PR supersession is the only path that
+            # may re-intake a parked Issue while its historical PR remains
+            # linked.  Evaluate the signal against the unfiltered fresh
+            # decision first; then exclude the durable evidence from all later
+            # completion decisions.
+            if decision.authoritative:
+                supersede_result = _consume_explicit_pr_supersede(
+                    conn, client, ref, decision, task_id, row,
+                    dry_run=dry_run,
+                )
+                if supersede_result is not None:
+                    results.append(_annotate(supersede_result, row, ref))
+                    continue
+                superseded_prs = _explicit_superseded_pr_numbers(
+                    conn, task_id, ref,
+                )
+                if superseded_prs:
+                    decision = evaluate_completion(
+                        ref,
+                        decision.pull_requests,
+                        linked_pr_numbers=decision.linked_pr_numbers,
+                        superseded_pr_numbers=superseded_prs,
+                    )
 
             # PR rework lifecycle: when a consumed rework round governs this
             # task, GitHub-visible worker ownership (agent-working /

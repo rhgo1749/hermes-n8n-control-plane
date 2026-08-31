@@ -5388,6 +5388,219 @@ def test_127_github_sync_review_parking_normalizes_stale_review_ready():
     ]) == 1, str(task_events(tid)))
 
 
+# ---------------------------------------------------------------------------
+# Explicit closed-unmerged PR supersession (Issue #96).
+# ---------------------------------------------------------------------------
+
+SUPERSEDE_EVENT_KIND = getattr(mod, "SUPERSEDE_EVENT_KIND", "github_pr_superseded")
+
+def _post_supersede_comment(
+    fake: FakeGitHub,
+    tid: str,
+    *,
+    pr_number: int = PR_N,
+    when: Optional[str] = None,
+    author: str = "rhgo1749",
+    task: Optional[str] = None,
+    body: str | None = None,
+) -> int:
+    """Post the exact trusted PR-scope supersede signal fixture."""
+    if when is None:
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+    _MARKER_ID[0] += 1
+    marker = getattr(mod, "SUPERSEDE_MARKER", "AGENT_PR_SUPERSEDE")
+    signal_body = body or "\n".join([
+        marker,
+        f"pr={pr_number} task={task if task is not None else tid}",
+    ])
+    fake.issue_comments.setdefault(pr_number, []).append({
+        "id": _MARKER_ID[0],
+        "user": {"login": author},
+        "body": signal_body,
+        "created_at": when,
+        "updated_at": when,
+    })
+    return _MARKER_ID[0]
+
+
+def _closed_unmerged_supersede_case(
+    status: str = "review",
+) -> tuple[FakeGitHub, str, int]:
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="closed", merged=False)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task(status)
+    signal_id = _post_supersede_comment(fake, tid)
+    return fake, tid, signal_id
+
+
+def test_128_closed_unmerged_trusted_supersede_reintakes_ready():
+    print(
+        "128. trusted exact supersede signal -> closed-unmerged PR excluded "
+        "and REVIEW -> READY"
+    )
+    fake, tid, signal_id = _closed_unmerged_supersede_case()
+    results = run_sync(fake)
+    row = task_row(tid)
+    events = [e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND]
+    check("128: one tick review -> ready",
+          row["status"] == "ready" and any(
+              r.get("reason") == "explicit_pr_superseded" and r.get("changed")
+              for r in results), str(results))
+    check("128: exactly one supersede event", len(events) == 1, str(events))
+    if events:
+        payload = events[0]["payload"]
+        check("128: durable supersede provenance",
+              payload.get("previous_status") == "review"
+              and payload.get("new_status") == "ready"
+              and payload.get("repository") == REPO
+              and payload.get("issue_number") == ISSUE_N
+              and payload.get("pr_number") == PR_N
+              and payload.get("signal_comment_id") == signal_id
+              and payload.get("reason") == "explicit_pr_superseded"
+              and payload.get("merge_authority") == "human"
+              and payload.get("auto_merge") is False,
+              str(payload))
+    check("128: no PR label mutation", fake.patch_calls == [], str(fake.patch_calls))
+
+
+def test_129_supersede_signal_is_one_shot():
+    print("129. replayed supersede signal -> no duplicate event or READY transition")
+    fake, tid, _signal_id = _closed_unmerged_supersede_case()
+    run_sync(fake)
+    events_before = [e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND]
+    results = run_sync(fake)
+    events_after = [e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND]
+    check(
+        "129: exactly one consumed event",
+        len(events_before) == 1 and len(events_after) == 1,
+        str(events_after),
+    )
+    check("129: ready remains stable", task_row(tid)["status"] == "ready", str(results))
+    check(
+        "129: superseded PR excluded from completion",
+        any((r.get("evidence") or {}).get("reason") == "no_linked_pr"
+            for r in results),
+        str(results),
+    )
+    check("129: no second changed result", not any(
+        r.get("reason") == "explicit_pr_superseded" and r.get("changed")
+        for r in results), str(results))
+
+
+def test_130_closed_unmerged_without_signal_stays_fail_closed():
+    print(
+        "130. closing a linked PR without a supersede signal -> REVIEW "
+        "remains fail-closed"
+    )
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="closed", merged=False)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("review")
+    results = run_sync(fake)
+    check("130: remains review", task_row(tid)["status"] == "review", str(results))
+    check("130: no supersede event", not [
+        e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND
+    ], str(task_events(tid)))
+
+
+def test_131_closed_issue_cannot_start_supersede_round():
+    print("131. closed source Issue + supersede signal -> no new round")
+    fake, tid, _signal_id = _closed_unmerged_supersede_case()
+    fake.issue_state = "closed"
+    results = run_sync(fake)
+    check("131: remains review", task_row(tid)["status"] == "review", str(results))
+    check("131: no supersede event", not [
+        e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND
+    ], str(task_events(tid)))
+
+
+def test_132_open_linked_pr_blocks_supersede():
+    print("132. open linked PR alongside signal -> fail-closed")
+    fake, tid, _signal_id = _closed_unmerged_supersede_case()
+    fake.prs[PR2_N] = make_pr(PR2_N, state="open", merged=False, title="replacement")
+    fake.pr_labels[PR2_N] = []
+    fake.pr_timeline[PR2_N] = []
+    fake.issue_timeline_override = cross_ref_timeline(PR_N) + [{
+        "event": "cross-referenced",
+        "source": {"issue": {"number": PR2_N,
+                             "pull_request": {
+                                 "url": (
+                                     f"https://api.github.com/repos/{REPO}/"
+                                     f"pulls/{PR2_N}"
+                                 )
+                             },
+                             "html_url": f"https://github.com/{REPO}/pull/{PR2_N}",
+                             "repository": {"full_name": REPO}}},
+    }]
+    results = run_sync(fake)
+    check("132: remains review", task_row(tid)["status"] == "review", str(results))
+    check("132: no supersede event", not [
+        e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND
+    ], str(task_events(tid)))
+
+
+def test_133_merged_pr_completion_precedes_supersede():
+    print(
+        "133. merged linked PR + supersede-looking comment -> existing "
+        "DONE precedence"
+    )
+    fake = fresh_env()
+    fake.prs[PR_N] = make_pr(PR_N, state="closed", merged=True)
+    fake.pr_labels[PR_N] = []
+    fake.pr_timeline[PR_N] = []
+    tid = new_task("review")
+    _post_supersede_comment(fake, tid)
+    results = run_sync(fake)
+    check("133: merged PR -> done", task_row(tid)["status"] == "done", str(results))
+    check("133: no supersede event", not [
+        e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND
+    ], str(task_events(tid)))
+
+
+def test_134_multiple_linked_prs_fail_closed():
+    print("134. multiple linked PRs + supersede signal -> fail-closed ambiguity")
+    fake, tid, _signal_id = _closed_unmerged_supersede_case()
+    fake.prs[PR2_N] = make_pr(PR2_N, state="closed", merged=False, title="other")
+    fake.pr_labels[PR2_N] = []
+    fake.pr_timeline[PR2_N] = []
+    fake.issue_timeline_override = cross_ref_timeline(PR_N) + [{
+        "event": "cross-referenced",
+        "source": {"issue": {"number": PR2_N,
+                             "pull_request": {
+                                 "url": (
+                                     f"https://api.github.com/repos/{REPO}/"
+                                     f"pulls/{PR2_N}"
+                                 )
+                             },
+                             "html_url": f"https://github.com/{REPO}/pull/{PR2_N}",
+                             "repository": {"full_name": REPO}}},
+    }]
+    results = run_sync(fake)
+    check("134: remains review", task_row(tid)["status"] == "review", str(results))
+    check("134: no supersede event", not [
+        e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND
+    ], str(task_events(tid)))
+
+
+def test_135_supersede_lookup_failure_preserves_state():
+    print("135. supersede comment lookup failure -> no mutation")
+    fake, tid, _signal_id = _closed_unmerged_supersede_case()
+    fake.fail_urls.append(f"/issues/{PR_N}/comments")
+    results = run_sync(fake)
+    check("135: remains review", task_row(tid)["status"] == "review", str(results))
+    check("135: no supersede event", not [
+        e for e in task_events(tid) if e["kind"] == SUPERSEDE_EVENT_KIND
+    ], str(task_events(tid)))
+    check(
+        "135: no task comments or external mutation",
+        fake.patch_calls == [] and fake.post_calls == [],
+        str({"patch": fake.patch_calls, "post": fake.post_calls}),
+    )
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -5512,6 +5725,14 @@ def main() -> int:
         test_label_only_rework_does_not_inherit_prior_completion_comment,
         test_prior_same_head_delivery_is_not_current_round_delivery,
         test_127_github_sync_review_parking_normalizes_stale_review_ready,
+        test_128_closed_unmerged_trusted_supersede_reintakes_ready,
+        test_129_supersede_signal_is_one_shot,
+        test_130_closed_unmerged_without_signal_stays_fail_closed,
+        test_131_closed_issue_cannot_start_supersede_round,
+        test_132_open_linked_pr_blocks_supersede,
+        test_133_merged_pr_completion_precedes_supersede,
+        test_134_multiple_linked_prs_fail_closed,
+        test_135_supersede_lookup_failure_preserves_state,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")

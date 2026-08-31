@@ -287,6 +287,40 @@ fail-closed: the card stays in its current state, no duplicate
 forcing recovered `REVIEW` back to `BLOCKED` — is intentionally rejected so
 the normal review lane does not acquire a new state transition.
 
+
+## Explicit closed-unmerged PR supersede (Issue #96)
+
+A plain GitHub PR close is never interpreted as a request for new work.  A
+parked GitHub-backed Issue may return to a fresh implementation round only
+when the edge reads all of the following in one reconciliation pass:
+
+- the source Issue is freshly `open` and still has `agent-ready`;
+- exactly one effective linked PR exists, and it is freshly `closed` and
+  `not merged` into the target branch;
+- no open or otherwise ambiguous linked PR/rework lineage is present; and
+- the PR has a trusted-maintainer comment whose entire non-empty body is
+  exactly these two lines (surrounding whitespace is ignored):
+
+  ```text
+  AGENT_PR_SUPERSEDE
+  pr=<pr_number> task=<task_id>
+  ```
+
+The trusted actor set is the existing `TRUSTED_GITHUB_ACTORS` policy.  The
+comment id is recorded in one durable `github_pr_superseded` event together
+with the repository, Issue, PR, head, prior state, and human merge authority.
+That event consumes the signal one-shot; replaying the same comment cannot
+open another round.  A failed GitHub read, malformed/untrusted/stale signal,
+closed Issue, merged PR, open/multiple linked PRs, or ambiguous rework
+provenance leaves the Kanban card unchanged and fail-closed.
+
+The accepted transition is `REVIEW` or `BLOCKED` -> `READY`.  The abandoned PR
+is then excluded from completion evaluation only by that explicit durable
+evidence; the historical PR remains visible on GitHub.  The fresh `READY`
+card is owned by the normal Kanban dispatcher, not the edge rework worker, and
+no PR label mutation or new PR is created.  Subsequent implementation work
+must still establish its own linked PR and completion evidence.
+
 ## Terminal merge convergence of a stale rework graph (Issue #73)
 
 A merged GitHub PR is an authoritative fact, but the internal dependency
