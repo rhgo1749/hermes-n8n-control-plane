@@ -736,6 +736,28 @@ def test_same_task_terminal_pid_safety() -> None:
         conn.close()
 
 
+def test_dynamic_backend_provider_matching_ornith_and_cloud() -> None:
+    """Verify endpoint/provider resolution classifies custom local/ornith and cloud routes correctly."""
+    import kanban_dynamic_resource as kdr
+
+    check(
+        "custom:local-llamacpp-(8080) matches local",
+        kdr._provider_is_local("custom:local-llamacpp-(8080)"),
+    )
+    check(
+        "custom:local-ornith-1.5-35b-(8082) matches local",
+        kdr._provider_is_local("custom:local-ornith-1.5-35b-(8082)"),
+    )
+    check(
+        "openai-codex does not match local provider",
+        not kdr._provider_is_local("openai-codex"),
+    )
+    check(
+        "cloud codex backend resolves to cloud kind",
+        kdr.resolve_profile_backend("kanban-developer").kind == "cloud",
+    )
+
+
 def test_diagnostics_are_bounded() -> None:
     clear_outcomes()
     for index in range(256):
@@ -758,6 +780,7 @@ def test_diagnostics_are_bounded() -> None:
 
 
 def main() -> int:
+    test_dynamic_backend_provider_matching_ornith_and_cloud()
     test_ready_and_review_busy_then_release()
     test_no_resource_config_preserves_legacy_probe()
     test_dry_run_filters_busy_without_claim()
