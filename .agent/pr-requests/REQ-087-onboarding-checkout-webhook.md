@@ -1,6 +1,6 @@
 # REQ-087: 신규 hermes-agent 저장소 checkout·실시간 webhook 자동 온보딩
 
-- Status: Rework round 5 latest-main integration and validation complete; PR refresh and host validation required
+- Status: Rework round 6 (trusted host/runtime review fixes) complete; PR refresh and host validation required
 - Project: `hermes-n8n-control-plane`
 - Product type: `CONTROL_PLANE_AUTOMATION` / `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `N8N_VALIDATE`, `HOST_NETWORKING`
@@ -13,7 +13,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#87`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/87
-- Kanban task ID: `t_fc3dc14c` (round 5 latest-main integration/validation); prior round 4 ordinary App installation-identity rework: `t_f1244aea`; prior round 3 standalone/provenance/analyzer rework: `t_c55ea2fa`; prior safety/provenance rework: `t_577aa06e`; prior implementation/rework card: `t_14dfe9ee`; original implementation card: `t_1631db5d`
+- Kanban task ID: `t_6bff2230` (root intake card, round 6 trusted host/runtime review fixes); round 5 latest-main integration/validation: `t_fc3dc14c`; round 4 ordinary App installation-identity rework: `t_f1244aea`; round 3 standalone/provenance/analyzer rework: `t_c55ea2fa`; safety/provenance rework: `t_577aa06e`; implementation/rework card: `t_14dfe9ee`; original implementation card: `t_1631db5d`
 - Design provenance: `t_d26a81e2`, completed DESIGN handoff/comment `227`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:87`
 - Planning/lead owner: `kanban-main`
@@ -68,6 +68,74 @@ the installation-identity fix and passed after restoration. This round added no
 production-code fix; the latest-main merge was conflict-free and the combined tree
 introduced no candidate-only failure/error identity.
 
+## Round 6 — trusted host/runtime review fixes (root card `t_6bff2230`)
+
+Trusted review comment `5471756378` (2026-08-30T22:51:42Z) on PR #88 at head
+`b2a952f9016a24b26ee2879d0ad20fd2a0ef7866` requested three bounded code
+fixes. Round 6 implemented all three on the existing PR/branch; no second
+PR, no merge/auto-merge, no live job, deployment, or host mutation.
+
+### Fix 1 — canonical event-driven rework dispatch lane
+
+The actuator's edge-sync path (`github_intake_actuator._run_edge_sync`, the
+canonical router -> n8n -> actuator -> `kanban-github-sync --json` route) now
+passes `HERMES_KANBAN_REWORK_DISPATCH=1` to the sync child. A successful
+managed `agent-rework` delivery therefore runs the edge-owned rework lane in
+the same wake: READY + reserved assignee -> claim/`agent-working`, instead of
+waiting for a later intake tick (the live round-5 reproduction showed READY +
+reserved assignee without immediate claim). The lane remains strictly scoped
+to tasks whose governing transition is a consumed agent-rework, so the core
+dispatcher's `active_pr` duplicate-spawn protection is unchanged for every
+other task. Regression added: the actuator edge-sync child environment must
+carry the flag (`test_edge_sync_enables_rework_dispatch_lane_for_agent_rework_deliveries`).
+
+### Fix 2 — diagnostic drops the non-existent job-object `profile` key
+
+`diagnose-github-onboarding.sh` no longer requires
+`job.get("profile") == "default"`. Hermes `cron/jobs.py` never persists an
+object-level `profile` key; profile identity is the per-profile jobs store
+path. The diagnostic binds profile identity to the already-validated canonical
+store location (default profile home `cron/jobs.json`) and reports the store-
+derived profile for the operator-readable summary. The test fixture no longer
+carries the synthetic `profile` field and matches the real Hermes serializer.
+
+### Fix 3 — diagnostic drops the exact short-name gate; identity bound to store + id + script + runtime fields
+
+The diagnostic no longer requires the invented exact short name
+`GitHub agent-ready Issue intake`, which conflicted with durable runtime
+evidence (live `bf431b2a6ba6` historically carries a longer name) and the
+no-rename contract in `OPERATIONS.md`. Job identity is now bound to the
+canonical default store + exact job id + intake script + preserved
+schedule/runtime fields; `name` is operator-readable only. Regressions added:
+the realistic historical shape passes, a second job with a different id in the
+same store is ignored (identity is the exact job id), a wrong script for the
+authoritative id fails closed, a non-string cron expr fails closed, and the
+interval schedule variant is still accepted.
+
+### Round-6 validation (combined head after merging latest `origin/main` `d3992a5`)
+
+Latest `origin/main` `d3992a5` (includes merged PR #93 `c5cd933` and PR #94/
+#55 `0582a03`) was merged into the existing branch conflict-free (merge
+`91b4bc0`); the round-6 fix commit is `ed58ff2`. All repository-local gates
+below were re-run at the final combined pushed HEAD. GitHub Actions remain
+disabled by policy; host/App validation is a separate operator gate.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Focused implementation/regression suites (round-6 scope) | PASS | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider -q tests/test_onboarding_diagnostics.py tests/test_repository_onboarding.py tests/test_github_intake_actuator.py tests/test_github_router.py` — 103 passed |
+| Round-6 regression: actuator enables rework dispatch lane | PASS | `test_edge_sync_enables_rework_dispatch_lane_for_agent_rework_deliveries` asserts the sync child env carries `HERMES_KANBAN_REWORK_DISPATCH=1` |
+| Round-6 regression: diagnostic identity gates | PASS | `tests/test_onboarding_diagnostics.py` — 12 passed (historical shape, exact-id binding, wrong-script fail-closed, non-string cron fail-closed, interval variant) |
+| Focused onboarding safety subset | PASS | `tests/test_repository_onboarding.py`, `tests/test_github_router.py`, `tests/test_github_intake_actuator.py`, `tests/test_onboarding_diagnostics.py` (in the 103-passed run above) |
+| Standalone registry / concurrency contract runners | PASS | `python3 tests/test_repository_registry.py` — `{"ok": true, "tests": 31}`; `python3 tests/test_github_event_concurrency_contract.py` — exit 0 |
+| Full local suite excluding known baseline modules | PASS | `python3 -m pytest -p no:cacheprovider -q --deselect tests/test_board_identity_migration.py --deselect tests/test_completion_wake_contention_retry.py` — 262 passed |
+| Full local suite candidate vs detached latest `origin/main` | BASELINE-EQUIVALENT FAIL | Candidate — `1 failed, 265 passed, 23 errors`; detached `origin/main` `d3992a5` — `1 failed, 185 passed, 23 errors`. Parsed failure/error identities identical: 24 candidate-only `0`, baseline-only `0`; all in the known baseline module `tests/test_board_identity_migration.py`. |
+| `N8N_VALIDATE` | PASS | `python3 automation/n8n/scripts/validate.py` — exit 0 (`schedule_workflows=0`, `edge_sync_workflows=1`, `github_workflows=1`, `github_event_router=1`) |
+| Python compile / shell syntax / diff check | PASS | `python3 -m compileall -q` (touched files), `bash -n automation/n8n/scripts/diagnose-github-onboarding.sh`, `shellcheck` (exit 0), `git diff --check b2a952f..HEAD` — exit 0 |
+| LSP/type diagnostics (Pyright 1.1.411) | BASELINE-EQUIVALENT | 5 common Python files: candidate `11 errors` (all `reportMissingImports` `hermes_cli`) vs detached `origin/main` `18 errors` — candidate is a subset, `0` candidate-only production error |
+| Ruff selected `E4,E7,E9,F` (changed files) | PASS | `ruff check --select E4,E7,E9,F` — all checks passed |
+| Pyflakes (touched Python files) | PASS | exit 0, no output |
+| Host/App/network canary | NOT RUN — USER VALIDATION REQUIRED | GitHub App installation/permissions, protected secrets, public HTTPS ingress, checkout root, production `default:bf431b2a6ba6` job/lease, signed canary, duplicate-delivery/pause behavior, and the operator-owned live rework lane remain user-owned |
+
 ## Operator handoff / recovery
 
 Live acceptance must prove an active personal-owner GitHub App webhook whose `installation.id` matches the protected `GITHUB_ROUTER_INSTALLATION_ID`, protected HMAC/API/intake credentials, writable checkout root, healthy router/lease-controller, exactly one scoped wake of `default:bf431b2a6ba6`, one canonical board/task, duplicate-delivery no-op, and paused state after the lease. Topic-only changes without a later supported delivery require explicit `--repository owner/repo` recovery. Archived, foreign, unavailable, contract-invalid, lock-busy, clone-failed, partial, or board/intake-authority failures remain fail-closed; only the current attempt's temporary paths may be removed. Existing checkout rollback is an explicit human action.
@@ -80,10 +148,11 @@ Live acceptance must prove an active personal-owner GitHub App webhook whose `in
 
 - Base SHA: `4424d654127797ddaedf712b94c0cea72806af58` (latest fetched `origin/main`)
 - Branch: `issue87/onboarding-checkout-webhook`
-- Commits through the pre-REQ-refresh combined validation head (complete `origin/main..HEAD` set): `0fe9a431161b26b1e0cc2ec25f613fb17d056a72`, `99334584fb297db105f975d0c527521c7d286a33`, `110bcb907d3a774b56004b7849bb8f80b4dd3845`, `f4cad8f739d9c16c229dd160cbaba4ac50b4872d`, `b044ea831e175a07a14df74c757988a71e31788e`, `1707128ce6501b2e521ad8edb5c3b95a5cd95e93`, `8be40ad80d2bb538ea0123c50abcb79ffb08c6e2`, `8b5c96b83ae8ba918f4b26d792174f15a5290d69`, `8d188042fe72209aa498fcacabf2beea32c07e17`, `ef34614232e44835295cf8c72b385da51e1919ce`, `2c7b56aa1162a8d2898fbd6b025a43d5c8a7679c`, `da5406a88f6f6e81a3a0dbf1337060599bf21023`, `11dea2df308fa570efbb3fe37837e11342d79021`, `12820fcf1854f213be4e8f389ef2d3d1ee0fa0f2`, `b7027b821d3bdfec8267dc1aacccef791d47fbcbc`, `8b79ddf216677fe9cc906683fa4e01ec06a5d864`, `441114d191d09fb4b2e9a5486bb70a2c39194f72`, `ffad4844be778a9f09f74d8c40b34de11bb8d214`, `41b98a1b39ef7b4e0cc9ef045236d0ef56141dd7`, `eca01449fab37ca00751e0fa28fed3e44436255b`
-- Round 5 provenance: latest-main integration merge `eca01449fab37ca00751e0fa28fed3e44436255b` incorporates `origin/main` `4424d654127797ddaedf712b94c0cea72806af58` conflict-free; combined validation was run at that head. This REQ refresh commit is intentionally not self-referenced; the exact final PR head is independently recorded by the post-push REST/GraphQL and remote-branch read-back.
-- Last non-self-referential implementation/validation head: `eca01449fab37ca00751e0fa28fed3e44436255b`
-- Final PR head: exact full OID is the post-push REST/GraphQL and remote-branch read-back recorded in the live PR body and Kanban handoff; no stale round-4 head is used here.
+- Commits through the pre-REQ-refresh combined validation head (complete `origin/main..HEAD` set): `0fe9a431161b26b1e0cc2ec25f613fb17d056a72`, `99334584fb297db105f975d0c527521c7d286a33`, `110bcb907d3a774b56004b7849bb8f80b4dd3845`, `f4cad8f739d9c16c229dd160cbaba4ac50b4872d`, `b044ea831e175a07a14df74c757988a71e31788e`, `1707128ce6501b2e521ad8edb5c3b95a5cd95e93`, `8be40ad80d2bb538ea0123c50abcb79ffb08c6e2`, `8b5c96b83ae8ba918f4b26d792174f15a5290d69`, `8d188042fe72209aa498fcacabf2beea32c07e17`, `ef34614232e44835295cf8c72b385da51e1919ce`, `2c7b56aa1162a8d2898fbd6b025a43d5c8a7679c`, `da5406a88f6f6e81a3a0dbf1337060599bf21023`, `11dea2df308fa570efbb3fe37837e11342d79021`, `12820fcf1854f213be4e8f389ef2d3d1ee0fa0f2`, `b7027b821d3bdfec8267dc1aacccef791d47fbcbc`, `8b79ddf216677fe9cc906683fa4e01ec06a5d864`, `441114d191d09fb4b2e9a5486bb70a2c39194f72`, `ffad4844be778a9f09f74d8c40b34de11bb8d214`, `41b98a1b39ef7b4e0cc9ef045236d0ef56141dd7`, `eca01449fab37ca00751e0fa28fed3e44436255b`, `ed58ff255a87b21f2848199af6e49eb1981b648a`, `91b4bc0` (round-6 fix + latest-main integration merge)
+- Round 5 provenance: latest-main integration merge `eca01449fab37ca00751e0fa28fed3e44436255b` incorporates `origin/main` `4424d654127797ddaedf712b94c0cea72806af58` conflict-free; combined validation was run at that head.
+- Round 6 provenance: fix commit `ed58ff2` (actuator rework-dispatch env + diagnostic identity gates + regressions); latest-main integration merge `91b4bc0` incorporates `origin/main` `d3992a5` (PR #93 `c5cd933`, PR #94/`#55` `0582a03`) conflict-free; combined validation re-run at the final combined head. This REQ refresh commit is intentionally not self-referenced; the exact final PR head is independently recorded by the post-push REST/GraphQL and remote-branch read-back.
+- Last non-self-referential implementation/validation head: the round-6 merge `91b4bc0` (exact full OID from the post-push remote-branch read-back)
+- Final PR head: exact full OID is the post-push REST/GraphQL and remote-branch read-back recorded in the live PR body and Kanban handoff; no stale round-4/round-5 head is used here.
 - PR number/title/URL: PR #88 — `Issue #87: 신규 hermes-agent 저장소 webhook 온보딩` — https://github.com/rhgo1749/hermes-n8n-control-plane/pull/88
 - Working tree: clean after final commit; PR #88 open and verified by REST/GraphQL read-back
 - Merge performed: NO
