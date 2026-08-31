@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#96`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/96
-- Kanban task ID: t_36aec6f6
+- Kanban task ID: t_0eb29732
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:96`
 - Planning/lead owner: kanban-main
 - Implementation owner: kanban-developer
