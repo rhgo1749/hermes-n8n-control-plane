@@ -48,10 +48,16 @@ from pathlib import Path
 
 home = Path(sys.argv[1]).expanduser()
 expected_id = "bf431b2a6ba6"
-expected_name = "GitHub agent-ready Issue intake"
 expected_script = "github-agent-ready-kanban-intake.py"
 max_metadata_bytes = 1 * 1024 * 1024
 canonical_store = home / "cron" / "jobs.json"
+# Job identity is bound to the canonical store location, the exact job id,
+# the intake script, and the preserved schedule/runtime fields below.
+# Deliberately NOT bound to: a persisted object-level `profile` key (Hermes
+# cron/jobs.py never persists one; profile identity is the store path) or
+# an exact short `name` (non-authoritative; the no-rename contract in
+# docs/OPERATIONS.md means historical names must keep passing).  The `name`
+# field is still read for the operator-readable summary only.
 
 
 def has_symlink_component(path: Path) -> bool:
@@ -143,10 +149,11 @@ if len(matches) != 1 or matches[0][0] != "default":
 profile, path, job = matches[0]
 if path != (home / "cron" / "jobs.json"):
     fail("authoritative_job_metadata_invalid", reason="noncanonical_store")
-if job.get("name") != expected_name:
-    fail("authoritative_job_metadata_invalid", reason="name_mismatch")
 if job.get("script") != expected_script:
     fail("authoritative_job_metadata_invalid", reason="script_mismatch")
+# NOTE: no object-level `profile` gate — profile identity is the canonical
+# store path above (default profile home), not a persisted job field.
+# NOTE: no exact `name` gate — name is non-authoritative (see header).
 script_path = home / "scripts" / expected_script
 if (
     has_symlink_component(script_path)
@@ -154,8 +161,6 @@ if (
     or not script_path.is_file()
 ):
     fail("authoritative_job_metadata_invalid", reason="script_missing")
-if job.get("profile") != "default":
-    fail("authoritative_job_metadata_invalid", reason="profile_mismatch")
 if "workdir" not in job or job.get("workdir") is not None:
     fail("authoritative_job_metadata_invalid", reason="workdir_mismatch")
 if job.get("no_agent") is not True:

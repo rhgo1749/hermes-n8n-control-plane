@@ -604,6 +604,60 @@ def test_edge_sync_fixed_command_is_bounded_and_shell_free() -> None:
             actuator.__dict__["_github_token"] = original_github_token
 
 
+def test_edge_sync_enables_rework_dispatch_lane_for_agent_rework_deliveries() -> None:
+    """Canonical event-driven rework path regression.
+
+    A managed ``agent-rework`` label delivery flows router -> actuator ->
+    edge sync.  The edge's own respawn lane (``_dispatch_pending_rework``
+    gated by ``HERMES_KANBAN_REWORK_DISPATCH``) must run inside this same
+    sync so a READY + reserved-assignee task is claimed and spawned in the
+    same wake — not left waiting for a later intake tick.  The actuator
+    therefore always passes the flag to the edge sync child; the lane's
+    scope (governing-transition check) still keeps every other task under
+    the core dispatcher's active-PR duplicate-spawn protection.
+    """
+    original_edge = actuator.EDGE_SYNC_SCRIPT
+    original_registry = actuator.REGISTRY_SCRIPT
+    original_python = actuator.PYTHON_BIN
+    original_github_token = actuator._github_token
+    original_popen = actuator.subprocess.Popen
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        edge = root / "kanban-github-sync.py"
+        registry = root / "repository_registry.py"
+        env_probe = root / "env-probe.json"
+        edge.write_text(
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            f"probe = Path({str(env_probe)!r})\n"
+            "probe.write_text(json.dumps(os.environ.get("
+            "'HERMES_KANBAN_REWORK_DISPATCH')), encoding='utf-8')\n"
+            "print(json.dumps([{'task_id': 'task-rework'}]))\n",
+            encoding="utf-8",
+        )
+        registry.write_text("# registry\n", encoding="utf-8")
+        actuator.__dict__["PYTHON_BIN"] = Path(sys.executable)
+        actuator.__dict__["EDGE_SYNC_SCRIPT"] = edge
+        actuator.__dict__["REGISTRY_SCRIPT"] = registry
+        actuator.__dict__["_github_token"] = lambda: TEST_TOKEN
+        try:
+            assert actuator._run_edge_sync("ctrlhangul") == [
+                {"task_id": "task-rework"}
+            ]
+            flag = env_probe.read_text(encoding="utf-8")
+            assert flag == '"1"', (
+                f"rework dispatch lane must be enabled for the edge sync "
+                f"child, got env flag {flag!r}"
+            )
+        finally:
+            actuator.subprocess.Popen = original_popen
+            actuator.__dict__["PYTHON_BIN"] = original_python
+            actuator.__dict__["EDGE_SYNC_SCRIPT"] = original_edge
+            actuator.__dict__["REGISTRY_SCRIPT"] = original_registry
+            actuator.__dict__["_github_token"] = original_github_token
+
+
 def test_edge_sync_oversized_output_fails_closed_and_terminates_child() -> None:
     original_edge = actuator.EDGE_SYNC_SCRIPT
     original_registry = actuator.REGISTRY_SCRIPT

@@ -276,6 +276,16 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
         ),
         "PYTHONDONTWRITEBYTECODE": "1",
         "GITHUB_TOKEN": _github_token(),
+        # The edge-owned rework respawn lane is the canonical event-driven
+        # path for managed ``agent-rework`` deliveries: a successful label
+        # event flows router -> actuator -> this sync, and the sync must
+        # claim/spawn the rework task in the same run instead of leaving
+        # it waiting for a later intake tick.  The lane itself stays
+        # strictly scoped to tasks whose governing transition is a
+        # consumed agent-rework (see ``_dispatch_pending_rework``), so
+        # enabling it here does not bypass the core dispatcher's
+        # active-PR duplicate-spawn protection for any other task.
+        "HERMES_KANBAN_REWORK_DISPATCH": "1",
     }
     command = [
         str(PYTHON_BIN),
