@@ -304,6 +304,34 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             "FROM tasks WHERE status != 'archived' ORDER BY created_at ASC, id ASC"
         ).fetchall()
         ids = [str(row["id"]) for row in rows]
+        pending_parents_by_task: dict[str, list[dict[str, str]]] = {}
+        block_projection_errors: dict[str, str] = {}
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            try:
+                link_rows = conn.execute(
+                    "SELECT l.child_id, l.parent_id, t.status AS parent_status "
+                    "FROM task_links AS l LEFT JOIN tasks AS t ON t.id = l.parent_id "
+                    f"WHERE l.child_id IN ({placeholders}) "
+                    "ORDER BY l.child_id, l.parent_id",
+                    tuple(ids),
+                ).fetchall()
+                for link in link_rows:
+                    parent = {
+                        "id": str(link["parent_id"]),
+                        "status": str(link["parent_status"] or "missing"),
+                    }
+                    if parent["status"] not in {"done", "archived"}:
+                        pending_parents_by_task.setdefault(
+                            str(link["child_id"]), []
+                        ).append(parent)
+            except sqlite3.Error as exc:
+                error = f"{type(exc).__name__}: {_safe_text(exc)}"
+                block_projection_errors = {
+                    str(row["id"]): error
+                    for row in rows
+                    if str(row["status"] or "") == "blocked"
+                }
         event_rows: list[sqlite3.Row] = []
         if ids:
             placeholders = ",".join("?" for _ in ids)
@@ -370,12 +398,29 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
                 attention = True
                 attention_reason = block_kind
 
+            block: dict[str, Any] | None = None
+            if status == "blocked":
+                projected_kind = block_kind or "untyped"
+                pending = pending_parents_by_task.get(task_id, [])
+                block = {
+                    "block_kind": projected_kind,
+                    "pending_parent_ids": [item["id"] for item in pending],
+                    "pending_parents": pending,
+                    "dependency_driven": projected_kind == "dependency",
+                    "auto_promotable": projected_kind == "dependency",
+                }
+                if task_id in block_projection_errors:
+                    block["projection_error"] = block_projection_errors[task_id]
+                    block["auto_promotable"] = False
+
             task = {
                 "id": task_id,
                 "title": _safe_text(row["title"], 120),
                 "status": status,
                 "assignee": row["assignee"],
-                "block_kind": row["block_kind"],
+                "block_kind": block["block_kind"] if block else row["block_kind"],
+                "block": block,
+                "auto_promotable": block["auto_promotable"] if block else False,
                 "block_recurrences": int(row["block_recurrences"] or 0),
                 "consecutive_failures": int(row["consecutive_failures"] or 0),
                 "last_failure_error": _safe_text(row["last_failure_error"]),

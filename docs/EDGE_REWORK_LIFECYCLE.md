@@ -70,6 +70,47 @@ Rules:
   never a rework owner: the label projection keeps `agent-review-ready` and
   never downgrades to `agent-working`.
 
+## Block-kind gate and blocked read projection (Issue #92)
+
+Hermes core retains its backwards-compatible nullable `kanban_block(kind=...)`
+API. The deployed control-plane `pre_tool_call` guard therefore rejects a
+missing, `None`, empty, malformed, or unknown kind before the core mutation is
+called. It covers both the MCP `kanban_block` tool and `hermes kanban block`
+terminal commands; unrelated tools and terminal commands remain fail-open.
+
+The guard reads the existing board database in read-only mode. It fails closed
+when the board cannot be resolved, the schema cannot be read, or the task is
+missing. When pending direct `task_links` parents exist, the diagnostic names
+each parent and status and requires an explicit `kind=dependency`; otherwise
+it tells the caller to choose one of `dependency`, `needs_input`, `capability`,
+or `transient`. An explicit canonical kind passes through unchanged, so the
+core dependency route (`dependency` → `todo` → parent-gated promotion) is not
+reimplemented or altered here.
+
+Every blocked read projection preserves the same distinction from the durable
+`tasks.block_kind` and `task_links` sources:
+
+```text
+block:
+  block_kind: dependency | needs_input | capability | transient | untyped
+  dependency_driven: true|false
+  auto_promotable: true|false
+  pending_parent_ids: [ ... ]
+  pending_parents: [{id: ..., status: ...}, ...]
+```
+
+The edge sync context and blocker comment carry this machine-readable section,
+and the read-only H4V3 Overview task projection exposes it as `task.block`
+plus the flat `block_kind`/`auto_promotable` fields. Legacy nullable rows are
+shown as `untyped`, never silently relabeled as human attention. A failed
+parent projection is explicit and forces `auto_promotable=false`.
+
+The repository deployer installs the guard before activating two
+`config.yaml` `hooks.pre_tool_call` entries (`kanban_block` and `terminal`),
+both with `fail_closed: true`. `--dry-run` validates the candidate and prints
+the planned config entries without changing the live Hermes home. Applying the
+live hook and restarting Hermes remain a separate human validation gate.
+
 ## Transitions implemented
 
 | Transition | Trigger | Effect |

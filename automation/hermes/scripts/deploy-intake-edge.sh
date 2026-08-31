@@ -37,6 +37,7 @@
 #   * timestamped backup of the previous files (existing .bak-* convention)
 #   * rollback = restore the backup (exact command printed)
 #   * NEVER touches cron jobs.json / job id / schedule / enabled state
+#   * the block-kind guard is installed before its config hook is activated
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -48,6 +49,8 @@ EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
 EDGE_HEAD_BINDING_SOURCE="$ROOT/edge/kanban_head_binding_feedback.py"
 EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 EDGE_WS_ADMISSION_SOURCE="$ROOT/edge/kanban_workspace_admission.py"
+BLOCK_KIND_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
+BLOCK_KIND_CONFIG_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-hook-config.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
 MIGRATION_SOURCE="$ROOT/automation/n8n/scripts/board_identity_migration.py"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -82,6 +85,11 @@ For the current containerized deployment:
   docker exec hermes-cloudcli-agent bash /ws/projects/<checkout>/automation/hermes/scripts/deploy-intake-edge.sh --hermes-home /home/hermes/.hermes
 
 The Hermes cron job definition (id/schedule/enabled) is never modified.
+
+The deployment also installs the fail-closed kanban_block guard and atomically
+registers its pre_tool_call matchers for kanban_block and terminal in
+config.yaml. Use --dry-run for candidate validation only; applying the live
+config hook is a human validation gate.
 EOF
 }
 
@@ -103,6 +111,8 @@ for source in \
   "$EDGE_HEAD_BINDING_SOURCE" \
   "$EDGE_RETRY_GUARD_SOURCE" \
   "$EDGE_WS_ADMISSION_SOURCE" \
+  "$BLOCK_KIND_GUARD_SOURCE" \
+  "$BLOCK_KIND_CONFIG_SOURCE" \
   "$REGISTRY_SOURCE" \
   "$MIGRATION_SOURCE"
 do
@@ -114,6 +124,8 @@ done
 
 TARGET_DIR="$HERMES_HOME/scripts"
 [[ -d "$TARGET_DIR" ]] || { echo "Hermes scripts dir not found: $TARGET_DIR" >&2; exit 2; }
+CONFIG_TARGET="$HERMES_HOME/config.yaml"
+[[ -f "$CONFIG_TARGET" ]] || { echo "Hermes config not found: $CONFIG_TARGET" >&2; exit 2; }
 
 # 1) candidate copy into a temp dir on the same filesystem
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -127,8 +139,32 @@ cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
 cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
 cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$EDGE_WS_ADMISSION_SOURCE" "$CANDIDATE/kanban_workspace_admission.py"
+cp -p "$BLOCK_KIND_GUARD_SOURCE" "$CANDIDATE/kanban-block-kind-guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
+python3 "$BLOCK_KIND_CONFIG_SOURCE" "$CONFIG_TARGET" "$CANDIDATE/config.yaml" \
+  --guard "$TARGET_DIR/kanban-block-kind-guard.py"
+python3 - "$CANDIDATE/config.yaml" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+entries = config.get("hooks", {}).get("pre_tool_call", [])
+guard_entries = [
+    entry for entry in entries
+    if isinstance(entry, dict)
+    and entry.get("matcher") in {"kanban_block", "terminal"}
+    and "kanban-block-kind-guard.py" in str(entry.get("command", ""))
+]
+if {
+    entry.get("matcher") for entry in guard_entries
+} != {"kanban_block", "terminal"} or any(
+    entry.get("fail_closed") is not True for entry in guard_entries
+):
+    raise SystemExit("candidate config is missing fail-closed block-kind hook entries")
+PY
 
 # 2) validation: compile + argparse smoke (--help exits 0)
 python3 -m py_compile \
@@ -140,6 +176,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_head_binding_feedback.py" \
   "$CANDIDATE/kanban_retry_signal_guard.py" \
   "$CANDIDATE/kanban_workspace_admission.py" \
+  "$CANDIDATE/kanban-block-kind-guard.py" \
   "$CANDIDATE/repository_registry.py" \
   "$CANDIDATE/board_identity_migration.py" || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (py_compile)" >&2; exit 1;
@@ -170,11 +207,15 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_resource_admission.py"
   echo "dry-run:   $TARGET_DIR/kanban_head_binding_feedback.py"
   echo "dry-run:   $TARGET_DIR/kanban_retry_signal_guard.py"
+  echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
   echo "dry-run:   $TARGET_DIR/board_identity_migration.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake-core.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
+  echo "dry-run: would atomically replace $CONFIG_TARGET with config hook entries"
+  echo "dry-run:   pre_tool_call matcher=kanban_block (fail_closed=true)"
+  echo "dry-run:   pre_tool_call matcher=terminal (fail_closed=true)"
   rm -rf "$CANDIDATE"
   exit 0
 fi
@@ -190,6 +231,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
+  kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py \
   github-agent-ready-kanban-intake-core.py \
@@ -203,6 +245,9 @@ do
   fi
   mv -f "$CANDIDATE/$name" "$TARGET_DIR/$name"
 done
+CONFIG_BACKUP="$HERMES_HOME/.bak-config.yaml-$TS"
+cp -p "$CONFIG_TARGET" "$CONFIG_BACKUP"
+mv -f "$CANDIDATE/config.yaml" "$CONFIG_TARGET"
 rm -rf "$CANDIDATE"
 
 source_path_for() {
@@ -231,6 +276,9 @@ source_path_for() {
     kanban_workspace_admission.py)
       printf '%s\n' "$ROOT/edge/kanban_workspace_admission.py"
       ;;
+    kanban-block-kind-guard.py)
+      printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
+      ;;
     repository_registry.py)
       printf '%s\n' "$ROOT/automation/n8n/scripts/repository_registry.py"
       ;;
@@ -253,6 +301,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
+  kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py
 do
@@ -264,7 +313,8 @@ do
   }
 done
 
-echo "Deployed intake/edge/registry to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
+echo "Deployed intake/edge/registry and block-kind hook to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
+echo "Config hook installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
 echo "Cron job bf431b2a6ba6 is untouched (id/schedule/enabled unchanged)."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Rollback:"
@@ -274,3 +324,4 @@ if [[ ${#BACKUPS[@]} -gt 0 ]]; then
     echo "  mv \"$backup\" \"$TARGET_DIR/$name\""
   done
 fi
+echo "  mv \"$CONFIG_BACKUP\" \"$CONFIG_TARGET\""
