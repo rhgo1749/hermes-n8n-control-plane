@@ -299,7 +299,7 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             shell=False,
             close_fds=True,
             env=env,
@@ -308,14 +308,16 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
         raise RuntimeError("edge_sync_spawn_failed") from exc
 
     assert process.stdout is not None
+    assert process.stderr is not None
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    output: list[bytes] = []
+    selector.register(process.stdout, selectors.EVENT_READ, data="stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, data="stderr")
+    stdout_output: list[bytes] = []
     output_bytes = 0
     deadline = time.monotonic() + timeout_seconds
-    stream_closed = False
+    open_streams = 2
     try:
-        while not stream_closed:
+        while open_streams:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _stop_edge_process(process)
@@ -327,16 +329,21 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
             for key, _ in events:
                 data = os.read(key.fd, 4096)
                 if not data:
-                    stream_closed = True
                     selector.unregister(key.fileobj)
-                    break
+                    open_streams -= 1
+                    continue
                 if (
                     output_bytes + len(data)
                     > _TIMEOUT_CONTRACT.EDGE_SYNC_OUTPUT_LIMIT_BYTES
                 ):
                     _stop_edge_process(process)
                     raise RuntimeError("edge_sync_output_limit")
-                output.append(data)
+                # stdout is the machine-readable JSON protocol. stderr is a
+                # bounded diagnostic channel and must never be parsed as JSON.
+                # Drain both pipes concurrently so a warning-heavy child cannot
+                # deadlock while preserving the existing combined output budget.
+                if key.data == "stdout":
+                    stdout_output.append(data)
                 output_bytes += len(data)
 
         remaining = deadline - time.monotonic()
@@ -352,10 +359,11 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
             selector.close()
         finally:
             process.stdout.close()
+            process.stderr.close()
 
     if returncode != 0:
         raise RuntimeError("edge_sync_command_failed")
-    raw_output = b"".join(output)
+    raw_output = b"".join(stdout_output)
     try:
         payload = json.loads(raw_output or b"")
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
