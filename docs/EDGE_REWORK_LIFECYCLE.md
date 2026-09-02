@@ -91,6 +91,15 @@ valid invocations such as `bash -ilc`, `bash -e -c`, and `bash --rcfile
 ... -c` are classified.  A definitively parsed inner command is classified
 recursively (compound `&&`/`;` segments included).
 
+The argument scan for the `hermes kanban block` invocation itself stops at the
+real shell-control-operator boundaries (`&&`, `||`, `;`, `&`, `|`, including
+adjacent no-whitespace forms such as `waiting;` or `t&&`).  A `--kind` option
+that follows such a boundary belongs to the *next* compound command and is
+never accepted for the preceding invocation, so a form such as
+`hermes kanban block <task> waiting && echo --kind=capability` is classified
+as an omitted-kind block (fail-closed), never as `kind=capability`.  A first
+segment that carries its own explicit kind is unaffected by later segments.
+
 If the command is *not* definitively parsed but references the family — a
 `hermes` reference (whole word or as in a `x=hermes` assignment) followed by
 `kanban` and then the word `block`, in any position: an unrecognized option

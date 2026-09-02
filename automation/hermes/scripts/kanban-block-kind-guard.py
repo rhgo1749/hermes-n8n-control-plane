@@ -25,6 +25,14 @@ path.  Commands that do not reference the family at all (for example
 ``printf hello`` or ``bash -lc 'printf hello'``) remain fail-open.  Shell
 options that can reinterpret their arguments (for example ``bash -i -c``)
 never prevent the family check, so dynamic spellings cannot bypass the gate.
+
+Terminal boundary (Issue #92 rework round 4): the argument scan for a
+definitively located ``hermes kanban block`` invocation stops at the real
+shell-control-operator boundaries (``&&``, ``||``, ``;``, ``&``, ``|``,
+including adjacent no-whitespace forms).  A ``--kind`` option that follows
+such a boundary belongs to the next compound command and is never accepted
+for the preceding invocation, so a compound command's options can no longer
+misattribute a kind to an omitted-kind block invocation.
 """
 from __future__ import annotations
 
@@ -47,7 +55,6 @@ _LOG_PATH = Path(
         "/home/hermes/.hermes/kanban/logs/block-kind-guard.log",
     )
 )
-_COMMAND_SEPARATORS = frozenset({";", "|", "&"})
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _SHELL_BINARIES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 _LAUNCHER_BINARIES = frozenset({"command", "builtin", "exec", "nohup"})
@@ -234,6 +241,33 @@ def _split_command(command: str) -> list[str]:
         return shlex.split(command)
     except ValueError as exc:
         raise GuardError(f"could not parse hermes kanban command: {exc}") from exc
+
+
+# Shell control operators.  ``shlex.split`` does NOT split these into separate
+# tokens the way a real shell would: ``&&`` stays a single token (whereas the
+# legacy ``_COMMAND_SEPARATORS`` only matched the single char ``&``), and an
+# unspaced ``;`` gets glued onto the preceding word (``waiting;``).  Left alone,
+# that lets a later compound command's ``--kind`` leak into the preceding
+# ``hermes kanban block`` argument scan and defeat the gate.
+_CONTROL_OPERATOR_CHARS = frozenset("&|;")
+
+
+def _is_pure_operator(token: str) -> bool:
+    """True when the token is entirely a control operator (``&&``, ``||``, ``;``)."""
+    return bool(token) and all(ch in _CONTROL_OPERATOR_CHARS for ch in token)
+
+
+def _strip_trailing_operators(value: str) -> tuple[str, bool]:
+    """Return ``(value_with_trailing_operators_removed, had_trailing_operator)``.
+
+    A glued form such as ``waiting;`` or ``t123&&`` ends one shell command; the
+    stripped prefix is still the last argument of the ``hermes kanban block``
+    invocation, while the trailing operator begins the next command.
+    """
+    index = len(value)
+    while index > 0 and value[index - 1] in _CONTROL_OPERATOR_CHARS:
+        index -= 1
+    return value[:index], index < len(value)
 
 
 # Conservative execution-family marker.  ``hermes`` and ``kanban`` must appear
@@ -467,10 +501,32 @@ def _terminal_call(
     for start, token in enumerate(tokens):
         if Path(token).name != "hermes":
             continue
+        # Bound the command segment at the real shell-control-operator boundary
+        # (``&&``, ``||``, ``;``, ``&``, ``|``).  A glued trailing operator
+        # (``waiting;``) ends this command but its stripped prefix is still the
+        # last argument of this invocation.  Options that follow the operator
+        # belong to the *next* compound command and must never feed this call's
+        # argument scan (Issue #92 rework round 4).
         end = start + 1
-        while end < len(tokens) and tokens[end] not in _COMMAND_SEPARATORS:
+        glued = False
+        while end < len(tokens):
+            candidate = tokens[end]
+            if _is_pure_operator(candidate):
+                glued = True
+                break
+            stripped, had_operator = _strip_trailing_operators(candidate)
+            if had_operator:
+                tokens[end] = stripped
+                glued = True
+                break
             end += 1
         segment = tokens[start + 1 : end]
+        if glued:
+            # Re-check whether the (possibly stripped) last segment token is
+            # itself now a bare operator, so a glued ``&&`` cannot extend the
+            # segment one token too far.
+            while segment and _is_pure_operator(segment[-1]):
+                segment = segment[:-1]
         try:
             kanban_at = segment.index("kanban")
         except ValueError:

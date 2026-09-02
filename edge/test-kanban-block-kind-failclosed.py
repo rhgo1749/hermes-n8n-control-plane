@@ -250,6 +250,72 @@ def test_omitted_kind_through_shell_wrappers_is_blocked(board_db, command):
     _assert_blocked(result, "explicit kind")
 
 
+def test_compound_followup_kind_does_not_leak_into_block_segment(board_db):
+    """A ``--kind`` from a *later* compound command must not classify the block.
+
+    ``shlex.split`` yields ``&&`` as one token and glues an unspaced ``;`` onto
+    the preceding word (``waiting;``), so the argument scan must stop at the
+    real shell-control-operator boundary instead of reading the next command's
+    options (Issue #92 rework round 4).
+    """
+    path, _, child = board_db
+    commands = (
+        f"hermes kanban block {child} waiting && echo --kind=capability",
+        f"hermes kanban block {child} waiting; echo --kind=capability",
+        f"hermes kanban block {child} waiting&& echo --kind=capability",
+        f"hermes kanban block {child} waiting| echo --kind=capability",
+        f"bash -lc 'hermes kanban block {child} waiting && echo --kind=capability'",
+        f"bash -lc 'hermes kanban block {child} waiting; echo --kind=capability'",
+    )
+    for command in commands:
+        result = _run_guard(
+            path,
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+        )
+        _assert_blocked(result, "explicit kind")
+        with kanban_db.connect_closing(path) as conn:
+            row = conn.execute(
+                "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+            ).fetchone()
+        assert tuple(row) == ("ready", None)
+
+
+def test_explicit_kind_in_block_segment_survives_compound_followup(board_db):
+    """A valid block with its own explicit kind still passes when a later
+    compound command mentions ``--kind`` (the first segment's kind wins)."""
+    path, _, child = board_db
+    result = _run_guard(
+        path,
+        {
+            "tool_name": "terminal",
+            "tool_input": {
+                "command": (
+                    f"hermes kanban block {child} waiting --kind=capability"
+                    " && echo --kind=dependency"
+                )
+            },
+        },
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+def test_unrelated_followup_compound_remains_fail_open(board_db):
+    """A non-block first segment with a later ``--kind`` is unrelated and
+    fail-open; the operator boundary must not turn it into a block."""
+    path, _, child = board_db
+    commands = (
+        "echo hi && echo --kind=capability",
+        f"hermes kanban show {child} && echo --kind=capability",
+        f"hermes kanban unblock {child} && echo --kind=capability",
+    )
+    for command in commands:
+        result = _run_guard(
+            path,
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+        )
+        assert result.returncode == 0, (command, result.stdout, result.stderr)
+
+
 def test_explicit_kind_through_shell_wrapper_passes(board_db):
     path, _, child = board_db
     result = _run_guard(
