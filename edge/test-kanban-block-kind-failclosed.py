@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 sys.path.insert(0, "/ws/hermes-agent")
 from hermes_cli import kanban_db  # type: ignore[import-not-found]
@@ -558,6 +559,128 @@ def test_deployer_dry_run_validates_without_changing_live_config():
         assert "matcher=kanban_block (fail_closed=true)" in result.stdout
         assert "matcher=terminal (fail_closed=true)" in result.stdout
         assert config.read_text(encoding="utf-8") == original
+        assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
+
+
+def test_hook_config_preserves_following_sibling_hook():
+    # A valid config where post_tool_call immediately follows pre_tool_call.
+    # The pre_tool_call range must terminate at that sibling so the guard is
+    # attached to pre_tool_call, not swallowed under post_tool_call.
+    original = (
+        "hooks:\n"
+        "  pre_tool_call:\n"
+        "    - matcher: other\n"
+        "      command: python3 /tmp/other.py\n"
+        "  post_tool_call:\n"
+        "    - matcher: audit\n"
+        "      command: python3 /tmp/audit.py\n"
+        "\n"
+        "logging:\n"
+        "  level: INFO\n"
+    )
+    helper = _load("issue92_config_helper", CONFIG_HELPER)
+    command = "python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+    rendered = helper.render(original, command)
+    again = helper.render(rendered, command)
+    assert rendered == again
+    config = yaml.safe_load(rendered)
+    pre = config["hooks"]["pre_tool_call"]
+    post = config["hooks"]["post_tool_call"]
+    pre_matchers = {entry["matcher"] for entry in pre}
+    post_matchers = {entry["matcher"] for entry in post}
+    assert pre_matchers == {"other", "kanban_block", "terminal"}
+    assert post_matchers == {"audit"}
+    guard_entries = [
+        entry
+        for entry in pre
+        if "kanban-block-kind-guard.py" in str(entry.get("command", ""))
+    ]
+    assert {entry["matcher"] for entry in guard_entries} == {"kanban_block", "terminal"}
+    assert all(entry.get("fail_closed") is True for entry in guard_entries)
+    # the sibling entry and its command survive byte-for-byte
+    assert "  post_tool_call:\n" in rendered
+    assert "      command: python3 /tmp/audit.py\n" in rendered
+    assert "logging:\n" in rendered
+
+
+def test_history_read_back_preserves_block_kind_across_blocked_runs(board_db):
+    # Issue #92 requirement: a PAST status=blocked / outcome=blocked run must not
+    # collapse to an undifferentiated "blocked" reading.  Cycle a task through
+    # several distinct block kinds (including a legacy None block) and assert the
+    # historical read-back preserves each block_kind + dependency provenance.
+    path, _, _ = board_db
+    with kanban_db.connect_closing(path) as conn:
+        # A no-parent task cycles cleanly through ready <-> blocked for the
+        # truly-blocked kinds, so each block lands in `blocked` with an
+        # outcome=blocked run and a distinct payload.kind.
+        task = kanban_db.create_task(conn, title="history-probe", assignee="worker", initial_status="running")
+        assert kanban_db.block_task(conn, task, reason="needs maintainer", kind="capability")
+        assert kanban_db.unblock_task(conn, task)
+        assert kanban_db.block_task(conn, task, reason="waiting on decision", kind="needs_input")
+        assert kanban_db.unblock_task(conn, task)
+        assert kanban_db.block_task(conn, task, reason="legacy untyped block", kind=None)
+        history = sync._task_block_history(conn, task)
+        projection = sync._blocked_state_projection(conn, task, None)
+        rendered = sync._render_sync_context(
+            sync.GithubTaskRef("owner/repo", 92),
+            [],
+            {},
+            block_projection=projection,
+            block_history=history,
+        )
+    # Most-recent-first: legacy untyped, then needs_input, then capability.
+    assert [entry["block_kind"] for entry in history] == ["untyped", "needs_input", "capability"]
+    # Every truly-blocked entry is dependency-false; none is misclassified as a
+    # dependency hold (that is the R2 invariant: omitted/None is not dependency).
+    assert all(entry["dependency_driven"] is False for entry in history)
+    assert all(entry["auto_promotable"] is False for entry in history)
+    # The reason for each historical block is preserved, not erased.
+    reasons = {entry["block_kind"]: entry["reason"] for entry in history}
+    assert "needs maintainer" in reasons["capability"]
+    assert "waiting on decision" in reasons["needs_input"]
+    assert "legacy untyped block" in reasons["untyped"]
+    # The read-back is rendered into the sync context (a canonical read surface),
+    # not only the current Overview row.
+    assert "block_history:" in rendered
+    assert "block_kind=capability" in rendered
+    assert "block_kind=needs_input" in rendered
+    assert "block_kind=untyped" in rendered
+    assert "auto_promotable=false" in rendered
+    assert "dependency_driven=false" in rendered
+
+
+def test_deployer_dry_run_with_following_sibling_hook():
+    with tempfile.TemporaryDirectory(prefix="issue92-hermes-home-sib-") as directory:
+        home = Path(directory)
+        scripts = home / "scripts"
+        scripts.mkdir()
+        config = home / "config.yaml"
+        config.write_text(
+            "hooks:\n"
+            "  pre_tool_call:\n"
+            "    - matcher: other\n"
+            "      command: python3 /tmp/other.py\n"
+            "  post_tool_call:\n"
+            "    - matcher: audit\n"
+            "      command: python3 /tmp/audit.py\n"
+            "\n"
+            "logging:\n"
+            "  level: INFO\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "matcher=kanban_block (fail_closed=true)" in result.stdout
+        assert "matcher=terminal (fail_closed=true)" in result.stdout
+        # dry-run leaves the live config untouched and no candidate behind
+        live = config.read_text(encoding="utf-8")
+        assert live.count("post_tool_call") == 1
+        assert "kanban-block-kind-guard.py" not in live
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
 
 

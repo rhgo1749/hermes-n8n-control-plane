@@ -34,9 +34,27 @@ def _render_entry_block(command: str) -> list[str]:
     return lines
 
 
-def _top_level_end(lines: list[str], start: int) -> int:
+def _pre_tool_call_end(lines: list[str], start: int) -> int:
+    """End of the ``hooks: pre_tool_call:`` block.
+
+    The range stops at the next *sibling* key that sits at the same two-space
+    indentation under ``hooks:`` (for example ``post_tool_call:``) or at the
+    next unindented top-level key (for example ``logging:``).  A blank line or
+    a comment that belongs to the following section does not terminate the
+    range.  Terminating only at the next top-level key made a valid config with
+    a ``post_tool_call`` sibling swallow that sibling (and its entries) into
+    the ``pre_tool_call`` range, so the guard entries were appended at the end
+    of a range that already contained the sibling — and the YAML parser then
+    attached the new entries to ``post_tool_call`` instead of ``pre_tool_call``.
+    """
     for index in range(start + 1, len(lines)):
-        if lines[index].strip() and not lines[index].startswith((" ", "\t", "#")):
+        line = lines[index]
+        # A two-space-indented key that is NOT the deeper four-space entry
+        # form (``    - ``) is a sibling hook key and terminates the range.
+        if line.startswith("  ") and not line.startswith(("    ", "  \t")) and line.lstrip() and line.lstrip()[0] not in "#-":
+            return index
+        # An unindented top-level key also terminates the range.
+        if line.strip() and not line.startswith(" "):
             return index
     return len(lines)
 
@@ -44,7 +62,7 @@ def _top_level_end(lines: list[str], start: int) -> int:
 def _pre_tool_call_range(lines: list[str]) -> tuple[int, int] | None:
     for index, line in enumerate(lines):
         if line.startswith("  pre_tool_call:"):
-            return index, _top_level_end(lines, index)
+            return index, _pre_tool_call_end(lines, index)
     return None
 
 

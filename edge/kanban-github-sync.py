@@ -81,7 +81,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, cast
+from typing import Any, Iterable, Mapping, Optional, Sequence, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -1132,6 +1132,7 @@ def _build_context_block(
     *,
     rework_pr_number: Optional[int] = None,
     block_projection: Mapping[str, Any] | None = None,
+    block_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     prs = tuple(pull_requests)
     contexts = {pr.number: _collect_pr_context(client, ref, pr) for pr in prs}
@@ -1141,6 +1142,7 @@ def _build_context_block(
         contexts,
         rework_pr_number=rework_pr_number,
         block_projection=block_projection,
+        block_history=block_history,
     )
 
 
@@ -1217,6 +1219,7 @@ def _render_sync_context(
     *,
     rework_pr_number: Optional[int] = None,
     block_projection: Mapping[str, Any] | None = None,
+    block_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     prs = sorted(pull_requests, key=lambda item: item.number)
     lines: list[str] = [SYNC_CONTEXT_BEGIN, ""]
@@ -1242,6 +1245,20 @@ def _render_sync_context(
         )
         if block_projection.get("projection_error"):
             lines.append(f"  projection_error: {block_projection['projection_error']}")
+        if block_history:
+            lines.append("  block_history:")
+            for entry in block_history:
+                lines.append(
+                    "    - at: "
+                    f"{entry.get('at')} kind={entry.get('kind')} "
+                    f"block_kind={entry.get('block_kind')} "
+                    f"dependency_driven={str(bool(entry.get('dependency_driven'))).lower()} "
+                    f"auto_promotable={str(bool(entry.get('auto_promotable'))).lower()}"
+                )
+                if entry.get("source_status"):
+                    lines.append(f"      source_status: {entry['source_status']}")
+                if entry.get("reason"):
+                    lines.append(f"      reason: {entry['reason']}")
         lines.append("")
     lines.append("## Current linked PR" if len(prs) == 1 else "## Linked PRs")
     for pr in prs:
@@ -1380,6 +1397,60 @@ def _blocked_state_projection(
         projection["projection_error"] = f"{type(exc).__name__}: {exc}"
         projection["auto_promotable"] = False
     return projection
+
+
+def _task_block_history(conn: sqlite3.Connection, task_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Reconstruct the block-semantics history for ``task_id``.
+
+    Issue #92 requires that a past ``status=blocked`` / ``outcome=blocked`` run
+    does not collapse to an undifferentiated ``blocked`` reading.  This reads
+    the canonical durable sources (``task_events`` kind ``blocked`` /
+    ``dependency_wait`` / ``block_loop_detected``, plus the matching
+    ``task_runs`` ``outcome=blocked`` row) and projects each historical block
+    with its ``block_kind``, ``dependency_driven`` / ``auto_promotable``
+    semantics, and a bounded reason.  A missing legacy ``kind`` is rendered as
+    ``untyped`` rather than guessed.  No new parallel store is introduced.
+    """
+    entries: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT kind, payload, created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected') "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (task_id, limit),
+    ).fetchall()
+    for row in rows:
+        payload: dict[str, Any] = {}
+        if row["payload"]:
+            try:
+                loaded = json.loads(row["payload"])
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (TypeError, ValueError):
+                payload = {}
+        kind = payload.get("kind")
+        kind_text = "untyped" if kind in (None, "") else str(kind)
+        reason = str(payload.get("reason") or "").strip()
+        if not reason:
+            run = conn.execute(
+                "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'blocked' "
+                "AND summary IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if run and run["summary"]:
+                reason = str(run["summary"]).strip()
+        entries.append(
+            {
+                "kind": row["kind"],
+                "block_kind": kind_text,
+                "dependency_driven": kind == "dependency",
+                "auto_promotable": kind == "dependency",
+                "recurrences": payload.get("recurrences"),
+                "source_status": payload.get("source_status"),
+                "reason": _truncate(reason, MAX_ITEM_CHARS) if reason else "",
+                "at": row["created_at"],
+            }
+        )
+    return entries
 
 
 def _blocker_comment_body(
@@ -3705,6 +3776,7 @@ def _reconcile_blocked(
                 ref,
                 decision.pull_requests,
                 block_projection=block_projection,
+                block_history=_task_block_history(conn, task_id),
             )
         except GithubCompletionError:
             context_block = None
