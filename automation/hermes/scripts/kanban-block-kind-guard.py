@@ -11,6 +11,20 @@ The hook is registered for both the MCP ``kanban_block`` tool and terminal
 commands invoking ``hermes kanban block``.  Explicit canonical kinds are
 allowed after the task/parent graph has been read successfully.  Missing,
 empty, malformed, ambiguous, or unresolvable input fails closed.
+
+Terminal boundary (Issue #92 rework round 3): the classifier first tries to
+definitively parse a recognized invocation chain (env assignments, launcher
+prefixes, a supported ``sh``/``bash``/``dash``/``zsh``/``ksh`` ``-c``/``-lc``
+inline command, bounded depth).  When a command is *not* definitively parsed
+but conservatively references the ``hermes kanban block`` execution family
+(``hermes`` present as a lowercase substring, ``kanban`` and ``block`` as
+tokens, in any position: quoted inline command, ``eval`` or variable
+indirection, script-form argument, or compound segment), it fails closed
+instead of guessing a ``kind`` or allowing the legacy ``kind=None`` mutation
+path.  Commands that do not reference the family at all (for example
+``printf hello`` or ``bash -lc 'printf hello'``) remain fail-open.  Shell
+options that can reinterpret their arguments (for example ``bash -i -c``)
+never prevent the family check, so dynamic spellings cannot bypass the gate.
 """
 from __future__ import annotations
 
@@ -222,6 +236,32 @@ def _split_command(command: str) -> list[str]:
         raise GuardError(f"could not parse hermes kanban command: {exc}") from exc
 
 
+# Conservative execution-family marker.  ``hermes`` and ``kanban`` must appear
+# as whole words in order, and ``block`` must appear as a whole word *after*
+# them.  Requiring ``block`` as a whole word means ``unblock`` and ``show``
+# (a different word) do not fire, while variable indirection (``x=hermes; $x
+# kanban block ...``) and a quoted inline command (``eval "hermes kanban
+# block ..."``) still reference the family.
+_BLOCK_FAMILY_RE = re.compile(
+    r"\bhermes\b[\s\S]*?\bkanban\b[\s\S]*?\bblock\b",
+    re.IGNORECASE,
+)
+
+
+def _references_block_family(command: str) -> bool:
+    """Conservative marker for the ``hermes kanban block`` execution family.
+
+    Fires when an executable command string references the family: a top-level
+    invocation, an inline ``-c`` command, ``eval`` or variable indirection, or
+    a compound segment.  It intentionally does *not* fire on ``hermes kanban
+    unblock`` / ``show`` (a different word than ``block``) or on a command that
+    has no ``hermes`` reference at all.  A reference the parser could not
+    definitively classify is the *safe* case to fail closed on, so it is treated
+    as a potential ``hermes kanban block`` invocation.
+    """
+    return _BLOCK_FAMILY_RE.search(command) is not None
+
+
 def _consume_env_prefix(tokens: list[str], index: int) -> int | None:
     """Consume a conservative, invocation-only subset of ``env`` options."""
     index += 1
@@ -332,34 +372,65 @@ def _launcher_shell_index(tokens: list[str]) -> int | None:
     return None
 
 
+_SHELL_FLAG_ONLY = frozenset(
+    {
+        # Flags that do not take a command string; they may appear (grouped or
+        # not) before a ``-c`` and never change which argument is the command.
+        "-l", "--login", "-i", "--interactive", "-e", "-x", "-n", "--norc",
+        "--noprofile", "--posix", "-v", "-s", "-p", "-f",
+    }
+)
+
+
 def _shell_inline_command(tokens: list[str], index: int) -> str | None:
-    """Return the command string for a supported shell option spelling."""
+    """Return the command string a recognized shell will execute.
+
+    Scans the option cluster after the shell name.  A *command-string* option
+    (``-c``, ``--command``, or a grouped short option whose characters include
+    ``c``, e.g. ``-lc``/``-ilc``/``-elc``) makes the following token the
+    command to execute; flag-only options (``-i``, ``-e``, ``-l``, ``-x``,
+    ``--login``, ...) are skipped.  A command string is only returned when such
+    an option is present, so a shell invoked with a bare script or a positional
+    argument (for example ``dash -x '...'`` or ``/tmp/w.sh '...'``) is *not*
+    treated as an inline command and keeps the fail-open behavior.
+    """
     rest = tokens[index + 1 :]
     position = 0
     while position < len(rest):
         value = rest[position]
-        if value in ("--login", "-l"):
-            position += 1
-            continue
-        if value in ("-c", "-lc", "-cl"):
+        if value == "--command" or value == "-c":
             if position + 1 >= len(rest):
                 return None
-            inner = rest[position + 1]
-            return inner if inner else None
-        # A shell option not explicitly covered above could change how the
-        # remaining arguments are interpreted; leave it fail-open.
+            return rest[position + 1]
+        if value in _SHELL_FLAG_ONLY:
+            position += 1
+            continue
+        if (
+            value.startswith("-")
+            and not value.startswith("--")
+            and len(value) > 1
+            and "c" in value[1:]
+        ):
+            # Grouped short option containing ``c``: the next token is the
+            # command string (bash ``-ilc`` == ``-i -l -c``).
+            if position + 1 >= len(rest):
+                return None
+            return rest[position + 1]
+        # A long option we do not classify, or a non-dash token (a script path
+        # / positional argument): the shell will not run an inline command
+        # string here, so leave it fail-open rather than guess.
         return None
     return None
 
 
 def _unwrap_shell_command(tokens: list[str]) -> str | None:
-    """Return a safely unwrapped supported shell ``-c`` command.
+    """Return a definitively parsed supported shell ``-c`` command.
 
-    Common launchers are handled only for known invocation options.  Any other
-    shape (an unknown binary, a bare script path, or an unrecognized flag)
-    returns ``None`` so the caller keeps the previous fail-open behavior.  This
-    only exposes an inner command to the same classification; it never infers or
-    repairs a ``kind``.
+    Only recognized invocation chains (env assignments, ``env``/``command``/
+    ``builtin``/``exec``/``nohup`` prefixes, supported shell option spellings)
+    yield a parsed inner command.  Any other shape returns ``None``; the caller
+    then classifies the conservative block family instead of guessing an inner
+    command.  This never infers or repairs a ``kind``.
     """
     index = _launcher_shell_index(tokens)
     if index is None or index >= len(tokens):
@@ -374,9 +445,15 @@ def _terminal_call(
 ) -> tuple[str | None, str, str, str] | None:
     """Return one parsed block command, or None for unrelated terminal input.
 
-    A supported inline shell wrapper (``sh -c``, ``bash -lc``, ...) is unwrapped first
-    so a ``hermes kanban block`` call hidden behind a shell cannot bypass the gate.
-    Commands that are not a supported wrapper keep the previous fail-open behavior.
+    A definitively parsed inline shell wrapper (``sh -c``, ``bash -lc``, ...)
+    is unwrapped first so a ``hermes kanban block`` call hidden behind a
+    recognized shell cannot bypass the gate.  A top-level ``hermes`` invocation
+    is classified directly.  If none of that resolves but the command still
+    references the ``hermes kanban block`` execution family (an unrecognized
+    shell option, ``eval``, variable indirection, or an indirect form), it fails
+    closed (``GuardError``) rather than allowing the legacy ``kind=None``
+    mutation path; only commands that do not reference the family remain
+    fail-open.
     """
     tokens = _split_command(command)
     inner = _unwrap_shell_command(tokens)
@@ -436,6 +513,13 @@ def _terminal_call(
             index += 1
         task_id = positionals[0] if positionals else os.environ.get("HERMES_KANBAN_TASK", "")
         return kind, task_id.strip(), board.strip(), "terminal"
+    if _references_block_family(command):
+        raise GuardError(
+            "terminal command references a hermes kanban block invocation that "
+            "the gate cannot classify definitively (unknown shell option, "
+            "dynamic or indirect form). An explicit --kind is required before "
+            "the command can be allowed; no task mutation was performed"
+        )
     return None
 
 

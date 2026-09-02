@@ -78,16 +78,36 @@ missing, `None`, empty, malformed, or unknown kind before the core mutation is
 called. It covers both the MCP `kanban_block` tool and `hermes kanban block`
 terminal commands; unrelated tools and terminal commands remain fail-open.
 
-For terminal commands, the classifier safely unwraps only an allowlisted
-invocation chain: `env` assignments plus recognized environment flags, then
-`command`, `builtin`, `exec`, or `nohup` with their invocation-only options,
-followed by a supported `sh`/`bash`/`dash`/`zsh`/`ksh` inline command. Shell
-forms `-c`, `-lc`, `-cl`, `-l -c`, and `--login -c` are supported. Unknown
-launcher flags, shell options, bare scripts, and unsupported wrappers remain
-fail-open rather than being guessed as a hidden Kanban call. The chain is
-bounded at `_MAX_UNWRAP_DEPTH` (currently 8); a recognized wrapper beyond that
-bound raises a guard error and blocks, including when the inner command carries
-an otherwise explicit kind.
+For terminal commands the gate classifies the `hermes kanban block`
+execution family, not an allowlist of exact shell spellings.  It first tries
+to definitively parse a recognized invocation chain: `env` assignments plus
+recognized environment flags, then `command`, `builtin`, `exec`, or `nohup`
+with their invocation-only options, followed by a supported `sh`/`bash`/
+`dash`/`zsh`/`ksh` inline command.  The inline-command scan accepts a
+command-string option (`-c`, `--command`, or a grouped short option whose
+characters include `c`, e.g. `-lc`/`-cl`/`-ilc`/`-elc`) after any number of
+flag-only options (`-i`, `-e`, `-x`, `-n`, `-l`, `--login`, ...), so ordinary
+valid invocations such as `bash -ilc`, `bash -e -c`, and `bash --rcfile
+... -c` are classified.  A definitively parsed inner command is classified
+recursively (compound `&&`/`;` segments included).
+
+If the command is *not* definitively parsed but references the family — a
+`hermes` reference (whole word or as in a `x=hermes` assignment) followed by
+`kanban` and then the word `block`, in any position: an unrecognized option
+cluster, `eval`, variable indirection (`x=hermes; $x kanban block ...`), a
+non-shell script-form argument, or a compound segment — the gate fails closed
+instead of guessing a `kind` or
+allowing the legacy `kind=None` mutation path.  This is the boundary the
+Issue asks for: the classifier does not claim that only an enumerated subset
+of shell spellings is closed; it closes the CLI boundary for every command
+string that can execute `hermes kanban block` and cannot be proven not to.
+Commands with no family reference (for example `printf hello`, `hermes
+kanban show`, `hermes kanban unblock`, or `bash -lc 'printf hello'`) remain
+fail-open, and no `kind` is ever inferred or repaired.
+
+The recursive unwrap chain is bounded at `_MAX_UNWRAP_DEPTH` (currently 8); a
+recognized wrapper beyond that bound raises a guard error and blocks,
+including when the inner command carries an otherwise explicit kind.
 
 The guard reads the existing board database in read-only mode. It fails closed
 when the board cannot be resolved, the schema cannot be read, or the task is

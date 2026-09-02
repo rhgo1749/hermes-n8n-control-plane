@@ -333,18 +333,21 @@ def test_shell_wrapper_depth_limit_fails_closed_without_mutation(board_db):
 @pytest.mark.parametrize(
     "command",
     [
+        "printf hello",
         "bash -lc 'printf hello'",
         "sh -c 'ls -la'",
-        "dash -x 'hermes kanban block t_nonexistent waiting'",
-        "/tmp/w.sh 'hermes kanban block t_nonexistent waiting'",
+        "bash --rcfile /dev/null -c 'printf hello'",
+        "hermes kanban show t_nonexistent",
+        "hermes kanban unblock t_nonexistent",
     ],
 )
-def test_unrelated_or_unsupported_wrappers_fail_open(board_db, command):
-    """Wrappers the gate does not recognize must not be falsely blocked.
+def test_unrelated_commands_fail_open(board_db, command):
+    """Commands that do not reference the block family must not be falsely blocked.
 
-    ``sh``/``bash`` ``-c``/``-lc`` unwrapping is intentionally narrow; an unknown
-    binary, a bare script path, or an unrecognized flag keeps the previous fail-open
-    behavior rather than guessing at a hidden ``kind``.
+    The classifier unwraps only a recognized invocation chain; commands without a
+    ``hermes``/``kanban``/``block`` reference (or a different subcommand such as
+    ``show``/``unblock``) keep the fail-open behavior rather than being guessed as
+    a hidden ``kind``.
     """
     path = board_db[0]
     result = _run_guard(
@@ -352,6 +355,79 @@ def test_unrelated_or_unsupported_wrappers_fail_open(board_db, command):
         {"tool_name": "terminal", "tool_input": {"command": command}},
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A command string that references the block family through an
+        # unrecognized shell flag or a non-shell script-form argument cannot be
+        # definitively classified, so the gate fails closed instead of allowing
+        # the legacy ``kind=None`` mutation path (Issue #92 rework round 3).
+        "dash -x 'hermes kanban block t_nonexistent waiting'",
+        "/tmp/w.sh 'hermes kanban block t_nonexistent waiting'",
+        "eval 'hermes kanban block t_nonexistent waiting'",
+    ],
+)
+def test_family_referencing_unsupported_forms_fail_closed(board_db, command):
+    """A family reference the parser cannot definitively unwrap fails closed.
+
+    The conservative execution-family check (rather than an allowlist of exact
+    spellings) is what closes the CLI boundary: if the command string could
+    execute ``hermes kanban block`` and the gate cannot prove it cannot, it
+    blocks instead of guessing a ``kind``.
+    """
+    path = board_db[0]
+    result = _run_guard(
+        path,
+        {"tool_name": "terminal", "tool_input": {"command": command}},
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Trusted review findings at head a6d9f84: ordinary valid Bash
+        # invocations that actually execute the omitted-kind CLI path.
+        "bash -ilc 'hermes kanban block {child} waiting'",
+        "bash -e -c 'hermes kanban block {child} waiting'",
+        "bash -lc 'eval \"hermes kanban block {child} waiting\"'",
+        "bash -lc 'x=hermes; $x kanban block {child} waiting'",
+    ],
+)
+def test_dynamic_and_indirect_block_forms_fail_closed(board_db, command):
+    """Dynamic/indirect spellings of the omitted-kind call fail closed.
+
+    A shell option that can reinterpret its argument (``-i``, ``-e``), an
+    ``eval`` indirection, or a variable indirection (``x=hermes; $x ...``) all
+    actually execute the same ``hermes kanban block`` CLI path, so the gate
+    must block them rather than allow the legacy ``kind=None`` mutation.  No
+    ``kind`` is inferred or repaired.
+
+    The ``-ilc``/``-e -c`` forms are now definitively unwrapped by the
+    inline-command scan (grouped ``c`` plus flag-only ``-i``/``-e``) and blocked
+    with a parsed ``explicit kind`` diagnostic; the ``eval``/``$x`` indirection
+    forms are not definitively parsed and fail closed on the conservative
+    execution-family check.  Either way the gate blocks instead of guessing a
+    ``kind``, so the invariant asserted here is: rc=2, a ``block`` action, and
+    no task mutation.
+    """
+    path, _, child = board_db
+    result = _run_guard(
+        path,
+        {"tool_name": "terminal", "tool_input": {"command": command.format(child=child)}},
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "No task mutation was performed" in body["message"]
+    # No task mutation was performed.
+    with kanban_db.connect_closing(path) as conn:
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+        ).fetchone()
+    assert tuple(row) == ("ready", None)
 
 
 def test_block_projection_and_sync_context_keep_kind_and_parent_provenance(board_db):
