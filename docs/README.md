@@ -17,6 +17,7 @@ Do not preload every document. Use the narrowest route that covers the change su
 | --- | --- |
 | GitHub webhook intake, delivery dedupe, lease ordering, async event flow | [`GITHUB_EVENT_CONCURRENCY.md`](GITHUB_EVENT_CONCURRENCY.md) |
 | Rework dispatch, retry, verification-only handling, terminal/review transitions | [`EDGE_REWORK_LIFECYCLE.md`](EDGE_REWORK_LIFECYCLE.md) |
+| `kanban_block` kind validation and blocked-state provenance projection | [`EDGE_REWORK_LIFECYCLE.md`](EDGE_REWORK_LIFECYCLE.md) |
 | Worker slot/resource admission and dispatch capacity | [`EDGE_WORKER_RESOURCE_ADMISSION.md`](EDGE_WORKER_RESOURCE_ADMISSION.md) |
 | Worker completion vs GitHub review/done projection | [`GITHUB_COMPLETION_LIFECYCLE.md`](GITHUB_COMPLETION_LIFECYCLE.md) |
 | Kanban role ownership and role-specific authority | [`KANBAN_ROLE_CONTRACTS.md`](KANBAN_ROLE_CONTRACTS.md) |

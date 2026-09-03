@@ -70,6 +70,116 @@ Rules:
   never a rework owner: the label projection keeps `agent-review-ready` and
   never downgrades to `agent-working`.
 
+## Block-kind gate and blocked read projection (Issue #92)
+
+Hermes core retains its backwards-compatible nullable `kanban_block(kind=...)`
+API. The deployed control-plane `pre_tool_call` guard therefore rejects a
+missing, `None`, empty, malformed, or unknown kind before the core mutation is
+called. It covers both the MCP `kanban_block` tool and `hermes kanban block`
+terminal commands; unrelated tools and terminal commands remain fail-open.
+
+For terminal commands the gate classifies the `hermes kanban block`
+execution family, not an allowlist of exact shell spellings.  It first tries
+to definitively parse a recognized invocation chain: `env` assignments plus
+recognized environment flags, then `command`, `builtin`, `exec`, or `nohup`
+with their invocation-only options, followed by a supported `sh`/`bash`/
+`dash`/`zsh`/`ksh` inline command.  The inline-command scan accepts a
+command-string option (`-c`, `--command`, or a grouped short option whose
+characters include `c`, e.g. `-lc`/`-cl`/`-ilc`/`-elc`) after any number of
+flag-only options (`-i`, `-e`, `-x`, `-n`, `-l`, `--login`, ...), so ordinary
+valid invocations such as `bash -ilc`, `bash -e -c`, and `bash --rcfile
+... -c` are classified.  A definitively parsed inner command is classified
+recursively (compound `&&`/`;` segments included).
+
+The argument scan for the `hermes kanban block` invocation itself stops at the
+real shell-control-operator boundaries (`&&`, `||`, `;`, `&`, `|`, including
+adjacent no-whitespace forms such as `waiting;` or `t&&`).  A `--kind` option
+that follows such a boundary belongs to the *next* compound command and is
+never accepted for the preceding invocation, so a form such as
+`hermes kanban block <task> waiting && echo --kind=capability` is classified
+as an omitted-kind block (fail-closed), never as `kind=capability`.  A first
+segment that carries its own explicit kind is unaffected by later segments.
+
+If the command is *not* definitively parsed but references the family — a
+`hermes` reference (whole word or as in a `x=hermes` assignment) followed by
+`kanban` and then the word `block`, in any position: an unrecognized option
+cluster, `eval`, variable indirection (`x=hermes; $x kanban block ...`), a
+non-shell script-form argument, or a compound segment — the gate fails closed
+instead of guessing a `kind` or
+allowing the legacy `kind=None` mutation path.  This is the boundary the
+Issue asks for: the classifier does not claim that only an enumerated subset
+of shell spellings is closed; it closes the CLI boundary for every command
+string that can execute `hermes kanban block` and cannot be proven not to.
+Commands with no family reference (for example `printf hello`, `hermes
+kanban show`, `hermes kanban unblock`, or `bash -lc 'printf hello'`) remain
+fail-open, and no `kind` is ever inferred or repaired.
+
+The recursive unwrap chain is bounded at `_MAX_UNWRAP_DEPTH` (currently 8); a
+recognized wrapper beyond that bound raises a guard error and blocks,
+including when the inner command carries an otherwise explicit kind.
+
+The guard reads the existing board database in read-only mode. It fails closed
+when the board cannot be resolved, the schema cannot be read, or the task is
+missing. When pending direct `task_links` parents exist, the diagnostic names
+each parent and status and requires an explicit `kind=dependency`; otherwise
+it tells the caller to choose one of `dependency`, `needs_input`, `capability`,
+or `transient`. An explicit canonical kind passes through unchanged, so the
+core dependency route (`dependency` → `todo` → parent-gated promotion) is not
+reimplemented or altered here.
+
+Every blocked read projection preserves the same distinction from the durable
+`tasks.block_kind` and `task_links` sources:
+
+```text
+block:
+  block_kind: dependency | needs_input | capability | transient | untyped
+  dependency_driven: true|false
+  auto_promotable: true|false
+  pending_parent_ids: [ ... ]
+  pending_parents: [{id: ..., status: ...}, ...]
+```
+
+The edge sync context and blocker comment carry this machine-readable section,
+and the read-only H4V3 Overview task projection exposes it as `task.block`
+plus the flat `block_kind`/`auto_promotable` fields. Legacy nullable rows are
+shown as `untyped`, never silently relabeled as human attention. A failed
+parent projection is explicit and forces `auto_promotable=false`.
+
+### Historical block-semantics read surface (Issue #92)
+
+A past `status=blocked` / `outcome=blocked` run must not collapse to an
+undifferentiated `blocked` reading. The durable history is reconstructed from
+the canonical `task_events` (kind `blocked` / `dependency_wait` /
+`block_loop_detected`) plus the matching `task_runs` row — no parallel state
+store is introduced. Each historical entry carries `block_kind`,
+`dependency_driven` / `auto_promotable`, and a bounded reason.
+
+Two invariants make the read surface safe and useful:
+
+* **Status-agnostic reachability.** A canonical `kanban_block(kind=
+  "dependency")` routes the task to `todo` (auto-promotable) and later `ready`
+  when its parents resolve — it does NOT remain `blocked`. The history is
+  therefore exposed on a general read surface reachable while the task is in
+  the dependency `todo`/`ready` path AND after auto-promotion, not only while
+  it sits in a human `blocked` state. The H4V3 Overview carries it as
+  `task.block_history`; the edge sync context renders a `block_history:` section
+  whenever history exists, even without a current `block:` projection. A
+  dependency hold therefore stays distinguishable from a human-attention hold
+  in every state.
+
+* **Run-bound provenance.** Each historical event carries its canonical
+  `run_id`. When the event payload has no reason, the fallback summary is taken
+  from that event's own `task_runs` row (`task_runs.id = run_id`) — never from
+  an unrelated (e.g. newer) blocked run. A legacy event without a `run_id`
+  leaves the reason unavailable rather than attaching a cross-run summary, so
+  transition provenance is never corrupted.
+
+The repository deployer installs the guard before activating two
+`config.yaml` `hooks.pre_tool_call` entries (`kanban_block` and `terminal`),
+both with `fail_closed: true`. `--dry-run` validates the candidate and prints
+the planned config entries without changing the live Hermes home. Applying the
+live hook and restarting Hermes remain a separate human validation gate.
+
 ## Transitions implemented
 
 | Transition | Trigger | Effect |

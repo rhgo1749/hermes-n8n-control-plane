@@ -189,6 +189,53 @@ def _safe_text(value: Any, limit: int = _MAX_REASON_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+# Durable block-semantics event kinds (mirrors hermes_cli.kanban_db block kinds
+# plus the dependency-wait routing event).  A canonical ``kanban_block(kind=
+# "dependency")`` routes the task to ``todo`` (auto-promotable) and emits a
+# ``dependency_wait`` event — it does NOT remain ``blocked``.  These event
+# kinds carry the block semantics that must stay distinguishable from an
+# undifferentiated ``status=blocked`` reading (Issue #92).
+_BLOCK_EVENT_KINDS = frozenset({"blocked", "dependency_wait", "block_loop_detected"})
+_BLOCK_HISTORY_LIMIT = 5
+
+
+def _task_block_history(events: list[Any]) -> list[dict[str, Any]]:
+    """Project a task's block-semantics history from its durable events.
+
+    ``events`` is the task's ``task_events`` rows in newest-first order (the
+    overview loads them globally ordered by ``created_at DESC, id DESC``).
+    This is a *status-agnostic* read surface: a canonical dependency block
+    leaves the task in ``todo`` (auto-promotable) and later ``ready`` after
+    its parents resolve, so the dependency-wait history must be reconstructable
+    while the task is in ``todo``/``ready`` — not only while it sits in a
+    human ``blocked`` state.  A missing legacy ``kind`` renders as ``untyped``
+    rather than being guessed, and a dependency hold is never collapsed into a
+    human-attention hold.  Reconstructed from canonical ``task_events`` only —
+    no parallel store is introduced.
+    """
+    entries: list[dict[str, Any]] = []
+    for event in events:
+        if event["kind"] not in _BLOCK_EVENT_KINDS:
+            continue
+        payload = _json_payload(event["payload"])
+        kind = payload.get("kind")
+        block_kind = "untyped" if kind in (None, "") else str(kind)
+        dependency_driven = kind == "dependency"
+        entries.append(
+            {
+                "kind": str(event["kind"]),
+                "block_kind": block_kind,
+                "dependency_driven": dependency_driven,
+                "auto_promotable": dependency_driven,
+                "reason": _safe_text(payload.get("reason")),
+                "at": int(event["created_at"]),
+            }
+        )
+        if len(entries) >= _BLOCK_HISTORY_LIMIT:
+            break
+    return entries
+
+
 def _display_name(metadata: Mapping[str, Any], slug: str) -> str:
     return str(metadata.get("name") or slug.replace("-", " ").title()).strip() or slug
 
@@ -304,6 +351,34 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
             "FROM tasks WHERE status != 'archived' ORDER BY created_at ASC, id ASC"
         ).fetchall()
         ids = [str(row["id"]) for row in rows]
+        pending_parents_by_task: dict[str, list[dict[str, str]]] = {}
+        block_projection_errors: dict[str, str] = {}
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            try:
+                link_rows = conn.execute(
+                    "SELECT l.child_id, l.parent_id, t.status AS parent_status "
+                    "FROM task_links AS l LEFT JOIN tasks AS t ON t.id = l.parent_id "
+                    f"WHERE l.child_id IN ({placeholders}) "
+                    "ORDER BY l.child_id, l.parent_id",
+                    tuple(ids),
+                ).fetchall()
+                for link in link_rows:
+                    parent = {
+                        "id": str(link["parent_id"]),
+                        "status": str(link["parent_status"] or "missing"),
+                    }
+                    if parent["status"] not in {"done", "archived"}:
+                        pending_parents_by_task.setdefault(
+                            str(link["child_id"]), []
+                        ).append(parent)
+            except sqlite3.Error as exc:
+                error = f"{type(exc).__name__}: {_safe_text(exc)}"
+                block_projection_errors = {
+                    str(row["id"]): error
+                    for row in rows
+                    if str(row["status"] or "") == "blocked"
+                }
         event_rows: list[sqlite3.Row] = []
         if ids:
             placeholders = ",".join("?" for _ in ids)
@@ -370,12 +445,35 @@ def _load_board_projection(metadata: Mapping[str, Any]) -> dict[str, Any]:
                 attention = True
                 attention_reason = block_kind
 
+            block: dict[str, Any] | None = None
+            if status == "blocked":
+                projected_kind = block_kind or "untyped"
+                pending = pending_parents_by_task.get(task_id, [])
+                block = {
+                    "block_kind": projected_kind,
+                    "pending_parent_ids": [item["id"] for item in pending],
+                    "pending_parents": pending,
+                    "dependency_driven": projected_kind == "dependency",
+                    "auto_promotable": projected_kind == "dependency",
+                }
+                if task_id in block_projection_errors:
+                    block["projection_error"] = block_projection_errors[task_id]
+                    block["auto_promotable"] = False
+
             task = {
                 "id": task_id,
                 "title": _safe_text(row["title"], 120),
                 "status": status,
                 "assignee": row["assignee"],
-                "block_kind": row["block_kind"],
+                "block_kind": block["block_kind"] if block else row["block_kind"],
+                "block": block,
+                "auto_promotable": block["auto_promotable"] if block else False,
+                # Status-agnostic block-semantics history (Issue #92): visible
+                # while the task is in any status, including the dependency
+                # ``todo``/``ready`` path and after auto-promotion, so a
+                # dependency hold can never be read as an undifferentiated
+                # ``blocked``.
+                "block_history": _task_block_history(task_events),
                 "block_recurrences": int(row["block_recurrences"] or 0),
                 "consecutive_failures": int(row["consecutive_failures"] or 0),
                 "last_failure_error": _safe_text(row["last_failure_error"]),

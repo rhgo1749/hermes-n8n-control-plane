@@ -57,6 +57,23 @@ Safety:
     aborts if another actor changed the row first.
   * No ``complete_task``/hooks are invoked, so no duplicate completion
     side effects are re-fired.
+
+Blocked-state read contract:
+  * A blocked projection carries ``block_kind`` (``untyped`` for legacy rows),
+    pending direct parent ids/statuses, ``dependency_driven``, and
+    ``auto_promotable``.  It is derived from ``tasks`` + ``task_links`` only;
+    no parallel state store is introduced.
+  * The same machine-readable ``block:`` section is included in refreshed
+    sync context and blocker comments, so dependency holds and human
+    attention holds cannot collapse into ``status=blocked`` alone.
+  * The durable block-history read surface (Issue #92) is status-agnostic: a
+    canonical ``kanban_block(kind="dependency")`` routes the task to ``todo``
+    (auto-promotable) and later ``ready``, so the history is exposed while the
+    task is in the dependency path and after auto-promotion, not only while it
+    sits in a human ``blocked`` state.  Each historical entry's fallback reason
+    is bound to its own ``run_id`` (``task_runs.id = run_id``), never to an
+    unrelated newer run; a legacy event without a ``run_id`` leaves the reason
+    unavailable rather than attaching a cross-run summary.
 """
 from __future__ import annotations
 
@@ -72,7 +89,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, cast
+from typing import Any, Iterable, Mapping, Optional, Sequence, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -1122,10 +1139,19 @@ def _build_context_block(
     pull_requests: Iterable[GithubPullRequest],
     *,
     rework_pr_number: Optional[int] = None,
+    block_projection: Mapping[str, Any] | None = None,
+    block_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     prs = tuple(pull_requests)
     contexts = {pr.number: _collect_pr_context(client, ref, pr) for pr in prs}
-    return _render_sync_context(ref, prs, contexts, rework_pr_number=rework_pr_number)
+    return _render_sync_context(
+        ref,
+        prs,
+        contexts,
+        rework_pr_number=rework_pr_number,
+        block_projection=block_projection,
+        block_history=block_history,
+    )
 
 
 def _truncate(text: Any, limit: int) -> str:
@@ -1200,9 +1226,56 @@ def _render_sync_context(
     contexts: Mapping[int, Mapping[str, Any]],
     *,
     rework_pr_number: Optional[int] = None,
+    block_projection: Mapping[str, Any] | None = None,
+    block_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     prs = sorted(pull_requests, key=lambda item: item.number)
     lines: list[str] = [SYNC_CONTEXT_BEGIN, ""]
+    # The ``## Block`` read surface is emitted when EITHER the current blocked
+    # projection is available OR a historical block history is present.  The
+    # two are intentionally decoupled: a canonical dependency block routes the
+    # task to ``todo`` (auto-promotable) and later ``ready``, so there is no
+    # current ``blocked`` projection — yet the dependency-wait history must
+    # still be exposed on the same read surface (Issue #92).  A dependency
+    # hold therefore never collapses into an undifferentiated reading.
+    if block_projection is not None or block_history:
+        lines.append("## Block")
+        lines.append("")
+        if block_projection is not None:
+            block_kind = str(block_projection.get("block_kind") or "untyped")
+            pending = list(block_projection.get("pending_parents") or [])
+            pending_ids = [
+                str(item.get("id"))
+                for item in pending
+                if isinstance(item, Mapping) and item.get("id")
+            ]
+            lines.extend(
+                [
+                    "block:",
+                    f"  block_kind: {block_kind}",
+                    f"  dependency_driven: {str(bool(block_projection.get('dependency_driven'))).lower()}",
+                    f"  auto_promotable: {str(bool(block_projection.get('auto_promotable'))).lower()}",
+                    f"  pending_parent_ids: {json.dumps(pending_ids, ensure_ascii=False)}",
+                    f"  pending_parents: {json.dumps(pending, ensure_ascii=False, sort_keys=True)}",
+                ]
+            )
+            if block_projection.get("projection_error"):
+                lines.append(f"  projection_error: {block_projection['projection_error']}")
+        if block_history:
+            lines.append("block_history:")
+            for entry in block_history:
+                lines.append(
+                    "- at: "
+                    f"{entry.get('at')} kind={entry.get('kind')} "
+                    f"block_kind={entry.get('block_kind')} "
+                    f"dependency_driven={str(bool(entry.get('dependency_driven'))).lower()} "
+                    f"auto_promotable={str(bool(entry.get('auto_promotable'))).lower()}"
+                )
+                if entry.get("source_status"):
+                    lines.append(f"  source_status: {entry['source_status']}")
+                if entry.get("reason"):
+                    lines.append(f"  reason: {entry['reason']}")
+        lines.append("")
     lines.append("## Current linked PR" if len(prs) == 1 else "## Linked PRs")
     for pr in prs:
         lines.append("")
@@ -1311,7 +1384,106 @@ def _task_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
     return "The task is blocked pending maintainer input (no reason recorded)."
 
 
-def _blocker_comment_body(task_id: str, reason: str, needs: str, *, no_pr: bool) -> str:
+def _blocked_state_projection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    block_kind: Any,
+) -> dict[str, Any]:
+    """Project durable blocked semantics without inferring a missing kind.
+
+    ``block_kind`` is intentionally rendered as ``untyped`` when the legacy
+    nullable column is empty.  Pending parents are read from the canonical
+    direct ``task_links`` graph; a lookup failure is represented explicitly
+    and makes ``auto_promotable`` false rather than guessing.
+    """
+    kind = str(block_kind or "untyped")
+    projection: dict[str, Any] = {
+        "block_kind": kind,
+        "pending_parents": [],
+        "pending_parent_ids": [],
+        "dependency_driven": kind == "dependency",
+        "auto_promotable": kind == "dependency",
+    }
+    try:
+        gate = _internal_dependency_gate(conn, task_id)
+        pending = list(gate.get("pending") or [])
+        projection["pending_parents"] = pending
+        projection["pending_parent_ids"] = [str(item["id"]) for item in pending]
+    except (SyncError, sqlite3.Error) as exc:
+        projection["projection_error"] = f"{type(exc).__name__}: {exc}"
+        projection["auto_promotable"] = False
+    return projection
+
+
+def _task_block_history(conn: sqlite3.Connection, task_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Reconstruct the block-semantics history for ``task_id``.
+
+    Issue #92 requires that a past ``status=blocked`` / ``outcome=blocked`` run
+    does not collapse to an undifferentiated ``blocked`` reading.  This reads
+    the canonical durable sources (``task_events`` kind ``blocked`` /
+    ``dependency_wait`` / ``block_loop_detected``, plus the matching
+    ``task_runs`` ``outcome=blocked`` row) and projects each historical block
+    with its ``block_kind``, ``dependency_driven`` / ``auto_promotable``
+    semantics, and a bounded reason.  A missing legacy ``kind`` is rendered as
+    ``untyped`` rather than guessed.  No new parallel store is introduced.
+    """
+    entries: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT kind, payload, created_at, id, run_id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected') "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (task_id, limit),
+    ).fetchall()
+    for row in rows:
+        payload: dict[str, Any] = {}
+        if row["payload"]:
+            try:
+                loaded = json.loads(row["payload"])
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (TypeError, ValueError):
+                payload = {}
+        kind = payload.get("kind")
+        kind_text = "untyped" if kind in (None, "") else str(kind)
+        reason = str(payload.get("reason") or "").strip()
+        run_id = row["run_id"]
+        if not reason and run_id is not None:
+            # Bind the fallback reason to THIS event's own run, never to an
+            # unrelated (e.g. newer) blocked run.  A legacy event without a
+            # run id leaves the reason unavailable rather than attaching a
+            # cross-run summary (Issue #92 run-provenance invariant).
+            run = conn.execute(
+                "SELECT summary FROM task_runs "
+                "WHERE task_id = ? AND id = ? AND outcome = 'blocked' "
+                "AND summary IS NOT NULL LIMIT 1",
+                (task_id, run_id),
+            ).fetchone()
+            if run and run["summary"]:
+                reason = str(run["summary"]).strip()
+        entries.append(
+            {
+                "kind": row["kind"],
+                "block_kind": kind_text,
+                "dependency_driven": kind == "dependency",
+                "auto_promotable": kind == "dependency",
+                "recurrences": payload.get("recurrences"),
+                "source_status": payload.get("source_status"),
+                "run_id": run_id,
+                "reason": _truncate(reason, MAX_ITEM_CHARS) if reason else "",
+                "at": row["created_at"],
+            }
+        )
+    return entries
+
+
+def _blocker_comment_body(
+    task_id: str,
+    reason: str,
+    needs: str,
+    *,
+    no_pr: bool,
+    block_projection: Mapping[str, Any] | None = None,
+) -> str:
     lines = [
         f"{BLOCKER_MARKER_PREFIX}{task_id}{BLOCKER_MARKER_SUFFIX}",
         "",
@@ -1325,6 +1497,19 @@ def _blocker_comment_body(task_id: str, reason: str, needs: str, *, no_pr: bool)
         "Needs from maintainer:",
         needs,
     ]
+    if block_projection is not None:
+        block_kind = str(block_projection.get("block_kind") or "untyped")
+        pending_ids = list(block_projection.get("pending_parent_ids") or [])
+        lines += [
+            "",
+            "Block metadata:",
+            f"block: block_kind={block_kind}",
+            f"block: dependency_driven={str(bool(block_projection.get('dependency_driven'))).lower()}",
+            f"block: auto_promotable={str(bool(block_projection.get('auto_promotable'))).lower()}",
+            f"block: pending_parent_ids={json.dumps(pending_ids, ensure_ascii=False)}",
+        ]
+        if block_projection.get("projection_error"):
+            lines.append(f"block: projection_error={block_projection['projection_error']}")
     if no_pr:
         lines += ["", "No reviewable pull request is currently available."]
     lines += ["", "This comment is maintained by the Hermes GitHub reconciliation layer."]
@@ -3539,6 +3724,7 @@ def _reconcile_blocked(
     """
     task_id = str(row["id"])
     block_kind = row["block_kind"] if "block_kind" in row.keys() else None
+    block_projection = _blocked_state_projection(conn, task_id, block_kind)
 
     def _entry(reason: str, **extra: Any) -> dict[str, Any]:
         entry: dict[str, Any] = {
@@ -3546,6 +3732,9 @@ def _reconcile_blocked(
             "status": "blocked",
             "changed": False,
             "reason": reason,
+            "block": block_projection,
+            "block_kind": block_projection["block_kind"],
+            "auto_promotable": block_projection["auto_promotable"],
         }
         entry.update(extra)
         return entry
@@ -3605,7 +3794,13 @@ def _reconcile_blocked(
     if any(pr.state == "open" and not pr.draft for pr in decision.pull_requests):
         context_block: Optional[str] = None
         try:
-            context_block = _build_context_block(client, ref, decision.pull_requests)
+            context_block = _build_context_block(
+                client,
+                ref,
+                decision.pull_requests,
+                block_projection=block_projection,
+                block_history=_task_block_history(conn, task_id),
+            )
         except GithubCompletionError:
             context_block = None
         if dry_run:
@@ -3700,7 +3895,11 @@ def _reconcile_blocked(
     reason = _task_block_reason(conn, task_id)
     needs = _NEEDS_FROM_MAINTAINER.get(block_kind) or _NEEDS_FROM_MAINTAINER[None]
     body = _blocker_comment_body(
-        task_id, reason, needs, no_pr=not decision.pull_requests
+        task_id,
+        reason,
+        needs,
+        no_pr=not decision.pull_requests,
+        block_projection=block_projection,
     )
     issue_labels = {
         str(item.get("name"))
