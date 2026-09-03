@@ -110,9 +110,10 @@ services:
       GITHUB_ROUTER_INTAKE_TOKEN_FILE: /run/secrets/hermes-intake-control-token
     command:
       - python3
-      - /app/router.py
+      - /app/router_entrypoint.py
     volumes:
       - ./github-router/router.py:/app/router.py:ro
+      - ./github-router/router_entrypoint.py:/app/router_entrypoint.py:ro
       - ./scripts/repository_registry.py:/app/repository_registry.py:ro
       - type: bind
         source: ${HERMES_N8N_STATE_ROOT:?run host-install.sh first}
