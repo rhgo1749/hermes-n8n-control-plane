@@ -190,6 +190,8 @@ SyslogIdentifier=hermes-github-intake-actuator
 WantedBy=multi-user.target
 UNIT
 
+install -o root -g root -m 0644 "$TMP/unit" "$UNIT_PATH"
+
 # Upgrade safety for installs created before ExecStop existed.  `systemctl
 # stop` can terminate only the host docker-exec client and strand the old
 # Python listener in the container.  Explicitly reap that exact process before
