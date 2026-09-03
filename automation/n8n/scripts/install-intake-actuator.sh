@@ -21,6 +21,7 @@ TOKEN_HOST="$SECRET_DIR/hermes-intake-control-token"
 LIBEXEC_DIR="/home/hermes/.local/libexec"
 BIN_DIR="/home/hermes/.local/bin"
 CONTROL_DIR="/home/hermes/.hermes/.control-plane"
+HERMES_AGENT_SOURCE_ROOT="${HERMES_AGENT_SOURCE_ROOT:-/ws/hermes-agent}"
 
 ACTUATOR_REMOTE="$LIBEXEC_DIR/github_intake_actuator.py"
 TIMEOUT_REMOTE="$LIBEXEC_DIR/edge_sync_timeout.py"
@@ -128,13 +129,17 @@ hermes_write "$SOURCE" "$ACTUATOR_REMOTE" 0755
 hermes_write "$TIMEOUT_SOURCE" "$TIMEOUT_REMOTE" 0644
 hermes_write "$TOKEN_HOST" "$TOKEN_REMOTE" 0600
 
-cat > "$TMP/launcher" <<'LAUNCHER'
+cat > "$TMP/launcher" <<LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
 
 export HOME=/home/hermes
 export HERMES_HOME=/home/hermes/.hermes
 export HERMES_INTAKE_ACTUATOR_TOKEN_FILE=/home/hermes/.hermes/.control-plane/github-intake-control-token
+# The Hermes runtime uses editable installs whose finder can lag newly-added
+# top-level modules. Bind the canonical source checkout explicitly so the
+# actuator child resolves the exact same source tree as the Hermes CLI.
+export PYTHONPATH="$HERMES_AGENT_SOURCE_ROOT\${PYTHONPATH:+:\$PYTHONPATH}"
 
 exec /opt/venv/bin/python3 \
   /home/hermes/.local/libexec/github_intake_actuator.py
@@ -144,6 +149,15 @@ hermes_write "$TMP/launcher" "$LAUNCHER_REMOTE" 0755
 
 hermes_exec /opt/venv/bin/python3 -m py_compile "$ACTUATOR_REMOTE"
 hermes_exec /opt/venv/bin/python3 -m py_compile "$TIMEOUT_REMOTE"
+
+# Exercise the same interpreter/import boundary used by /v1/edge-sync.  File
+# existence alone is insufficient: a stale editable finder can leave the
+# actuator apparently healthy while every real edge-sync child crashes.
+hermes_exec env \
+    "PYTHONPATH=$HERMES_AGENT_SOURCE_ROOT" \
+    /opt/venv/bin/python3 -c \
+    'import hermes_cli.kanban_db; import hermes_state; import hermes_state_holders' \
+    || fail "Hermes edge runtime import preflight failed"
 
 DOCKER_BIN="$(command -v docker)"
 
@@ -201,6 +215,7 @@ assert payload["ok"] is True, payload
 assert payload["service"] == "hermes-github-intake-actuator", payload
 assert payload["token_ready"] is True, payload
 assert payload["runtime_ready"] is True, payload
+assert payload["edge_sync_runtime_ready"] is True, payload
 
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PYHEALTH
