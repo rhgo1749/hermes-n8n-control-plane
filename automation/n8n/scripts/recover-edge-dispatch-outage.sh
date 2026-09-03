@@ -113,12 +113,14 @@ for line in lines:
 if not replaced:
     out.append(f"GITHUB_ROUTER_INSTALLATION_ID={installation_id}")
 content = "\n".join(out) + "\n"
-mode = stat.S_IMODE(path.stat().st_mode)
+info = path.stat()
+mode = stat.S_IMODE(info.st_mode)
 fd, temporary = tempfile.mkstemp(prefix=".n8n.env.", dir=path.parent)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(content)
     os.chmod(temporary, mode)
+    os.chown(temporary, info.st_uid, info.st_gid)
     os.replace(temporary, path)
 finally:
     if os.path.exists(temporary):
