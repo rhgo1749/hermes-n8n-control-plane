@@ -85,15 +85,19 @@ do
   [[ "$ok" == 1 ]] || fail "service did not become healthy: $endpoint"
 done
 
-echo "[2/5] restore canonical public intake route"
+echo "[2/5] restore canonical public intake Funnel"
 if [[ "$RESTORE_FUNNEL" == 1 ]]; then
   command -v tailscale >/dev/null 2>&1 || fail "tailscale CLI missing"
-  tailscale serve --https=10000 \
+  # This endpoint must be reachable from public GitHub. `tailscale serve` is
+  # tailnet-only on current clients; the most recent command for a port decides
+  # whether that port is Serve or Funnel. Reassert an explicit persistent
+  # Funnel for only the intake path.
+  tailscale funnel --bg --yes --https=10000 \
     --set-path=/github/hermes-intake \
     http://127.0.0.1:5681/github/hermes-intake
-  tailscale serve status
+  tailscale funnel status
 else
-  echo "skip: funnel/serve recovery"
+  echo "skip: Funnel recovery"
 fi
 
 echo "[3/5] reinstall actuator with canonical Hermes source path"
