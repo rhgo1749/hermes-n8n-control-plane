@@ -10,8 +10,11 @@ Small, independently reviewable overlays are installed here so the canonical
 state machine can stay unchanged: resource admission controls worker capacity,
 dynamic backend resolution (when installed) makes that admission follow each
 profile's current provider/endpoint, head-binding feedback adds observational
-PR guidance without changing rework transitions, and the retry-signal guard
-prevents edge-owned help text from being consumed as a fresh maintainer retry.
+PR guidance without changing rework transitions, the retry-signal guard
+prevents edge-owned help text from being consumed as a fresh maintainer retry,
+and the trusted completed-Issue fallback terminalizes only stale
+``review/no_linked_pr`` cards explicitly closed as completed by a trusted
+maintainer.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from types import ModuleType
 import kanban_resource_admission as resource_admission
 from kanban_head_binding_feedback import install_head_binding_feedback
 from kanban_retry_signal_guard import (
+    install_closed_completed_terminal_fallback,
     install_retry_signal_guard,
     install_supersede_signal_guard,
 )
@@ -72,6 +76,7 @@ def _load_core() -> ModuleType:
     install_head_binding_feedback(module)
     install_retry_signal_guard(module)
     install_supersede_signal_guard(module)
+    install_closed_completed_terminal_fallback(module)
     if install_workspace_admission is not None:
         install_workspace_admission(module)
     return module
