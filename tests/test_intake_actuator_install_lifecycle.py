@@ -23,6 +23,14 @@ def test_systemd_boundary_pins_canonical_source_path() -> None:
     assert 'export PYTHONPATH="$HERMES_AGENT_SOURCE_ROOT"' in text
 
 
+def test_unit_file_is_installed_before_daemon_reload() -> None:
+    text = _text()
+    install_at = text.index('install -o root -g root -m 0644 "$TMP/unit" "$UNIT_PATH"')
+    reload_at = text.index("systemctl daemon-reload")
+    start_at = text.index('systemctl start "$UNIT_NAME"')
+    assert install_at < reload_at < start_at
+
+
 def test_unit_stops_exact_in_container_actuator() -> None:
     text = _text()
     exact = (
