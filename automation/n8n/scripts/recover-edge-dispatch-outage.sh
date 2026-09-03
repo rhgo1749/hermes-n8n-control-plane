@@ -65,9 +65,26 @@ done
 export HERMES_N8N_ENV_FILE="$ENV_FILE"
 export HERMES_N8N_STATE_ROOT="$STATE_ROOT"
 
+start_existing_compose_service() {
+  local service="$1"
+  local ids
+  ids="$(docker ps -aq \
+    --filter 'label=com.docker.compose.project=hermes-n8n-control-plane' \
+    --filter "label=com.docker.compose.service=$service")"
+  [[ -n "$ids" ]] || fail "no existing Compose container for service: $service"
+  # shellcheck disable=SC2086
+  docker start $ids >/dev/null
+}
+
 echo "[1/5] restore private n8n/router/lease stack"
 systemctl enable --now docker >/dev/null
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
+if ! docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d; then
+  echo "WARN: Compose reconciliation is blocked by runtime env drift; starting the existing reviewed containers in-place." >&2
+  echo "WARN: repair the missing Compose env contract after service recovery; existing container configuration is preserved for this bounded start." >&2
+  start_existing_compose_service n8n
+  start_existing_compose_service lease-controller
+  start_existing_compose_service github-router
+fi
 
 for endpoint in \
   http://127.0.0.1:5678/healthz \
