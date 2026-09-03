@@ -65,12 +65,72 @@ done
 export HERMES_N8N_ENV_FILE="$ENV_FILE"
 export HERMES_N8N_STATE_ROOT="$STATE_ROOT"
 
+existing_compose_ids() {
+  local service="$1"
+  docker ps -aq \
+    --filter 'label=com.docker.compose.project=hermes-n8n-control-plane' \
+    --filter "label=com.docker.compose.service=$service"
+}
+
+repair_router_installation_id_from_existing_container() {
+  if grep -Eq '^GITHUB_ROUTER_INSTALLATION_ID=[1-9][0-9]*$' "$ENV_FILE"; then
+    return 0
+  fi
+
+  local router_ids router_id installation_id
+  router_ids="$(existing_compose_ids github-router)"
+  router_id="$(printf '%s\n' "$router_ids" | sed -n '1p')"
+  [[ -n "$router_id" ]] || return 0
+
+  installation_id="$(
+    docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$router_id" \
+      | sed -n 's/^GITHUB_ROUTER_INSTALLATION_ID=//p' \
+      | sed -n '1p'
+  )"
+  [[ "$installation_id" =~ ^[1-9][0-9]*$ ]] || return 0
+
+  python3 - "$ENV_FILE" "$installation_id" <<'PY'
+from __future__ import annotations
+
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+installation_id = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines()
+out: list[str] = []
+replaced = False
+for line in lines:
+    if line.startswith("GITHUB_ROUTER_INSTALLATION_ID="):
+        if not replaced:
+            out.append(f"GITHUB_ROUTER_INSTALLATION_ID={installation_id}")
+            replaced = True
+        continue
+    out.append(line)
+if not replaced:
+    out.append(f"GITHUB_ROUTER_INSTALLATION_ID={installation_id}")
+content = "\n".join(out) + "\n"
+mode = stat.S_IMODE(path.stat().st_mode)
+fd, temporary = tempfile.mkstemp(prefix=".n8n.env.", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(content)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+  echo "recovered GITHUB_ROUTER_INSTALLATION_ID from existing reviewed github-router container"
+}
+
 start_existing_compose_service() {
   local service="$1"
   local ids
-  ids="$(docker ps -aq \
-    --filter 'label=com.docker.compose.project=hermes-n8n-control-plane' \
-    --filter "label=com.docker.compose.service=$service")"
+  ids="$(existing_compose_ids "$service")"
   [[ -n "$ids" ]] || fail "no existing Compose container for service: $service"
   # shellcheck disable=SC2086
   docker start $ids >/dev/null
@@ -78,9 +138,10 @@ start_existing_compose_service() {
 
 echo "[1/5] restore private n8n/router/lease stack"
 systemctl enable --now docker >/dev/null
+repair_router_installation_id_from_existing_container
 if ! docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d; then
-  echo "WARN: Compose reconciliation is blocked by runtime env drift; starting the existing reviewed containers in-place." >&2
-  echo "WARN: repair the missing Compose env contract after service recovery; existing container configuration is preserved for this bounded start." >&2
+  echo "WARN: Compose reconciliation is still blocked by runtime env drift; starting the existing reviewed containers in-place." >&2
+  echo "WARN: existing container configuration is preserved for this bounded start." >&2
   start_existing_compose_service n8n
   start_existing_compose_service lease-controller
   start_existing_compose_service github-router
