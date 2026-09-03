@@ -60,6 +60,17 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
   board, selected by `(created_at, id)` across all tasks — not per-task
   iteration order.
 * **Need You items**: computed projections with a one-line reason.
+* **Block-semantics history** (`task.block_history`, Issue #92): a bounded,
+  status-agnostic projection of each task's durable block events
+  (`blocked` / `dependency_wait` / `block_loop_detected`), reconstructed from
+  `task_events` only — no parallel store. Each entry carries `block_kind`,
+  `dependency_driven` / `auto_promotable`, and a bounded reason. Because a
+  canonical `kanban_block(kind="dependency")` routes the task to `todo`
+  (auto-promotable) and later `ready`, the history is exposed while the task
+  is in the dependency `todo`/`ready` path and after auto-promotion, not only
+  while it sits in a human `blocked` state — a dependency hold therefore stays
+  distinguishable from a human-attention hold in every state. A missing
+  legacy `kind` renders as `untyped`, never guessed.
 * **Deep links**: every board/task links to the existing Kanban tab
   (`/kanban?board=<slug>&task=<id>`); the Kanban plugin understands `board`,
   and the `task` query is retained as a provenance hint for future Kanban

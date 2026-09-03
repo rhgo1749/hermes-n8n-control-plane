@@ -145,6 +145,35 @@ plus the flat `block_kind`/`auto_promotable` fields. Legacy nullable rows are
 shown as `untyped`, never silently relabeled as human attention. A failed
 parent projection is explicit and forces `auto_promotable=false`.
 
+### Historical block-semantics read surface (Issue #92)
+
+A past `status=blocked` / `outcome=blocked` run must not collapse to an
+undifferentiated `blocked` reading. The durable history is reconstructed from
+the canonical `task_events` (kind `blocked` / `dependency_wait` /
+`block_loop_detected`) plus the matching `task_runs` row — no parallel state
+store is introduced. Each historical entry carries `block_kind`,
+`dependency_driven` / `auto_promotable`, and a bounded reason.
+
+Two invariants make the read surface safe and useful:
+
+* **Status-agnostic reachability.** A canonical `kanban_block(kind=
+  "dependency")` routes the task to `todo` (auto-promotable) and later `ready`
+  when its parents resolve — it does NOT remain `blocked`. The history is
+  therefore exposed on a general read surface reachable while the task is in
+  the dependency `todo`/`ready` path AND after auto-promotion, not only while
+  it sits in a human `blocked` state. The H4V3 Overview carries it as
+  `task.block_history`; the edge sync context renders a `block_history:` section
+  whenever history exists, even without a current `block:` projection. A
+  dependency hold therefore stays distinguishable from a human-attention hold
+  in every state.
+
+* **Run-bound provenance.** Each historical event carries its canonical
+  `run_id`. When the event payload has no reason, the fallback summary is taken
+  from that event's own `task_runs` row (`task_runs.id = run_id`) — never from
+  an unrelated (e.g. newer) blocked run. A legacy event without a `run_id`
+  leaves the reason unavailable rather than attaching a cross-run summary, so
+  transition provenance is never corrupted.
+
 The repository deployer installs the guard before activating two
 `config.yaml` `hooks.pre_tool_call` entries (`kanban_block` and `terminal`),
 both with `fail_closed: true`. `--dry-run` validates the candidate and prints

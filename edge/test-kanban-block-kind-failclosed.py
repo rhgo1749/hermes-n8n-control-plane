@@ -649,6 +649,123 @@ def test_history_read_back_preserves_block_kind_across_blocked_runs(board_db):
     assert "dependency_driven=false" in rendered
 
 
+def test_dependency_block_history_reachable_in_todo_and_after_promotion(board_db):
+    # Issue #92 requirement 5 + R6 blocker 1: a canonical kind="dependency"
+    # block routes the task to `todo` (auto-promotable), NOT `blocked`.  The
+    # dependency-wait history must therefore be exposed by a read surface
+    # reachable while the task is in the dependency `todo` path AND after its
+    # parent resolves (auto-promotion), not only while it sits in a human
+    # `blocked` state.
+    path, parent, child = board_db
+    with kanban_db.connect_closing(path) as conn:
+        # Canonical dependency block on a task with a pending parent.
+        assert kanban_db.block_task(conn, child, reason="waiting on parent", kind="dependency")
+        row = conn.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (child,)).fetchone()
+        assert tuple(row) == ("todo", "dependency")
+
+        # While still in the dependency `todo` path (NOT `blocked`), the
+        # canonical read surfaces show the dependency hold distinctly.
+        history = sync._task_block_history(conn, child)
+        assert history and history[0]["kind"] == "dependency_wait"
+        assert history[0]["block_kind"] == "dependency"
+        assert history[0]["dependency_driven"] is True
+        assert history[0]["auto_promotable"] is True
+        assert "waiting on parent" in history[0]["reason"]
+        rendered = sync._render_sync_context(
+            sync.GithubTaskRef("owner/repo", 92), [], {}, block_history=history,
+        )
+        assert "block_history:" in rendered
+        assert "block_kind=dependency" in rendered
+        assert "dependency_driven=true" in rendered
+        assert "auto_promotable=true" in rendered
+
+        # Resolve the parent -> auto-promote -> the history SURVIVES the
+        # promotion (it is status-agnostic, not blocked-only).
+        assert kanban_db.complete_task(conn, parent, result="parent done")
+        kanban_db.recompute_ready(conn)
+        promoted = conn.execute("SELECT status FROM tasks WHERE id = ?", (child,)).fetchone()
+        assert promoted[0] == "ready"
+
+        history_after = sync._task_block_history(conn, child)
+        assert history_after and history_after[0]["block_kind"] == "dependency"
+        assert history_after[0]["dependency_driven"] is True
+        assert history_after[0]["auto_promotable"] is True
+        rendered_after = sync._render_sync_context(
+            sync.GithubTaskRef("owner/repo", 92), [], {}, block_history=history_after,
+        )
+        assert "block_kind=dependency" in rendered_after
+        assert "auto_promotable=true" in rendered_after
+
+
+def test_dependency_and_human_blocks_stay_distinct_in_history(board_db):
+    # A dependency hold and a human-attention hold must never collapse into
+    # each other on the historical read surface (Issue #92 invariant).
+    path, _, _ = board_db
+    with kanban_db.connect_closing(path) as conn:
+        task = kanban_db.create_task(conn, title="dep-vs-human", assignee="worker")
+        # Parent-less task starts ready; a dependency block routes it to todo.
+        assert kanban_db.block_task(conn, task, reason="dependency wait", kind="dependency")
+        # Reopen to a blockable state (todo -> ready) so a genuinely different
+        # human kind can be applied without guessing a kind.
+        kanban_db.recompute_ready(conn)
+        assert kanban_db.block_task(conn, task, reason="capability wall", kind="capability")
+        history = sync._task_block_history(conn, task)
+        # Newest-first: capability (human) then dependency.
+        assert [entry["block_kind"] for entry in history][:2] == ["capability", "dependency"]
+        by_kind = {entry["block_kind"]: entry for entry in history}
+        assert by_kind["dependency"]["dependency_driven"] is True
+        assert by_kind["dependency"]["auto_promotable"] is True
+        assert by_kind["capability"]["dependency_driven"] is False
+        assert by_kind["capability"]["auto_promotable"] is False
+
+
+def test_history_run_id_binding_prevents_cross_run_summary_leakage(board_db):
+    # R6 blocker 2: an event's fallback reason must bind to its OWN run_id,
+    # never to an unrelated (newer) blocked run.  Two blocked runs, one older
+    # historical event that lacks a payload reason: the older event must fall
+    # back to ITS OWN run's summary and must NOT inherit the newer run's
+    # summary (the pre-fix query selected the latest blocked run regardless).
+    path, _, _ = board_db
+    with kanban_db.connect_closing(path) as conn:
+        task = kanban_db.create_task(conn, title="run-binding", assignee="worker")
+        # Two blocked runs with distinct summaries.
+        run1 = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
+            "VALUES (?, 'worker', 'blocked', 1000, 1001, 'blocked', 'OLD-RUN-SUMMARY')",
+            (task,),
+        ).lastrowid
+        run2 = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
+            "VALUES (?, 'worker', 'blocked', 2000, 2001, 'blocked', 'NEWER-RUN-SUMMARY')",
+            (task,),
+        ).lastrowid
+        # The OLDER event carries no payload reason -> must fall back to its
+        # OWN run (run1) summary.  The NEWER event carries its own reason.
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'dependency_wait', ?, 1001)",
+            (task, run1, json.dumps({"kind": "dependency", "source_status": "running"})),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'blocked', ?, 2001)",
+            (task, run2, json.dumps({"kind": "capability", "reason": "capability wall"})),
+        )
+        conn.commit()
+        history = sync._task_block_history(conn, task)
+        by_kind = {entry["block_kind"]: entry for entry in history}
+        # The newer capability entry carries its own (payload) reason.
+        assert by_kind["capability"]["reason"] == "capability wall"
+        # The older dependency entry falls back to ITS OWN run summary ...
+        assert by_kind["dependency"]["reason"] == "OLD-RUN-SUMMARY"
+        # ... and never the newer run's summary (no cross-run leakage).
+        assert by_kind["dependency"]["reason"] != "NEWER-RUN-SUMMARY"
+        assert "NEWER-RUN-SUMMARY" not in by_kind["dependency"]["reason"]
+        # The older entry is still a genuine dependency hold.
+        assert by_kind["dependency"]["dependency_driven"] is True
+        assert by_kind["dependency"]["run_id"] == run1
+
+
 def test_deployer_dry_run_with_following_sibling_hook():
     with tempfile.TemporaryDirectory(prefix="issue92-hermes-home-sib-") as directory:
         home = Path(directory)

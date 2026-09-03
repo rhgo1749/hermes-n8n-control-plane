@@ -66,6 +66,14 @@ Blocked-state read contract:
   * The same machine-readable ``block:`` section is included in refreshed
     sync context and blocker comments, so dependency holds and human
     attention holds cannot collapse into ``status=blocked`` alone.
+  * The durable block-history read surface (Issue #92) is status-agnostic: a
+    canonical ``kanban_block(kind="dependency")`` routes the task to ``todo``
+    (auto-promotable) and later ``ready``, so the history is exposed while the
+    task is in the dependency path and after auto-promotion, not only while it
+    sits in a human ``blocked`` state.  Each historical entry's fallback reason
+    is bound to its own ``run_id`` (``task_runs.id = run_id``), never to an
+    unrelated newer run; a legacy event without a ``run_id`` leaves the reason
+    unavailable rather than attaching a cross-run summary.
 """
 from __future__ import annotations
 
@@ -1223,42 +1231,50 @@ def _render_sync_context(
 ) -> str:
     prs = sorted(pull_requests, key=lambda item: item.number)
     lines: list[str] = [SYNC_CONTEXT_BEGIN, ""]
-    if block_projection is not None:
-        block_kind = str(block_projection.get("block_kind") or "untyped")
-        pending = list(block_projection.get("pending_parents") or [])
-        pending_ids = [
-            str(item.get("id"))
-            for item in pending
-            if isinstance(item, Mapping) and item.get("id")
-        ]
-        lines.extend(
-            [
-                "## Block",
-                "",
-                "block:",
-                f"  block_kind: {block_kind}",
-                f"  dependency_driven: {str(bool(block_projection.get('dependency_driven'))).lower()}",
-                f"  auto_promotable: {str(bool(block_projection.get('auto_promotable'))).lower()}",
-                f"  pending_parent_ids: {json.dumps(pending_ids, ensure_ascii=False)}",
-                f"  pending_parents: {json.dumps(pending, ensure_ascii=False, sort_keys=True)}",
+    # The ``## Block`` read surface is emitted when EITHER the current blocked
+    # projection is available OR a historical block history is present.  The
+    # two are intentionally decoupled: a canonical dependency block routes the
+    # task to ``todo`` (auto-promotable) and later ``ready``, so there is no
+    # current ``blocked`` projection — yet the dependency-wait history must
+    # still be exposed on the same read surface (Issue #92).  A dependency
+    # hold therefore never collapses into an undifferentiated reading.
+    if block_projection is not None or block_history:
+        lines.append("## Block")
+        lines.append("")
+        if block_projection is not None:
+            block_kind = str(block_projection.get("block_kind") or "untyped")
+            pending = list(block_projection.get("pending_parents") or [])
+            pending_ids = [
+                str(item.get("id"))
+                for item in pending
+                if isinstance(item, Mapping) and item.get("id")
             ]
-        )
-        if block_projection.get("projection_error"):
-            lines.append(f"  projection_error: {block_projection['projection_error']}")
+            lines.extend(
+                [
+                    "block:",
+                    f"  block_kind: {block_kind}",
+                    f"  dependency_driven: {str(bool(block_projection.get('dependency_driven'))).lower()}",
+                    f"  auto_promotable: {str(bool(block_projection.get('auto_promotable'))).lower()}",
+                    f"  pending_parent_ids: {json.dumps(pending_ids, ensure_ascii=False)}",
+                    f"  pending_parents: {json.dumps(pending, ensure_ascii=False, sort_keys=True)}",
+                ]
+            )
+            if block_projection.get("projection_error"):
+                lines.append(f"  projection_error: {block_projection['projection_error']}")
         if block_history:
-            lines.append("  block_history:")
+            lines.append("block_history:")
             for entry in block_history:
                 lines.append(
-                    "    - at: "
+                    "- at: "
                     f"{entry.get('at')} kind={entry.get('kind')} "
                     f"block_kind={entry.get('block_kind')} "
                     f"dependency_driven={str(bool(entry.get('dependency_driven'))).lower()} "
                     f"auto_promotable={str(bool(entry.get('auto_promotable'))).lower()}"
                 )
                 if entry.get("source_status"):
-                    lines.append(f"      source_status: {entry['source_status']}")
+                    lines.append(f"  source_status: {entry['source_status']}")
                 if entry.get("reason"):
-                    lines.append(f"      reason: {entry['reason']}")
+                    lines.append(f"  reason: {entry['reason']}")
         lines.append("")
     lines.append("## Current linked PR" if len(prs) == 1 else "## Linked PRs")
     for pr in prs:
@@ -1413,7 +1429,7 @@ def _task_block_history(conn: sqlite3.Connection, task_id: str, limit: int = 5) 
     """
     entries: list[dict[str, Any]] = []
     rows = conn.execute(
-        "SELECT kind, payload, created_at, id FROM task_events "
+        "SELECT kind, payload, created_at, id, run_id FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected') "
         "ORDER BY created_at DESC, id DESC LIMIT ?",
         (task_id, limit),
@@ -1430,11 +1446,17 @@ def _task_block_history(conn: sqlite3.Connection, task_id: str, limit: int = 5) 
         kind = payload.get("kind")
         kind_text = "untyped" if kind in (None, "") else str(kind)
         reason = str(payload.get("reason") or "").strip()
-        if not reason:
+        run_id = row["run_id"]
+        if not reason and run_id is not None:
+            # Bind the fallback reason to THIS event's own run, never to an
+            # unrelated (e.g. newer) blocked run.  A legacy event without a
+            # run id leaves the reason unavailable rather than attaching a
+            # cross-run summary (Issue #92 run-provenance invariant).
             run = conn.execute(
-                "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'blocked' "
-                "AND summary IS NOT NULL ORDER BY id DESC LIMIT 1",
-                (task_id,),
+                "SELECT summary FROM task_runs "
+                "WHERE task_id = ? AND id = ? AND outcome = 'blocked' "
+                "AND summary IS NOT NULL LIMIT 1",
+                (task_id, run_id),
             ).fetchone()
             if run and run["summary"]:
                 reason = str(run["summary"]).strip()
@@ -1446,6 +1468,7 @@ def _task_block_history(conn: sqlite3.Connection, task_id: str, limit: int = 5) 
                 "auto_promotable": kind == "dependency",
                 "recurrences": payload.get("recurrences"),
                 "source_status": payload.get("source_status"),
+                "run_id": run_id,
                 "reason": _truncate(reason, MAX_ITEM_CHARS) if reason else "",
                 "at": row["created_at"],
             }

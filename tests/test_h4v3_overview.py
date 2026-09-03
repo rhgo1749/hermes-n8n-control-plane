@@ -372,6 +372,58 @@ def test_missing_board_db_is_safe() -> None:
     assert result["counts"] == overview._empty_counts()
 
 
+def test_block_history_reachable_in_todo_and_ready_states() -> None:
+    # Issue #92: the block-semantics history is a STATUS-AGNOSTIC read surface.
+    # A canonical dependency block routes the task to `todo` (auto-promotable)
+    # and later `ready` — it never sits in `blocked` — so the Overview must
+    # expose the dependency hold distinctly in `todo`/`ready`, not only for a
+    # current human `blocked` card.
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                # dependency-wait task still in the dependency `todo` path
+                ("t-dep-todo", "Dep wait", "todo", "worker", "dependency", 0, 0, None, None, ""),
+                # dependency-wait task after parent resolution (auto-promoted)
+                ("t-dep-ready", "Dep promoted", "ready", "worker", None, 0, 0, None, None, ""),
+                # a distinct human-attention hold in `blocked`
+                ("t-human", "Human", "blocked", "worker", "capability", 0, 0, None, None, ""),
+                # a task with no block history at all
+                ("t-plain", "Plain", "ready", "worker", None, 0, 0, None, None, ""),
+            ],
+            [
+                ("t-dep-todo", "dependency_wait", json.dumps({"kind": "dependency", "reason": "waiting on parent", "source_status": "running"}), 100),
+                ("t-dep-ready", "dependency_wait", json.dumps({"kind": "dependency", "reason": "waiting on parent", "source_status": "running"}), 100),
+                ("t-dep-ready", "promoted", json.dumps({"status": "ready"}), 200),
+                ("t-human", "blocked", json.dumps({"kind": "capability", "reason": "hard wall", "source_status": "running"}), 150),
+            ],
+        )
+        result = overview._load_board_projection({"slug": "demo", "name": "Demo", "db_path": str(path)})
+        by_id = {task["id"]: task for task in result["tasks"]}
+        # The `todo` dependency-wait task exposes its dependency hold ...
+        todo_hist = by_id["t-dep-todo"]["block_history"]
+        assert todo_hist and todo_hist[0]["kind"] == "dependency_wait"
+        assert todo_hist[0]["block_kind"] == "dependency"
+        assert todo_hist[0]["dependency_driven"] is True
+        assert todo_hist[0]["auto_promotable"] is True
+        assert todo_hist[0]["reason"] == "waiting on parent"
+        # ... and the `ready` (auto-promoted) task's dependency history SURVIVES
+        # the promotion — it is not lost once the task leaves `blocked`-ish
+        # states (the pre-fix read surface was only reachable while `blocked`).
+        ready_hist = by_id["t-dep-ready"]["block_history"]
+        assert ready_hist and ready_hist[0]["block_kind"] == "dependency"
+        assert ready_hist[0]["dependency_driven"] is True
+        assert ready_hist[0]["auto_promotable"] is True
+        # A distinct human-attention hold stays a human hold, never a dependency.
+        human_hist = by_id["t-human"]["block_history"]
+        assert human_hist and human_hist[0]["block_kind"] == "capability"
+        assert human_hist[0]["dependency_driven"] is False
+        assert human_hist[0]["auto_promotable"] is False
+        # A task without block events has an (explicitly empty) history.
+        assert by_id["t-plain"]["block_history"] == []
+
+
 def main() -> int:
     tests = [
         value
