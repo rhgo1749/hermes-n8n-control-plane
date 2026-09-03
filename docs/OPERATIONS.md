@@ -176,24 +176,28 @@ Set the reviewed public HTTPS endpoint for the router in the runtime `.env`:
 
 ```dotenv
 GITHUB_ROUTER_PUBLIC_URL=https://<reviewed-host>/github/hermes-intake
-# Positive decimal installation.id for the configured GitHub App installation.
+# Optional for existing managed repository webhooks. Required for GitHub App
+# first-discovery/onboarding; use the positive decimal installation.id when enabled.
 GITHUB_ROUTER_INSTALLATION_ID=<installation-id>
 ```
 
-Expose only that reviewed HTTPS path through the reverse proxy/Funnel. Do not
-publish ports `5678`, `5680`, or `5681` directly.
+The control-plane owns only the reviewed `/github/hermes-intake` public route.
+Do not publish ports `5678`, `5680`, or `5681` directly. If the same Funnel port
+also hosts another deliberately reviewed service, preserve that unrelated route
+instead of treating the whole port as control-plane-owned.
 
 ### Funnel path isolation (required)
 
 The Tailscale Funnel terminates TLS for the funnel-enabled port (the deployed
 host funnels `:10000`; the tailnet-only `:443` listener must stay
-non-funnel). A funnel rule that proxies `/` publishes every path the backend
-listens on to the public internet, so the funnel must proxy **only** the
-router intake path. Configure the host as:
+non-funnel). Reassert only the control-plane intake path; do not remove or
+overwrite unrelated reviewed routes that intentionally share the same Funnel
+port. Configure the intake path as:
 
 ```bash
-tailscale serve --https=10000 \
-  --set-path=/github/hermes-intake http://127.0.0.1:5681/github/hermes-intake
+tailscale funnel --bg --yes --https=10000 \
+  --set-path=/github/hermes-intake \
+  http://127.0.0.1:5681/github/hermes-intake
 ```
 
 Do not add a `/` (or any non-intake) funnel rule against the control-center
@@ -201,19 +205,20 @@ port (`8940`). The dashboard, `/voice`, `/avatar`, `/ramstation`, and the
 other tailnet-only listeners on `:443`/`:8443`/`:9443` stay inside the
 tailnet; they must not be publicly routed.
 
-Verify after applying (from outside the tailnet, e.g. a non-Tailscale
-network):
+Verify after applying:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>:10000/                  # expect 404 (not 200)
-curl -s -o /dev/null -w '%{http_code}\n' https://<ts-hostname>:10000/healthz           # expect 200 {"ok":true} only
+tailscale funnel status
+# Confirm /github/hermes-intake maps to 127.0.0.1:5681 without changing
+# unrelated reviewed routes on the same Funnel port.
+
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  https://<ts-hostname>:10000/github/hermes-intake                                     # expect 401 invalid_signature
+  https://<ts-hostname>:10000/github/hermes-intake  # expect 401 invalid_signature
 ```
 
-The external `/healthz` response is deliberately minimal (`{"ok": true}`);
-queue depth and secret-configuration details moved to the Bearer-authenticated
-`/debug/state` endpoint (see below).
+Router `/healthz` is a loopback diagnostic unless the operator deliberately
+publishes a separate health route. Queue depth and secret-configuration details
+remain on the Bearer-authenticated `/debug/state` endpoint (see below).
 
 ### Router operator diagnostics
 

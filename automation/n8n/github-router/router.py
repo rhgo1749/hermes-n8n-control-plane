@@ -1997,11 +1997,17 @@ def main() -> int:
         not GITHUB_OWNER
         or not GITHUB_TOPIC
         or GITHUB_OWNER_TYPE not in {"personal", "organization"}
-        or GITHUB_INSTALLATION_ID is None
     ):
         raise SystemExit(
-            "GITHUB_ROUTER_OWNER/TOPIC/INSTALLATION_ID are required and "
+            "GITHUB_ROUTER_OWNER/TOPIC are required and "
             "OWNER_TYPE must be personal or organization"
+        )
+    if GITHUB_INSTALLATION_ID is None:
+        print(
+            "github-router GitHub App installation ID is not configured; "
+            "managed repository webhooks remain enabled while App "
+            "first-discovery/onboarding remains fail-closed",
+            flush=True,
         )
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(
