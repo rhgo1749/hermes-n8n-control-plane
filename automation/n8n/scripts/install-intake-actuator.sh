@@ -21,6 +21,7 @@ TOKEN_HOST="$SECRET_DIR/hermes-intake-control-token"
 LIBEXEC_DIR="/home/hermes/.local/libexec"
 BIN_DIR="/home/hermes/.local/bin"
 CONTROL_DIR="/home/hermes/.hermes/.control-plane"
+HERMES_AGENT_SOURCE_ROOT="${HERMES_AGENT_SOURCE_ROOT:-/ws/hermes-agent}"
 
 ACTUATOR_REMOTE="$LIBEXEC_DIR/github_intake_actuator.py"
 TIMEOUT_REMOTE="$LIBEXEC_DIR/edge_sync_timeout.py"
@@ -117,6 +118,9 @@ hermes_write() {
 [[ "$(hermes_exec id -u)" == "1000" ]] \
     || fail "unexpected Hermes runtime uid"
 
+hermes_exec sh -c 'command -v pgrep >/dev/null && command -v pkill >/dev/null' \
+    || fail "Hermes runtime must provide pgrep/pkill for actuator lifecycle control"
+
 hermes_exec mkdir -p \
     "$LIBEXEC_DIR" \
     "$BIN_DIR" \
@@ -128,13 +132,17 @@ hermes_write "$SOURCE" "$ACTUATOR_REMOTE" 0755
 hermes_write "$TIMEOUT_SOURCE" "$TIMEOUT_REMOTE" 0644
 hermes_write "$TOKEN_HOST" "$TOKEN_REMOTE" 0600
 
-cat > "$TMP/launcher" <<'LAUNCHER'
+cat > "$TMP/launcher" <<LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
 
 export HOME=/home/hermes
 export HERMES_HOME=/home/hermes/.hermes
 export HERMES_INTAKE_ACTUATOR_TOKEN_FILE=/home/hermes/.hermes/.control-plane/github-intake-control-token
+export HERMES_AGENT_SOURCE_ROOT="$HERMES_AGENT_SOURCE_ROOT"
+# Bind the canonical checkout exactly.  Do not inherit a stale editable-install
+# path from the long-lived Hermes container.
+export PYTHONPATH="$HERMES_AGENT_SOURCE_ROOT"
 
 exec /opt/venv/bin/python3 \
   /home/hermes/.local/libexec/github_intake_actuator.py
@@ -144,6 +152,15 @@ hermes_write "$TMP/launcher" "$LAUNCHER_REMOTE" 0755
 
 hermes_exec /opt/venv/bin/python3 -m py_compile "$ACTUATOR_REMOTE"
 hermes_exec /opt/venv/bin/python3 -m py_compile "$TIMEOUT_REMOTE"
+
+# Exercise the same interpreter/import boundary used by /v1/edge-sync.  File
+# existence alone is insufficient: a stale editable finder can leave the
+# actuator apparently healthy while every real edge-sync child crashes.
+hermes_exec env \
+    "PYTHONPATH=$HERMES_AGENT_SOURCE_ROOT" \
+    /opt/venv/bin/python3 -c \
+    'import hermes_cli.kanban_db; import hermes_state; import hermes_state_holders' \
+    || fail "Hermes edge runtime import preflight failed"
 
 DOCKER_BIN="$(command -v docker)"
 
@@ -156,7 +173,11 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=$DOCKER_BIN exec --user 1000:1000 --env HOME=/home/hermes --env HERMES_HOME=/home/hermes/.hermes $CONTAINER_NAME $LAUNCHER_REMOTE
+ExecStart=$DOCKER_BIN exec --user 1000:1000 --env HOME=/home/hermes --env HERMES_HOME=/home/hermes/.hermes --env HERMES_AGENT_SOURCE_ROOT=$HERMES_AGENT_SOURCE_ROOT --env PYTHONPATH=$HERMES_AGENT_SOURCE_ROOT $CONTAINER_NAME $LAUNCHER_REMOTE
+# `docker exec` is a host-side client. Killing only that client can leave the
+# exec'd Python process alive inside the container and still bound to :5682.
+# Stop the exact in-container actuator before systemd tears down the client.
+ExecStop=$DOCKER_BIN exec --user 1000:1000 $CONTAINER_NAME sh -c 'pkill -TERM -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true'
 Restart=always
 RestartSec=5s
 TimeoutStopSec=15s
@@ -171,9 +192,51 @@ UNIT
 
 install -o root -g root -m 0644 "$TMP/unit" "$UNIT_PATH"
 
+# Upgrade safety for installs created before ExecStop existed.  `systemctl
+# stop` can terminate only the host docker-exec client and strand the old
+# Python listener in the container.  Explicitly reap that exact process before
+# starting the newly-written unit so /healthz cannot false-positive on stale
+# code/environment.
+systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
+hermes_exec sh -c '
+    set -eu
+    pids="$(pgrep -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
+    [ -z "$pids" ] || kill -TERM $pids 2>/dev/null || true
+    i=0
+    while [ -n "$pids" ] && [ "$i" -lt 20 ]; do
+        sleep .1
+        pids="$(pgrep -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
+        i=$((i + 1))
+    done
+    [ -z "$pids" ] || kill -KILL $pids 2>/dev/null || true
+'
+
 systemctl daemon-reload
 systemctl enable "$UNIT_NAME" >/dev/null
-systemctl restart "$UNIT_NAME"
+systemctl start "$UNIT_NAME"
+
+# Verify the process that actually owns the runtime, not just the copied
+# launcher file.  This closes the stale-listener false-positive that caused
+# Issue #106: the old process had no PYTHONPATH while the new launcher did.
+identity_ready=0
+for _ in $(seq 1 30); do
+    if hermes_exec sh -c '
+        set -eu
+        expected="$1"
+        pids="$(pgrep -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
+        count="$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)"
+        [ "$count" -eq 1 ] || exit 1
+        pid="$(printf "%s\n" "$pids" | sed -n "1p")"
+        actual="$(tr "\000" "\n" < "/proc/$pid/environ" | sed -n "s/^PYTHONPATH=//p" | sed -n "1p")"
+        [ "$actual" = "$expected" ]
+    ' sh "$HERMES_AGENT_SOURCE_ROOT"; then
+        identity_ready=1
+        break
+    fi
+    sleep .2
+done
+[[ "$identity_ready" == 1 ]] \
+    || fail "actuator process identity/PYTHONPATH did not converge"
 
 for _ in $(seq 1 30); do
     if curl \
@@ -201,6 +264,7 @@ assert payload["ok"] is True, payload
 assert payload["service"] == "hermes-github-intake-actuator", payload
 assert payload["token_ready"] is True, payload
 assert payload["runtime_ready"] is True, payload
+assert payload["edge_sync_runtime_ready"] is True, payload
 
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PYHEALTH

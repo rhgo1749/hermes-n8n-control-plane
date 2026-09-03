@@ -1787,13 +1787,19 @@ def _onboarding_checkout_is_clean(checkout: Path) -> bool:
     code, raw_index, _ = _git_onboarding_bytes(checkout, "ls-files", "--stage", "-z")
     if code != 0:
         return False
-    for other_args in (
-        ("ls-files", "--others", "--exclude-standard", "-z"),
-        ("ls-files", "--others", "--ignored", "--exclude-standard", "-z"),
-    ):
-        code, raw_other, _ = _git_onboarding_bytes(checkout, *other_args)
-        if code != 0 or raw_other:
-            return False
+    # Ordinary untracked files are unsafe because they can shadow or
+    # contaminate the canonical checkout. Ignored files are deliberately
+    # outside Git's cleanliness boundary: normal development anchors contain
+    # ignored build outputs, local runtime state, and Hermes-owned .worktrees/.
+    code, raw_other, _ = _git_onboarding_bytes(
+        checkout,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    if code != 0 or raw_other:
+        return False
 
     total_bytes = 0
     for raw_entry in raw_index.split(b"\x00"):

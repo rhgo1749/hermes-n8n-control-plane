@@ -68,10 +68,15 @@ KANBAN_BOARDS_ROOT = Path(
         "/home/hermes/.hermes/kanban/boards",
     )
 )
+HERMES_AGENT_SOURCE_ROOT = (
+    os.environ.get("HERMES_AGENT_SOURCE_ROOT", "").strip()
+    or "/ws/hermes-agent"
+)
 TIMEOUT_SECONDS = float(
     os.environ.get("HERMES_INTAKE_ACTUATOR_TIMEOUT_SECONDS", "900")
 )
 MAX_EDGE_SYNC_BODY_BYTES = 16 * 1024
+MAX_EDGE_SYNC_DIAGNOSTIC_BYTES = 4096
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ACTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DELIVERY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -219,6 +224,7 @@ def _run_intake() -> int:
             "/home/hermes/.local/bin:"
             "/usr/local/bin:/usr/bin:/bin"
         ),
+        "PYTHONPATH": HERMES_AGENT_SOURCE_ROOT,
         "PYTHONDONTWRITEBYTECODE": "1",
         # Resolve the GitHub credential once at the trusted actuator
         # boundary; never place it in the command or URL.
@@ -260,11 +266,27 @@ def _stop_edge_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _edge_sync_failure_diagnostic(
+    raw_stderr: bytes,
+    *,
+    github_token: str,
+) -> str:
+    """Return a bounded secret-redacted diagnostic for journal logging only."""
+    if not raw_stderr:
+        return ""
+    tail = raw_stderr[-MAX_EDGE_SYNC_DIAGNOSTIC_BYTES:]
+    text = tail.decode("utf-8", errors="replace").strip()
+    if github_token:
+        text = text.replace(github_token, "[REDACTED_GITHUB_TOKEN]")
+    return text
+
+
 def _run_edge_sync(board: str) -> list[dict[str, Any]]:
     timeout_seconds = _edge_sync_timeout_seconds()
     if not _edge_runtime_ready():
         raise RuntimeError("edge_sync_runtime_unavailable")
 
+    github_token = _github_token()
     env = {
         **os.environ,
         "HOME": "/home/hermes",
@@ -274,8 +296,12 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
             "/home/hermes/.local/bin:"
             "/usr/local/bin:/usr/bin:/bin"
         ),
+        # Do not depend on the long-lived parent actuator inheriting a
+        # launcher environment correctly.  The edge child always binds the
+        # canonical Hermes source checkout directly.
+        "PYTHONPATH": HERMES_AGENT_SOURCE_ROOT,
         "PYTHONDONTWRITEBYTECODE": "1",
-        "GITHUB_TOKEN": _github_token(),
+        "GITHUB_TOKEN": github_token,
         # The edge-owned rework respawn lane is the canonical event-driven
         # path for managed ``agent-rework`` deliveries: a successful label
         # event flows router -> actuator -> this sync, and the sync must
@@ -313,6 +339,7 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
     selector.register(process.stdout, selectors.EVENT_READ, data="stdout")
     selector.register(process.stderr, selectors.EVENT_READ, data="stderr")
     stdout_output: list[bytes] = []
+    stderr_output: list[bytes] = []
     output_bytes = 0
     deadline = time.monotonic() + timeout_seconds
     open_streams = 2
@@ -344,6 +371,8 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
                 # deadlock while preserving the existing combined output budget.
                 if key.data == "stdout":
                     stdout_output.append(data)
+                else:
+                    stderr_output.append(data)
                 output_bytes += len(data)
 
         remaining = deadline - time.monotonic()
@@ -362,6 +391,17 @@ def _run_edge_sync(board: str) -> list[dict[str, Any]]:
             process.stderr.close()
 
     if returncode != 0:
+        diagnostic = _edge_sync_failure_diagnostic(
+            b"".join(stderr_output),
+            github_token=github_token,
+        )
+        if diagnostic:
+            print(
+                f"[github-intake-actuator] edge-sync child failed "
+                f"board={board} returncode={returncode}; stderr_tail={diagnostic}",
+                file=sys.stderr,
+                flush=True,
+            )
         raise RuntimeError("edge_sync_command_failed")
     raw_output = b"".join(stdout_output)
     try:
