@@ -824,3 +824,55 @@ def test_clone_materialization_does_not_execute_repository_filter(
     assert "GIT_TEMPLATE_DIR" not in clone_env
     assert "GIT_SSL_NO_VERIFY" not in clone_env
     assert (checkout_root / "new-agent" / "link").is_symlink()
+
+
+
+def test_onboarding_checkout_allows_ignored_artifacts_but_rejects_ordinary_untracked(
+    tmp_path: Path,
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    _run_git("init", cwd=checkout)
+    _run_git("config", "user.email", "unit@example.test", cwd=checkout)
+    _run_git("config", "user.name", "Unit Test", cwd=checkout)
+
+    (checkout / "AGENTS.md").write_text(
+        "# contract\n",
+        encoding="utf-8",
+    )
+    (checkout / ".gitignore").write_text(
+        "build/\n.gradle/\n",
+        encoding="utf-8",
+    )
+
+    _run_git("add", "AGENTS.md", ".gitignore", cwd=checkout)
+    _run_git("commit", "-m", "initial", cwd=checkout)
+
+    info_exclude = checkout / ".git" / "info" / "exclude"
+    with info_exclude.open("a", encoding="utf-8") as handle:
+        handle.write("\n/.worktrees/\n")
+
+    worktree_artifact = checkout / ".worktrees" / "task-1"
+    worktree_artifact.mkdir(parents=True)
+    (worktree_artifact / "marker").write_text(
+        "managed artifact\n",
+        encoding="utf-8",
+    )
+
+    (checkout / "build").mkdir()
+    (checkout / "build" / "generated.bin").write_bytes(b"generated")
+
+    (checkout / ".gradle").mkdir()
+    (checkout / ".gradle" / "cache.bin").write_bytes(b"cache")
+
+    # Ignored build/runtime/Hermes artifacts are compatible with a clean
+    # canonical Git checkout.
+    assert intake._onboarding_checkout_is_clean(checkout) is True
+
+    # A genuinely ordinary untracked file remains fail-closed.
+    (checkout / "scratch.txt").write_text(
+        "unexpected\n",
+        encoding="utf-8",
+    )
+    assert intake._onboarding_checkout_is_clean(checkout) is False
