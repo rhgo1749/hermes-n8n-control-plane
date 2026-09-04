@@ -68,6 +68,7 @@ MAX_ISSUE_PAGES = 10
 DEFAULT_CHECKOUT_ROOT = "/ws/projects"
 ONBOARDING_LOCK_TIMEOUT_SECONDS = 10.0
 ONBOARDING_CLONE_TIMEOUT_SECONDS = 240
+ONBOARDING_REFRESH_TIMEOUT_SECONDS = 120
 ONBOARDING_MAX_CLONE_ATTEMPTS = 2
 MAX_GITHUB_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_ONBOARDING_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -239,6 +240,8 @@ class RepoSnapshot:
     origin_sha: str
     remote: str
     contract_paths: tuple[str, ...]
+    refresh_action: str = "reused"
+    refresh_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -272,6 +275,28 @@ class CheckoutProvisioning:
 
 _active_wake_scope: WakeScope | None = None
 _active_scope_progress: dict[str, Any] = {}
+_active_repository_outcomes: list[dict[str, str]] = []
+
+
+def _record_repository_outcome(
+    repository: str,
+    action: str,
+    reason: str = "",
+) -> None:
+    """Keep one bounded machine-readable outcome per repository."""
+    if not isinstance(repository, str):
+        return
+    outcome = {
+        "repository": repository,
+        "action": action,
+        "reason": reason,
+    }
+    key = repository.casefold()
+    for existing in _active_repository_outcomes:
+        if existing.get("repository", "").casefold() == key:
+            existing.update(outcome)
+            return
+    _active_repository_outcomes.append(outcome)
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1541,6 +1566,33 @@ def _git_onboarding(checkout: Path, *args: str) -> tuple[int, str, str]:
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
 
+def _git_onboarding_with_environment(
+    checkout: Path,
+    *args: str,
+    askpass: Path | None = None,
+    token: str | None = None,
+    extra_environment: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """Run one bounded Git command with the onboarding safety boundary."""
+    environment = _safe_git_environment(askpass=askpass, token=token)
+    if extra_environment:
+        environment.update(extra_environment)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(checkout), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=ONBOARDING_REFRESH_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", type(exc).__name__
+    stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+    stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+    return completed.returncode, stdout.strip(), stderr.strip()
+
+
 def _safe_git_environment(
     *,
     askpass: Path | None = None,
@@ -1597,6 +1649,285 @@ def _safe_git_environment(
         env["GIT_ONBOARDING_TOKEN"] = token
         env["GIT_ONBOARDING_USERNAME"] = "x-access-token"
     return env
+
+
+def _onboarding_objects_path(checkout: Path) -> Path:
+    """Resolve the canonical object store without following untrusted links."""
+    code, objects, _ = _git_onboarding(checkout, "rev-parse", "--git-path", "objects")
+    if code != 0 or not objects:
+        raise _onboarding_error("checkout_fetch_failed")
+    path = Path(objects)
+    if not path.is_absolute():
+        path = checkout / path
+    if (
+        not path.is_absolute()
+        or _path_has_symlink_component(path)
+        or not path.is_dir()
+    ):
+        raise _onboarding_error("checkout_fetch_failed")
+    return path.resolve()
+
+
+def _target_tree_has_attributes(checkout: Path, target: str) -> bool:
+    """Reject attribute-driven materialization before a working-tree merge.
+
+    A fast-forward merge materializes files and Git may execute a filter or a
+    custom merge driver declared by repository attributes.  The onboarding
+    environment disables hooks and fsmonitor, but it cannot safely neutralize
+    every repository-defined filter/driver without executing repository input.
+    Treating an attributes file as an explicit safety boundary keeps the merge
+    fail-closed and ensures no repository-controlled executable is run.
+    """
+    code, raw_paths, _ = _git_onboarding_bytes(
+        checkout,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        target,
+    )
+    if code != 0:
+        raise _onboarding_error("checkout_fetch_failed")
+    for raw_path in raw_paths.split(b"\x00"):
+        if not raw_path:
+            continue
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _onboarding_error("checkout_materialization_unsafe") from None
+        if path == ".gitattributes" or path.endswith("/.gitattributes"):
+            return True
+    return False
+
+
+def _probe_onboarding_ancestry(
+    token: str,
+    metadata: OnboardingRepository,
+    checkout: Path,
+    head_sha: str,
+    askpass: Path,
+) -> None:
+    """Prove fast-forward ancestry without mutating the canonical checkout.
+
+    The target commit is fetched into an agent-owned temporary bare repository.
+    Its object store is supplied as a read-only alternate to ``merge-base``;
+    the canonical refs, index, working tree, and object store remain untouched
+    when a checkout is divergent.
+    """
+    target_sha = metadata.default_branch_sha
+    if not isinstance(target_sha, str) or not _ONBOARDING_SHA.fullmatch(target_sha):
+        raise _onboarding_error("repository_metadata_invalid")
+    expected_remote = f"https://github.com/{metadata.repository}.git"
+    with tempfile.TemporaryDirectory(
+        prefix=".repository-onboarding-probe-",
+        dir=str(checkout.parent),
+    ) as temporary_root:
+        probe = Path(temporary_root) / "objects"
+        try:
+            probe.mkdir()
+        except OSError:
+            raise _onboarding_error("checkout_fetch_failed") from None
+        code, _, _ = _git_onboarding_with_environment(
+            probe,
+            "init",
+            "--bare",
+            "--quiet",
+            askpass=askpass,
+            token=token,
+        )
+        if code != 0:
+            raise _onboarding_error("checkout_fetch_failed")
+        code, _, _ = _git_onboarding_with_environment(
+            probe,
+            "fetch",
+            "--no-tags",
+            "--quiet",
+            expected_remote,
+            target_sha,
+            askpass=askpass,
+            token=token,
+        )
+        if code != 0:
+            raise _onboarding_error("checkout_fetch_failed")
+        canonical_objects = _onboarding_objects_path(checkout)
+        alternate_objects = os.pathsep.join(
+            (str(canonical_objects), str(probe / "objects"))
+        )
+        code, _, _ = _git_onboarding_with_environment(
+            probe,
+            "merge-base",
+            "--is-ancestor",
+            head_sha,
+            target_sha,
+            extra_environment={
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_objects,
+            },
+        )
+        if code == 1:
+            raise _onboarding_error("checkout_diverged")
+        if code != 0:
+            raise _onboarding_error("checkout_ancestry_failed")
+        if _target_tree_has_attributes(probe, target_sha):
+            raise _onboarding_error("checkout_materialization_unsafe")
+
+
+def _self_heal_stale_checkout(
+    token: str,
+    metadata: OnboardingRepository,
+    checkout: Path,
+) -> str:
+    """Refresh a clean stale canonical checkout by a bounded fast-forward.
+
+    The caller must hold ``_repository_onboarding_lock(metadata.repository)``.
+    Every rejection before the first canonical Git mutation is represented by a
+    bounded semantic code.  No reset, force update, checkout, or broad cleanup
+    is used.  ``noop`` means the exact clean SHA was already present; ``healed``
+    means a ref and/or working tree was advanced.
+    """
+    if (
+        not isinstance(token, str)
+        or not token
+        or not _ONBOARDING_REPOSITORY.fullmatch(metadata.repository)
+        or not _valid_onboarding_branch(metadata.default_branch)
+        or not isinstance(metadata.default_branch_sha, str)
+        or not _ONBOARDING_SHA.fullmatch(metadata.default_branch_sha)
+    ):
+        raise _onboarding_error("repository_metadata_invalid")
+    if (
+        not checkout.is_absolute()
+        or _path_has_symlink_component(checkout)
+        or checkout.is_symlink()
+        or not checkout.is_dir()
+    ):
+        raise _onboarding_error("checkout_path_conflict")
+
+    code, root, _ = _git_onboarding(checkout, "rev-parse", "--show-toplevel")
+    if code != 0 or not root or Path(root).resolve() != checkout.resolve():
+        raise _onboarding_error("checkout_path_conflict")
+    code, remote, _ = _git_onboarding(checkout, "remote", "get-url", "origin")
+    expected_remote = _normalise_remote(
+        f"https://github.com/{metadata.repository}.git"
+    )
+    if code != 0 or _normalise_remote(remote) != expected_remote:
+        raise _onboarding_error("checkout_origin_mismatch")
+    code, branch, _ = _git_onboarding(
+        checkout,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+    )
+    if code != 0 or branch != metadata.default_branch:
+        raise _onboarding_error("checkout_default_branch_invalid")
+    if not _onboarding_checkout_is_clean(checkout):
+        raise _onboarding_error("checkout_dirty")
+    if _target_tree_has_attributes(checkout, "HEAD"):
+        raise _onboarding_error("checkout_materialization_unsafe")
+
+    remote_ref = f"refs/remotes/origin/{metadata.default_branch}"
+    code, remote_sha, _ = _git_onboarding(
+        checkout,
+        "rev-parse",
+        "--verify",
+        f"{remote_ref}^{{commit}}",
+    )
+    code_head, head_sha, _ = _git_onboarding(
+        checkout,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+    )
+    target_sha = cast(str, metadata.default_branch_sha).casefold()
+    if (
+        code_head != 0
+        or not _ONBOARDING_SHA.fullmatch(head_sha)
+    ):
+        raise _onboarding_error("checkout_default_branch_invalid")
+    if (
+        code == 0
+        and _ONBOARDING_SHA.fullmatch(remote_sha)
+        and remote_sha.casefold() == target_sha
+        and head_sha.casefold() == target_sha
+    ):
+        _validate_onboarding_checkout(metadata, checkout)
+        return "noop"
+
+    askpass: Path | None = None
+    try:
+        askpass = _onboarding_askpass_file(checkout.parent)
+        _probe_onboarding_ancestry(token, metadata, checkout, head_sha, askpass)
+
+        code, shallow, _ = _git_onboarding(checkout, "rev-parse", "--is-shallow-repository")
+        if code != 0:
+            raise _onboarding_error("checkout_unshallow_failed")
+        if shallow.casefold() == "true":
+            code, _, _ = _git_onboarding_with_environment(
+                checkout,
+                "fetch",
+                "--no-tags",
+                "--unshallow",
+                "origin",
+                target_sha,
+                askpass=askpass,
+                token=token,
+            )
+            if code != 0:
+                raise _onboarding_error("checkout_unshallow_failed")
+        elif shallow.casefold() != "false":
+            raise _onboarding_error("checkout_unshallow_failed")
+
+        code, remote_sha, _ = _git_onboarding(
+            checkout,
+            "rev-parse",
+            "--verify",
+            f"{remote_ref}^{{commit}}",
+        )
+        if (
+            code != 0
+            or not _ONBOARDING_SHA.fullmatch(remote_sha)
+            or remote_sha.casefold() != target_sha
+        ):
+            code, _, _ = _git_onboarding_with_environment(
+                checkout,
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "origin",
+                f"{target_sha}:{remote_ref}",
+                askpass=askpass,
+                token=token,
+            )
+            if code != 0:
+                raise _onboarding_error("checkout_fetch_failed")
+
+        code, _, _ = _git_onboarding(
+            checkout,
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            f"origin/{metadata.default_branch}",
+        )
+        if code == 1:
+            raise _onboarding_error("checkout_diverged")
+        if code != 0:
+            raise _onboarding_error("checkout_ancestry_failed")
+        code, _, _ = _git_onboarding(
+            checkout,
+            "merge",
+            "--ff-only",
+            "--no-verify",
+            f"origin/{metadata.default_branch}",
+        )
+        if code != 0:
+            raise _onboarding_error("checkout_fast_forward_failed")
+        _validate_onboarding_checkout(metadata, checkout)
+        return "healed"
+    finally:
+        if askpass is not None:
+            try:
+                askpass.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _validate_onboarding_checkout(
@@ -2101,8 +2432,34 @@ def _ensure_checkout(
         destination = _checkout_path_for_onboarding(repository, root)
         _reject_casefold_checkout_collision(root, destination)
         if _path_exists_including_broken_symlink(destination):
-            _validate_onboarding_checkout(metadata, destination)
-            return CheckoutProvisioning(metadata.repository, str(destination), "reused")
+            if dry_run:
+                _validate_onboarding_checkout(metadata, destination)
+                refresh_action = "noop"
+            else:
+                try:
+                    refresh_action = _self_heal_stale_checkout(
+                        token,
+                        metadata,
+                        destination,
+                    )
+                except IntakeError as exc:
+                    # The normal clone path installs a complete Git root. A
+                    # tiny operator/test stub may only create the directory;
+                    # retain the pure validation seam for that case, while a
+                    # real non-Git directory still fails closed.
+                    if (
+                        _onboarding_error_code(exc) == "checkout_path_conflict"
+                        and not os.path.lexists(destination / ".git")
+                    ):
+                        _validate_onboarding_checkout(metadata, destination)
+                        refresh_action = "noop"
+                    else:
+                        raise
+            return CheckoutProvisioning(
+                metadata.repository,
+                str(destination),
+                "healed" if refresh_action == "healed" else "reused",
+            )
         if dry_run:
             return CheckoutProvisioning(
                 metadata.repository,
@@ -2137,6 +2494,8 @@ _PERMANENT_SCOPE_REASONS = frozenset(
         "checkout_default_branch_invalid",
         "checkout_default_branch_mismatch",
         "checkout_dirty",
+        "checkout_diverged",
+        "checkout_materialization_unsafe",
         "contract_visibility_invalid",
         "canonical_board_conflict",
         "ambiguous_canonical_board",
@@ -2197,6 +2556,7 @@ def _scoped_onboarding_error(
             "checkout_provisioning": checkout_provisioning,
             "board_provisioning": board_provisioning,
             "scope_skipped": skipped,
+            "repository_outcomes": list(_active_repository_outcomes),
         },
     )
 
@@ -2237,6 +2597,11 @@ def _provision_scoped_checkouts(
                     "reason": "repository_identity_invalid",
                 }
             )
+            _record_repository_outcome(
+                raw_repository if isinstance(raw_repository, str) else "[invalid]",
+                "skipped",
+                "repository_identity_invalid",
+            )
             _active_scope_progress["checkout_provisioning"] = results
             _active_scope_progress["scope_skipped"] = skipped
             continue
@@ -2252,11 +2617,17 @@ def _provision_scoped_checkouts(
                 dry_run=dry_run,
             )
         except IntakeError as exc:
+            reason = _onboarding_error_code(exc)
             skipped.append(
                 {
                     "repository": repository,
-                    "reason": _onboarding_error_code(exc),
+                    "reason": reason,
                 }
+            )
+            _record_repository_outcome(
+                repository,
+                "skipped" if _is_permanent_scope_reason(reason) else "failed",
+                reason,
             )
             _active_scope_progress["checkout_provisioning"] = results
             _active_scope_progress["scope_skipped"] = skipped
@@ -2267,6 +2638,15 @@ def _provision_scoped_checkouts(
                 "checkout": outcome.checkout,
                 "action": outcome.action,
             }
+        )
+        _record_repository_outcome(
+            outcome.repository,
+            "created" if outcome.action in {"registered", "provisioned"} else outcome.action,
+            "checkout_self_healed"
+            if outcome.action == "healed"
+            else "checkout_reused"
+            if outcome.action == "reused"
+            else "",
         )
         _active_scope_progress["checkout_provisioning"] = results
         _active_scope_progress["scope_skipped"] = skipped
@@ -2471,7 +2851,13 @@ def _strict_validate_bootstrap_checkout(
         ):
             raise _onboarding_error("checkout_path_conflict")
         metadata = _onboarding_repository_metadata(token, repository)
-        _validate_onboarding_checkout(metadata, path)
+        if path.is_dir() and not path.is_symlink():
+            _self_heal_stale_checkout(token, metadata, path)
+        else:
+            # Keep the pure validator as the final failure boundary for a
+            # missing checkout (and for lightweight operator probes that
+            # replace it in tests); no refresh can make a missing path safe.
+            _validate_onboarding_checkout(metadata, path)
     return path
 
 
@@ -3372,9 +3758,10 @@ def _sync_board(
 
 
 def _run_once(args: argparse.Namespace) -> int:
-    global _active_scope_progress, _active_wake_scope
+    global _active_scope_progress, _active_wake_scope, _active_repository_outcomes
     _active_scope_progress = {}
     _active_wake_scope = None
+    _active_repository_outcomes = []
     fixture_path = Path(args.fixture_json).resolve() if args.fixture_json else None
     token = None if fixture_path else _github_token()
 
@@ -3451,6 +3838,38 @@ def _run_once(args: argparse.Namespace) -> int:
                         board_provisioning=board_provisioning,
                         error="scoped_checkout_retryable",
                     )
+
+        # The fallback entrypoint may provision scoped checkouts inside its
+        # wake-claim wrapper.  Carry that progress into the result and later
+        # registry reconciliation instead of dropping a partial outcome.
+        if not args.repository and scoped_repositories is None:
+            progress_checkouts = _active_scope_progress.get("checkout_provisioning")
+            if isinstance(progress_checkouts, list):
+                checkout_provisioning = [
+                    item for item in progress_checkouts if isinstance(item, dict)
+                ]
+            progress_skipped = _active_scope_progress.get("scope_skipped")
+            if isinstance(progress_skipped, list):
+                scope_skipped.extend(
+                    item for item in progress_skipped
+                    if isinstance(item, dict)
+                    and item not in scope_skipped
+                )
+            retryable_overlay = [
+                item
+                for item in scope_skipped
+                if isinstance(item, dict)
+                and isinstance(item.get("reason"), str)
+                and not _is_permanent_scope_reason(item["reason"])
+            ]
+            if retryable_overlay and wake_scope is not None:
+                raise _scoped_onboarding_error(
+                    phase="checkout_provisioning",
+                    skipped=scope_skipped,
+                    checkout_provisioning=checkout_provisioning,
+                    board_provisioning=board_provisioning,
+                    error="scoped_checkout_retryable",
+                )
 
         # The registry is read-only, but its board/workdir intent must only be
         # consumed after every scoped candidate has passed fresh metadata and
@@ -3629,25 +4048,96 @@ def _run_once(args: argparse.Namespace) -> int:
             dry_run=bool(args.dry_run),
         )
     candidates = _issue_candidates(token, fixture_path, selected_configs)
-    snapshots: dict[str, RepoSnapshot] = {}
-    for config in selected_configs:
-        if any(candidate_config.name == config.name for candidate_config, _ in candidates):
-            snapshots[config.name] = _repo_snapshot(config)
-    sync_results: list[dict[str, Any]] = []
+    repository_isolation = bool(token and not fixture_path and not args.repository)
+    failed_repository_keys: set[str] = set()
+    processable_configs = selected_configs
+
+    def skip_repository(config: RepositoryConfig, reason: str) -> None:
+        key = config.name.casefold()
+        if key in failed_repository_keys:
+            return
+        failed_repository_keys.add(key)
+        _record_repository_outcome(
+            config.name,
+            "skipped" if _is_permanent_scope_reason(reason) else "failed",
+            reason,
+        )
+        registry_unready.append({"repository": config.name, "reason": reason})
+        scope_skipped.append({"repository": config.name, "reason": reason})
+
     if not args.dry_run:
         board_slugs = _board_slugs()
-        missing_boards = sorted({config.board for config in selected_configs} - board_slugs)
+        missing_boards = {
+            config.board for config in selected_configs if config.board not in board_slugs
+        }
+        if missing_boards and not repository_isolation:
+            raise IntakeError(
+                f"configured Kanban boards are missing: {', '.join(sorted(missing_boards))}"
+            )
         if missing_boards:
-            raise IntakeError(f"configured Kanban boards are missing: {', '.join(missing_boards)}")
+            for config in selected_configs:
+                if config.board in missing_boards:
+                    skip_repository(config, "board_missing")
+            processable_configs = tuple(
+                config
+                for config in selected_configs
+                if config.name.casefold() not in failed_repository_keys
+            )
+
+    snapshots: dict[str, RepoSnapshot] = {}
+    candidate_keys = {
+        candidate_config.name.casefold() for candidate_config, _ in candidates
+    }
+    for config in processable_configs:
+        if config.name.casefold() not in candidate_keys:
+            continue
+        try:
+            snapshot = _repo_snapshot(config)
+        except IntakeError as exc:
+            reason = _onboarding_error_code(exc)
+            if not repository_isolation:
+                raise
+            skip_repository(config, reason)
+            continue
+        except Exception:
+            if not repository_isolation:
+                raise
+            skip_repository(config, "intake_failed")
+            continue
+        snapshots[config.name] = snapshot
+        refresh_action = getattr(snapshot, "refresh_action", "reused")
+        refresh_reason = getattr(snapshot, "refresh_reason", "")
+        _record_repository_outcome(
+            config.name,
+            refresh_action if refresh_action in {"reused", "healed"} else "reused",
+            refresh_reason or "checkout_reused",
+        )
+
+    if failed_repository_keys:
+        processable_configs = tuple(
+            config
+            for config in processable_configs
+            if config.name.casefold() not in failed_repository_keys
+        )
+        candidates = [
+            (config, issue)
+            for config, issue in candidates
+            if config.name.casefold() not in failed_repository_keys
+        ]
+    for config in processable_configs:
+        if config.name.casefold() not in candidate_keys:
+            _record_repository_outcome(config.name, "reused", "no_agent_ready_issue")
+    sync_results: list[dict[str, Any]] = []
     imported_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     results: list[dict[str, Any]] = []
     notification_lines: list[str] = []
-    for config, issue in candidates:
+    def process_candidate(config: RepositoryConfig, issue: dict[str, Any]) -> None:
         snapshot = snapshots[config.name]
         key = _idempotency_key(config.name, issue["number"])
         if args.dry_run:
             results.append({"key": key, "board": config.board, "title": issue.get("title", "")})
-            continue
+            _record_repository_outcome(config.name, "created", "dry_run_predicted")
+            return
         if token is None:
             raise IntakeError("GitHub token is required for non-dry-run intake")
         # Completed-work guard: an OPEN agent-ready Issue that a merged PR
@@ -3680,20 +4170,65 @@ def _run_once(args: argparse.Namespace) -> int:
                 "merged_pr_numbers": merged_prs,
                 "labels_cleared": labels,
             })
-            continue
+            _record_repository_outcome(
+                config.name,
+                "skipped",
+                "all_linked_prs_merged",
+            )
+            return
         created = _create_task(config, issue, snapshot, imported_at, tick_started=tick_started)
         results.append(created)
+        _record_repository_outcome(config.name, "created", "task_upserted")
         # Card creation is intake work, not an operator incident: it is
         # visible on the H4V3 Overview and deliberately produces no Telegram
         # alert. Only human-attention events below may notify.
+
+    for config, issue in candidates:
+        try:
+            process_candidate(config, issue)
+        except IntakeError as exc:
+            if not repository_isolation:
+                raise
+            skip_repository(config, _onboarding_error_code(exc))
+        except Exception:
+            if not repository_isolation:
+                raise
+            skip_repository(config, "intake_failed")
     # Intake and completion reconciliation share the same five-minute cron
     # tick.  Reconcile every configured board even when there are no new
     # agent-ready Issues; this detects merges performed outside Hermes.
     # In dry-run the sync runs read-only so predicted notifications can be
     # reported without ever sending.
     if token:
-        for config in selected_configs:
-            sync_results.extend(_sync_board(config, token, dry_run=bool(args.dry_run)))
+        for config in processable_configs:
+            try:
+                sync_results.extend(
+                    _sync_board(config, token, dry_run=bool(args.dry_run))
+                )
+            except IntakeError as exc:
+                if not repository_isolation:
+                    raise
+                skip_repository(config, _onboarding_error_code(exc))
+            except Exception:
+                if not repository_isolation:
+                    raise
+                skip_repository(config, "intake_failed")
+    if repository_isolation and wake_scope is not None:
+        retryable_repository_failures = [
+            item
+            for item in scope_skipped
+            if isinstance(item, dict)
+            and isinstance(item.get("reason"), str)
+            and not _is_permanent_scope_reason(item["reason"])
+        ]
+        if retryable_repository_failures:
+            raise _scoped_onboarding_error(
+                phase="repository_reconciliation",
+                skipped=scope_skipped,
+                checkout_provisioning=checkout_provisioning,
+                board_provisioning=board_provisioning,
+                error="repository_refresh_retryable",
+            )
     predicted: list[str] = []
     telegram_sent = False
     telegram_skipped = False
@@ -3759,6 +4294,7 @@ def _run_once(args: argparse.Namespace) -> int:
             "id": wake_scope.scope_id if wake_scope is not None else "",
         },
         "scope_skipped": scope_skipped,
+        "repository_outcomes": list(_active_repository_outcomes),
         "dry_run": bool(args.dry_run),
         "fixture": bool(fixture_path),
         "candidate_count": len(candidates),
@@ -3796,6 +4332,7 @@ def _handle_run_failure(error: IntakeError) -> None:
                 "checkout_registered_board_pending": _onboarding_progress_is_partial(),
                 "phase": "intake",
                 "error": error_code,
+                "repository_outcomes": list(_active_repository_outcomes),
                 **_active_scope_progress,
             }
         )

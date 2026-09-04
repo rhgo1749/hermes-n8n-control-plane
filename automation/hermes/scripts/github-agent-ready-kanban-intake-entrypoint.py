@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -225,12 +226,16 @@ def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
             return scope
 
         try:
-            module._provision_scoped_checkouts(
+            results, skipped, _ = module._provision_scoped_checkouts(
                 token,
                 repositories,
                 snapshot,
                 dry_run=bool(getattr(module, "_intake_overlay_dry_run", False)),
             )
+            progress = getattr(module, "_active_scope_progress", {})
+            if isinstance(progress, dict):
+                progress["checkout_provisioning"] = results
+                progress["scope_skipped"] = skipped
         except Exception:
             _requeue_claimed_scope(module, scope, "onboarding_retryable")
             raise
@@ -285,36 +290,102 @@ def _install_existing_ready_scope_overlay(module: ModuleType) -> None:
                 strict.append(raw_repository)
                 continue
 
+            self_heal = getattr(module, "_self_heal_stale_checkout", None)
+            refresh_action = "noop"
+            refresh_reason = "checkout_reused"
             try:
-                metadata = module._onboarding_repository_metadata(token, raw_repository)
+                if callable(self_heal):
+                    lock_factory: Any = getattr(
+                        module,
+                        "_repository_onboarding_lock",
+                        None,
+                    )
+                    lock: Any = (
+                        lock_factory(raw_repository)
+                        if callable(lock_factory)
+                        else nullcontext()
+                    )
+                    with lock:
+                        metadata = module._onboarding_repository_metadata(
+                            token,
+                            raw_repository,
+                        )
+                        if (
+                            metadata.repository.casefold() != key
+                            or metadata.default_branch != entry.get("default_branch")
+                        ):
+                            raise module.IntakeError("repository_metadata_invalid")
+                        if dry_run:
+                            module._validate_onboarding_checkout(
+                                metadata,
+                                Path(str(entry["checkout"])),
+                            )
+                            refresh_action = "noop"
+                        else:
+                            refresh_action = str(
+                                self_heal(
+                                    token,
+                                    metadata,
+                                    Path(str(entry["checkout"])),
+                                )
+                            )
+                        refresh_reason = (
+                            "checkout_self_healed"
+                            if refresh_action == "healed"
+                            else "self_heal_noop_same_sha"
+                        )
+                else:
+                    # Compatibility for operator probes that load an older
+                    # core module; deployed cores always expose the shared
+                    # locked self-heal contract above.
+                    metadata = module._onboarding_repository_metadata(
+                        token,
+                        raw_repository,
+                    )
+                    if (
+                        metadata.repository.casefold() != key
+                        or metadata.default_branch != entry.get("default_branch")
+                    ):
+                        raise module.IntakeError("repository_metadata_invalid")
             except module.IntakeError as exc:
+                reason = module._onboarding_error_code(exc)
                 skipped.append(
                     {
                         "repository": raw_repository,
-                        "reason": module._onboarding_error_code(exc),
+                        "reason": reason,
                     }
                 )
+                recorder = getattr(module, "_record_repository_outcome", None)
+                permanent = getattr(module, "_is_permanent_scope_reason", None)
+                if callable(recorder):
+                    recorder(
+                        raw_repository,
+                        "skipped" if callable(permanent) and permanent(reason) else "failed",
+                        reason,
+                    )
                 continue
-
-            if (
-                metadata.repository.casefold() != key
-                or metadata.default_branch != entry.get("default_branch")
-            ):
+            except Exception:
                 skipped.append(
                     {
                         "repository": raw_repository,
-                        "reason": "repository_metadata_invalid",
+                        "reason": "intake_failed",
                     }
                 )
+                recorder = getattr(module, "_record_repository_outcome", None)
+                if callable(recorder):
+                    recorder(raw_repository, "failed", "intake_failed")
                 continue
 
             reused.append(
                 {
                     "repository": metadata.repository,
                     "checkout": str(entry["checkout"]),
-                    "action": "reused",
+                    "action": "healed" if refresh_action == "healed" else "reused",
                 }
             )
+            recorder = getattr(module, "_record_repository_outcome", None)
+            if callable(recorder):
+                recorder(metadata.repository, reused[-1]["action"], refresh_reason)
 
         strict_results: list[dict[str, str]] = []
         strict_skipped: list[dict[str, str]] = []
@@ -378,12 +449,32 @@ def _origin_snapshot_unlocked(module: ModuleType, config: Any):
     if code != 0 or module._normalise_remote(remote) != expected:
         raise module.IntakeError(f"origin mismatch for {config.name}")
 
+    token = module._github_token()
     metadata = module._onboarding_repository_metadata(
-        module._github_token(),
+        token,
         config.name,
     )
     if metadata.default_branch != config.default_branch:
         raise module.IntakeError(f"default branch drift for {config.name}")
+
+    refresh_action = "noop"
+    refresh_reason = "checkout_reused"
+    self_heal = getattr(module, "_self_heal_stale_checkout", None)
+    if callable(self_heal) and not bool(
+        getattr(module, "_intake_overlay_dry_run", False)
+    ):
+        refresh_action = str(
+            self_heal(
+                token,
+                metadata,
+                checkout,
+            )
+        )
+        refresh_reason = (
+            "checkout_self_healed"
+            if refresh_action == "healed"
+            else "self_heal_noop_same_sha"
+        )
 
     remote_ref = f"origin/{config.default_branch}"
     code, sha, _ = module._run_git(
@@ -434,6 +525,8 @@ def _origin_snapshot_unlocked(module: ModuleType, config: Any):
         origin_sha=sha,
         remote=remote,
         contract_paths=contract_paths,
+        refresh_action="healed" if refresh_action == "healed" else "reused",
+        refresh_reason=refresh_reason,
     )
 
 
