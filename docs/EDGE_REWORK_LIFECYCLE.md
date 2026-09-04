@@ -35,7 +35,10 @@ agent-rework          rework request exists; not yet claimed by a Kanban worker
    ▼
 agent-working         worker owns the rework (running task, live claim)
    │  implementation + commit + push + PR head update
-   │  + required validation + completion handoff comment
+   │  + required validation + ordinary Kanban completion metadata
+   ▼
+edge-owned handoff    edge resolves the current round and posts the
+   │  canonical AGENT_REWORK_COMPLETE marker after durable read-back
    ▼
 agent-review-ready    remote delivery complete; human review/merge remains
    │  human merges the PR
@@ -186,7 +189,8 @@ live hook and restarting Hermes remain a separate human validation gate.
 |---|---|---|
 | `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; claim is reclaimed and request label restored if claim-time projection fails |
 | `agent-working` maintained | running task with live claim/run | per-pass label projection (idempotent) |
-| `agent-working` → `agent-review-ready` | delivery evidence complete (marker + head + validation) | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
+| `agent-working` → edge-owned handoff | finished run metadata attests `validation=passed` and the live PR head | edge re-reads the open target PR, source Issue, trusted retry binding, and current round; posts the canonical marker and reads it back; no worker-supplied task/request/head fields are used |
+| `edge-owned handoff` → `agent-review-ready` | read-back marker satisfies the existing delivery gate | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, restore `agent-rework`, and never project `agent-review-ready` or completion |
@@ -260,11 +264,22 @@ live hook and restarting Hermes remain a separate human validation gate.
     inherits a completion/request comment from an earlier round. A delivery
     from an earlier round is rejected even when its full PR head is identical
     to the current round's requested head.
+14. The edge-owned marker path is additive and idempotent. Before posting, the
+    edge re-reads the current open PR/head, source Issue (`open` + `agent-ready`),
+    and the current round's request binding, then checks for a current-round
+    trusted marker. It posts at most one canonical marker per `(task, round,
+    head)`, verifies the authenticated edge actor is trusted, and reads the
+    created comment back before projecting `agent-review-ready`. Any stale
+    head, round/run provenance mismatch, missing request binding, untrusted
+    actor, unresolved read, or failed read-back fails closed without a marker.
 
 ## Machine-readable completion handoff
 
-Workers post the marker in their existing human-readable final report on the
-PR (trusted actor only):
+The worker no longer creates the completion marker. It completes through the
+ordinary Kanban completion surface and durably records `validation=passed` plus
+the full validated `head_sha` in the current `task_runs.metadata`. The edge
+then resolves the marker fields from the governing round and fresh GitHub state
+and posts this top-level PR comment (trusted edge actor only):
 
 ```text
 AGENT_REWORK_COMPLETE
@@ -274,11 +289,17 @@ head=<full 40-char PR head SHA>
 validation=passed
 ```
 
-### Worker pre-post checklist (mandatory)
+The edge-created body may carry additional audit fields (such as
+`rework_round` and `source=edge-reconciliation`) after the five required lines.
+The edge reads the comment back through the existing trusted-marker validator;
+only that observed comment can authorize `agent-review-ready`.
 
-Before posting `AGENT_REWORK_COMPLETE`, verify ALL of the following — a
-comment that merely contains the marker string without these exact
-key=value lines is REJECTED:
+### Legacy/manual marker compatibility checklist
+
+For D1 backward compatibility, an existing trusted worker/maintainer marker is
+still accepted by the existing delivery gate. If a legacy/manual actor posts
+`AGENT_REWORK_COMPLETE`, verify ALL of the following — a comment that merely
+contains the marker string without these exact key=value lines is REJECTED:
 
 - [ ] first line is exactly `AGENT_REWORK_COMPLETE` — no suffix, no
       parenthetical, no surrounding text on that line;

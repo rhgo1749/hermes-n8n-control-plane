@@ -3687,13 +3687,9 @@ def apply_rework(
                 "",
                 "Update the EXISTING linked PR only; do not create a new PR.",
                 "Run the repository-required validation and publish the final head.",
-                "After the remote PR head is verified, add the following exact machine-readable lines to the PR:",
-                REWORK_COMPLETE_MARKER,
-                f"task={task_id}",
-                f"request_comment={rework.request_comment_id if rework.request_comment_id is not None else 'none'}",
-                "head=<full 40-character PR head SHA>",
-                "validation=passed",
-                "Keep the existing human-readable final report in the same comment.",
+                "Complete the task through the normal Kanban completion surface; do not post AGENT_REWORK_COMPLETE.",
+                "Record machine-readable run metadata validation=passed and the full head_sha observed after validation.",
+                "The edge resolves task, request binding, current PR head, and creates the canonical completion marker after read-back.",
             ]),
             int(time.time()),
         ),
@@ -4460,6 +4456,8 @@ def _completion_marker(
     task_id: str,
     rework_at: int,
     request_comment_id: Optional[int],
+    *,
+    expected_round: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     """Find a trusted, post-rework machine-readable delivery handoff."""
     comments = client.get_paginated(
@@ -4490,6 +4488,13 @@ def _completion_marker(
             continue
         if fields.get("validation") != "passed" or head != pr.head_sha.casefold():
             continue
+        marker_round = fields.get("rework_round")
+        if expected_round is not None and marker_round is not None:
+            try:
+                if int(marker_round) != expected_round:
+                    continue
+            except (TypeError, ValueError):
+                continue
         expected_request_comment = (
             str(request_comment_id) if request_comment_id is not None else "none"
         )
@@ -4503,8 +4508,207 @@ def _completion_marker(
             "request_comment": request_comment,
             "head": head,
             "validation": "passed",
+            "rework_round": marker_round,
         }
     return None
+
+
+def _edge_owned_completion_marker(
+    client: Any,
+    ref: GithubTaskRef,
+    pr: GithubPullRequest,
+    task_id: str,
+    event: tuple[dict[str, Any], int, str],
+    run: sqlite3.Row,
+    *,
+    open_pr_count: Optional[int] = None,
+) -> tuple[Optional[dict[str, Any]], str, dict[str, Any]]:
+    """Create and read back the canonical completion marker at the edge.
+
+    The worker only attests validation and the observed head in its durable
+    ``task_runs.metadata``.  Every value written to the GitHub marker is
+    resolved here from the governing event or a fresh GitHub read.  The
+    existing marker parser remains the acceptance gate: a marker is posted
+    only after its exact body is assembled, then the newly-created comment is
+    fetched again before delivery can proceed.
+    """
+    payload, rework_at, event_kind = event
+    round_value = payload.get("rework_round")
+    if not isinstance(round_value, int) or isinstance(round_value, bool) or round_value <= 0:
+        return None, "rework_event_round_invalid", {}
+    if event_kind not in {"github_pr_rework", "github_pr_rework_retry"}:
+        return None, "rework_event_invalid_shape", {}
+    if open_pr_count is not None and open_pr_count != 1:
+        return None, "rework_pr_ambiguous", {"open_pr_count": open_pr_count}
+
+    # Do not use the PR snapshot that opened the reconciliation pass for the
+    # marker fields.  A worker can finish while the branch advances, so the
+    # edge must resolve the live PR and target branch immediately before the
+    # write.
+    fresh_payload, _ = client.get(
+        f"/repos/{ref.repository}/pulls/{pr.number}"
+    )
+    live_pr = _parse_pull_request(pr.number, fresh_payload, ref)
+    if live_pr.state != "open" or live_pr.base_branch != ref.target_branch:
+        return None, "rework_pr_not_open", {
+            "pr_number": live_pr.number,
+            "state": live_pr.state,
+            "base_branch": live_pr.base_branch,
+        }
+    live_head = live_pr.head_sha.casefold()
+    if _FULL_SHA_RE.fullmatch(live_head) is None:
+        return None, "rework_head_invalid", {"head": live_pr.head_sha}
+
+    request_comment_id = payload.get("request_comment_id")
+    typed_request_comment = (
+        int(request_comment_id) if request_comment_id is not None else None
+    )
+
+    # This second lookup closes the race between the initial delivery probe
+    # and the fresh PR read.  It also preserves D1: a valid trusted marker
+    # already present is consumed without requiring a new worker attestation.
+    marker = _completion_marker(
+        client,
+        ref,
+        live_pr,
+        task_id,
+        rework_at,
+        typed_request_comment,
+        expected_round=round_value,
+    )
+    if marker is not None:
+        return marker, "delivery_complete", {
+            "completion_comment_id": marker.get("comment_id"),
+            "edge_created": False,
+        }
+    if str(run["outcome"] or "") == "review_requested":
+        return None, "delivery_run_review_requested", {"run_id": run["id"]}
+
+    issue_payload, _ = client.get(
+        f"/repos/{ref.repository}/issues/{ref.issue_number}"
+    )
+    if not isinstance(issue_payload, dict):
+        return None, "issue_query_invalid", {}
+    issue_state = str(issue_payload.get("state", "")).casefold()
+    issue_labels = {
+        str(item.get("name"))
+        for item in issue_payload.get("labels", [])
+        if isinstance(item, dict)
+    }
+    if issue_state != "open" or AGENT_READY_LABEL not in issue_labels:
+        return None, "issue_not_agent_ready", {
+            "issue_state": issue_state,
+            "issue_agent_ready": AGENT_READY_LABEL in issue_labels,
+        }
+
+    # A non-null request binding can only be the exact trusted retry comment.
+    # Label-only rounds deliberately carry null and render as ``none``.
+    if typed_request_comment is not None:
+        request_comments = client.get_paginated(
+            f"/repos/{ref.repository}/issues/{live_pr.number}/comments",
+            {"per_page": 100},
+        )
+        request_comment = next(
+            (
+                item for item in request_comments
+                if isinstance(item, dict) and item.get("id") == typed_request_comment
+            ),
+            None,
+        )
+        if request_comment is None:
+            return None, "rework_request_missing", {
+                "request_comment_id": typed_request_comment,
+            }
+        request_author = str((request_comment.get("user") or {}).get("login") or "")
+        if request_author not in TRUSTED_GITHUB_ACTORS:
+            return None, "rework_request_untrusted", {
+                "request_comment_id": typed_request_comment,
+                "author": request_author,
+            }
+        if _rework_round_is_maintainer_retry(payload):
+            request_lines = [
+                line.strip()
+                for line in str(request_comment.get("body") or "").splitlines()
+                if line.strip()
+            ]
+            if request_lines != [
+                REWORK_RETRY_MARKER,
+                f"task={task_id}",
+            ]:
+                return None, "rework_request_invalid", {
+                    "request_comment_id": typed_request_comment,
+                }
+
+    metadata = _run_metadata(run)
+    if metadata.get("validation") != "passed":
+        return None, "validation_attestation_missing", {
+            "run_id": run["id"],
+            "validation": metadata.get("validation"),
+        }
+    run_heads = _rework_head_candidates(run)
+    if not run_heads:
+        return None, "run_head_missing", {"run_id": run["id"]}
+    if live_head not in run_heads:
+        return None, "run_head_mismatch", {
+            "run_id": run["id"],
+            "run_heads": sorted(run_heads),
+            "live_head": live_head,
+        }
+
+    # Ordinary rounds must advance beyond the head captured by the rework
+    # request.  Explicit maintainer retries retain the existing verification-
+    # only exception in the delivery gate below.
+    requested_head = str(payload.get("head_sha") or "").casefold()
+    if requested_head and requested_head == live_head and not _rework_round_is_maintainer_retry(payload):
+        return None, "rework_head_unchanged", {
+            "requested_head": requested_head,
+            "head": live_head,
+        }
+
+    # The edge actor is resolved from GitHub, never inferred from the worker
+    # or from the POST response.  A token owned by an untrusted actor cannot
+    # create a completion handoff.
+    actor_payload, _ = client.get("/user")
+    actor = str(actor_payload.get("login") or "") if isinstance(actor_payload, dict) else ""
+    if actor not in TRUSTED_GITHUB_ACTORS:
+        return None, "edge_actor_untrusted", {"actor": actor}
+
+    body = "\n".join([
+        REWORK_COMPLETE_MARKER,
+        f"task={task_id}",
+        f"request_comment={typed_request_comment if typed_request_comment is not None else 'none'}",
+        f"head={live_head}",
+        "validation=passed",
+        f"rework_round={round_value}",
+        "source=edge-reconciliation",
+    ])
+    status, _ = client.post(
+        f"/repos/{ref.repository}/issues/{live_pr.number}/comments",
+        {"body": body},
+    )
+    if not 200 <= status < 300:
+        return None, "completion_marker_post_failed", {"http_status": int(status)}
+
+    observed = _completion_marker(
+        client,
+        ref,
+        live_pr,
+        task_id,
+        rework_at,
+        typed_request_comment,
+        expected_round=round_value,
+    )
+    if observed is None:
+        return None, "completion_marker_unobserved", {
+            "http_status": int(status),
+            "head": live_head,
+            "rework_round": round_value,
+        }
+    return observed, "edge_marker_created", {
+        "completion_comment_id": observed.get("comment_id"),
+        "edge_created": True,
+        "edge_actor": actor,
+    }
 
 
 def _malformed_completion_marker(
@@ -4617,6 +4821,9 @@ def _rework_delivery_evidence(
     task_id: str,
     pr: GithubPullRequest,
     event: tuple[dict[str, Any], int, str],
+    *,
+    open_pr_count: Optional[int] = None,
+    allow_edge_creation: bool = True,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Check the complete remote-delivery contract without mutating state."""
     invalid_event = _validate_rework_event(
@@ -4653,35 +4860,65 @@ def _rework_delivery_evidence(
         return False, "delivery_run_failed", {
             "outcome": run["outcome"], "run_id": run["id"],
         }
+    expected_round = int(payload["rework_round"])
+    request_comment_id = (
+        int(payload["request_comment_id"])
+        if payload.get("request_comment_id") is not None
+        else None
+    )
     marker = _completion_marker(
         client,
         ref,
         pr,
         task_id,
         rework_at,
-        int(payload["request_comment_id"])
-        if payload.get("request_comment_id") is not None
-        else None,
+        request_comment_id,
+        expected_round=expected_round,
     )
+    marker_source: dict[str, Any] = {}
     if marker is None:
-        malformed = _malformed_completion_marker(
-            client,
-            ref,
-            pr,
-            task_id,
-            rework_at,
-            int(payload["request_comment_id"])
-            if payload.get("request_comment_id") is not None
-            else None,
-        )
-        if malformed is not None:
-            comment_id, missing_fields = malformed
-            return False, "completion_marker_malformed", {
+        if allow_edge_creation:
+            marker, marker_reason, marker_evidence = _edge_owned_completion_marker(
+                client,
+                ref,
+                pr,
+                task_id,
+                event,
+                run,
+                open_pr_count=open_pr_count,
+            )
+        else:
+            marker, marker_reason, marker_evidence = (
+                None,
+                "edge_marker_creation_skipped_dry_run",
+                {},
+            )
+        if marker is None and marker_reason not in {
+            "validation_attestation_missing",
+            "run_head_missing",
+        }:
+            return False, marker_reason, {
                 "run_id": run["id"],
-                "completion_comment_id": comment_id,
-                "missing_fields": missing_fields,
+                **marker_evidence,
             }
-        return False, "completion_handoff_missing", {"run_id": run["id"]}
+        marker_source = dict(marker_evidence)
+        if marker is None:
+            malformed = _malformed_completion_marker(
+                client,
+                ref,
+                pr,
+                task_id,
+                rework_at,
+                request_comment_id,
+            )
+            if malformed is not None:
+                comment_id, missing_fields = malformed
+                return False, "completion_marker_malformed", {
+                    "run_id": run["id"],
+                    "completion_comment_id": comment_id,
+                    "missing_fields": missing_fields,
+                }
+            return False, "completion_handoff_missing", {"run_id": run["id"]}
     run_heads = _rework_head_candidates(run)
     if run_heads and marker["head"] not in run_heads:
         return False, "run_head_mismatch", {
@@ -4747,6 +4984,8 @@ def _rework_delivery_evidence(
         "validation": marker["validation"],
         "completion_comment_id": marker.get("comment_id"),
     }
+    if marker_source.get("edge_created") is True:
+        evidence["completion_source"] = "edge-reconciliation"
     return True, "delivery_complete", evidence
 
 
@@ -4881,6 +5120,11 @@ def _rework_human_attention(reason: str, run: Optional[sqlite3.Row]) -> bool:
     )) or reason in {
         "delivery_run_missing", "completion_handoff_missing",
         "completion_marker_malformed",
+        "issue_query_invalid", "issue_not_agent_ready", "rework_pr_ambiguous",
+        "rework_pr_not_open", "rework_head_invalid", "rework_request_missing",
+        "rework_request_untrusted", "rework_request_invalid", "edge_actor_untrusted",
+        "completion_marker_post_failed", "completion_marker_unobserved",
+        "delivery_run_review_requested",
     }
 
 
@@ -4919,6 +5163,7 @@ def _rework_context(
     # The PR comes from the current decision, freshly fetched from
     # ``/pulls/{n}`` in this sync run: existence is authoritative.
     labels = _pr_labels(client, ref.repository, pr.number, pr_exists=True)
+    open_pr_count = sum(item.state == "open" for item in decision.pull_requests)
     return {
         "task_id": task_id,
         "repository": ref.repository,
@@ -4931,6 +5176,7 @@ def _rework_context(
         "event_kind": event_kind,
         "event_at": event_at,
         "implicit_request": payload.get("trigger") == "changes_requested",
+        "open_pr_count": open_pr_count,
     }
 
 
@@ -6528,6 +6774,8 @@ def _reconcile_rework_lifecycle(
         try:
             delivered, _delivery_reason, evidence = _rework_delivery_evidence(
                 conn, client, ref, task_id, context["pr"], context["event"],
+                open_pr_count=context.get("open_pr_count"),
+                allow_edge_creation=not dry_run,
             )
         except GithubCompletionError as exc:
             return {
@@ -6749,6 +6997,8 @@ def _reconcile_rework_lifecycle(
         try:
             delivered, delivery_reason, evidence = _rework_delivery_evidence(
                 conn, client, ref, task_id, context["pr"], context["event"],
+                open_pr_count=context.get("open_pr_count"),
+                allow_edge_creation=not dry_run,
             )
         except GithubCompletionError as exc:
             return {

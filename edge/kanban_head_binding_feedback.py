@@ -41,9 +41,19 @@ def install_head_binding_feedback(core: Any) -> Any:
         task_id: str,
         pr: Any,
         event: tuple[dict[str, Any], int, str],
+        *,
+        open_pr_count: Optional[int] = None,
+        allow_edge_creation: bool = True,
     ) -> tuple[bool, str, dict[str, Any]]:
         delivered, reason, evidence = original_delivery_evidence(
-            conn, client, ref, task_id, pr, event
+            conn,
+            client,
+            ref,
+            task_id,
+            pr,
+            event,
+            open_pr_count=open_pr_count,
+            allow_edge_creation=allow_edge_creation,
         )
         # Evidence-only enrichment.  Acceptance/rejection remains entirely
         # authoritative in the canonical PR #36 validator above.
