@@ -76,7 +76,6 @@ def _core_path() -> Path:
     if deployed.is_file():
         return deployed
 
-    # Repository checkout mode: the wrapper sits beside the canonical source.
     source = here.with_name("github-agent-ready-kanban-intake.py")
     if source != here and source.is_file():
         return source
@@ -146,17 +145,345 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
             1,
         )
 
-    setattr(  # noqa: B010 - dynamic marker controls idempotent overlay install
-        patched_task_body,
-        "_github_completion_overlay_installed",
+    setattr(patched_task_body, "_github_completion_overlay_installed", True)
+    setattr(patched_task_body, "_github_completion_overlay_original", original)
+    module.__dict__["_task_body"] = patched_task_body
+
+
+def _registry_entries_by_repository(
+    module: ModuleType,
+    snapshot: object,
+) -> dict[str, dict[str, Any]]:
+    entries = snapshot.get("repositories") if isinstance(snapshot, dict) else None
+    if not isinstance(entries, list):
+        raise module.IntakeError("registry_unavailable")
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise module.IntakeError("registry_unavailable")
+        raw_repository = entry.get("repository")
+        if (
+            not isinstance(raw_repository, str)
+            or not raw_repository
+            or raw_repository != raw_repository.strip()
+        ):
+            raise module.IntakeError("registry_unavailable")
+        key = raw_repository.casefold()
+        if key in by_name:
+            raise module.IntakeError("registry_unavailable")
+        by_name[key] = entry
+    return by_name
+
+
+def _missing_checkout_repositories_from_registry(
+    module: ModuleType,
+    snapshot: object,
+) -> tuple[str, ...]:
+    entries = _registry_entries_by_repository(module, snapshot)
+    repositories: list[str] = []
+    for entry in entries.values():
+        checkout_status = entry.get("checkout_status")
+        reason = entry.get("reason")
+        if checkout_status != "missing" and reason != "checkout_missing":
+            continue
+        repositories.append(str(entry["repository"]))
+    return tuple(sorted(repositories, key=str.casefold))
+
+
+def _requeue_claimed_scope(module: ModuleType, scope: object, reason: str) -> None:
+    try:
+        module._requeue_wake_scope(scope, reason)
+    except Exception:
+        pass
+
+
+def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
+    original = getattr(module, "_claim_wake_scope", None)
+    if not callable(original):
+        raise RuntimeError("intake core has no _claim_wake_scope")
+    if getattr(original, "_full_scope_onboarding_overlay_installed", False):
+        return
+
+    def patched_claim_wake_scope():
+        scope = original()
+        if scope is None or getattr(scope, "mode", None) != "full":
+            return scope
+
+        try:
+            token = module._github_token()
+            snapshot = module._load_registry_snapshot(token)
+            repositories = _missing_checkout_repositories_from_registry(
+                module,
+                snapshot,
+            )
+        except Exception:
+            _requeue_claimed_scope(module, scope, "registry_unavailable")
+            raise
+
+        if not repositories:
+            return scope
+
+        try:
+            module._provision_scoped_checkouts(
+                token,
+                repositories,
+                snapshot,
+                dry_run=bool(getattr(module, "_intake_overlay_dry_run", False)),
+            )
+        except Exception:
+            _requeue_claimed_scope(module, scope, "onboarding_retryable")
+            raise
+
+        return scope
+
+    setattr(patched_claim_wake_scope, "_full_scope_onboarding_overlay_installed", True)
+    setattr(patched_claim_wake_scope, "_full_scope_onboarding_overlay_original", original)
+    module.__dict__["_claim_wake_scope"] = patched_claim_wake_scope
+
+
+def _install_existing_ready_scope_overlay(module: ModuleType) -> None:
+    original = getattr(module, "_provision_scoped_checkouts", None)
+    if not callable(original):
+        raise RuntimeError("intake core has no _provision_scoped_checkouts")
+    if getattr(original, "_existing_ready_scope_overlay_installed", False):
+        return
+
+    def patched_provision_scoped_checkouts(
+        token: str,
+        repositories: Any,
+        snapshot: object,
+        *,
+        dry_run: bool,
+    ):
+        if bool(getattr(module, "_intake_overlay_manual_repository", False)):
+            return original(token, repositories, snapshot, dry_run=dry_run)
+
+        registry_snapshot = module._load_registry_snapshot(token)
+        entries = _registry_entries_by_repository(module, registry_snapshot)
+        reused: list[dict[str, str]] = []
+        skipped: list[dict[str, str]] = []
+        strict: list[Any] = []
+        seen: set[str] = set()
+
+        for raw_repository in repositories:
+            if not isinstance(raw_repository, str):
+                strict.append(raw_repository)
+                continue
+            key = raw_repository.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            entry = entries.get(key)
+            if not (
+                isinstance(entry, dict)
+                and entry.get("ready") is True
+                and entry.get("checkout_status") == "verified"
+                and isinstance(entry.get("checkout"), str)
+                and str(entry.get("checkout")).startswith("/")
+            ):
+                strict.append(raw_repository)
+                continue
+
+            try:
+                metadata = module._onboarding_repository_metadata(token, raw_repository)
+            except module.IntakeError as exc:
+                skipped.append(
+                    {
+                        "repository": raw_repository,
+                        "reason": module._onboarding_error_code(exc),
+                    }
+                )
+                continue
+
+            if (
+                metadata.repository.casefold() != key
+                or metadata.default_branch != entry.get("default_branch")
+            ):
+                skipped.append(
+                    {
+                        "repository": raw_repository,
+                        "reason": "repository_metadata_invalid",
+                    }
+                )
+                continue
+
+            reused.append(
+                {
+                    "repository": metadata.repository,
+                    "checkout": str(entry["checkout"]),
+                    "action": "reused",
+                }
+            )
+
+        strict_results: list[dict[str, str]] = []
+        strict_skipped: list[dict[str, str]] = []
+        reload_required = False
+        if strict:
+            strict_results, strict_skipped, reload_required = original(
+                token,
+                strict,
+                registry_snapshot,
+                dry_run=dry_run,
+            )
+
+        results = reused + strict_results
+        all_skipped = skipped + strict_skipped
+        progress = getattr(module, "_active_scope_progress", {})
+        if isinstance(progress, dict):
+            progress["checkout_provisioning"] = results
+            progress["scope_skipped"] = all_skipped
+        return results, all_skipped, reload_required
+
+    setattr(
+        patched_provision_scoped_checkouts,
+        "_existing_ready_scope_overlay_installed",
         True,
     )
-    setattr(  # noqa: B010 - dynamic marker preserves the wrapped task body
-        patched_task_body,
-        "_github_completion_overlay_original",
+    setattr(
+        patched_provision_scoped_checkouts,
+        "_existing_ready_scope_overlay_original",
         original,
     )
-    module.__dict__["_task_body"] = patched_task_body
+    module.__dict__["_provision_scoped_checkouts"] = patched_provision_scoped_checkouts
+
+
+def _origin_snapshot_unlocked(module: ModuleType, config: Any):
+    checkout = Path(str(config.checkout))
+    if (
+        not checkout.is_absolute()
+        or module._path_has_symlink_component(checkout)
+        or checkout.is_symlink()
+        or not checkout.is_dir()
+    ):
+        raise module.IntakeError(f"checkout missing or unsafe: {config.checkout}")
+
+    code, root, _ = module._run_git(
+        str(config.checkout),
+        "rev-parse",
+        "--show-toplevel",
+    )
+    if code != 0 or not root or Path(root).resolve() != checkout.resolve():
+        raise module.IntakeError(
+            f"checkout is not the expected Git root: {config.checkout}"
+        )
+
+    code, remote, _ = module._run_git(
+        str(config.checkout),
+        "remote",
+        "get-url",
+        "origin",
+    )
+    expected = module._normalise_remote(f"https://github.com/{config.name}.git")
+    if code != 0 or module._normalise_remote(remote) != expected:
+        raise module.IntakeError(f"origin mismatch for {config.name}")
+
+    metadata = module._onboarding_repository_metadata(
+        module._github_token(),
+        config.name,
+    )
+    if metadata.default_branch != config.default_branch:
+        raise module.IntakeError(f"default branch drift for {config.name}")
+
+    remote_ref = f"origin/{config.default_branch}"
+    code, sha, _ = module._run_git(
+        str(config.checkout),
+        "rev-parse",
+        "--verify",
+        f"{remote_ref}^{{commit}}",
+    )
+    if (
+        code != 0
+        or not isinstance(sha, str)
+        or module._ONBOARDING_SHA.fullmatch(sha) is None
+    ):
+        raise module.IntakeError(f"{remote_ref} unavailable for {config.name}")
+    if (
+        not isinstance(metadata.default_branch_sha, str)
+        or sha.casefold() != metadata.default_branch_sha.casefold()
+    ):
+        raise module.IntakeError(f"{remote_ref} is stale for {config.name}")
+
+    contract_paths = tuple(metadata.contract_paths)
+    if (
+        not contract_paths
+        or len(set(contract_paths)) != len(contract_paths)
+        or any(
+            path not in module.ONBOARDING_CONTRACT_CANDIDATES
+            for path in contract_paths
+        )
+    ):
+        raise module.IntakeError(f"contract paths are invalid for {config.name}")
+
+    missing: list[str] = []
+    for contract_path in contract_paths:
+        code, _, _ = module._run_git(
+            str(config.checkout),
+            "cat-file",
+            "-e",
+            f"{remote_ref}:{contract_path}",
+        )
+        if code != 0:
+            missing.append(contract_path)
+    if missing:
+        raise module.IntakeError(
+            f"{remote_ref} contract missing for {config.name}: {', '.join(missing)}"
+        )
+
+    return module.RepoSnapshot(
+        origin_sha=sha,
+        remote=remote,
+        contract_paths=contract_paths,
+    )
+
+
+def _install_origin_snapshot_overlay(module: ModuleType) -> None:
+    original = getattr(module, "_repo_snapshot", None)
+    if not callable(original):
+        raise RuntimeError("intake core has no _repo_snapshot")
+    if getattr(original, "_origin_snapshot_overlay_installed", False):
+        return
+
+    def patched_repo_snapshot(config: Any):
+        with module._repository_onboarding_lock(config.name):
+            return _origin_snapshot_unlocked(module, config)
+
+    setattr(patched_repo_snapshot, "_origin_snapshot_overlay_installed", True)
+    setattr(patched_repo_snapshot, "_origin_snapshot_overlay_original", original)
+    module.__dict__["_repo_snapshot"] = patched_repo_snapshot
+
+
+def _install_run_context_overlay(module: ModuleType) -> None:
+    original = getattr(module, "_run_once", None)
+    if not callable(original):
+        raise RuntimeError("intake core has no _run_once")
+    if getattr(original, "_run_context_overlay_installed", False):
+        return
+
+    def patched_run_once(args: Any) -> int:
+        previous_dry_run = module.__dict__.get("_intake_overlay_dry_run")
+        previous_manual = module.__dict__.get("_intake_overlay_manual_repository")
+        module.__dict__["_intake_overlay_dry_run"] = bool(
+            getattr(args, "dry_run", False)
+        )
+        module.__dict__["_intake_overlay_manual_repository"] = bool(
+            getattr(args, "repository", None)
+        )
+        try:
+            return int(original(args))
+        finally:
+            if previous_dry_run is None:
+                module.__dict__.pop("_intake_overlay_dry_run", None)
+            else:
+                module.__dict__["_intake_overlay_dry_run"] = previous_dry_run
+            if previous_manual is None:
+                module.__dict__.pop("_intake_overlay_manual_repository", None)
+            else:
+                module.__dict__["_intake_overlay_manual_repository"] = previous_manual
+
+    setattr(patched_run_once, "_run_context_overlay_installed", True)
+    setattr(patched_run_once, "_run_context_overlay_original", original)
+    module.__dict__["_run_once"] = patched_run_once
 
 
 def _load_core() -> ModuleType:
@@ -169,6 +496,10 @@ def _load_core() -> ModuleType:
     sys.modules[name] = module
     spec.loader.exec_module(module)
     _install_completion_contract_overlay(module)
+    _install_full_scope_onboarding_overlay(module)
+    _install_existing_ready_scope_overlay(module)
+    _install_origin_snapshot_overlay(module)
+    _install_run_context_overlay(module)
     return module
 
 
