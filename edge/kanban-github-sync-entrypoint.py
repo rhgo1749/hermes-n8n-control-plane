@@ -59,11 +59,135 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
     The held round is recovered only when the already-installed strict delivery
     evidence function accepts it; no timestamp-only or ordinary core run can
     enter this path.
+
+    Attention self-heal restores ``agent-rework`` before recording the durable
+    attention event. Canonical delivery freshness can therefore mistake that
+    edge-owned label restoration for a new maintainer request. For the exact
+    same-round recovery shape, and only when the newest label addition lands
+    immediately before the current attention record, retry delivery validation
+    once with that single timeline event hidden. All later marker/head/run
+    validation still executes through the canonical delivery function.
     """
     if getattr(core, "_rework_attention_delivery_recovery_installed", False):
         return
 
     original_reconcile = core._reconcile_rework_lifecycle
+
+    def _same_round_recovery_event(context):
+        if not isinstance(context, dict):
+            return False
+        event = context.get("event")
+        if not isinstance(event, tuple) or len(event) != 3:
+            return False
+        payload, _event_at, kind = event
+        return bool(
+            isinstance(payload, dict)
+            and kind == "github_pr_rework_retry"
+            and payload.get("source") == "github_edge_rework_recovery"
+            and isinstance(payload.get("rework_round"), int)
+            and not isinstance(payload.get("rework_round"), bool)
+            and int(payload["rework_round"]) > 0
+        )
+
+    def _retry_without_attention_selfheal_label(
+        conn,
+        client,
+        ref,
+        task_id,
+        pr,
+        context,
+        pending_result,
+    ):
+        if not _same_round_recovery_event(context):
+            return None
+        try:
+            attention_at = int(pending_result.get("attention_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        if attention_at <= 0:
+            return None
+
+        latest_label_fn = getattr(core, "_latest_rework_label_at", None)
+        parse_ts = getattr(core, "_parse_iso_ts", None)
+        if latest_label_fn is None or parse_ts is None:
+            return None
+        try:
+            latest_label_at = latest_label_fn(
+                client, ref, int(context["pr_number"])
+            )
+        except core.GithubCompletionError:
+            return None
+        if latest_label_at is None:
+            return None
+        try:
+            latest_label_at = int(latest_label_at)
+        except (TypeError, ValueError):
+            return None
+
+        # _restore_rework_labels() runs before _record_rework_attention().
+        # Require exactly that ordering and a tight bounded window. A label
+        # added after attention (or long before it) remains genuine newer
+        # lifecycle evidence and is never hidden.
+        delta = attention_at - latest_label_at
+        if delta < 0 or delta > 30:
+            return None
+
+        timeline_path = (
+            f"/repos/{ref.repository}/issues/{int(context['pr_number'])}/timeline"
+        )
+
+        class _AttentionLabelFilteredClient:
+            def __init__(self, base):
+                self._base = base
+
+            def __getattr__(self, name):
+                return getattr(self._base, name)
+
+            def get_paginated(self, path, params=None, *, max_pages=10):
+                items = self._base.get_paginated(
+                    path, params, max_pages=max_pages
+                )
+                if path != timeline_path:
+                    return items
+                filtered = []
+                for item in items:
+                    if not isinstance(item, dict) or item.get("event") != "labeled":
+                        filtered.append(item)
+                        continue
+                    label = item.get("label")
+                    if (
+                        not isinstance(label, dict)
+                        or str(label.get("name") or "") != core.REWORK_LABEL
+                    ):
+                        filtered.append(item)
+                        continue
+                    event_at = parse_ts(item.get("created_at"))
+                    if event_at is not None and int(event_at) == latest_label_at:
+                        continue
+                    filtered.append(item)
+                return filtered
+
+        filtered_client = _AttentionLabelFilteredClient(client)
+        try:
+            delivered, reason, evidence = core._rework_delivery_evidence(
+                conn,
+                filtered_client,
+                ref,
+                task_id,
+                pr,
+                context["event"],
+            )
+        except core.GithubCompletionError:
+            return None
+        if not delivered:
+            return delivered, reason, evidence
+        recovered_evidence = dict(evidence)
+        recovered_evidence.update({
+            "attention_selfheal_label_recovered": True,
+            "attention_at": attention_at,
+            "selfheal_label_at": latest_label_at,
+        })
+        return True, reason, recovered_evidence
 
     def reconcile_rework_lifecycle(
         conn,
@@ -107,7 +231,7 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
 
         task_id = str(row["id"])
         try:
-            delivered, _delivery_reason, evidence = core._rework_delivery_evidence(
+            delivered, delivery_reason, evidence = core._rework_delivery_evidence(
                 conn,
                 client,
                 ref,
@@ -117,6 +241,21 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
             )
         except core.GithubCompletionError:
             return result
+        if (
+            not delivered
+            and delivery_reason == "delivery_superseded_by_new_rework"
+        ):
+            retried = _retry_without_attention_selfheal_label(
+                conn,
+                client,
+                ref,
+                task_id,
+                pr,
+                context,
+                result,
+            )
+            if retried is not None:
+                delivered, delivery_reason, evidence = retried
         if not delivered:
             return result
 
