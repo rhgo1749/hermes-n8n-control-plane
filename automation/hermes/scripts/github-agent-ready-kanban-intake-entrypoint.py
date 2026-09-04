@@ -159,6 +159,80 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
     module.__dict__["_task_body"] = patched_task_body
 
 
+def _managed_repositories_from_registry(module: ModuleType) -> tuple[str, ...]:
+    token = module._github_token()
+    snapshot = module._load_registry_snapshot(token)
+    entries = snapshot.get("repositories") if isinstance(snapshot, dict) else None
+    if not isinstance(entries, list):
+        raise module.IntakeError("registry_unavailable")
+
+    repositories: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise module.IntakeError("registry_unavailable")
+        raw_repository = entry.get("repository")
+        if (
+            not isinstance(raw_repository, str)
+            or not raw_repository
+            or raw_repository != raw_repository.strip()
+        ):
+            raise module.IntakeError("registry_unavailable")
+        key = raw_repository.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        repositories.append(raw_repository)
+    return tuple(sorted(repositories, key=str.casefold))
+
+
+def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
+    original = getattr(module, "_claim_wake_scope", None)
+    if not callable(original):
+        raise RuntimeError("intake core has no _claim_wake_scope")
+    if getattr(original, "_full_scope_onboarding_overlay_installed", False):
+        return
+
+    def patched_claim_wake_scope():
+        scope = original()
+        if scope is None or getattr(scope, "mode", None) != "full":
+            return scope
+
+        try:
+            repositories = _managed_repositories_from_registry(module)
+        except Exception:
+            # The scope is already claimed at this point. Preserve durable
+            # recovery instead of stranding the claim until lease expiry.
+            try:
+                module._requeue_wake_scope(scope, "registry_unavailable")
+            except Exception:
+                pass
+            raise
+
+        if not repositories:
+            return scope
+
+        return module.WakeScope(
+            mode="event",
+            repositories=repositories,
+            expires_at=scope.expires_at,
+            scope_id=scope.scope_id,
+            claim_token=scope.claim_token,
+        )
+
+    setattr(
+        patched_claim_wake_scope,
+        "_full_scope_onboarding_overlay_installed",
+        True,
+    )
+    setattr(
+        patched_claim_wake_scope,
+        "_full_scope_onboarding_overlay_original",
+        original,
+    )
+    module.__dict__["_claim_wake_scope"] = patched_claim_wake_scope
+
+
 def _load_core() -> ModuleType:
     path = _core_path()
     name = "github_agent_ready_kanban_intake_core"
@@ -169,6 +243,7 @@ def _load_core() -> ModuleType:
     sys.modules[name] = module
     spec.loader.exec_module(module)
     _install_completion_contract_overlay(module)
+    _install_full_scope_onboarding_overlay(module)
     return module
 
 
