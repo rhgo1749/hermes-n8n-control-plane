@@ -273,3 +273,20 @@ def test_one_edge_replay_can_clear_multiple_stranded_tasks(tmp_path, monkeypatch
     mod._on_dispatch_tick(board="demo")
 
     assert primary.calls == [("t_11111111", "demo")]
+
+
+def test_dispatch_dry_run_never_replays_or_reads_board(tmp_path, monkeypatch):
+    mod = _load()
+
+    monkeypatch.setattr(
+        mod,
+        "_recent_stranded_completions",
+        lambda board: (_ for _ in ()).throw(AssertionError("board read during dry-run")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_load_primary",
+        lambda: (_ for _ in ()).throw(AssertionError("primary load during dry-run")),
+    )
+
+    mod._on_dispatch_tick(board="demo", dry_run=True)

@@ -237,9 +237,12 @@ def _forget_event(key: tuple[str, int]) -> None:
 def _on_dispatch_tick(
     *,
     board: str | None = None,
+    dry_run: bool = False,
     **_: Any,
 ) -> None:
     """Replay the primary completion wake for a recent stranded completion."""
+    if dry_run:
+        return
     task_for_diag: str | None = None
     try:
         safe_board = _valid_board(board)
