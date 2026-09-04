@@ -159,9 +159,10 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
     module.__dict__["_task_body"] = patched_task_body
 
 
-def _managed_repositories_from_registry(module: ModuleType) -> tuple[str, ...]:
-    token = module._github_token()
-    snapshot = module._load_registry_snapshot(token)
+def _missing_checkout_repositories_from_registry(
+    module: ModuleType,
+    snapshot: object,
+) -> tuple[str, ...]:
     entries = snapshot.get("repositories") if isinstance(snapshot, dict) else None
     if not isinstance(entries, list):
         raise module.IntakeError("registry_unavailable")
@@ -178,12 +179,23 @@ def _managed_repositories_from_registry(module: ModuleType) -> tuple[str, ...]:
             or raw_repository != raw_repository.strip()
         ):
             raise module.IntakeError("registry_unavailable")
+        checkout_status = entry.get("checkout_status")
+        reason = entry.get("reason")
+        if checkout_status != "missing" and reason != "checkout_missing":
+            continue
         key = raw_repository.casefold()
         if key in seen:
             continue
         seen.add(key)
         repositories.append(raw_repository)
     return tuple(sorted(repositories, key=str.casefold))
+
+
+def _requeue_claimed_scope(module: ModuleType, scope: object, reason: str) -> None:
+    try:
+        module._requeue_wake_scope(scope, reason)
+    except Exception:
+        pass
 
 
 def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
@@ -199,26 +211,41 @@ def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
             return scope
 
         try:
-            repositories = _managed_repositories_from_registry(module)
+            token = module._github_token()
+            snapshot = module._load_registry_snapshot(token)
+            repositories = _missing_checkout_repositories_from_registry(
+                module,
+                snapshot,
+            )
         except Exception:
             # The scope is already claimed at this point. Preserve durable
             # recovery instead of stranding the claim until lease expiry.
-            try:
-                module._requeue_wake_scope(scope, "registry_unavailable")
-            except Exception:
-                pass
+            _requeue_claimed_scope(module, scope, "registry_unavailable")
             raise
 
         if not repositories:
             return scope
 
-        return module.WakeScope(
-            mode="event",
-            repositories=repositories,
-            expires_at=scope.expires_at,
-            scope_id=scope.scope_id,
-            claim_token=scope.claim_token,
-        )
+        try:
+            # Full fallback must keep the historical full-scan semantics for
+            # already-ready repositories. Only registry entries whose checkout
+            # is genuinely absent go through strict fresh onboarding here.
+            # Permanent or transient per-repository skips do not poison the
+            # full sweep; healthy missing repositories can still be registered,
+            # while existing ready repositories continue to Issue intake.
+            module._provision_scoped_checkouts(
+                token,
+                repositories,
+                snapshot,
+                dry_run=bool(
+                    getattr(module, "_full_scope_onboarding_dry_run", False)
+                ),
+            )
+        except Exception:
+            _requeue_claimed_scope(module, scope, "onboarding_retryable")
+            raise
+
+        return scope
 
     setattr(
         patched_claim_wake_scope,
@@ -233,6 +260,39 @@ def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
     module.__dict__["_claim_wake_scope"] = patched_claim_wake_scope
 
 
+def _install_full_scope_dry_run_overlay(module: ModuleType) -> None:
+    original = getattr(module, "_run_once", None)
+    if not callable(original):
+        raise RuntimeError("intake core has no _run_once")
+    if getattr(original, "_full_scope_dry_run_overlay_installed", False):
+        return
+
+    def patched_run_once(args: Any) -> int:
+        previous = module.__dict__.get("_full_scope_onboarding_dry_run")
+        module.__dict__["_full_scope_onboarding_dry_run"] = bool(
+            getattr(args, "dry_run", False)
+        )
+        try:
+            return int(original(args))
+        finally:
+            if previous is None:
+                module.__dict__.pop("_full_scope_onboarding_dry_run", None)
+            else:
+                module.__dict__["_full_scope_onboarding_dry_run"] = previous
+
+    setattr(
+        patched_run_once,
+        "_full_scope_dry_run_overlay_installed",
+        True,
+    )
+    setattr(
+        patched_run_once,
+        "_full_scope_dry_run_overlay_original",
+        original,
+    )
+    module.__dict__["_run_once"] = patched_run_once
+
+
 def _load_core() -> ModuleType:
     path = _core_path()
     name = "github_agent_ready_kanban_intake_core"
@@ -244,6 +304,7 @@ def _load_core() -> ModuleType:
     spec.loader.exec_module(module)
     _install_completion_contract_overlay(module)
     _install_full_scope_onboarding_overlay(module)
+    _install_full_scope_dry_run_overlay(module)
     return module
 
 
