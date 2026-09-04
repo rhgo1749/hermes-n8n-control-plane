@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -290,6 +291,7 @@ def test_event_ready_repository_reuses_registry_checkout_without_strict_head_gat
     ]
     assert skipped == []
     assert reload_required is False
+    assert fake._active_scope_progress["checkout_provisioning"] == results
 
 
 def test_event_missing_repository_still_uses_strict_onboarding():
@@ -386,7 +388,7 @@ def _snapshot_fake_module(tmp_path: Path, *, remote_sha: str, github_sha: str):
         repository,
         github_sha,
     )
-    fake._repository_onboarding_lock = lambda repository: _NullContext()
+    fake._repository_onboarding_lock = lambda repository: nullcontext()
 
     checkout = tmp_path / "repo"
     checkout.mkdir()
@@ -407,14 +409,6 @@ def _snapshot_fake_module(tmp_path: Path, *, remote_sha: str, github_sha: str):
         AssertionError("canonical strict snapshot must be replaced")
     )
     return fake, checkout
-
-
-class _NullContext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 
 def test_origin_snapshot_accepts_shared_head_drift_when_origin_ref_is_fresh(tmp_path):
