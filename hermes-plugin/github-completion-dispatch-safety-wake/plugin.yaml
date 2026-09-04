@@ -1,0 +1,9 @@
+name: github-completion-dispatch-safety-wake
+version: "1.0.0"
+description: "Dispatcher-side bounded safety wake for recent GitHub-backed completions stranded in provisional done."
+author: hermes-n8n-control-plane
+kind: standalone
+hooks:
+  - on_kanban_dispatch_tick
+provides_hooks:
+  - on_kanban_dispatch_tick
