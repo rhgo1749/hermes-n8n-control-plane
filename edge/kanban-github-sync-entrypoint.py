@@ -27,6 +27,7 @@ import kanban_resource_admission as resource_admission
 from kanban_head_binding_feedback import install_head_binding_feedback
 from kanban_retry_signal_guard import (
     install_closed_completed_terminal_fallback,
+    install_rework_delivery_provenance_guard,
     install_retry_signal_guard,
     install_supersede_signal_guard,
 )
@@ -77,6 +78,7 @@ def _load_core() -> ModuleType:
     install_retry_signal_guard(module)
     install_supersede_signal_guard(module)
     install_closed_completed_terminal_fallback(module)
+    install_rework_delivery_provenance_guard(module)
     if install_workspace_admission is not None:
         install_workspace_admission(module)
     return module
