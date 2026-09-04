@@ -74,10 +74,12 @@ Read-only host probe에서:
 - `tests/test_repo_scoped_intake.py`
 - `tests/test_repository_onboarding.py`
 - `automation/n8n/scripts/validate.py`
-- host/Docker acceptance:
+- corrected host/Docker acceptance (required before merge):
   - exact branch/head checkout
   - live wrapper deploy + candidate/live SHA equality
   - one fresh full fallback ACK + upstream 200
   - `hermes-github-kanban` 신규 checkout/board onboarding 보존
   - existing board `ctrl-hangul#100` 및 `re-bound#124` idempotency keys가 실제 task로 생성됨
   - CtrlHangul/Re-Bound shared checkout HEAD/branch/status가 control-plane에 의해 변경되지 않음
+
+The earlier acceptance at `5c72719bbd80958ca0f29be197950c8a6d2c60dc` is partial evidence only and is superseded by the corrected implementation. It proved missing-repository clone/board bootstrap, but failed the existing-ready Issue intake gate and therefore is not merge acceptance.
