@@ -179,7 +179,7 @@ def test_missing_checkout_skip_does_not_poison_existing_full_sweep():
     assert transitions == []
 
 
-def test_full_scope_dry_run_is_forwarded_to_missing_checkout_provisioning():
+def test_full_scope_dry_run_is_forwarded_through_run_once():
     original = _full_scope("scope-dry")
     snapshot = {
         "schema_version": 2,
@@ -202,18 +202,16 @@ def test_full_scope_dry_run_is_forwarded_to_missing_checkout_provisioning():
         )
     )
 
+    def run_once(args):
+        assert fake._claim_wake_scope() is original
+        return 0
+
+    fake._run_once = run_once
     mod._install_full_scope_onboarding_overlay(fake)
     mod._install_full_scope_dry_run_overlay(fake)
 
     assert fake._run_once(argparse.Namespace(dry_run=True)) == 0
     assert fake.__dict__.get("_full_scope_onboarding_dry_run") is None
-
-    fake.__dict__["_full_scope_onboarding_dry_run"] = True
-    try:
-        assert fake._claim_wake_scope() is original
-    finally:
-        fake.__dict__.pop("_full_scope_onboarding_dry_run", None)
-
     assert calls == [True]
 
 
