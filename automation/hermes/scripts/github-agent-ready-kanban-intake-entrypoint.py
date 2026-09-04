@@ -76,7 +76,6 @@ def _core_path() -> Path:
     if deployed.is_file():
         return deployed
 
-    # Repository checkout mode: the wrapper sits beside the canonical source.
     source = here.with_name("github-agent-ready-kanban-intake.py")
     if source != here and source.is_file():
         return source
@@ -146,16 +145,8 @@ def _install_completion_contract_overlay(module: ModuleType) -> None:
             1,
         )
 
-    setattr(  # noqa: B010 - dynamic marker controls idempotent overlay install
-        patched_task_body,
-        "_github_completion_overlay_installed",
-        True,
-    )
-    setattr(  # noqa: B010 - dynamic marker preserves the wrapped task body
-        patched_task_body,
-        "_github_completion_overlay_original",
-        original,
-    )
+    setattr(patched_task_body, "_github_completion_overlay_installed", True)
+    setattr(patched_task_body, "_github_completion_overlay_original", original)
     module.__dict__["_task_body"] = patched_task_body
 
 
@@ -227,8 +218,6 @@ def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
                 snapshot,
             )
         except Exception:
-            # The scope is already claimed at this point. Preserve durable
-            # recovery instead of stranding the claim until lease expiry.
             _requeue_claimed_scope(module, scope, "registry_unavailable")
             raise
 
@@ -236,17 +225,11 @@ def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
             return scope
 
         try:
-            # Full fallback keeps historical full-scan semantics for ready
-            # repositories. Only genuinely absent checkouts use strict fresh
-            # onboarding here. Per-repository bounded skips do not poison the
-            # existing full sweep.
             module._provision_scoped_checkouts(
                 token,
                 repositories,
                 snapshot,
-                dry_run=bool(
-                    getattr(module, "_intake_overlay_dry_run", False)
-                ),
+                dry_run=bool(getattr(module, "_intake_overlay_dry_run", False)),
             )
         except Exception:
             _requeue_claimed_scope(module, scope, "onboarding_retryable")
@@ -254,16 +237,8 @@ def _install_full_scope_onboarding_overlay(module: ModuleType) -> None:
 
         return scope
 
-    setattr(
-        patched_claim_wake_scope,
-        "_full_scope_onboarding_overlay_installed",
-        True,
-    )
-    setattr(
-        patched_claim_wake_scope,
-        "_full_scope_onboarding_overlay_original",
-        original,
-    )
+    setattr(patched_claim_wake_scope, "_full_scope_onboarding_overlay_installed", True)
+    setattr(patched_claim_wake_scope, "_full_scope_onboarding_overlay_original", original)
     module.__dict__["_claim_wake_scope"] = patched_claim_wake_scope
 
 
@@ -281,21 +256,14 @@ def _install_existing_ready_scope_overlay(module: ModuleType) -> None:
         *,
         dry_run: bool,
     ):
-        # Explicit operator --repository probes remain strict by design. This
-        # overlay only changes event/full automation behavior.
         if bool(getattr(module, "_intake_overlay_manual_repository", False)):
-            return original(
-                token,
-                repositories,
-                snapshot,
-                dry_run=dry_run,
-            )
+            return original(token, repositories, snapshot, dry_run=dry_run)
 
         registry_snapshot = module._load_registry_snapshot(token)
         entries = _registry_entries_by_repository(module, registry_snapshot)
         reused: list[dict[str, str]] = []
         skipped: list[dict[str, str]] = []
-        strict: list[str] = []
+        strict: list[Any] = []
         seen: set[str] = set()
 
         for raw_repository in repositories:
@@ -361,11 +329,10 @@ def _install_existing_ready_scope_overlay(module: ModuleType) -> None:
 
         results = reused + strict_results
         all_skipped = skipped + strict_skipped
-        module.__dict__["_active_scope_progress"] = {
-            **getattr(module, "_active_scope_progress", {}),
-            "checkout_provisioning": results,
-            "scope_skipped": all_skipped,
-        }
+        progress = getattr(module, "_active_scope_progress", {})
+        if isinstance(progress, dict):
+            progress["checkout_provisioning"] = results
+            progress["scope_skipped"] = all_skipped
         return results, all_skipped, reload_required
 
     setattr(
@@ -481,16 +448,8 @@ def _install_origin_snapshot_overlay(module: ModuleType) -> None:
         with module._repository_onboarding_lock(config.name):
             return _origin_snapshot_unlocked(module, config)
 
-    setattr(
-        patched_repo_snapshot,
-        "_origin_snapshot_overlay_installed",
-        True,
-    )
-    setattr(
-        patched_repo_snapshot,
-        "_origin_snapshot_overlay_original",
-        original,
-    )
+    setattr(patched_repo_snapshot, "_origin_snapshot_overlay_installed", True)
+    setattr(patched_repo_snapshot, "_origin_snapshot_overlay_original", original)
     module.__dict__["_repo_snapshot"] = patched_repo_snapshot
 
 
@@ -522,16 +481,8 @@ def _install_run_context_overlay(module: ModuleType) -> None:
             else:
                 module.__dict__["_intake_overlay_manual_repository"] = previous_manual
 
-    setattr(
-        patched_run_once,
-        "_run_context_overlay_installed",
-        True,
-    )
-    setattr(
-        patched_run_once,
-        "_run_context_overlay_original",
-        original,
-    )
+    setattr(patched_run_once, "_run_context_overlay_installed", True)
+    setattr(patched_run_once, "_run_context_overlay_original", original)
     module.__dict__["_run_once"] = patched_run_once
 
 
