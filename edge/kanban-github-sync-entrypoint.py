@@ -21,6 +21,7 @@ closed as completed by a trusted maintainer.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -60,36 +61,153 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
     evidence function accepts it; no timestamp-only or ordinary core run can
     enter this path.
 
-    Attention self-heal restores ``agent-rework`` before recording the durable
-    attention event. Canonical delivery freshness can therefore mistake that
-    edge-owned label restoration for a new maintainer request. For the exact
-    same-round recovery shape, and only when the newest label addition lands
-    immediately before the current attention record, retry delivery validation
-    once with that single timeline event hidden. All later marker/head/run
-    validation still executes through the canonical delivery function.
+    Edge recovery may restore ``agent-rework`` more than once during one
+    immutable rework round: once for an automatic same-round retry and again
+    when a later human-attention hold is projected. Canonical label freshness
+    sees those GitHub timeline additions but cannot tell that they were emitted
+    by the edge itself. For an exact current same-round recovery only, this
+    wrapper identifies edge-owned label projections by two independent facts:
+
+      * GitHub shows ``agent-working`` removed and ``agent-rework`` added at the
+        same second; and
+      * a durable same-round ``github_pr_rework_retry`` or
+        ``github_pr_rework_attention`` event follows within 30 seconds.
+
+    Only those label-addition events are hidden for one strict delivery
+    re-evaluation. Any unmatched/new maintainer label remains visible, and all
+    completion-marker, exact-head, run, validation, and specialist provenance
+    checks still execute through the canonical delivery function.
     """
     if getattr(core, "_rework_attention_delivery_recovery_installed", False):
         return
 
     original_reconcile = core._reconcile_rework_lifecycle
 
-    def _same_round_recovery_event(context):
-        if not isinstance(context, dict):
-            return False
-        event = context.get("event")
-        if not isinstance(event, tuple) or len(event) != 3:
-            return False
-        payload, _event_at, kind = event
-        return bool(
+    def _json_payload(raw):
+        try:
+            value = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _current_same_round_recovery(conn, task_id, context):
+        latest_event = None
+        latest_fn = getattr(core, "_latest_rework_event", None)
+        if latest_fn is not None:
+            try:
+                latest_event = latest_fn(conn, task_id)
+            except Exception:
+                latest_event = None
+        if latest_event is None and isinstance(context, dict):
+            latest_event = context.get("event")
+        if not isinstance(latest_event, tuple) or len(latest_event) != 3:
+            return None
+        payload, _event_at, kind = latest_event
+        if not (
             isinstance(payload, dict)
             and kind == "github_pr_rework_retry"
             and payload.get("source") == "github_edge_rework_recovery"
             and isinstance(payload.get("rework_round"), int)
             and not isinstance(payload.get("rework_round"), bool)
             and int(payload["rework_round"]) > 0
-        )
+        ):
+            return None
 
-    def _retry_without_attention_selfheal_label(
+        origin_fn = getattr(core, "_rework_round_origin_event", None)
+        origin_event = (
+            origin_fn(conn, task_id, latest_event)
+            if origin_fn is not None
+            else latest_event
+        )
+        if not isinstance(origin_event, tuple) or len(origin_event) != 3:
+            return None
+        origin_payload, origin_at, origin_kind = origin_event
+        if not (
+            isinstance(origin_payload, dict)
+            and origin_kind == "github_pr_rework"
+            and origin_payload.get("rework_round") == payload.get("rework_round")
+            and origin_payload.get("pr_number") == payload.get("pr_number")
+            and str(origin_payload.get("head_sha") or "").casefold()
+            == str(payload.get("head_sha") or "").casefold()
+        ):
+            return None
+        return latest_event, origin_event
+
+    def _edge_projection_label_times(
+        conn,
+        task_id,
+        latest_event,
+        origin_event,
+        timeline_items,
+        parse_ts,
+    ):
+        latest_payload, _latest_at, _latest_kind = latest_event
+        _origin_payload, origin_at, _origin_kind = origin_event
+        target_round = latest_payload.get("rework_round")
+        target_pr = latest_payload.get("pr_number")
+        target_head = str(latest_payload.get("head_sha") or "").casefold()
+
+        durable_times = []
+        rows = conn.execute(
+            "SELECT kind, payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('github_pr_rework_retry', 'github_pr_rework_attention') "
+            "ORDER BY created_at ASC, id ASC",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            payload = _json_payload(row["payload"])
+            if payload.get("rework_round") != target_round:
+                continue
+            if payload.get("pr_number") != target_pr:
+                continue
+            row_head = str(payload.get("head_sha") or "").casefold()
+            if target_head and row_head and row_head != target_head:
+                continue
+            kind = str(row["kind"] or "")
+            if (
+                kind == "github_pr_rework_retry"
+                and payload.get("source") == "github_edge_rework_recovery"
+            ) or (
+                kind == "github_pr_rework_attention"
+                and payload.get("source") == "github_edge_rework_reconciliation"
+                and payload.get("reason") == "rework_human_attention"
+            ):
+                durable_times.append(int(row["created_at"] or 0))
+
+        if not durable_times:
+            return set()
+
+        working_unlabeled_times = set()
+        rework_labeled_times = []
+        for item in timeline_items:
+            if not isinstance(item, dict):
+                continue
+            event_name = str(item.get("event") or "")
+            label = item.get("label")
+            if not isinstance(label, dict):
+                continue
+            label_name = str(label.get("name") or "")
+            ts = parse_ts(item.get("created_at"))
+            if ts is None:
+                continue
+            ts = int(ts)
+            if event_name == "unlabeled" and label_name == core.WORKING_LABEL:
+                working_unlabeled_times.add(ts)
+            elif event_name == "labeled" and label_name == core.REWORK_LABEL:
+                rework_labeled_times.append(ts)
+
+        edge_times = set()
+        for label_at in rework_labeled_times:
+            if label_at <= int(origin_at):
+                continue
+            if label_at not in working_unlabeled_times:
+                continue
+            if any(0 <= durable_at - label_at <= 30 for durable_at in durable_times):
+                edge_times.add(label_at)
+        return edge_times
+
+    def _retry_without_edge_projection_labels(
         conn,
         client,
         ref,
@@ -98,45 +216,53 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
         context,
         pending_result,
     ):
-        if not _same_round_recovery_event(context):
+        recovery = _current_same_round_recovery(conn, task_id, context)
+        if recovery is None:
             return None
-        try:
-            attention_at = int(pending_result.get("attention_at") or 0)
-        except (TypeError, ValueError):
-            return None
-        if attention_at <= 0:
-            return None
+        latest_event, origin_event = recovery
 
-        latest_label_fn = getattr(core, "_latest_rework_label_at", None)
         parse_ts = getattr(core, "_parse_iso_ts", None)
-        if latest_label_fn is None or parse_ts is None:
+        if parse_ts is None:
             return None
         try:
-            latest_label_at = latest_label_fn(
-                client, ref, int(context["pr_number"])
+            pr_number = int(context["pr_number"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        timeline_path = f"/repos/{ref.repository}/issues/{pr_number}/timeline"
+        try:
+            timeline_items = client.get_paginated(
+                timeline_path,
+                {"per_page": 100},
             )
         except core.GithubCompletionError:
             return None
-        if latest_label_at is None:
-            return None
-        try:
-            latest_label_at = int(latest_label_at)
-        except (TypeError, ValueError):
-            return None
 
-        # _restore_rework_labels() runs before _record_rework_attention().
-        # Require exactly that ordering and a tight bounded window. A label
-        # added after attention (or long before it) remains genuine newer
-        # lifecycle evidence and is never hidden.
-        delta = attention_at - latest_label_at
-        if delta < 0 or delta > 30:
-            return None
-
-        timeline_path = (
-            f"/repos/{ref.repository}/issues/{int(context['pr_number'])}/timeline"
+        edge_label_times = _edge_projection_label_times(
+            conn,
+            task_id,
+            latest_event,
+            origin_event,
+            timeline_items,
+            parse_ts,
         )
+        if not edge_label_times:
+            return None
 
-        class _AttentionLabelFilteredClient:
+        filtered_items = []
+        for item in timeline_items:
+            hide = False
+            if isinstance(item, dict) and item.get("event") == "labeled":
+                label = item.get("label")
+                if (
+                    isinstance(label, dict)
+                    and str(label.get("name") or "") == core.REWORK_LABEL
+                ):
+                    event_at = parse_ts(item.get("created_at"))
+                    hide = event_at is not None and int(event_at) in edge_label_times
+            if not hide:
+                filtered_items.append(item)
+
+        class _EdgeProjectionLabelFilteredClient:
             def __init__(self, base):
                 self._base = base
 
@@ -144,30 +270,13 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
                 return getattr(self._base, name)
 
             def get_paginated(self, path, params=None, *, max_pages=10):
-                items = self._base.get_paginated(
+                if path == timeline_path:
+                    return list(filtered_items)
+                return self._base.get_paginated(
                     path, params, max_pages=max_pages
                 )
-                if path != timeline_path:
-                    return items
-                filtered = []
-                for item in items:
-                    if not isinstance(item, dict) or item.get("event") != "labeled":
-                        filtered.append(item)
-                        continue
-                    label = item.get("label")
-                    if (
-                        not isinstance(label, dict)
-                        or str(label.get("name") or "") != core.REWORK_LABEL
-                    ):
-                        filtered.append(item)
-                        continue
-                    event_at = parse_ts(item.get("created_at"))
-                    if event_at is not None and int(event_at) == latest_label_at:
-                        continue
-                    filtered.append(item)
-                return filtered
 
-        filtered_client = _AttentionLabelFilteredClient(client)
+        filtered_client = _EdgeProjectionLabelFilteredClient(client)
         try:
             delivered, reason, evidence = core._rework_delivery_evidence(
                 conn,
@@ -175,17 +284,18 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
                 ref,
                 task_id,
                 pr,
-                context["event"],
+                latest_event,
             )
         except core.GithubCompletionError:
             return None
         if not delivered:
             return delivered, reason, evidence
+
         recovered_evidence = dict(evidence)
         recovered_evidence.update({
-            "attention_selfheal_label_recovered": True,
-            "attention_at": attention_at,
-            "selfheal_label_at": latest_label_at,
+            "edge_projection_labels_recovered": True,
+            "filtered_rework_label_times": sorted(edge_label_times),
+            "attention_at": int(pending_result.get("attention_at") or 0),
         })
         return True, reason, recovered_evidence
 
@@ -245,7 +355,7 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
             not delivered
             and delivery_reason == "delivery_superseded_by_new_rework"
         ):
-            retried = _retry_without_attention_selfheal_label(
+            retried = _retry_without_edge_projection_labels(
                 conn,
                 client,
                 ref,
