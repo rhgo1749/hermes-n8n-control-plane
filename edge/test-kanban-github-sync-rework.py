@@ -134,6 +134,7 @@ class FakeGitHub:
         self.stale_label_readback = False
         self._stale_label_readback: dict[int, list[str]] = {}
         self._next_comment_id = 1000
+        self.authenticated_actor = "rhgo1749"
 
     # -- client interface -------------------------------------------------
     def get(self, path, params=None):
@@ -200,12 +201,18 @@ class FakeGitHub:
             n = int(m.group(1))
             cid = self._next_comment_id
             self._next_comment_id += 1
+            body = str(payload.get("body") or "")
+            edge_marker = body.startswith(mod.REWORK_COMPLETE_MARKER + "\n")
+            comment_time = (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                if edge_marker else "2026-08-10T02:00:00Z"
+            )
             comment = {
                 "id": cid,
-                "user": {"login": "rhgo1749"},
-                "body": str(payload.get("body") or ""),
-                "created_at": "2026-08-10T02:00:00Z",
-                "updated_at": "2026-08-10T02:00:00Z",
+                "user": {"login": self.authenticated_actor if edge_marker else "rhgo1749"},
+                "body": body,
+                "created_at": comment_time,
+                "updated_at": comment_time,
             }
             self.issue_comments.setdefault(n, []).append(comment)
             return 201, comment
@@ -248,6 +255,8 @@ class FakeGitHub:
         for marker in self.fail_urls:
             if marker in path:
                 raise mod.GithubCompletionError(f"simulated failure for {marker}")
+        if path == "/user":
+            return {"login": self.authenticated_actor}
         m = re.fullmatch(r"/repos/[^/]+/[^/]+/labels", path)
         if m:
             return [{"name": x} for x in self.repo_labels]
@@ -1295,6 +1304,7 @@ def _close_rework_run(
     head: str,
     outcome: str = "completed",
     summary: str = "rework delivered",
+    validation: Optional[str] = None,
 ) -> int:
     """Simulate a finished worker run + task done for the current round."""
     with connect_closing() as conn:
@@ -1309,12 +1319,15 @@ def _close_rework_run(
         rework_event = (rework_payload, rework_at, "github_pr_rework")
         started = rework_at + 1
         ended = started + 600
+        metadata = {"head_sha": head, "pull_request": {"head_sha": head}}
+        if validation is not None:
+            metadata["validation"] = validation
         cur = conn.execute(
             "INSERT INTO task_runs (task_id, profile, status, claim_lock, started_at, "
             "ended_at, outcome, summary, metadata) "
             "VALUES (?, 'kanban-main', 'done', NULL, ?, ?, ?, ?, ?)",
             (tid, started, ended, outcome, summary,
-             json.dumps({"head_sha": head, "pull_request": {"head_sha": head}})),
+             json.dumps(metadata)),
         )
         run_id = cur.lastrowid
         conn.execute(
@@ -5680,6 +5693,251 @@ def test_137_specialist_graph_provenance_inheritance_accepted() -> None:
         check("137: inherited run is lead run id", inherited_run is not None and int(inherited_run["id"]) == lead_run_id)
 
 
+def _edge_completion_comments(fake: FakeGitHub) -> list[dict[str, Any]]:
+    return [
+        item for item in fake.issue_comments.get(PR_N, [])
+        if str(item.get("body") or "").startswith(mod.REWORK_COMPLETE_MARKER + "\n")
+    ]
+
+
+def _edge_completion_posts(fake: FakeGitHub) -> list[tuple[str, dict]]:
+    return [
+        item for item in fake.post_calls
+        if str(item[1].get("body") or "").startswith(mod.REWORK_COMPLETE_MARKER + "\n")
+    ]
+
+
+def test_138_edge_owned_completion_marker_is_accepted() -> None:
+    print("138. completed run attests validation -> edge posts canonical marker and reaches review-ready")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000138"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, validation="passed")
+    check("138: worker did not post marker", _edge_completion_posts(fake) == [])
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    ready = [entry for entry in entries if entry.get("reason") == "agent_review_ready"]
+    check("138: edge marker accepted", len(ready) == 1, str(entries))
+    markers = _edge_completion_comments(fake)
+    check("138: one edge-created marker", len(markers) == 1, str(markers))
+    if markers:
+        lines = str(markers[0].get("body") or "").splitlines()
+        check("138: authoritative marker fields", lines[:5] == [
+            mod.REWORK_COMPLETE_MARKER,
+            f"task={tid}",
+            "request_comment=none",
+            f"head={final_head}",
+            "validation=passed",
+        ], str(lines))
+        check("138: round/source are edge-owned",
+              "rework_round=1" in lines and "source=edge-reconciliation" in lines,
+              str(lines))
+        check("138: trusted edge author",
+              markers[0].get("user", {}).get("login") == "rhgo1749", str(markers[0]))
+    if ready:
+        evidence = ready[0].get("evidence") or {}
+        check("138: delivery records edge source",
+              evidence.get("completion_source") == "edge-reconciliation", str(evidence))
+    check("138: review status and label",
+          task_row(tid)["status"] == "review"
+          and fake.pr_labels.get(PR_N) == ["agent-review-ready"],
+          str({"task": task_row(tid), "labels": fake.pr_labels.get(PR_N)}))
+
+
+def test_139_edge_owned_stale_run_head_fails_closed() -> None:
+    print("139. edge-owned completion with stale run head -> no marker or delivery")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000139"
+    stale_head = "0123456789abcdef0123456789abcdef0000013a"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=stale_head, validation="passed")
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    check("139: no edge marker", _edge_completion_posts(fake) == [])
+    check("139: no delivery transition", not any(
+        entry.get("reason") == "agent_review_ready" for entry in entries
+    ), str(entries))
+    check("139: no delivery event", not [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ], str(task_events(tid)))
+    check("139: stale head diagnostic", any(
+        entry.get("diagnostic") == "run_head_mismatch"
+        or entry.get("reason") == "rework_retry_scheduled"
+        for entry in entries
+    ), str(entries))
+
+
+def test_140_edge_owned_round_mismatch_fails_closed() -> None:
+    print("140. current event/run provenance round mismatch -> no marker or delivery")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000140"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, validation="passed")
+    with connect_closing() as conn:
+        event_row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'github_pr_rework' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event_row is not None
+        event_payload = json.loads(event_row["payload"] or "{}")
+        event_payload["rework_round"] = 2
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(event_payload), event_row["id"]),
+        )
+        conn.commit()
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    check("140: no edge marker", _edge_completion_posts(fake) == [])
+    check("140: no review-ready", not any(
+        entry.get("reason") == "agent_review_ready" for entry in entries
+    ), str(entries))
+    check("140: delivery run missing is provenance failure", any(
+        entry.get("diagnostic") == "delivery_run_missing"
+        for entry in entries
+    ), str(entries))
+    check("140: no delivery event", not [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ], str(task_events(tid)))
+
+
+def test_141_edge_owned_duplicate_callback_is_idempotent() -> None:
+    print("141. duplicate completion callback -> one edge marker and one delivery event")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000141"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, validation="passed")
+    first = run_sync(fake)
+    marker_count = len(_edge_completion_comments(fake))
+    delivery_count = len([
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ])
+    second = run_sync(fake)
+    check("141: first callback delivered", any(
+        entry.get("reason") == "agent_review_ready" for entry in first
+    ), str(first))
+    check("141: second callback does not post", len(_edge_completion_comments(fake)) == marker_count
+          and len(_edge_completion_posts(fake)) == 1, str(fake.post_calls))
+    check("141: second callback does not duplicate transition", len([
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ]) == delivery_count, str(second))
+    check("141: review-ready remains authoritative",
+          task_row(tid)["status"] == "review"
+          and fake.pr_labels.get(PR_N) == ["agent-review-ready"],
+          str({"task": task_row(tid), "labels": fake.pr_labels.get(PR_N)}))
+
+
+def test_142_edge_owned_old_round_marker_is_rejected() -> None:
+    print("142. edge marker from round 1 -> never consumed by round 2")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000142"
+    fake.prs[PR_N]["head"]["sha"] = head
+    _close_rework_run(tid, head=head, validation="passed")
+    first = run_sync(fake)
+    check("142: round 1 delivered", any(
+        entry.get("reason") == "agent_review_ready" for entry in first
+    ), str(first))
+    future_label = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+    fake.pr_timeline[PR_N] = labeled_timeline(future_label)
+    fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
+    run_sync(fake)
+    rounds = [
+        event["payload"].get("rework_round")
+        for event in task_events(tid)
+        if event["kind"] == "github_pr_rework"
+    ]
+    check("142: round 2 opened", rounds[-1:] == [2], str(rounds))
+    _close_rework_run(
+        tid,
+        head=head,
+        outcome="review_requested",
+        validation="passed",
+        summary="verification requested for round two",
+    )
+    before_markers = len(_edge_completion_comments(fake))
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    check("142: old marker not reused", len(_edge_completion_comments(fake)) == before_markers
+          and not any(entry.get("reason") == "agent_review_ready" for entry in entries),
+          str(entries))
+    check("142: only round 1 delivery exists", len([
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ]) == 1, str(task_events(tid)))
+    check("142: round 2 stays review attention", task_row(tid)["status"] == "review", str(task_row(tid)))
+
+
+def test_143_worker_supplied_marker_remains_backward_compatible() -> None:
+    print("143. trusted worker-supplied marker -> existing delivery gate remains accepted")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000143"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head)
+    _post_completion_marker(fake, tid, final_head)
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    check("143: existing marker accepted", any(
+        entry.get("reason") == "agent_review_ready" for entry in entries
+    ), str(entries))
+    check("143: edge does not duplicate worker marker", _edge_completion_posts(fake) == [], str(fake.post_calls))
+    check("143: review-ready label", fake.pr_labels.get(PR_N) == ["agent-review-ready"], str(fake.pr_labels))
+
+
+def test_144_untrusted_edge_actor_fails_closed() -> None:
+    print("144. edge token resolves to untrusted actor -> no completion marker")
+    fake = fresh_env()
+    fake.authenticated_actor = "mallory"
+    tid = _rework_ready_task(fake)
+    final_head = "0123456789abcdef0123456789abcdef00000144"
+    fake.prs[PR_N]["head"]["sha"] = final_head
+    _close_rework_run(tid, head=final_head, validation="passed")
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    check("144: no edge marker", _edge_completion_posts(fake) == [])
+    check("144: untrusted actor diagnostic", any(
+        entry.get("diagnostic") == "edge_actor_untrusted" for entry in entries
+    ), str(entries))
+    check("144: no delivery event", not [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ], str(task_events(tid)))
+
+
+def test_145_dry_run_edge_marker_creation_is_suppressed() -> None:
+    print("145. dry-run edge-owned completion -> no GitHub marker side effect")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = fake.prs[PR_N]["head"]["sha"]
+    _close_rework_run(
+        tid,
+        head=head,
+        outcome="completed",
+        summary="dry-run validation",
+        validation="passed",
+    )
+    results = mod.sync_board("default", dry_run=True, client=fake)
+    entries = [result for result in results if result.get("task_id") == tid]
+    check("145: no edge marker", _edge_completion_posts(fake) == [], str(fake.post_calls))
+    check("145: no GitHub mutation", not fake.post_calls, str(fake.post_calls))
+    check(
+        "145: predicts retry without state mutation",
+        any(result.get("reason") == "rework_retry_predicted" for result in entries),
+        str(entries),
+    )
+    check("145: task remains done", task_row(tid)["status"] == "done", str(task_row(tid)))
+
+
 def main() -> int:
     tests = [
         test_1_rework_full_flow, test_2_open_pr_no_rework, test_3_closed_unmerged,
@@ -5814,6 +6072,14 @@ def main() -> int:
         test_135_supersede_lookup_failure_preserves_state,
         test_136_authoritative_done_preserved_when_graphql_empty,
         test_137_specialist_graph_provenance_inheritance_accepted,
+        test_138_edge_owned_completion_marker_is_accepted,
+        test_139_edge_owned_stale_run_head_fails_closed,
+        test_140_edge_owned_round_mismatch_fails_closed,
+        test_141_edge_owned_duplicate_callback_is_idempotent,
+        test_142_edge_owned_old_round_marker_is_rejected,
+        test_143_worker_supplied_marker_remains_backward_compatible,
+        test_144_untrusted_edge_actor_fails_closed,
+        test_145_dry_run_edge_marker_creation_is_suppressed,
     ]
     for test in tests:
         print(f"\n=== {test.__name__} ===")
