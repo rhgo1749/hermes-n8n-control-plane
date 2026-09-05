@@ -4,9 +4,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Iterator
 
 import pytest
 
@@ -373,6 +374,59 @@ def test_manual_repository_keeps_original_strict_onboarding():
     )
 
     assert calls == [(repository,)]
+
+
+def test_event_ready_repository_uses_locked_shared_self_heal_contract():
+    repository = "rhgo1749/ctrl-hangul"
+    snapshot = {
+        "schema_version": 2,
+        "repositories": [
+            {
+                "repository": repository,
+                "ready": True,
+                "checkout_status": "verified",
+                "checkout": "/ws/projects/ctrl-hangul",
+                "default_branch": "main",
+            }
+        ],
+    }
+    fake = _fake_module(_event_scope(repository), snapshot)
+    lock_events: list[tuple[str, str]] = []
+    refresh_calls = []
+
+    @contextmanager
+    def lock(repository_name: str) -> Iterator[None]:
+        lock_events.append(("acquire", repository_name))
+        with nullcontext():
+            yield
+        lock_events.append(("release", repository_name))
+
+    setattr(fake, "_repository_onboarding_lock", lock)
+    setattr(fake, "_self_heal_stale_checkout", (
+        lambda token, metadata, checkout: refresh_calls.append(
+            (token, metadata.repository, str(checkout))
+        )
+        or "healed"
+    ))
+    mod._install_existing_ready_scope_overlay(fake)
+
+    results, skipped, reload_required = fake._provision_scoped_checkouts(
+        "token",
+        (repository,),
+        {},
+        dry_run=False,
+    )
+
+    assert refresh_calls == [
+        ("token", repository, "/ws/projects/ctrl-hangul"),
+    ]
+    assert lock_events == [
+        ("acquire", repository),
+        ("release", repository),
+    ]
+    assert results[0]["action"] == "healed"
+    assert skipped == []
+    assert reload_required is False
 
 
 def _snapshot_fake_module(tmp_path: Path, *, remote_sha: str, github_sha: str):

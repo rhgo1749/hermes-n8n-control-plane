@@ -50,10 +50,25 @@ When no canonical checkout exists, intake provisions
 per-repository lock for at most 10 seconds, clones with a fixed `shell=False`
 argument vector into a temporary sibling, validates only Git metadata and
 contract paths, and registers the result with an atomic no-replace rename.
-Existing directories are validated and reused; they are never reset, fetched,
-overwritten, or deleted. A later registry or board failure leaves a newly
-registered checkout in place and reports the partial onboarding state for the
-next idempotent intake.
+Existing directories are validated and reused. A clean, exact-SHA checkout is
+a no-op; a clean stale checkout is refreshed only while holding the same
+per-repository lock used by onboarding. Refresh is bounded and Git-owned:
+shallow repositories are unshallowed, the GitHub default-branch SHA is fetched
+into the canonical remote-tracking ref, Git itself proves `HEAD` is an ancestor,
+and `git merge --ff-only origin/<default-branch>` advances the checkout. No
+reset, force update, broad cleanup, or overwrite is allowed. Dirty, detached,
+wrong-branch, wrong-origin, diverged/non-fast-forward, and unsafe
+attribute-driven materialization states fail closed without changing the
+canonical checkout. Fetch, unshallow, and fast-forward failures use bounded
+semantic reasons, and the final head/ref/contract/cleanliness gate is rerun.
+A later registry or board failure leaves a newly registered checkout in place
+and reports the partial onboarding state for the next idempotent intake.
+
+The `repository_outcomes` result field reports one machine-readable record per
+repository (`reused`, `healed`, `created`, `skipped`, or `failed`) with a
+bounded `reason`. Full fallback sweeps isolate repository checkout and sync
+failures so one repository can be skipped or requeued without suppressing
+successful intake for other ready repositories.
 
 ## Derived fields and authority
 
