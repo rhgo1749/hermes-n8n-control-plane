@@ -280,12 +280,71 @@ def test_local_claim_becomes_cross_board_reservation() -> None:
         conn_b.close()
 
 
+def test_stray_archived_db_does_not_poison_admission() -> None:
+    """Regression: a stray zero-byte ``kanban.db`` left directly inside the
+    archive container (``boards/_archived/kanban.db``) must not poison
+    cross-board enumeration or the worker inspection.
+
+    A read-only diagnostic that opened a write-mode ``sqlite3.connect`` on the
+    ``_archived/`` directory had created that empty file; because the board
+    glob swept it in, ``_active_resource_workers`` raised
+    ``ResourceAdmissionError`` (``no such table: task_runs``) and refused every
+    claim on every board.
+    """
+    root = Path(tempfile.mkdtemp(prefix="dynamic-resource-stray-"))
+    kb = FakeKanban(root)
+    default_conn = make_db(kb.kanban_db_path(board="default"))
+    named_conn = make_db(kb.kanban_db_path(board="alpha"))
+    boards_root = kb.boards_root()
+    stray = boards_root / "_archived" / "kanban.db"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_bytes(b"")
+    # A non-empty schema-bearing DB also inside the archive container, to prove
+    # the whole internal container is excluded, not just empty files.
+    archived_board = boards_root / "_archived" / "old-1234"
+    archived_conn = make_db(archived_board / "kanban.db")
+    dynamic.install_cross_board_helpers(admission)
+    try:
+        paths = set(dynamic._all_board_db_paths(kb, "default"))
+        check(
+            "stray _archived/kanban.db is not enumerated",
+            stray.resolve() not in paths,
+            str(paths),
+        )
+        check(
+            "archived board DB is not enumerated",
+            (archived_board / "kanban.db").resolve() not in paths,
+            str(paths),
+        )
+        check(
+            "real default + named boards remain enumerated",
+            kb.kanban_db_path(board="default").resolve() in paths
+            and kb.kanban_db_path(board="alpha").resolve() in paths,
+            str(paths),
+        )
+        resource = admission.WorkerResource("serial", 1, ("kanban-main",))
+        try:
+            active = admission._active_resource_workers(kb, "default", resource)
+        except admission.ResourceAdmissionError as exc:
+            active = f"RAISED {type(exc).__name__}: {exc}"
+        check(
+            "worker inspection resolves despite stray file",
+            isinstance(active, list),
+            str(active),
+        )
+    finally:
+        default_conn.close()
+        named_conn.close()
+        archived_conn.close()
+
+
 def main() -> int:
     test_same_profile_changes_resource_with_backend()
     test_legacy_policy_remains_assignee_only()
     test_default_and_named_board_discovery()
     test_core_claim_gate_separates_local_from_cloud()
     test_local_claim_becomes_cross_board_reservation()
+    test_stray_archived_db_does_not_poison_admission()
     print(f"\n{len(PASS)} passed; {len(FAIL)} failed")
     return 1 if FAIL else 0
 

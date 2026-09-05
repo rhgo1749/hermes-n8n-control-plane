@@ -275,6 +275,27 @@ def install_dynamic_resource_policy(admission_module: Any) -> None:
     admission_module._resource_policies = dynamic_policies
 
 
+def _board_db_is_enumerable(path: Path) -> bool:
+    """Return True only for a real sibling board DB worth inspecting.
+
+    Mirrors the base admission helper.  A raw ``boards_root/`` glob also
+    matches stray non-board files; most notably a zero-byte ``kanban.db``
+    directly inside the archive container (``boards/_archived/kanban.db``).
+    That file is not a board and, being empty, cannot be inspected; including
+    it makes the whole cross-board scan fail closed and refuse every claim on
+    every board.  Exclude internal underscore-prefixed containers (the archive
+    root is ``_archived``) and empty (zero-byte) files.
+    """
+    try:
+        if path.parent.name.startswith("_"):
+            return False
+        if path.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def _all_board_db_paths(kanban_db: Any, board: str) -> tuple[Path, ...]:
     """Return default + named board DB paths for the shared Hermes root."""
     current = Path(kanban_db.kanban_db_path(board=board)).expanduser().resolve()
@@ -288,10 +309,18 @@ def _all_board_db_paths(kanban_db: Any, board: str) -> tuple[Path, ...]:
         candidates.append(default)
     try:
         root = Path(kanban_db.boards_root()).expanduser().resolve()
-        candidates.extend(sorted(root.glob("*/kanban.db")))
+        candidates.extend(
+            path
+            for path in sorted(root.glob("*/kanban.db"))
+            if path.is_file() and _board_db_is_enumerable(path)
+        )
     except Exception:
         # Older Hermes builds: derive the named-board root from the default DB.
-        candidates.extend(sorted((default.parent / "kanban" / "boards").glob("*/kanban.db")))
+        candidates.extend(
+            path
+            for path in sorted((default.parent / "kanban" / "boards").glob("*/kanban.db"))
+            if path.is_file() and _board_db_is_enumerable(path)
+        )
     if current.is_file():
         candidates.append(current)
     return tuple(dict.fromkeys(path.resolve() for path in candidates if path.is_file()))

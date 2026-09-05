@@ -382,6 +382,29 @@ def _quiesce_superseded_worker(
     }
 
 
+def _board_db_is_enumerable(path: Path) -> bool:
+    """Return True only for a real sibling board DB worth inspecting.
+
+    The raw ``boards_root/`` glob also matches stray files that are not
+    boards.  Most notably, a zero-byte ``kanban.db`` left directly inside the
+    archive container (``boards/_archived/kanban.db``) is not a board; when it
+    is empty it cannot be inspected and makes the entire cross-board scan fail
+    closed, refusing every claim on every board.  Exclude internal
+    underscore-prefixed containers (the archive root is ``_archived``) and
+    empty (zero-byte) files.  The canonical board registry is otherwise
+    unchanged, and the caller always re-adds the current board DB itself.
+    """
+    try:
+        parent_name = path.parent.name
+        if parent_name.startswith("_"):
+            return False
+        if path.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def _board_db_paths(kanban_db: Any, board: str) -> tuple[Path, ...]:
     try:
         current = Path(kanban_db.kanban_db_path(board=board)).resolve()
@@ -394,7 +417,11 @@ def _board_db_paths(kanban_db: Any, board: str) -> tuple[Path, ...]:
     # Derive from the core-resolved current DB instead of hardcoding HERMES_HOME.
     board_dir = current.parent
     boards_root = board_dir.parent
-    candidates = sorted(boards_root.glob("*/kanban.db"))
+    candidates = [
+        path
+        for path in sorted(boards_root.glob("*/kanban.db"))
+        if path.is_file() and _board_db_is_enumerable(path)
+    ]
     if current not in candidates:
         candidates.append(current)
     return tuple(dict.fromkeys(path.resolve() for path in candidates if path.is_file()))
