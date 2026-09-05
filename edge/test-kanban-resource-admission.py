@@ -260,12 +260,50 @@ def test_ambiguous_assignment_fails_closed() -> None:
         check("ambiguous resource mapping rejected", False)
 
 
+def test_stray_archive_db_is_not_enumerated() -> None:
+    """Regression: a stray zero-byte ``kanban.db`` directly inside the archive
+    container (``boards/_archived/kanban.db``) must not be enumerated by the
+    base cross-board scan, nor poison ``_active_resource_workers``.
+    """
+    root = Path(tempfile.mkdtemp(prefix="resource-admission-stray-"))
+    kdb = FakeKanban(root)
+    conn_a = make_db(kdb.kanban_db_path(board="a"))
+    stray = kdb.kanban_db_path(board="_archived")
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_bytes(b"")
+    try:
+        paths = set(admission._board_db_paths(kdb, "a"))
+        check(
+            "stray _archived/kanban.db is not enumerated",
+            stray.resolve() not in paths,
+            str(paths),
+        )
+        check(
+            "current board db remains enumerated",
+            kdb.kanban_db_path(board="a").resolve() in paths,
+            str(paths),
+        )
+        resource = admission.WorkerResource("serial", 1, ("local-worker",))
+        try:
+            active = admission._active_resource_workers(kdb, "a", resource)
+        except admission.ResourceAdmissionError as exc:
+            active = f"RAISED {type(exc).__name__}: {exc}"
+        check(
+            "worker inspection resolves despite stray file",
+            isinstance(active, list),
+            str(active),
+        )
+    finally:
+        conn_a.close()
+
+
 def main() -> int:
     test_unconfigured_and_unmatched_delegate()
     test_cross_board_capacity()
     test_terminal_same_task_worker_is_reaped()
     test_active_same_task_worker_is_never_killed()
     test_ambiguous_assignment_fails_closed()
+    test_stray_archive_db_is_not_enumerated()
     print(f"\n{len(PASS)} passed; {len(FAIL)} failed")
     return 1 if FAIL else 0
 
