@@ -5312,6 +5312,8 @@ def _requeue_rework_task(
     failure_limit: Optional[int],
 ) -> dict[str, Any]:
     """Return a failed/incomplete rework to READY without bypassing the breaker."""
+    from hermes_cli import kanban_db_dispatch
+
     event = context["event"]
     payload = dict(event[0])
     row = conn.execute(
@@ -5332,12 +5334,13 @@ def _requeue_rework_task(
             (task_id,),
         )
         _append_rework_retry_event(conn, task_id, payload, reason=reason)
-    auto_blocked = bool(kanban_db._record_task_failure(
+    auto_blocked = bool(kanban_db_dispatch._record_task_failure(
         conn,
         task_id,
         f"rework delivery retry: {reason}",
         outcome="rework_delivery_failed",
-        failure_limit=failure_limit,
+        failure_limit=(failure_limit if failure_limit is not None
+                       else kanban_db_dispatch.DEFAULT_FAILURE_LIMIT),
         release_claim=False,
         end_run=False,
     ))
@@ -7484,6 +7487,10 @@ def _dispatch_pending_rework_locked(
                 "reason": "assignee_profile_missing", "assignee": assignee,
             }]
 
+    # Resolve private implementation owners before taking the claim. Hermes
+    # no longer exports these helpers through kanban_db.
+    from hermes_cli import kanban_db_dispatch, kanban_db_workspace
+
     claimed = kanban_db.claim_task(conn, task_id, claimer=claim_lock)
     if claimed is None:
         return [{
@@ -7588,16 +7595,19 @@ def _dispatch_pending_rework_locked(
     # keeps parity if it was moved or recreated).
     try:
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch = kanban_db._resolve_worktree_workspace(
+            workspace, resolved_branch = kanban_db_workspace._resolve_worktree_workspace(
                 claimed, board=board
             )
         else:
             workspace = kanban_db.resolve_workspace(claimed, board=board)
             resolved_branch = None
     except Exception as exc:
-        auto_blocked = bool(kanban_db._record_spawn_failure(
+        auto_blocked = bool(kanban_db_dispatch._record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
-            failure_limit=failure_limit,
+            outcome="spawn_failed",
+            failure_limit=(failure_limit if failure_limit is not None
+                           else kanban_db_dispatch.DEFAULT_FAILURE_LIMIT),
+            release_claim=True, end_run=True,
         ))
         _reserve_rework_task(conn, task_id)
         if on_failure is not None:
@@ -7623,11 +7633,11 @@ def _dispatch_pending_rework_locked(
             resolved_branch or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
 
-    spawn = spawn_fn if spawn_fn is not None else kanban_db._default_spawn
+    spawn = spawn_fn if spawn_fn is not None else kanban_db_dispatch._default_spawn
     try:
         pid = spawn(claimed, str(workspace), board=board)
         if pid:
-            kanban_db._set_worker_pid(conn, claimed.id, int(pid))
+            kanban_db_dispatch._set_worker_pid(conn, claimed.id, int(pid))
         _append_rework_dispatch_provenance(
             conn,
             claimed,
@@ -7636,8 +7646,12 @@ def _dispatch_pending_rework_locked(
             pid=int(pid) if pid else None,
         )
     except Exception as exc:
-        auto_blocked = bool(kanban_db._record_spawn_failure(
-            conn, claimed.id, str(exc), failure_limit=failure_limit,
+        auto_blocked = bool(kanban_db_dispatch._record_task_failure(
+            conn, claimed.id, str(exc),
+            outcome="spawn_failed",
+            failure_limit=(failure_limit if failure_limit is not None
+                           else kanban_db_dispatch.DEFAULT_FAILURE_LIMIT),
+            release_claim=True, end_run=True,
         ))
         _reserve_rework_task(conn, task_id)
         if on_failure is not None:
@@ -7692,6 +7706,8 @@ def _dispatch_pending_rework(
     board path cannot be resolved.
     """
     try:
+        from hermes_cli import kanban_db_connect
+
         db_path = kanban_db.kanban_db_path(board=board)
     except Exception as exc:
         return [{
@@ -7702,7 +7718,7 @@ def _dispatch_pending_rework(
             "error": f"{type(exc).__name__}: {exc}",
             "board": board,
         }]
-    lock_factory = getattr(kanban_db, "_dispatch_tick_lock", None)
+    lock_factory = getattr(kanban_db_connect, "_dispatch_tick_lock", None)
     if not callable(lock_factory):
         return [{
             "task_id": None,

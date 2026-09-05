@@ -18,6 +18,7 @@ Round-2 (PR #77 rework) regressions included:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import sys
 import tempfile
@@ -443,7 +444,7 @@ def _actual_core_regression(tmp: Path) -> None:
     core = ep._core
 
     try:
-        from hermes_cli import kanban_db
+        from hermes_cli import kanban_db, kanban_db_dispatch
         from hermes_cli.kanban_db import connect_closing, init_db
 
         check("actual-core: entrypoint installed the workspace-admission wrapper",
@@ -463,12 +464,17 @@ def _actual_core_regression(tmp: Path) -> None:
             spawn_calls.append(str(task.id))
             return 12345
 
-        def spy_record_spawn_failure(conn, task_id, error, *, failure_limit=None):
+        def spy_record_spawn_failure(conn, task_id, error, **kwargs):
             fail_calls.append((task_id, str(error)[:80]))
             return False
 
-        kanban_db._default_spawn = spy_default_spawn
-        kanban_db._record_spawn_failure = spy_record_spawn_failure
+        from unittest.mock import patch
+        patches = (
+            patch.object(kanban_db_dispatch, "_default_spawn", spy_default_spawn),
+            patch.object(kanban_db_dispatch, "_record_task_failure", spy_record_spawn_failure),
+        )
+        for runtime_patch in patches:
+            runtime_patch.start()
 
         def make_impl_task(tag: str) -> str:
             """A rework-pending implementation card bound to the shared checkout."""
@@ -491,7 +497,10 @@ def _actual_core_regression(tmp: Path) -> None:
                 conn.execute(
                     "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
                     "VALUES (?, NULL, 'github_pr_rework', ?, ?)",
-                    (tid, '{"source":"actual_core_regression","pr_number":77}',
+                    (tid, json.dumps({
+                        "source": "actual_core_regression", "pr_number": 77,
+                        "rework_round": 1, "head_sha": "a" * 40,
+                    }),
                      int(_time.time())))
                 conn.commit()
             return tid
@@ -603,6 +612,8 @@ def _actual_core_regression(tmp: Path) -> None:
                   ("failed", "unavailable"), str(f2_result))
 
     finally:
+        for runtime_patch in locals().get("patches", ()):
+            runtime_patch.stop()
         # Restore the process env so the suite's other phases are unaffected.
         for k, v in saved_env.items():
             if v is None:
