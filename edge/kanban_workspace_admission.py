@@ -311,6 +311,12 @@ def _guarded_spawn(
 
     if violation is None:
         real_spawn = inner_spawn if inner_spawn is not None else default_spawn
+        if real_spawn is None:
+            # Retain injected/legacy callbacks, but resolve the split runtime
+            # only after the workspace gate has allowed the spawn.
+            from hermes_cli import kanban_db_dispatch
+
+            real_spawn = kanban_db_dispatch._default_spawn
         return real_spawn(claimed, str(workspace), board=board)
 
     raise _blocked_failure(conn, kanban_db, board, task_id, violation)

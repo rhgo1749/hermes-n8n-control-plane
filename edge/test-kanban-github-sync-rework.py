@@ -56,7 +56,7 @@ wake_plugin: Any = importlib.util.module_from_spec(wake_spec)
 sys.modules[wake_spec.name] = wake_plugin
 wake_spec.loader.exec_module(wake_plugin)
 
-from hermes_cli import kanban_db  # type: ignore  # noqa: E402
+from hermes_cli import kanban_db, kanban_db_dispatch  # type: ignore  # noqa: E402
 from hermes_cli.kanban_db import connect_closing, init_db  # type: ignore  # noqa: E402
 
 
@@ -608,17 +608,17 @@ def test_7_rework_label_retained_until_claim():
     _make_profile_dir()
     stub = StubSpawn()
     orig_cfg = mod._kanban_config
-    original_spawn = kanban_db._default_spawn
+    original_spawn = kanban_db_dispatch._default_spawn
     mod._kanban_config = lambda: {
         "max_in_progress": 1, "default_assignee": "kanban-main", "failure_limit": 5,
     }
-    kanban_db._default_spawn = stub
+    kanban_db_dispatch._default_spawn = stub
     os.environ[mod.REWORK_DISPATCH_ENV] = "1"
     try:
         results = run_sync(fake)
     finally:
         mod._kanban_config = orig_cfg
-        kanban_db._default_spawn = original_spawn
+        kanban_db_dispatch._default_spawn = original_spawn
         os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
     spawned = [r for r in results if r.get("reason") == "rework_worker_spawned"]
     check("worker spawned", len(spawned) == 1, str(results))
@@ -1403,17 +1403,17 @@ def _claim_edge_rework(tid: str):
 
 def _run_sync_with_dispatch(fake: FakeGitHub, stub: StubSpawn) -> list[dict]:
     orig_cfg = mod._kanban_config
-    original_spawn = kanban_db._default_spawn
+    original_spawn = kanban_db_dispatch._default_spawn
     mod._kanban_config = lambda: {
         "max_in_progress": 1, "default_assignee": "kanban-main", "failure_limit": 5,
     }
-    kanban_db._default_spawn = stub
+    kanban_db_dispatch._default_spawn = stub
     os.environ[mod.REWORK_DISPATCH_ENV] = "1"
     try:
         return run_sync(fake)
     finally:
         mod._kanban_config = orig_cfg
-        kanban_db._default_spawn = original_spawn
+        kanban_db_dispatch._default_spawn = original_spawn
         os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
 
 
@@ -3644,9 +3644,9 @@ def test_46_changes_requested_canonical_pr_dispatch():
     _make_profile_dir()
     stub = StubSpawn()
     saved_env = os.environ.get(mod.REWORK_DISPATCH_ENV)
-    original_spawn = kanban_db._default_spawn
+    original_spawn = kanban_db_dispatch._default_spawn
     os.environ[mod.REWORK_DISPATCH_ENV] = "1"
-    kanban_db._default_spawn = stub
+    kanban_db_dispatch._default_spawn = stub
     try:
         results = run_sync(fake)
         dispatch = [r for r in results if r.get("reason") == "rework_worker_spawned"]
@@ -3687,7 +3687,7 @@ def test_46_changes_requested_canonical_pr_dispatch():
             e for e in task_events(tid) if e["kind"] == "github_pr_rework"
         ]) == 1)
     finally:
-        kanban_db._default_spawn = original_spawn
+        kanban_db_dispatch._default_spawn = original_spawn
         if saved_env is None:
             os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
         else:
@@ -3700,13 +3700,13 @@ def test_47_changes_requested_without_canonical_pr_not_dispatched():
     tid = _changes_requested_ready_task(fake, canonical_pr=False)
     stub = StubSpawn()
     saved_env = os.environ.get(mod.REWORK_DISPATCH_ENV)
-    original_spawn = kanban_db._default_spawn
+    original_spawn = kanban_db_dispatch._default_spawn
     os.environ[mod.REWORK_DISPATCH_ENV] = "1"
-    kanban_db._default_spawn = stub
+    kanban_db_dispatch._default_spawn = stub
     try:
         results = run_sync(fake)
     finally:
-        kanban_db._default_spawn = original_spawn
+        kanban_db_dispatch._default_spawn = original_spawn
         if saved_env is None:
             os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
         else:
@@ -3727,13 +3727,13 @@ def test_48_changes_requested_dry_run_predicts_without_mutation():
     before_events = len(task_events(tid))
     stub = StubSpawn()
     saved_env = os.environ.get(mod.REWORK_DISPATCH_ENV)
-    original_spawn = kanban_db._default_spawn
+    original_spawn = kanban_db_dispatch._default_spawn
     os.environ[mod.REWORK_DISPATCH_ENV] = "1"
-    kanban_db._default_spawn = stub
+    kanban_db_dispatch._default_spawn = stub
     try:
         results = mod.sync_board("default", dry_run=True, client=fake)
     finally:
-        kanban_db._default_spawn = original_spawn
+        kanban_db_dispatch._default_spawn = original_spawn
         if saved_env is None:
             os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
         else:
@@ -4356,11 +4356,11 @@ def test_113_claim_failure_label_recoverable():
     _make_profile_dir()
     stub = StubSpawn()
     orig_cfg = mod._kanban_config
-    original_spawn = kanban_db._default_spawn
+    original_spawn = kanban_db_dispatch._default_spawn
     mod._kanban_config = lambda: {  # type: ignore[assignment]
         "max_in_progress": 1, "default_assignee": "kanban-main", "failure_limit": 5,
     }
-    kanban_db._default_spawn = stub
+    kanban_db_dispatch._default_spawn = stub
     orig_claim = kanban_db.claim_task
     kanban_db.claim_task = lambda *args, **kwargs: None  # type: ignore[assignment]
     os.environ[mod.REWORK_DISPATCH_ENV] = "1"
@@ -4368,7 +4368,7 @@ def test_113_claim_failure_label_recoverable():
         run_sync(fake)
     finally:
         mod._kanban_config = orig_cfg  # type: ignore[assignment]
-        kanban_db._default_spawn = original_spawn
+        kanban_db_dispatch._default_spawn = original_spawn
         kanban_db.claim_task = orig_claim  # type: ignore[assignment]
         os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
     check("no spawn on claim failure", stub.calls == [], str(stub.calls))
