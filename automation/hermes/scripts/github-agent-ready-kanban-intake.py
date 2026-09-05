@@ -3702,6 +3702,40 @@ def _sync_python() -> str:
     return sys.executable
 
 
+def _sync_script_path() -> Path:
+    """Locate the edge sync script for one of the known deployments.
+
+    Resolution order:
+
+    1. ``HERMES_KANBAN_SYNC_SCRIPT`` override (candidate verification runs;
+       the cron never sets it).
+    2. The deployed layout: a sibling ``kanban-github-sync.py`` next to this
+       intake core (``~/.hermes/scripts``).  This is the production path.
+    3. The repository checkout layout: ``edge/kanban-github-sync.py`` next to
+       the canonical edge source.  Running the entrypoint straight from a
+       repository checkout must not fail closed just because the script was
+       relocated to ``edge/`` during deployment layout refactors.
+
+    Raises ``IntakeError`` (fail-closed) when no candidate is a file.
+    """
+    override = os.environ.get("HERMES_KANBAN_SYNC_SCRIPT")
+    if override:
+        script = Path(override)
+        if script.is_file():
+            return script
+        raise IntakeError(f"edge sync script is missing: {script}")
+    candidates = (
+        Path(__file__).resolve().parent / "kanban-github-sync.py",
+        Path(__file__).resolve().parents[3] / "edge" / "kanban-github-sync.py",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise IntakeError(
+        "edge sync script is missing: " + ", ".join(str(c) for c in candidates)
+    )
+
+
 def _sync_board(
     config: RepositoryConfig, token: str, *, dry_run: bool = False
 ) -> list[dict[str, Any]]:
@@ -3716,12 +3750,7 @@ def _sync_board(
     ``HERMES_KANBAN_SYNC_SCRIPT`` overrides the sync script path for
     candidate verification runs; the cron never sets it.
     """
-    script = Path(
-        os.environ.get("HERMES_KANBAN_SYNC_SCRIPT")
-        or (Path(__file__).resolve().parent / "kanban-github-sync.py")
-    )
-    if not script.is_file():
-        raise IntakeError(f"edge sync script is missing: {script}")
+    script = _sync_script_path()
     env = os.environ.copy()
     env["GITHUB_TOKEN"] = token
     env["HERMES_HOME"] = str(_hermes_home())
