@@ -2,20 +2,25 @@
 """Small event-routing overlay for the GitHub router.
 
 The canonical router intentionally owns signature verification, delivery dedupe,
-owner/managed-repository admission and generic intake scope persistence.  This
-entrypoint leaves those boundaries unchanged and adds one low-latency *wake
-hint* for a PR conversation ``issue_comment(created)`` whose first non-empty
-line is exactly ``AGENT_REWORK_COMPLETE``.
+owner/managed-repository admission and generic intake scope persistence. This
+entrypoint leaves those boundaries unchanged and adds two bounded wake hints:
 
-The comment is never treated as completion authority here.  The edge reconciler
-still fresh-reads GitHub and validates trusted actor, task/request binding, live
-PR head, validation marker, timing and current-round run provenance before any
-Kanban or label transition.  The router only asks the already-existing edge
-owner to look now instead of waiting for a later generic intake wake.
+* a low-latency edge wake for a PR conversation ``issue_comment(created)`` whose
+  first non-empty line is exactly ``AGENT_REWORK_COMPLETE``;
+* a low-frequency full-intake safety wake that reuses the canonical durable
+  scope queue so a missed ``agent-ready`` webhook cannot strand an Issue
+  indefinitely.
+
+Neither hint is lifecycle authority. The completion-comment path only asks the
+existing edge owner to fresh-read GitHub. The periodic path only enqueues a
+canonical ``full`` intake scope and wakes the preserved Hermes intake job; it
+never reads or writes Issue/Kanban lifecycle state directly and it never runs
+webhook reconciliation.
 """
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import threading
 from pathlib import Path
@@ -24,6 +29,9 @@ from typing import Any
 
 _COMPLETION_MARKER = "AGENT_REWORK_COMPLETE"
 _HINT = threading.local()
+_PERIODIC_FULL_INTAKE_DELIVERY = "router-periodic-full-intake"
+_DEFAULT_FALLBACK_INTERVAL_SECONDS = 3600
+_MIN_FALLBACK_INTERVAL_SECONDS = 300
 
 
 def _load_core() -> ModuleType:
@@ -71,7 +79,7 @@ def install(core: ModuleType) -> ModuleType:
     original_enqueue_scope = core._enqueue_scope
 
     def event_repositories(event: str, payload: dict[str, Any]) -> list[str]:
-        # ThreadingHTTPServer uses one request thread per delivery.  Always
+        # ThreadingHTTPServer uses one request thread per delivery. Always
         # clear any prior hint before parsing the current signed event.
         _HINT.completion_comment = False
         repositories = original_event_repositories(event, payload)
@@ -109,9 +117,9 @@ def install(core: ModuleType) -> ModuleType:
                 return result
 
             # /v1/edge-sync currently exposes a deliberately tiny wake
-            # allowlist.  Reuse its existing rework wake envelope internally;
+            # allowlist. Reuse its existing rework wake envelope internally;
             # this payload is a control-plane trigger only and is never used as
-            # PR state evidence.  The edge immediately fresh-reads GitHub.
+            # PR state evidence. The edge immediately fresh-reads GitHub.
             wake = core._n8n_edge_sync(
                 {
                     "repository": target,
@@ -136,6 +144,75 @@ def install(core: ModuleType) -> ModuleType:
     return core
 
 
+def _fallback_interval_seconds() -> int:
+    raw = os.environ.get(
+        "GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS",
+        str(_DEFAULT_FALLBACK_INTERVAL_SECONDS),
+    )
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS must be an integer") from exc
+    if interval < _MIN_FALLBACK_INTERVAL_SECONDS:
+        raise RuntimeError(
+            "GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS must be at least "
+            f"{_MIN_FALLBACK_INTERVAL_SECONDS}"
+        )
+    return interval
+
+
+def _periodic_full_intake_once(core: ModuleType) -> dict[str, Any]:
+    """Enqueue one idempotent full-intake safety scope and wake canonical intake.
+
+    A stable synthetic delivery identity deduplicates only while the same safety
+    scope is queued, in-flight, or pending. Once an acknowledged scope leaves
+    those stores, the next interval may create a fresh full scan. If a prior
+    wake failed after enqueue, the next tick sees the queued scope and re-wakes
+    it rather than adding a duplicate.
+    """
+    scope = core._enqueue_scope(
+        full=True,
+        delivery_id=_PERIODIC_FULL_INTAKE_DELIVERY,
+    )
+    if scope.get("in_flight") or scope.get("pending"):
+        return {
+            "scope": scope,
+            "wake": {
+                "skipped": True,
+                "reason": "scope_already_active_or_pending",
+            },
+        }
+    return {"scope": scope, "wake": core._wake()}
+
+
+def _periodic_full_intake_loop(
+    core: ModuleType,
+    interval_seconds: int,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Run the safety wake at a bounded cadence, never immediately at startup."""
+    stop = stop_event if stop_event is not None else threading.Event()
+    while not stop.wait(interval_seconds):
+        try:
+            result = _periodic_full_intake_once(core)
+            scope = result.get("scope") or {}
+            wake = result.get("wake") or {}
+            print(
+                "github-router periodic full intake "
+                f"scope={scope.get('id', '')} "
+                f"existing={bool(scope.get('existing'))} "
+                f"wake_skipped={bool(wake.get('skipped'))} "
+                f"upstream_status={wake.get('upstream_status', '')}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - next interval is the bounded retry
+            print(
+                "github-router periodic full intake warning: "
+                f"{type(exc).__name__}",
+                flush=True,
+            )
+
+
 _core = install(_load_core())
 
 
@@ -144,6 +221,18 @@ def __getattr__(name: str):
 
 
 def main() -> int:
+    interval = _fallback_interval_seconds()
+    threading.Thread(
+        target=_periodic_full_intake_loop,
+        args=(_core, interval),
+        daemon=True,
+        name="github-router-periodic-full-intake",
+    ).start()
+    print(
+        "github-router periodic full intake enabled "
+        f"interval_seconds={interval}",
+        flush=True,
+    )
     return int(_core.main())
 
 
