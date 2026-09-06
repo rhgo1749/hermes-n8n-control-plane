@@ -2,6 +2,11 @@
 
 This directory is the durable project memory for the external Hermes → GitHub control plane. It is an index, not a second source of truth: each linked document owns its own contract and should be updated with the implementation change that affects it.
 
+## External readers
+
+- [`../PROJECT_OVERVIEW.md`](../PROJECT_OVERVIEW.md) — recruiter/user-friendly architecture and engineering overview without replacing canonical lifecycle contracts.
+- [`PUBLIC_RELEASE_CHECKLIST.md`](PUBLIC_RELEASE_CHECKLIST.md) — security/privacy checks to run before changing repository visibility to public.
+
 ## Recommended reading order
 
 1. Root [`AGENTS.md`](../AGENTS.md) for repository-wide agent rules.
