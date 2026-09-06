@@ -3393,6 +3393,15 @@ def _truncate_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
+def _entry_attention_key(entry: dict[str, Any]) -> str | None:
+    """Return the edge's semantic identity for notification dedupe."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if isinstance(value, dict) and value.get("attention_key"):
+            return str(value["attention_key"])
+    return None
+
+
 def _attention_notification_line(
     board: str,
     short_name: str,
@@ -3405,6 +3414,12 @@ def _attention_notification_line(
     if pr_number is not None:
         line += f" (PR #{pr_number})"
     line += f" — {reason}"
+    attention_key = _entry_attention_key(entry)
+    if attention_key is not None:
+        # Keep the exact edge identity in the delivered body. The existing
+        # full-body state file then suppresses repeated ticks but re-arms for
+        # a new blocked/rework generation with the same reason and title.
+        line += f" · incident={attention_key}"
     title = str(entry.get("issue_title") or "").strip()
     if title:
         line += f" — {_truncate_title(title)}"
