@@ -87,6 +87,31 @@ def test_attention_line_is_short_and_actionable() -> None:
     assert "확인 필요" in line
 
 
+def test_attention_line_carries_semantic_identity_for_delivery_dedupe() -> None:
+    first = _entry(
+        "rework_retry_blocked",
+        operator_attention={
+            "reason": "rework_retry_blocked",
+            "attention_key": "rework_retry_blocked:repo|106|123|1|7",
+        },
+    )
+    second = _entry(
+        "rework_retry_blocked",
+        operator_attention={
+            "reason": "rework_retry_blocked",
+            "attention_key": "rework_retry_blocked:repo|106|123|2|8",
+        },
+    )
+    first_line = intake._attention_notification_line(
+        "re-bound", "Re-Bound", 106, first
+    )
+    second_line = intake._attention_notification_line(
+        "re-bound", "Re-Bound", 106, second
+    )
+    assert "incident=rework_retry_blocked:repo|106|123|1|7" in first_line
+    assert first_line != second_line
+
+
 def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
@@ -99,23 +124,203 @@ def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
         """
     )
     conn.execute("INSERT INTO tasks (id, status, body) VALUES ('t1', 'blocked', 'x')")
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            "t1",
+            "blocked",
+            json.dumps({"kind": "needs_input", "reason": "first"}),
+            10,
+        ),
+    )
     entry = {
         "task_id": "t1",
         "repository": "rhgo1749/re-bound",
         "issue_number": 106,
-        "reason": "rework_retry_blocked",
+        "reason": "needs_input",
         "status": "blocked",
+        "block_kind": "needs_input",
     }
     try:
         assert edge._record_operator_attention(conn, entry) is True
-        assert edge._record_operator_attention(conn, entry) is False  # same incident: quiet
-        rows = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind = 'github_operator_attention'").fetchone()
-        assert rows[0] == 1
-        # A new ordinary lifecycle event changes the cursor -> recurrence may send again.
+        first_payload = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE kind = 'github_operator_attention'"
+            ).fetchone()[0]
+        )
+        assert first_payload["incident_provenance"]["source"] == "blocked_event"
+        assert first_payload["incident_provenance"]["blocked_event_id"]
+        assert edge._record_operator_attention(conn, entry) is False
+        assert (
+            entry["operator_attention"]["attention_key"]
+            == first_payload["attention_key"]
+        )
+        # Ordinary event churn, including repeated projections, does not
+        # create a new incident.
+        for index, kind in enumerate(
+            (
+                "github_blocked_projection",
+                "heartbeat",
+                "commented",
+                "respawn_guarded",
+                "claimed",
+                "spawned",
+            ),
+            start=11,
+        ):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, '{}', ?)",
+                ("t1", kind, index),
+            )
+            assert edge._record_operator_attention(conn, entry) is False
+        # A resolved blocker followed by a new blocked event re-arms even with
+        # the same reason and block_kind.
         conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t1', 'claimed', '{}', 1)"
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES ('t1', 'github_blocked_resolved', '{}', 20)"
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "t1",
+                "blocked",
+                json.dumps({"kind": "needs_input", "reason": "second"}),
+                21,
+            ),
         )
         assert edge._record_operator_attention(conn, entry) is True
+        rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE kind = 'github_operator_attention' ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert (
+            json.loads(rows[0][0])["attention_key"]
+            != json.loads(rows[1][0])["attention_key"]
+        )
+    finally:
+        conn.close()
+
+
+def test_operator_attention_rework_round_is_stable_across_retry_event() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER,
+          kind TEXT, payload TEXT, created_at INTEGER
+        );
+        """
+    )
+    rework = {
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "pr_number": 123,
+        "rework_round": 1,
+        "request_comment_id": 7,
+    }
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("t1", "github_pr_rework", json.dumps(rework), 10),
+    )
+    entry = {
+        "task_id": "t1",
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "reason": "rework_human_attention",
+        "status": "review",
+    }
+    try:
+        assert edge._record_operator_attention(conn, entry) is True
+        assert edge._record_operator_attention(conn, entry) is False
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("t1", "github_pr_rework_retry", json.dumps(rework), 11),
+        )
+        assert edge._record_operator_attention(conn, entry) is False
+        # A different governing request comment is a new rework incident even
+        # when the round number and reason remain unchanged.
+        rework["request_comment_id"] = 8
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("t1", "github_pr_rework_retry", json.dumps(rework), 12),
+        )
+        assert edge._record_operator_attention(conn, entry) is True
+        rework["rework_round"] = 2
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("t1", "github_pr_rework", json.dumps(rework), 13),
+        )
+        assert edge._record_operator_attention(conn, entry) is True
+        keys = [
+            json.loads(row[0])["attention_key"]
+            for row in conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE kind = 'github_operator_attention' ORDER BY id"
+            )
+        ]
+        assert len(keys) == 3
+        assert len(set(keys)) == 3
+        assert "|106|123|1|7" in keys[0]
+        assert "|106|123|1|8" in keys[1]
+        assert "|106|123|2|8" in keys[2]
+    finally:
+        conn.close()
+
+
+def test_operator_attention_without_identity_fails_open_and_dedupes_exact_key() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER,
+          kind TEXT, payload TEXT, created_at INTEGER
+        );
+        """
+    )
+    entry = {
+        "task_id": "t1",
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "reason": "lifecycle_label_conflict",
+        "status": "review",
+    }
+    try:
+        assert edge._record_operator_attention(conn, entry) is True
+        payload = json.loads(
+            conn.execute("SELECT payload FROM task_events").fetchone()[0]
+        )
+        assert payload["incident_unresolved"] is True
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("t1", "claimed", "{}", 10),
+        )
+        assert edge._record_operator_attention(conn, entry) is False
+        # A legacy cursor row cannot suppress a semantic row, even if the
+        # textual key happens to collide.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "t2",
+                "github_operator_attention",
+                json.dumps({"attention_key": "lifecycle_label_conflict:123"}),
+                11,
+            ),
+        )
+        new_entry = dict(entry)
+        new_entry["task_id"] = "t2"
+        new_entry["pr_number"] = 123
+        assert edge._record_operator_attention(conn, new_entry) is True
     finally:
         conn.close()
 

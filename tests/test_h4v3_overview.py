@@ -276,6 +276,341 @@ def test_legacy_attention_event_stales_after_lifecycle_progress() -> None:
         assert overview._need_you_reason(result["tasks"][0]) is None
 
 
+def test_semantic_attention_survives_non_attention_event_churn() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        rework = {
+            "repository": "rhgo1749/re-bound",
+            "issue_number": 106,
+            "pr_number": 123,
+            "rework_round": 1,
+            "request_comment_id": 7,
+        }
+        provenance = {
+            "source": "rework_round",
+            **rework,
+            "reason": "rework_human_attention",
+        }
+        attention_key = "rework_human_attention:" + overview._attention_ref(
+            ("rhgo1749/re-bound", 106, 123, 1, 7)
+        )
+        events = [
+            ("t-review", "github_pr_rework", json.dumps(rework), 9),
+            (
+                "t-review",
+                "github_operator_attention",
+                json.dumps({
+                    "reason": "rework_human_attention",
+                    "attention_key": attention_key,
+                    "incident_provenance": provenance,
+                }),
+                10,
+            ),
+            (
+                "t-review",
+                "github_blocked_projection",
+                json.dumps({"reason": "projection"}),
+                11,
+            ),
+        ]
+        events.extend(
+            ("t-noise", "lifecycle", "{}", 12 + index) for index in range(200)
+        )
+        _db(
+            path,
+            [
+                (
+                    "t-review",
+                    "Needs maintainer",
+                    "review",
+                    None,
+                    None,
+                    0,
+                    0,
+                    None,
+                    None,
+                    "",
+                ),
+                ("t-noise", "Noise", "ready", None, None, 0, 0, None, None, ""),
+            ],
+            events,
+        )
+        result = overview._load_board_projection(
+            {"slug": "demo", "name": "Demo", "db_path": str(path)}
+        )
+        task = next(task for task in result["tasks"] if task["id"] == "t-review")
+        assert overview._need_you_reason(task) == "rework_human_attention"
+
+
+def test_semantic_attention_rearms_only_for_a_new_rework_round() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        first = {
+            "repository": "rhgo1749/re-bound",
+            "issue_number": 106,
+            "pr_number": 123,
+            "rework_round": 1,
+            "request_comment_id": 7,
+        }
+        second = {**first, "rework_round": 2}
+
+        def attention_payload(
+            data: dict, reason: str = "rework_human_attention"
+        ) -> dict:
+            provenance = {
+                "source": "rework_round",
+                **data,
+                "reason": reason,
+            }
+            return {
+                "reason": reason,
+                "attention_key": reason
+                + ":"
+                + overview._attention_ref(
+                    (
+                        data["repository"],
+                        data["issue_number"],
+                        data["pr_number"],
+                        data["rework_round"],
+                        data["request_comment_id"],
+                    )
+                ),
+                "incident_provenance": provenance,
+            }
+
+        _db(
+            path,
+            [
+                (
+                    "t-review",
+                    "Needs maintainer",
+                    "review",
+                    None,
+                    None,
+                    0,
+                    0,
+                    None,
+                    None,
+                    "",
+                )
+            ],
+            [
+                ("t-review", "github_pr_rework", json.dumps(first), 9),
+                (
+                    "t-review",
+                    "github_operator_attention",
+                    json.dumps(attention_payload(first)),
+                    10,
+                ),
+                ("t-review", "github_pr_rework", json.dumps(second), 20),
+            ],
+        )
+        result = overview._load_board_projection(
+            {"slug": "demo", "name": "Demo", "db_path": str(path)}
+        )
+        assert overview._need_you_reason(result["tasks"][0]) is None
+
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "t-review",
+                    "github_operator_attention",
+                    json.dumps(attention_payload(second)),
+                    21,
+                ),
+            )
+            conn.commit()
+        result = overview._load_board_projection(
+            {"slug": "demo", "name": "Demo", "db_path": str(path)}
+        )
+        assert overview._need_you_reason(result["tasks"][0]) == "rework_human_attention"
+
+
+def test_semantic_blocked_attention_tracks_latest_block_and_resolution() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+
+        def blocked_payload(reason: str, at: int) -> dict:
+            blocked_id = overview._attention_ref(("needs_input", reason, at))
+            return {
+                "reason": "needs_input",
+                "attention_key": "needs_input:" + overview._attention_ref(
+                    ("needs_input", "needs_input", reason, at)
+                ),
+                "incident_provenance": {
+                    "source": "blocked_event",
+                    "blocked_event_id": blocked_id,
+                    "blocked_event_kind": "needs_input",
+                    "blocked_event_reason": reason,
+                    "blocked_event_created_at": at,
+                    "block_kind": "needs_input",
+                    "reason": "needs_input",
+                },
+            }
+
+        first_attention = blocked_payload("first", 10)
+        second_attention = blocked_payload("second", 30)
+        _db(
+            path,
+            [
+                (
+                    "t-blocked",
+                    "Input",
+                    "blocked",
+                    None,
+                    "needs_input",
+                    0,
+                    0,
+                    None,
+                    None,
+                    "",
+                )
+            ],
+            [
+                (
+                    "t-blocked",
+                    "blocked",
+                    json.dumps({"kind": "needs_input", "reason": "first"}),
+                    10,
+                ),
+                (
+                    "t-blocked",
+                    "github_operator_attention",
+                    json.dumps(first_attention),
+                    11,
+                ),
+                ("t-blocked", "github_blocked_projection", "{}", 12),
+            ],
+        )
+        projection = {"slug": "demo", "name": "Demo", "db_path": str(path)}
+        result = overview._load_board_projection(projection)
+        assert overview._need_you_reason(result["tasks"][0]) == "needs_input"
+
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', block_kind = NULL "
+                "WHERE id = 't-blocked'"
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES ('t-blocked', 'github_blocked_resolved', '{}', 20)"
+            )
+            conn.commit()
+        result = overview._load_board_projection(projection)
+        assert overview._need_you_reason(result["tasks"][0]) is None
+
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+                "WHERE id = 't-blocked'"
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "t-blocked",
+                    "blocked",
+                    json.dumps({"kind": "needs_input", "reason": "second"}),
+                    30,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "t-blocked",
+                    "github_operator_attention",
+                    json.dumps(second_attention),
+                    31,
+                ),
+            )
+            conn.commit()
+        result = overview._load_board_projection(projection)
+        assert overview._need_you_reason(result["tasks"][0]) == "needs_input"
+
+
+def test_semantic_attention_reason_change_replaces_previous_generation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        blocked_payload = {"kind": "needs_input", "reason": "operator input"}
+        blocked_event_id = "needs_input|operator input|10"
+        blocked_ref = "needs_input|needs_input|operator input|10"
+        _db(
+            path,
+            [
+                (
+                    "t-blocked",
+                    "Input",
+                    "blocked",
+                    None,
+                    "needs_input",
+                    0,
+                    0,
+                    None,
+                    None,
+                    "",
+                )
+            ],
+            [
+                (
+                    "t-blocked",
+                    "blocked",
+                    json.dumps(blocked_payload),
+                    10,
+                ),
+                (
+                    "t-blocked",
+                    "github_operator_attention",
+                    json.dumps({
+                        "reason": "needs_input",
+                        "attention_key": f"needs_input:{blocked_ref}",
+                        "incident_provenance": {
+                            "source": "blocked_event",
+                            "blocked_event_id": blocked_event_id,
+                            "blocked_event_kind": "needs_input",
+                            "blocked_event_reason": "operator input",
+                            "blocked_event_created_at": 10,
+                            "block_kind": "needs_input",
+                        },
+                    }),
+                    11,
+                ),
+                (
+                    "t-blocked",
+                    "github_operator_attention",
+                    json.dumps({
+                        "reason": "capability",
+                        "attention_key": f"capability:{blocked_ref}",
+                        "incident_provenance": {
+                            "source": "blocked_event",
+                            "blocked_event_id": blocked_event_id,
+                            "blocked_event_kind": "needs_input",
+                            "blocked_event_reason": "operator input",
+                            "blocked_event_created_at": 10,
+                            "block_kind": "needs_input",
+                        },
+                    }),
+                    12,
+                ),
+                (
+                    "t-blocked",
+                    "commented",
+                    json.dumps({"reason": "needs maintainer"}),
+                    13,
+                ),
+            ],
+        )
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            evidence = overview._load_attention_events(conn, ["t-blocked"])
+        assert list(evidence) == ["t-blocked"]
+        current = json.loads(evidence["t-blocked"]["payload"])
+        assert current["reason"] == "capability"
+        assert current["attention_key"] == f"capability:{blocked_ref}"
+
+
 def test_recent_meaningful_picks_newest_event_across_tasks() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"
