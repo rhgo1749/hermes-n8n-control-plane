@@ -1,247 +1,227 @@
-# Hermes → GitHub event control plane
+# Hermes → GitHub Event Control Plane
 
-External H4V3 Hermes control plane for GitHub event intake, edge reconciliation,
-operator notifications, and the read-only H4V3 Overview — without modifying
-Hermes core.
+Event-driven GitHub ↔ Hermes Kanban integration with **n8n as a bounded event hop, not a lifecycle owner**.
 
-The GitHub control plane is **event-driven**. The existing Hermes cron job
-remains the durable execution primitive for Issue intake, while PR completion
-and trusted rework signals use one private n8n Webhook hop to the edge sync
-actuator. n8n owns no polling Schedule Trigger.
+This repository connects signed GitHub events to an existing Hermes/Kanban runtime without modifying Hermes core. It focuses on explicit state ownership, idempotent event handling, fail-closed reconciliation, and reproducible validation.
+
+- **처음 보는 분 / 채용 검토자:** [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md)
+- **정본 문서 인덱스:** [`docs/README.md`](docs/README.md)
+- **Public 전환 점검:** [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)
+
+## What this project does
+
+GitHub-backed work has several failure modes that a simple webhook → action pipeline does not solve by itself:
+
+- the same delivery can arrive more than once;
+- events can arrive after local state has changed;
+- a worker can finish internally while its PR is still open;
+- a maintainer can request another rework round on an existing PR;
+- an external lookup or mutation can fail or return stale evidence;
+- two components can accidentally become competing state owners.
+
+This control plane separates **event transport** from **authoritative state projection** so those cases converge through one canonical edge state machine.
+
+## Architecture
 
 ```text
 GitHub repository event
-          │
-          ▼
-   github-router :5681
-     HMAC verify
-     delivery dedupe (X-GitHub-Delivery)
-     managed-repository admission
-         ├─ PR close/rework → n8n Webhook :5678
-         │                    → fixed edge actuator :5682
-         │                    → kanban-github-sync.py --board <slug> --json
-         └─ Issue/intake event → lease-controller :5680
-                                  → existing Hermes job
-                                     default:bf431b2a6ba6
+          |
+          v
+   github-router
+   - HMAC verification
+   - delivery dedupe
+   - repository admission
+          |
+          +-- Issue/intake event
+          |       -> lease-controller
+          |       -> existing Hermes intake job
+          |
+          +-- PR merge / trusted rework
+                  -> private n8n Webhook
+                  -> fixed edge actuator
+                  -> edge/kanban-github-sync.py
 
 GitHub-backed worker completion
-       └─ core kanban_complete (committed provisional DONE)
-          → kanban_task_completed observer
-          → fixed live edge command: --board <validated-slug> --json
-             └─ first timeout + task still provisional DONE
-                → exactly one fresh-budget retry
-          → existing DONE/REVIEW projection owner
+          -> kanban_task_completed observer
+          -> fixed edge wake
+          -> edge/kanban-github-sync.py
+          -> fresh GitHub evidence based projection
 ```
 
-The completion observer is a trigger only: it reads the committed task row,
-filters out ordinary/non-GitHub tasks, and invokes the already-deployed edge
-reconciler. It does not write Kanban state, replace the edge state machine, or
-turn n8n into a completion owner. If the first child times out, the observer
-re-reads the committed task; when the task is already projected away from
-`DONE`, it suppresses a duplicate run, while a still-provisional/uncertain row
-gets exactly one fresh-budget retry. There is no polling or retry loop. Invalid
-runtime/board evidence and a final failed wake remain bounded diagnostics and
-are never merge evidence.
+The current topology is event-driven. The tracked n8n workflow is an on-demand PR edge-sync Webhook; it is not a polling Schedule Trigger and it does not register itself as a second dispatcher or completion owner.
 
-## Durable ownership boundary
+## Ownership boundaries
 
-The migration does **not** recreate or replace the Hermes job.
+### GitHub router
 
-`default:bf431b2a6ba6` remains the authoritative GitHub intake job. Its stored
-job ID, name, script, schedule expression, profile, and Hermes ownership stay
-intact. In normal event-driven operation the job is kept **paused between
-external wakes**. `lease-controller` calls the existing dashboard
-`trigger`/`pause` routes for that exact job.
+`github-router` owns external event admission:
 
-Do not delete, recreate, rename, or edit the stored Hermes job as part of the
-n8n/event migration.
+- GitHub webhook signature verification;
+- `X-GitHub-Delivery` replay deduplication;
+- managed-repository admission;
+- bounded routing into the existing intake path or PR edge-sync path.
 
-## Current runtime topology
+It does **not** decide final GitHub/Kanban lifecycle state.
 
-- `github-router` discovers repositories carrying the `hermes-agent` topic,
-  validates signed GitHub webhook events, deduplicates deliveries, and keeps
-  repository admission authoritative. PR lifecycle events are reduced to a
-  bounded loopback payload for the private n8n Webhook; Issue/intake events
-  continue through the repository-scoped wake queue.
-- `lease-controller` is bound to `default:bf431b2a6ba6` and prevents stale
-  delayed pauses from overtaking a newer trigger for the existing Issue intake
-  path.
-- The tracked n8n Webhook workflow filters only merged PR close and trusted
-  `agent-rework` label events, then calls the fixed loopback actuator. The
-  repository-owned `import-workflows.sh` command creates the protected
-  control-token credential, binds it to both nodes, publishes the managed
-  workflow, restarts n8n, and runs a safe unsupported-action canary. No n8n UI
-  credential binding or activation step is required.
-- The loopback actuator resolves repository → board through the existing
-  repository registry/task provenance and executes the edge script with fixed
-  argv. It is not a generic command or completion API.
-- `github-agent-ready-kanban-intake.py` remains authoritative for repository
-  filtering, idempotency, Kanban projection, and reconciliation. The deployed
-  historical live name is a small completion-contract entrypoint backed by the
-  canonical implementation installed beside it as
-  `github-agent-ready-kanban-intake-core.py`.
-- `edge/kanban-github-sync.py` remains authoritative for GitHub ↔ Kanban edge
-  lifecycle reconciliation.
-- n8n CE remains a private, persistent control-plane service with one tracked
-  on-demand PR edge-sync Webhook workflow. There is no tracked n8n Schedule
-  workflow and no direct GitHub webhook registration to n8n.
-- `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` is only a retained load limit; intake
-  correctness comes from the router scope queue and persisted lease guard.
+### n8n
 
-## Webhook reconciliation
+n8n is deliberately narrow glue:
 
-Webhook registration is topic-driven but no longer piggybacks on a five-minute
-polling fallback. Reconcile intentionally when onboarding/removing a
-`hermes-agent` repository or after webhook configuration changes:
+- receives a normalized, authenticated PR event;
+- allows only the supported merged/rework event shapes;
+- calls one fixed loopback edge actuator.
 
-```bash
-automation/n8n/scripts/reconcile-github-router.sh
+n8n does **not** own polling, Kanban state, worker spawning, merge authority, or an alternative lifecycle state machine.
+
+### Canonical edge
+
+[`edge/kanban-github-sync.py`](edge/kanban-github-sync.py) owns GitHub ↔ Kanban lifecycle reconciliation. It reads current evidence and projects the authoritative state instead of trusting a previous webhook snapshot as completion evidence.
+
+This means:
+
+- Issue-side readiness/hold and PR-side rework lifecycle are distinct surfaces;
+- a trusted rework request opens a new PR rework round rather than following review-ready automatically;
+- current-round claim/delivery evidence matters;
+- stale delivery evidence must not create a fresh review-ready state;
+- internal Kanban completion can remain provisional until GitHub evidence confirms the external result.
+
+The exact lifecycle contract lives in [`docs/EDGE_REWORK_LIFECYCLE.md`](docs/EDGE_REWORK_LIFECYCLE.md) and [`docs/GITHUB_COMPLETION_LIFECYCLE.md`](docs/GITHUB_COMPLETION_LIFECYCLE.md).
+
+## Main event flows
+
+### Issue intake
+
+```text
+signed GitHub event
+  -> github-router
+  -> repository-scoped durable wake
+  -> lease-controller
+  -> existing Hermes intake job
+  -> repository / board / idempotency revalidation
 ```
 
-The router's authenticated `/fallback` endpoint remains available for deliberate
-operator recovery/full-registry intake. Nothing in the tracked n8n workflow set
-calls it periodically.
+The existing Hermes job remains the durable execution primitive. This repository does not recreate or replace it as part of the n8n/event integration.
 
-## Scope
+### PR merge / rework
 
-- n8n Community Edition runs persistently on the Ubuntu host through Docker
-  Compose and stays loopback-only.
-- `lease-controller` and `github-router` run as hardened, read-only companion
-  services on host networking.
-- legacy n8n cron authentication plugin (removed after direct actuator migration) authorizes only trigger/pause for
-  `default:bf431b2a6ba6`; it cannot list/create/edit/delete jobs or trigger any
-  other cron job.
-- Repository membership is discovered from the GitHub topic `hermes-agent`.
-- Operator notifications use the existing Hermes messaging path (`hermes send`)
-  and only surface human-attention incidents.
-- H4V3 Overview is a read-only multi-board dashboard projection.
+```text
+signed pull_request event
+  -> github-router
+  -> private n8n Webhook
+  -> normalized allowlist
+  -> fixed edge actuator
+  -> canonical edge reconciliation
+```
 
-The following Hermes jobs remain outside this migration and retain their
-existing ownership/state: `168bd63461e7`, `e432a90c1361`, `df360bfa297d`,
-`27f6725028ff`, and any other non-intake jobs.
+Only the reviewed event shapes are forwarded. Unsupported events are no-ops rather than generic command execution.
 
-## Explicit non-goals
+### Worker completion
 
-This repository does **not** modify Hermes core, redesign Kanban state, create a
-new dispatch/completion API, add a separate idempotency database, recreate
-worker/worktree/spawn behavior in n8n, or migrate H4V3 Broadcast Health Monitor
-to n8n.
+```text
+core kanban_complete
+  -> committed provisional DONE
+  -> completion observer
+  -> canonical edge wake
+  -> fresh GitHub state check
+  -> REVIEW / DONE projection
+```
 
-It also does not automatically create a polling schedule as a fallback. A
-future periodic fallback/reconciliation policy requires an explicit separately
-reviewed decision.
+The observer is a trigger, not a completion owner. A failed wake or ambiguous runtime condition is diagnostic evidence, not merge evidence.
+
+## Security and failure boundaries
+
+The implementation is designed around narrow trust boundaries rather than a broadly exposed automation API.
+
+- GitHub webhook ingress is signature-verified and delivery-deduplicated.
+- Internal n8n/router/controller/actuator paths remain private/loopback-oriented services.
+- Runtime credentials are generated or copied into protected external state rather than committed to workflow JSON.
+- The tracked n8n workflow contains credential placeholders and binds protected credentials during deployment.
+- The actuator invokes a fixed reconciliation path instead of accepting arbitrary shell commands.
+- Detailed operator diagnostics require authentication; a public health surface is not treated as a state dump.
+- External lookup/mutation ambiguity fails closed rather than being promoted to success.
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for the actual host deployment and recovery contract.
 
 ## Repository layout
 
 | Path | Purpose |
-|---|---|
-| `automation/n8n/compose.yaml` | Private n8n + router + lease-controller deployment |
-| `automation/n8n/github-router/router.py` | Signed GitHub event ingress + scope queue + webhook reconciliation |
-| `automation/n8n/lease-controller/controller.py` | Existing Hermes job trigger/pause lease guard |
-| `automation/n8n/workflows/github-pr-edge-sync.json` | Private PR lifecycle Webhook → filter → fixed edge actuator |
-| `automation/n8n/scripts/repository_registry.py` | `hermes-agent` repository discovery and board/checkout authority |
-| `automation/n8n/scripts/reconcile-github-router.sh` | Explicit webhook-registry reconciliation |
-| `automation/n8n/scripts/import-workflows.sh` | Render, bind, publish, restart, and canary the managed edge-sync workflow |
-| `automation/n8n/scripts/prepare_edge_sync_runtime.py` | Build private 0600 credential/canary artifacts and bind the runtime workflow |
-| `automation/hermes/scripts/github-agent-ready-kanban-intake.py` | Canonical GitHub intake + reconciliation tick |
-| `automation/hermes/scripts/github-agent-ready-kanban-intake-entrypoint.py` | Live-name wrapper that keeps GitHub-backed worker termination on core `kanban_complete` |
-| `automation/hermes/scripts/deploy-intake-edge.sh` | Safe deployment of live intake/edge runtime copies; never changes cron |
-| `hermes-plugin/github-completion-edge-wake/` | Post-commit worker observer with bounded post-timeout revalidation/retry for GitHub-backed completion |
-| `automation/hermes/scripts/install-github-completion-edge-wake.sh` | Candidate/atomic/rollback-safe host installation and plugin activation |
-| `edge/kanban-github-sync.py` | GitHub ↔ Kanban edge reconciliation |
-| legacy n8n cron authentication plugin (removed after direct actuator migration) | Legacy Hermes service authentication plugin for token-protected routes |
-| `hermes-plugin/h4v3-overview/` | Read-only multi-board dashboard plugin |
-| `docs/OPERATIONS.md` | Host rollout and async-only operating contract |
-| `docs/GITHUB_EVENT_CONCURRENCY.md` | Event/lease concurrency contract |
-| `docs/GITHUB_COMPLETION_LIFECYCLE.md` | Worker terminal action vs GitHub review/done projection contract |
-| `docs/REPOSITORY_REGISTRY.md` | Repository discovery/authority contract |
+| --- | --- |
+| `automation/n8n/github-router/` | Signed GitHub event ingress and bounded routing |
+| `automation/n8n/lease-controller/` | Existing Hermes intake-job wake/lease guard |
+| `automation/n8n/workflows/github-pr-edge-sync.json` | Private PR lifecycle Webhook → fixed actuator workflow |
+| `automation/n8n/scripts/` | Registry, deployment, workflow import and validation helpers |
+| `automation/hermes/scripts/` | Hermes-side intake/edge deployment and integration helpers |
+| `edge/` | Canonical GitHub/Kanban edge reconciliation and guards |
+| `hermes-plugin/` | Narrow Hermes observer / overview integrations |
+| `docs/` | Durable lifecycle, ownership, operations and registry contracts |
+| `tests/` | Repository-local regression and integration-contract tests |
+| `.agent/pr-requests/` | Historical task/request evidence for implementation work |
 
-## Host setup
+## Reading guide
 
-Run host operations from the Ubuntu host, not from the Hermes worker container.
-The worker container has no Docker socket, sudo, systemd, or host SSH authority.
+| If you want to understand... | Start here |
+| --- | --- |
+| Project intent and design choices | [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md) |
+| GitHub webhook concurrency / delivery dedupe | [`docs/GITHUB_EVENT_CONCURRENCY.md`](docs/GITHUB_EVENT_CONCURRENCY.md) |
+| PR rework lifecycle | [`docs/EDGE_REWORK_LIFECYCLE.md`](docs/EDGE_REWORK_LIFECYCLE.md) |
+| Worker completion vs GitHub review/done | [`docs/GITHUB_COMPLETION_LIFECYCLE.md`](docs/GITHUB_COMPLETION_LIFECYCLE.md) |
+| Worker resource admission | [`docs/EDGE_WORKER_RESOURCE_ADMISSION.md`](docs/EDGE_WORKER_RESOURCE_ADMISSION.md) |
+| Repository discovery / checkout / board authority | [`docs/REPOSITORY_REGISTRY.md`](docs/REPOSITORY_REGISTRY.md) |
+| Kanban role authority | [`docs/KANBAN_ROLE_CONTRACTS.md`](docs/KANBAN_ROLE_CONTRACTS.md) |
+| Host install, rollout and recovery | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) |
+| Public-release privacy/security gate | [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md) |
+
+The documentation index in [`docs/README.md`](docs/README.md) identifies the canonical owner for each contract. Source and tests remain authoritative for executable behavior.
+
+## Host deployment
+
+This is an operating control-plane repository, not a generic hosted n8n template. Host operations must follow [`docs/OPERATIONS.md`](docs/OPERATIONS.md) and the current runtime prerequisites.
+
+The high-level deployment path is:
 
 ```bash
-# 1. Install/start the private control-plane stack.
+# Install/start the private control-plane stack.
 automation/n8n/scripts/host-install.sh --enable-docker-service
 
-# 2. Install the least-privilege Hermes service-token plugin.
-automation/n8n/scripts/configure-hermes-service-auth.sh \
-  --hermes-home "$HOME/.hermes"
+# Configure protected GitHub/router credentials outside the repository.
+automation/n8n/scripts/configure-github-router-secrets.sh
 
-# Restart the existing Hermes dashboard through its current supervisor.
-
-# 3. Copy GitHub/Hermes secrets for the router.
-automation/n8n/scripts/configure-github-router-secrets.sh \
-  --hermes-home "$HOME/.hermes"
-
-# 4. Configure the reviewed public HTTPS router URL in .env, restart services,
-#    then reconcile topic-managed repository webhooks.
+# Reconcile managed repository webhooks when required.
 automation/n8n/scripts/reconcile-github-router.sh
 
-# 5. Render/import the private PR edge-sync workflow, bind the protected
-#    control-token credential, publish it, restart n8n, and run a safe canary.
+# Render/import/publish the managed private n8n edge-sync workflow.
 automation/n8n/scripts/import-workflows.sh
 ```
 
-`import-workflows.sh` is the complete n8n deployment command. It fails closed
-unless the loopback actuator reports `edge_sync_runtime_ready=true` and the
-n8n 2.x server CLI provides the required credential/workflow import, publish,
-and read-back commands. It keeps the decrypted Header Auth JSON and curl
-authorization config in a private `0600` temporary directory under the
-external state root and removes them on exit. The canary uses an unsupported
-`pull_request` action, so it must not invoke the edge-sync side effect.
+Do not infer that repository-local validation proves the live signed-delivery path. Host/runtime canaries are separate evidence gates.
 
-The command's local canary proves that the published production Webhook is
-reachable and authenticated. A live signed GitHub delivery or redelivery is
-still a separate host-runtime evidence gate for the full router → n8n →
-actuator path; repository validation does not claim that gate was run.
+## Validation
 
-If an older persisted n8n workflow named
-`Hermes schedule · GitHub agent-ready Issue intake` exists in the n8n database,
-leave it inactive or delete that n8n workflow record. Do **not** activate it.
-The tracked repository no longer contains that Schedule Trigger template.
+The repository intentionally relies on repository-local deterministic validation rather than treating GitHub Actions as the required correctness surface.
 
-## Runtime validation
-
-For the live host, verify all of the following:
-
-- `docker compose ps` reports the n8n, lease-controller, and github-router
-  services healthy;
-- `http://127.0.0.1:5680/healthz` and `http://127.0.0.1:5681/healthz` succeed;
-- webhook reconciliation reports the intended `hermes-agent` repositories;
-- a signed GitHub Issue/intake test event reaches the router and produces one
-  scoped Hermes wake;
-- a signed PR close/rework test event reaches the private n8n Webhook and
-  produces one fixed edge-sync actuator call;
-- `default:bf431b2a6ba6` gets a fresh successful run and returns to paused state
-  after the current lease cleanup;
-- no n8n Schedule Trigger is active for GitHub intake.
-
-## Local deterministic verification
+A useful starting point is:
 
 ```bash
 python3 automation/n8n/scripts/validate.py
-python3 tests/test_n8n_import_contract.py
-python3 tests/test_github_event_concurrency_contract.py
-python3 tests/test_github_router.py
-python3 tests/test_github_intake_actuator.py
-python3 tests/test_intake_completion_contract_entrypoint.py
-python3 tests/test_intake_lease_controller.py
-/ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
-/ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py
-python3 tests/test_repo_scoped_intake.py
-python3 tests/test_board_identity_migration.py
-python3 tests/test_intake_completion_contract_entrypoint.py
-python3 tests/test_repository_registry.py
-python3 tests/test_h4v3_overview.py
-python3 tests/test_h4v3_notification_policy.py
-PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_completion_edge_wake_plugin.py
-PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_completion_wake_retry_contract.py
-PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_completion_wake_contention_retry.py
-PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 tests/test_edge_single_flight.py
-/ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py
 ```
 
-GitHub Actions are intentionally not the required validation surface for this
-repository; see `AGENTS.md`.
+Focused suites then cover router behavior, lease ordering, repository registry, completion wake, resource admission, rework lifecycle and edge reconciliation. The owning documentation names the relevant validation surface for each subsystem.
+
+A test result, internal Kanban state, webhook acknowledgement, or successful command exit is not automatically authoritative GitHub completion evidence.
+
+## Explicit non-goals
+
+This repository does not aim to:
+
+- modify or replace Hermes core;
+- create a second Kanban/task database;
+- make n8n a dispatcher or lifecycle owner;
+- expose n8n as a public generic completion API;
+- recreate worker/worktree/spawn behavior in n8n;
+- infer merge from labels or internal completion alone;
+- perform automatic merge;
+- silently invent a new state when external evidence is ambiguous.
+
+## Public repository note
+
+Before changing repository visibility, review not only the current tree but the full Git history and GitHub Issues/PR discussions for credentials, personal paths, private hostnames and copied runtime logs. The repository-specific gate is documented in [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md).
