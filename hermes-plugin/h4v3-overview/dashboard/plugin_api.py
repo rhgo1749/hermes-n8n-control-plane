@@ -7,18 +7,21 @@ initializes a schema, writes a task/event, or creates an Overview database.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import re
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
-from typing import Any, Mapping, Optional
 
 try:
     from fastapi import APIRouter as _FastAPIRouter  # type: ignore[assignment]
-    from fastapi import HTTPException as _FastAPIHTTPException  # type: ignore[assignment]
+    from fastapi import (
+        HTTPException as _FastAPIHTTPException,  # type: ignore[assignment]
+    )
 except Exception:  # pragma: no cover - local pure-helper tests
     class _FastAPIRouter:  # type: ignore[no-redef]
         def get(self, *_args: Any, **_kwargs: Any):
@@ -73,6 +76,8 @@ _ATTENTION_EVENT_KINDS = frozenset({
 })
 _MAX_RECENT_EVENTS = 200
 _MAX_REASON_CHARS = 180
+_ATTENTION_COMPONENT_LIMIT = 96
+_ATTENTION_REF_LIMIT = 384
 
 
 def _json_payload(value: Any) -> dict[str, Any]:
@@ -89,6 +94,8 @@ def _json_payload(value: Any) -> dict[str, Any]:
 
 def _human_attention_reason(event: Any) -> Optional[str]:
     payload = _json_payload(event["payload"])
+    if event["kind"] in _ATTENTION_EVENT_KINDS and payload.get("reason"):
+        return _safe_text(payload["reason"])
     event_text = " ".join(
         str(payload.get(key) or "")
         for key in ("reason", "diagnostic", "retry_reason")
@@ -118,11 +125,254 @@ def _event_cursors(
 
 
 def _attention_key_cursor(payload: Mapping[str, Any]) -> Optional[int]:
+    if isinstance(payload.get("incident_provenance"), Mapping):
+        return None
     raw_key = str(payload.get("attention_key") or "")
     if ":" not in raw_key:
         return None
     suffix = raw_key.rsplit(":", 1)[1]
     return int(suffix) if suffix.isdigit() else None
+
+
+def _attention_component(value: Any, *, missing: str = "unknown") -> str:
+    if value is None:
+        text = missing
+    elif isinstance(value, int) and not isinstance(value, bool):
+        text = str(value)
+    else:
+        text = str(value).strip() or missing
+    text = (
+        text.replace("%", "%25")
+        .replace(":", "%3A")
+        .replace("|", "%7C")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+    if len(text) <= _ATTENTION_COMPONENT_LIMIT:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{text[:_ATTENTION_COMPONENT_LIMIT - 17]}~{digest}"
+
+
+def _attention_ref(parts: Sequence[Any]) -> str:
+    ref = "|".join(_attention_component(part) for part in parts)
+    if len(ref) <= _ATTENTION_REF_LIMIT:
+        return ref
+    digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:16]
+    return f"{ref[:_ATTENTION_REF_LIMIT - 17]}~{digest}"
+
+
+def _positive_attention_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return None
+    parsed = int(value.strip())
+    return parsed if parsed > 0 else None
+
+
+def _semantic_attention_key(
+    payload: Mapping[str, Any],
+) -> Optional[str]:
+    raw_key = payload.get("attention_key")
+    provenance = payload.get("incident_provenance")
+    if not isinstance(raw_key, str) or not isinstance(provenance, Mapping):
+        return None
+    reason = str(payload.get("reason") or "")
+    if not reason:
+        return None
+    source = str(provenance.get("source") or "")
+    if source == "rework_round":
+        required = (
+            provenance.get("repository"),
+            _positive_attention_int(provenance.get("issue_number")),
+            _positive_attention_int(provenance.get("pr_number")),
+            _positive_attention_int(provenance.get("rework_round")),
+        )
+        if not required[0] or any(value is None for value in required[1:]):
+            return None
+        request_comment_id = provenance.get("request_comment_id")
+        ref = _attention_ref(
+            (
+                *required,
+                request_comment_id if request_comment_id is not None else "none",
+            )
+        )
+        return f"{reason}:{ref}"
+    if source == "blocked_event":
+        blocked_event_id = provenance.get("blocked_event_id")
+        block_kind = provenance.get("block_kind") or "untyped"
+        if not blocked_event_id:
+            return None
+        ref = _attention_ref(
+            (
+                block_kind,
+                provenance.get("blocked_event_kind") or "untyped",
+                provenance.get("blocked_event_reason") or "unknown",
+                provenance.get("blocked_event_created_at") or 0,
+            )
+        )
+        return f"{reason}:{ref}"
+    if source == "entry_context":
+        pr_number = _positive_attention_int(provenance.get("pr_number"))
+        if pr_number is None:
+            return reason
+        return f"{reason}:{_attention_ref((pr_number,))}"
+    return None
+
+
+def _blocked_event_identity(event: sqlite3.Row) -> str:
+    payload = _json_payload(event["payload"])
+    return _attention_ref(
+        (
+            payload.get("kind") if payload.get("kind") is not None else "untyped",
+            payload.get("reason") if payload.get("reason") is not None else "unknown",
+            int(event["created_at"] or 0),
+        )
+    )
+
+
+def _semantic_attention_unresolved(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Keep semantic attention alive across bookkeeping events only."""
+    raw_key = payload.get("attention_key")
+    provenance = payload.get("incident_provenance")
+    if not isinstance(raw_key, str) or not isinstance(provenance, Mapping):
+        # A malformed new-format row must not make operator attention vanish.
+        return True
+    expected_key = _semantic_attention_key(payload)
+    if expected_key is not None and expected_key != raw_key:
+        return True
+    task_id = str(event["task_id"])
+    newer_attention = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'github_operator_attention' "
+        "AND (created_at > ? OR (created_at = ? AND id > ?)) "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (
+            task_id,
+            int(event["created_at"]),
+            int(event["created_at"]),
+            int(event["id"]),
+        ),
+    ).fetchone()
+    if newer_attention is not None:
+        newer_payload = _json_payload(newer_attention["payload"])
+        newer_key = newer_payload.get("attention_key")
+        if isinstance(newer_key, str) and newer_key != raw_key:
+            # A newer semantic row is the current generation, even if the
+            # older row's blocked/rework evidence has not been resolved yet.
+            return False
+    source = str(provenance.get("source") or "")
+    if source == "blocked_event":
+        row = conn.execute(
+            "SELECT payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            current_id = _blocked_event_identity(row)
+            if current_id != provenance.get("blocked_event_id"):
+                return False
+        # A resolution after this blocked event closes this incident. Ordinary
+        # projection/comment events deliberately do not enter this set.
+        resolved = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'github_blocked_resolved' "
+            "AND (created_at > ? OR (created_at = ? AND id > ?)) LIMIT 1",
+            (
+                task_id,
+                int(event["created_at"]),
+                int(event["created_at"]),
+                int(event["id"]),
+            ),
+        ).fetchone()
+        return resolved is None
+    if source == "rework_round":
+        row = conn.execute(
+            "SELECT payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('github_pr_rework', 'github_pr_rework_retry') "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            current_payload = _json_payload(row["payload"])
+            current_provenance = {
+                "source": "rework_round",
+                "repository": current_payload.get("repository"),
+                "issue_number": current_payload.get("issue_number"),
+                "pr_number": current_payload.get("pr_number"),
+                "rework_round": current_payload.get("rework_round"),
+                "request_comment_id": current_payload.get("request_comment_id"),
+            }
+            current_key = _semantic_attention_key(
+                {
+                    "reason": payload.get("reason"),
+                    "attention_key": raw_key,
+                    "incident_provenance": current_provenance,
+                }
+            )
+            if current_key is not None and current_key != raw_key:
+                return False
+            if current_key is None:
+                # A malformed replacement event is not proof that the
+                # operator's existing identity was resolved.
+                return True
+        resolved = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('github_blocked_resolved', 'github_pr_superseded') "
+            "AND (created_at > ? OR (created_at = ? AND id > ?)) LIMIT 1",
+            (
+                task_id,
+                int(event["created_at"]),
+                int(event["created_at"]),
+                int(event["id"]),
+            ),
+        ).fetchone()
+        return resolved is None
+    if source == "entry_context":
+        if payload.get("incident_unresolved") or provenance.get("pr_number") is None:
+            # No canonical PR identity is available yet. Keep the signal
+            # visible rather than allowing unrelated bookkeeping to hide it.
+            return True
+        # A newer semantic attention row owns the task's current identity; a
+        # non-attention rework/block transition supersedes this context.
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('github_operator_attention', 'github_pr_rework_attention') "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            latest_payload = _json_payload(row["payload"])
+            latest_key = latest_payload.get("attention_key")
+            if isinstance(latest_key, str) and latest_key != raw_key:
+                return False
+        progress = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('github_pr_rework', 'github_pr_rework_retry', "
+            "'github_blocked_resolved', 'github_pr_superseded') "
+            "AND (created_at > ? OR (created_at = ? AND id > ?)) LIMIT 1",
+            (
+                task_id,
+                int(event["created_at"]),
+                int(event["created_at"]),
+                int(event["id"]),
+            ),
+        ).fetchone()
+        return progress is None
+    # Unknown sources are retained rather than hidden.
+    return True
 
 
 def _load_attention_events(
@@ -133,25 +383,32 @@ def _load_attention_events(
 
     The recent-event window is intentionally bounded for board activity. It
     must not also bound durable attention evidence: an active task can remain
-    actionable after more than ``_MAX_RECENT_EVENTS`` unrelated events. An
-    attention event is unresolved only while its non-attention cursor remains
-    current. ``github_operator_attention`` reuses the edge's
-    ``attention_key=reason:<max-event-id-excluding-operator-attention>``
-    contract; legacy attention events fall back to their event id against the
-    lifecycle cursor.
+    actionable after more than ``_MAX_RECENT_EVENTS`` unrelated events. A
+    semantic attention event is unresolved while its ``attention_key`` still
+    identifies the current blocked/rework/entry incident; ordinary bookkeeping
+    events do not clear it. Legacy rows without ``incident_provenance`` retain
+    the cursor-based fallback for backward compatibility.
     """
     if not task_ids:
         return {}
     task_placeholders = ",".join("?" for _ in task_ids)
+    attention_kind_placeholders = ",".join("?" for _ in _ATTENTION_EVENT_KINDS)
     marker_clauses = " OR ".join(
         "instr(lower(COALESCE(payload, '')), ?) > 0"
         for _ in _HUMAN_MARKERS
     )
     candidates = conn.execute(
         "SELECT id, task_id, kind, payload, created_at FROM task_events "
-        f"WHERE task_id IN ({task_placeholders}) AND ({marker_clauses}) "
-        "ORDER BY created_at DESC, id DESC",
-        (*task_ids, *(marker.casefold() for marker in _HUMAN_MARKERS)),
+        f"WHERE task_id IN ({task_placeholders}) AND "
+        f"(kind IN ({attention_kind_placeholders}) OR ({marker_clauses})) "
+        f"ORDER BY CASE WHEN kind IN ({attention_kind_placeholders}) "
+        "THEN 0 ELSE 1 END, created_at DESC, id DESC",
+        (
+            *task_ids,
+            *sorted(_ATTENTION_EVENT_KINDS),
+            *(marker.casefold() for marker in _HUMAN_MARKERS),
+            *sorted(_ATTENTION_EVENT_KINDS),
+        ),
     ).fetchall()
     operator_cursors = _event_cursors(
         conn,
@@ -171,7 +428,10 @@ def _load_attention_events(
         if _human_attention_reason(event) is None:
             continue
         payload = _json_payload(event["payload"])
-        if event["kind"] == "github_operator_attention":
+        provenance = payload.get("incident_provenance")
+        if isinstance(provenance, Mapping):
+            unresolved = _semantic_attention_unresolved(conn, event, payload)
+        elif event["kind"] == "github_operator_attention":
             cursor = _attention_key_cursor(payload)
             if cursor is None:
                 unresolved = lifecycle_cursors.get(task_id, 0) <= int(event["id"])
