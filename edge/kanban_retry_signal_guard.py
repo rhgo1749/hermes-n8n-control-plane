@@ -485,6 +485,8 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
         task_id: str,
         pr: Any,
         event: Any,
+        *args: Any,
+        **kwargs: Any,
     ) -> tuple[bool, str, dict[str, Any]]:
         origin_event = _round_origin_event(conn, task_id, event)
         delivered, reason, evidence = original_rework_delivery_evidence(
@@ -494,6 +496,8 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
             task_id,
             pr,
             origin_event,
+            *args,
+            **kwargs,
         )
         if delivered or reason != "rework_head_unchanged":
             return delivered, reason, evidence
