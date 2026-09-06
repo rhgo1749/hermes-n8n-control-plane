@@ -6,7 +6,9 @@ Repository-specific n8n GitHub Trigger workflows and the n8n Schedule fallback
 are retired. Production intake is event-driven through one loopback GitHub
 router. Issue/intake events continue to use the existing Hermes cron primitive;
 PR completion/rework events use one private n8n Webhook hop and the existing
-edge reconciliation script.
+edge reconciliation script. A router-local low-frequency safety tick also
+reuses the same durable full-intake scope path so a single missed webhook cannot
+strand an `agent-ready` Issue indefinitely.
 
 ```text
 GitHub App webhook (or reconciled repository webhook)
@@ -22,6 +24,8 @@ GitHub App webhook (or reconciled repository webhook)
        -> new/unknown or other intake event: durable FIFO wake-scope queue
             -> lease-controller :5680
                  -> existing Hermes job default:bf431b2a6ba6 trigger
+       -> hourly safety tick: durable full-intake scope
+            -> same lease-controller and same Hermes intake job
 ```
 
 The App webhook is the discovery boundary for repositories that are not yet in
@@ -51,6 +55,18 @@ The Hermes job itself is preserved. Its stored job ID, name, script, schedule,
 and ownership are not migrated into n8n. Between event-driven invocations the
 job normally remains paused; an accepted lease temporarily triggers that same
 job and the latest lease alone may pause it again.
+
+The router entrypoint runs a bounded full-intake safety wake with a default
+interval of 3600 seconds and rejects configured intervals below 300 seconds.
+The first safety wake occurs only after one full interval; router startup does
+not immediately scan. Each tick calls the existing `_enqueue_scope(full=True)`
+and `_wake()` boundaries only. A stable synthetic scope identity prevents a
+queued, in-flight, or durable-pending safety scope from being duplicated. A
+queued scope may be re-woken after an earlier wake failure; in-flight or pending
+work is not double-woken. The safety tick does not call webhook reconciliation,
+does not inspect `agent-*` labels itself, and introduces no new state store or
+lifecycle owner. Normal signed webhook delivery remains the primary intake
+path.
 
 Each non-PR intake event, including a first App delivery for an unknown
 repository, enqueues its repository scope before triggering Hermes.
@@ -109,9 +125,9 @@ the task away from provisional `DONE`, the observer returns without a duplicate
 edge run. If the GitHub-backed task is still `DONE`, or that re-read cannot be
 trusted, the observer launches exactly one new fixed-argv edge child with a
 completely fresh deadline. There is no sleep loop, Schedule Trigger, or polling
-fallback. Non-timeout failures are not retried. Only when that fresh retry also
-times out is the completion wake reported as a final `edge_retry_timeout`
-failure.
+fallback in this completion-observer retry path. Non-timeout failures are not
+retried. Only when that fresh retry also times out is the completion wake
+reported as a final `edge_retry_timeout` failure.
 
 The process-level regression deliberately starts an owner before the simulated
 completion is committed, so the owner's snapshot cannot contain that completion.
@@ -122,8 +138,8 @@ a task already projected away from `DONE` suppresses the retry. A timeout
 diagnostic by itself is therefore not success evidence.
 
 This serializes the complete edge run, including GitHub reads and Kanban/GitHub
-side effects, without introducing a queue database, task store, second
-transition owner, or polling fallback.
+side effects, without introducing a queue database, task store, or second
+transition owner.
 
 ## Delivery replay deduplication
 
@@ -168,18 +184,21 @@ repositories carrying `hermes-agent`, creates or updates the router webhook,
 and removes only matching router-owned webhooks for repositories that leave the
 topic. It never deletes boards, tasks, or Hermes cron jobs.
 
-Reconciliation is now an explicit maintenance action rather than a five-minute
-polling side effect:
+Reconciliation remains an explicit maintenance action rather than a polling
+side effect:
 
 ```bash
 automation/n8n/scripts/reconcile-github-router.sh
 ```
 
 The authenticated `/fallback` endpoint remains available for deliberate
-operator recovery/full-registry intake, but no tracked n8n workflow calls it
-automatically. The tracked workflow is
+operator recovery/full-registry intake. Separately, the router entrypoint's
+low-frequency safety tick enqueues the same canonical full-intake scope without
+calling `/reconcile`; no tracked n8n workflow or n8n Schedule Trigger calls
+`/fallback` automatically. The tracked workflow is
 `automation/n8n/workflows/github-pr-edge-sync.json`; the repository-owned
 `automation/n8n/scripts/import-workflows.sh` binds its loopback Header Auth
 credential, publishes it, and runs an unsupported-action production canary.
 A live signed GitHub delivery or redelivery remains the host-runtime evidence
-gate for the full path.
+gate for the primary event path; a live safety-wake read-back is the additional
+evidence gate for missed-webhook self-heal.
