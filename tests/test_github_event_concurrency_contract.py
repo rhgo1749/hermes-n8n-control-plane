@@ -35,6 +35,10 @@ def main() -> int:
         router_env["GITHUB_ROUTER_N8N_EDGE_SYNC_URL"]
         == "http://127.0.0.1:5678/webhook/hermes-github-edge-sync"
     )
+    assert (
+        router_env["GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS"]
+        == "${GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS:-3600}"
+    )
 
     assert sorted(WORKFLOWS.glob("schedule-*.json")) == []
     github_paths = sorted(WORKFLOWS.glob("github-*.json"))
@@ -73,6 +77,15 @@ def main() -> int:
     assert '"/fallback"' in router_source
     assert '"/reconcile"' in router_source
 
+    router_entrypoint_source = (N8N / "github-router" / "router_entrypoint.py").read_text(
+        encoding="utf-8"
+    )
+    assert "GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS" in router_entrypoint_source
+    assert "_periodic_full_intake_once" in router_entrypoint_source
+    assert "_enqueue_scope(" in router_entrypoint_source
+    assert "full=True" in router_entrypoint_source
+    assert "_reconcile_webhooks" not in router_entrypoint_source
+
     actuator_source = (
         ROOT / "automation" / "hermes" / "actuator" / "github_intake_actuator.py"
     ).read_text(encoding="utf-8")
@@ -100,6 +113,7 @@ def main() -> int:
                 "production_concurrency_limit_role": "load-limiter",
                 "stale_pause_guard": "lease-controller",
                 "scope_handoff": "durable-fifo-queue-for-intake-events",
+                "intake_safety_wake": "router-hourly-full-scope",
                 "edge_sync_execution": "direct-actuator:5682",
             }
         )
