@@ -5,6 +5,13 @@ path, but retires the n8n-owned five-minute polling schedule. GitHub events now
 wake the preserved Hermes job through `github-router` and `lease-controller`;
 webhook reconciliation is an explicit maintenance action.
 
+Issue #127 supersedes the earlier deferred **automatic periodic polling
+fallback** item. The router now performs a bounded low-frequency full-intake
+safety wake (default hourly, minimum five minutes) using the existing durable
+scope queue and canonical Hermes intake job. This is not an n8n Schedule
+Trigger, does not perform periodic webhook reconciliation, and does not own or
+write GitHub/Kanban lifecycle state.
+
 Do not start these items as part of this migration:
 
 1. **Dispatcher redesign** — retain existing Hermes dispatcher, claim, workspace, spawn, worker session, and Kanban execution paths.
@@ -20,7 +27,6 @@ Do not start these items as part of this migration:
    Kanban business-logic owner. Any broader payload logic requires a separately
    scoped design and proof.
 7. **Hermes core fork or extraction** — the adapter remains a user plugin that authorizes exact existing routes; no core files are modified.
-8. **Automatic periodic polling fallback** — `/fallback` remains an operator recovery endpoint, but no tracked n8n Schedule Trigger calls it automatically. Re-introducing periodic polling requires an explicit reliability decision.
-9. **Automatic periodic webhook reconciliation** — repository webhook reconciliation is explicit via `automation/n8n/scripts/reconcile-github-router.sh`. A future low-frequency maintenance scheduler may be added only with a separately reviewed ownership/idempotency contract.
-10. **Request-scoped profile authorization** — the existing generic token seam authorizes route paths but does not pass a `profile` query into providers. The installer currently fail-closes on non-unique job IDs; a formal profile-bound token interface would require a separately authorized core or adapter design.
-11. **H4V3 Broadcast Health Monitor n8n-native redesign** — `27f6725028ff` remains an existing Hermes-owned active cron job. Do not add an n8n workflow, scheduler, or health-policy replacement without a separately scoped design.
+8. **Automatic periodic webhook reconciliation** — repository webhook reconciliation is explicit via `automation/n8n/scripts/reconcile-github-router.sh`. A future low-frequency maintenance scheduler may be added only with a separately reviewed ownership/idempotency contract.
+9. **Request-scoped profile authorization** — the existing generic token seam authorizes route paths but does not pass a `profile` query into providers. The installer currently fail-closes on non-unique job IDs; a formal profile-bound token interface would require a separately authorized core or adapter design.
+10. **H4V3 Broadcast Health Monitor n8n-native redesign** — `27f6725028ff` remains an existing Hermes-owned active cron job. Do not add an n8n workflow, scheduler, or health-policy replacement without a separately scoped design.
