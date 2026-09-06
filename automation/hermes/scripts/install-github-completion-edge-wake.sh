@@ -56,8 +56,9 @@ command -v "$HERMES_BIN" >/dev/null 2>&1 || { echo "Hermes binary not found: $HE
 
 TARGET_ROOT="$HERMES_HOME/plugins"
 TARGET="$TARGET_ROOT/github-completion-edge-wake"
+BACKUP_ROOT="$HERMES_HOME/plugin-backups/github-completion-edge-wake"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-BACKUP="${TARGET}.bak-${TS}"
+BACKUP="$BACKUP_ROOT/github-completion-edge-wake.bak-${TS}"
 
 if [[ -L "$TARGET" ]]; then
   echo "refusing to replace symlinked plugin target: $TARGET" >&2
@@ -91,7 +92,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-install -d -m 700 "$TARGET_ROOT" "$CANDIDATE"
+install -d -m 700 "$TARGET_ROOT" "$BACKUP_ROOT" "$CANDIDATE"
 install -m 644 "$SOURCE/plugin.yaml" "$CANDIDATE/plugin.yaml"
 install -m 644 "$SOURCE/__init__.py" "$CANDIDATE/__init__.py"
 install -m 644 "$TIMEOUT_SOURCE" "$CANDIDATE/edge_sync_timeout.py"

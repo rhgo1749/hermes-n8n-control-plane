@@ -22,7 +22,7 @@ previous plugin directory is kept as a timestamped backup for rollback.
 
 A dashboard restart is required after installation so the plugin tab
 (/h4v3-overview) registers. Rollback:
-  mv "$HERMES_HOME/plugins/h4v3-overview.bak-<ts>" "$HERMES_HOME/plugins/h4v3-overview"
+  mv "$HERMES_HOME/plugin-backups/h4v3-overview/h4v3-overview.bak-<ts>" "$HERMES_HOME/plugins/h4v3-overview"
   hermes plugins enable h4v3-overview --no-allow-tool-override
 EOF
 }
@@ -49,6 +49,7 @@ python3 -m py_compile "$SOURCE/dashboard/plugin_api.py" "$SOURCE/__init__.py" ||
 }
 
 TARGET="$HERMES_HOME/plugins/h4v3-overview"
+BACKUP_ROOT="$HERMES_HOME/plugin-backups/h4v3-overview"
 FILES=(
   "plugin.yaml"
   "__init__.py"
@@ -71,8 +72,10 @@ fi
 # timestamped backup, write the candidate into a temp dir on the same
 # filesystem, then mv the whole directory into place.
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP="$BACKUP_ROOT/h4v3-overview.bak-${TS}"
 if [[ -d "$TARGET" ]]; then
-  mv "$TARGET" "${TARGET}.bak-${TS}"
+  install -d -m 700 "$BACKUP_ROOT"
+  mv "$TARGET" "$BACKUP"
 fi
 
 CANDIDATE="${TARGET}.candidate-${TS}"
@@ -85,5 +88,5 @@ mv "$CANDIDATE" "$TARGET"
 HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" plugins enable h4v3-overview --no-allow-tool-override
 
 echo "H4V3 Overview installed at: $TARGET"
-echo "Previous version (rollback): ${TARGET}.bak-${TS} (restore with mv, then re-enable)"
+echo "Previous version (rollback): $BACKUP (restore with mv, then re-enable)"
 echo "Restart the existing Hermes dashboard with its current supervisor to load the plugin tab."
