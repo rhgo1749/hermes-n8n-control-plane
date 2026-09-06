@@ -5600,9 +5600,10 @@ def _attention_row_value(row: Any, name: str, index: int) -> Any:
 def _latest_blocked_event(
     conn: sqlite3.Connection,
     task_id: str,
-) -> Optional[tuple[dict[str, Any], int]]:
+) -> Optional[tuple[dict[str, Any], int, int]]:
+    """Return the latest blocked payload, timestamp, and durable row id."""
     row = conn.execute(
-        "SELECT payload, created_at FROM task_events "
+        "SELECT payload, created_at, id FROM task_events "
         "WHERE task_id = ? AND kind = 'blocked' "
         "ORDER BY created_at DESC, id DESC LIMIT 1",
         (task_id,),
@@ -5615,8 +5616,10 @@ def _latest_blocked_event(
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
-    return cast(dict[str, Any], payload), int(
-        _attention_row_value(row, "created_at", 1) or 0
+    return (
+        cast(dict[str, Any], payload),
+        int(_attention_row_value(row, "created_at", 1) or 0),
+        int(_attention_row_value(row, "id", 2)),
     )
 
 
@@ -5685,14 +5688,9 @@ def _blocked_attention_identity(
     latest = _latest_blocked_event(conn, str(entry.get("task_id") or ""))
     if latest is None:
         return None
-    event_payload, created_at = latest
+    event_payload, created_at, blocked_event_id = latest
     payload_kind = event_payload.get("kind")
     payload_reason = event_payload.get("reason")
-    blocked_event_id = _attention_ref(
-        (payload_kind if payload_kind is not None else "untyped",
-         payload_reason if payload_reason is not None else "unknown",
-         created_at)
-    )
     block_kind = str(entry.get("block_kind") or "untyped")
     incident_ref = _attention_ref(
         (
@@ -5700,6 +5698,7 @@ def _blocked_attention_identity(
             payload_kind if payload_kind is not None else "untyped",
             payload_reason if payload_reason is not None else "unknown",
             created_at,
+            blocked_event_id,
         )
     )
     provenance = {

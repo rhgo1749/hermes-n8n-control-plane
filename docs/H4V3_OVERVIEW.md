@@ -105,13 +105,13 @@ active tasks query their newest explicit human-attention event separately.
 Semantic `github_operator_attention` rows carry an `attention_key` of
 `<reason>:<incident_ref>` plus an `incident_provenance` object. Rework identity
 uses repository, Issue, PR, rework round, and request-comment identity; blocked
-identity uses the latest `blocked` event's payload kind/reason/timestamp plus
-`block_kind`; other diagnostics use the canonical entry PR number. Multi-field
-refs use `|`, and no raw task-event cursor is used as incident identity. A
-changed reason, PR/request, blocked event, or rework round therefore creates a
-new incident without re-alerting for ordinary bookkeeping. Entries with no
-canonical identity set `incident_unresolved: true` and remain visible
-(fail-open) until stronger evidence is available. Legacy rows without
+identity uses the latest `blocked` event's payload kind/reason/timestamp,
+durable row id, and `block_kind`; other diagnostics use the canonical entry PR
+number. Multi-field refs use `|`, and no raw task-event cursor is used as
+incident identity. A changed reason, PR/request, blocked event, or rework round
+therefore creates a new incident without re-alerting for ordinary bookkeeping.
+Entries with no canonical identity set `incident_unresolved: true` and remain
+visible (fail-open) until stronger evidence is available. Legacy rows without
 `incident_provenance` retain their cursor fallback.
 
 ### Source of truth
@@ -156,14 +156,19 @@ not explicitly classified can never silently start an alert storm.
 
 * The edge records a durable `github_operator_attention` event in the
   existing `task_events` table (no new notification DB) only for the first
-  tick of an incident. The semantic key is
-  `reason:incident_ref`; it is reused by the edge result and included in the
-  Telegram line so the existing full-body state dedupes the same generation
-  while a new blocked/rework/PR identity re-arms delivery. A task with no
-  canonical identity is marked `incident_unresolved: true` rather than being
-  assigned an event-id cursor.
+  tick of a semantic incident generation. The semantic key is
+  `reason:incident_ref`; it is reused by the edge result, the Overview
+  projection, and the Telegram line as `incident=<attention_key>`. A task with
+  no canonical identity is marked `incident_unresolved: true` rather than
+  being assigned an event-id cursor.
 * Rework attention keeps its existing round-aware `github_pr_rework_attention`
   writer (deduped per round/diagnostic).
+* The intake reuses the existing
+  `state/kanban-intake-last-sent.txt` surface as a versioned set of delivered
+  semantic keys. Each batch sends only lines whose key has not been delivered,
+  so adding incident B while A remains active sends B alone, and a title or
+  display-name change for A does not re-send it. Lines without a key fail open
+  and are sent without being persisted as a guessed generation.
 * `hermes send` failures are observer-only warnings; they never fail or roll
   back reconciliation.
 

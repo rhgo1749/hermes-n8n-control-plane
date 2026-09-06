@@ -113,6 +113,17 @@ def test_attention_line_carries_semantic_identity_for_delivery_dedupe() -> None:
     assert first_line != second_line
 
 
+def test_attention_line_parser_preserves_delimiters_in_semantic_identity() -> None:
+    key = "needs_input:needs_input|needs_input|operator — input|200|4"
+    entry = _entry(
+        "needs_input",
+        issue_title="Title — with punctuation",
+        operator_attention={"reason": "needs_input", "attention_key": key},
+    )
+    line = intake._attention_notification_line("re-bound", "Re-Bound", 106, entry)
+    assert intake._telegram_attention_key(line) == key
+
+
 def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
@@ -203,6 +214,66 @@ def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
             json.loads(rows[0][0])["attention_key"]
             != json.loads(rows[1][0])["attention_key"]
         )
+    finally:
+        conn.close()
+
+
+def test_blocked_generation_changes_when_resolved_and_reblocked_same_second() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER,
+          kind TEXT, payload TEXT, created_at INTEGER
+        );
+        """
+    )
+    blocked_payload = json.dumps({"kind": "needs_input", "reason": "same"})
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES ('t1', 'blocked', ?, 200)",
+        (blocked_payload,),
+    )
+    entry: dict[str, Any] = {
+        "task_id": "t1",
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "reason": "needs_input",
+        "status": "blocked",
+        "block_kind": "needs_input",
+    }
+    try:
+        assert edge._record_operator_attention(conn, entry) is True
+        first_payload = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE kind = 'github_operator_attention'"
+            ).fetchone()[0]
+        )
+        first_provenance = first_payload["incident_provenance"]
+
+        # The resolution and the new block intentionally share one timestamp.
+        # The governing blocked row id must still open a new generation.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES ('t1', 'github_blocked_resolved', '{}', 200)"
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES ('t1', 'blocked', ?, 200)",
+            (blocked_payload,),
+        )
+        assert edge._record_operator_attention(conn, entry) is True
+        rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE kind = 'github_operator_attention' ORDER BY id"
+        ).fetchall()
+        second_payload = json.loads(rows[1][0])
+        second_provenance = second_payload["incident_provenance"]
+        assert first_provenance["blocked_event_created_at"] == 200
+        assert second_provenance["blocked_event_created_at"] == 200
+        assert first_provenance["blocked_event_id"] != second_provenance["blocked_event_id"]
+        assert first_payload["attention_key"] != second_payload["attention_key"]
     finally:
         conn.close()
 
@@ -437,9 +508,15 @@ def test_send_dedup_skip_reports_skipped_and_never_invokes_hermes_send() -> None
         setattr(intake, "_hermes_home", lambda: home)
         state_dir = home / "state"
         state_dir.mkdir(parents=True)
-        lines = ["⚠️ [re-bound] Re-Bound #106 · 확인 필요 — rework_context_failed — t"]
-        text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
-        (state_dir / "kanban-intake-last-sent.txt").write_text(text, encoding="utf-8")
+        key = "rework_context_failed:rhgo1749/re-bound|106|123|1|7"
+        lines = [
+            "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — rework_context_failed — t "
+            f"· incident={key}"
+        ]
+        (state_dir / "kanban-intake-last-sent.txt").write_text(
+            json.dumps({"version": 2, "attention_keys": [key]}),
+            encoding="utf-8",
+        )
 
         def fail_if_called(*_args, **_kwargs):
             raise AssertionError("hermes send must not run on a dedup skip")
@@ -470,12 +547,107 @@ def test_send_delivery_reports_sent_and_writes_state() -> None:
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         setattr(intake.subprocess, "run", fake_run)
-        lines = ["line-one"]
+        key = "rework_context_failed:rhgo1749/re-bound|106|123|1|7"
+        lines = [
+            "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — rework_context_failed — line-one "
+            f"· incident={key}"
+        ]
         result = intake._send_telegram_batch(lines, ("123", "456"))
         assert result == "sent", result
         assert len(captured) == 1
-        state = (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
-        assert state == "🤖 Hermes Kanban\n\nline-one", state
+        state = json.loads(
+            (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
+        )
+        assert state == {"attention_keys": [key], "version": 2}, state
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_dedup_sends_only_unseen_semantic_lines() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-semantic-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        line_a = "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — needs_input — A · incident=A"
+        line_b = "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — needs_input — B · incident=B"
+        assert intake._send_telegram_batch([line_a], ("123", "")) == "sent"
+        assert intake._send_telegram_batch([line_a, line_b], ("123", "")) == "sent"
+        assert captured[1] == "🤖 Hermes Kanban\n\n" + line_b
+        assert "incident=A" not in captured[1]
+        assert intake._send_telegram_batch([line_a, line_b], ("123", "")) == "skipped"
+        assert len(captured) == 2
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_dedup_ignores_display_changes_for_same_semantic_key() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-display-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        first = "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — needs_input — old · incident=A"
+        changed = "⚠️ [re-bound] Renamed #106 · 확인 필요 — needs_input — new · incident=A"
+        assert intake._send_telegram_batch([first], ("123", "")) == "sent"
+        assert intake._send_telegram_batch([changed], ("123", "")) == "skipped"
+        assert len(captured) == 1
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_dedup_sends_genuinely_new_semantic_key_once() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-new-key-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        line_a = "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — needs_input — A · incident=A"
+        line_b = "⚠️ [re-bound] Re-Bound #106 · 확인 필요 — needs_input — B · incident=B"
+        assert intake._send_telegram_batch([line_a], ("123", "")) == "sent"
+        assert intake._send_telegram_batch([line_b], ("123", "")) == "sent"
+        assert intake._send_telegram_batch([line_b], ("123", "")) == "skipped"
+        assert len(captured) == 2
+        assert captured[1] == "🤖 Hermes Kanban\n\n" + line_b
     finally:
         setattr(intake, "_hermes_home", original_home)
         setattr(intake.subprocess, "run", original_run)

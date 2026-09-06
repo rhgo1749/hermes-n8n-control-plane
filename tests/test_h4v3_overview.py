@@ -582,6 +582,61 @@ def test_semantic_blocked_attention_tracks_latest_block_and_resolution() -> None
         assert overview._need_you_reason(result["tasks"][0]) == "needs_input"
 
 
+def test_semantic_blocked_attention_uses_row_id_for_same_second_generations() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+
+        def blocked_payload(event_id: int) -> dict[str, Any]:
+            ref = overview._attention_ref(
+                ("needs_input", "needs_input", "same", 200, event_id)
+            )
+            return {
+                "reason": "needs_input",
+                "attention_key": f"needs_input:{ref}",
+                "incident_provenance": {
+                    "source": "blocked_event",
+                    "blocked_event_id": event_id,
+                    "blocked_event_kind": "needs_input",
+                    "blocked_event_reason": "same",
+                    "blocked_event_created_at": 200,
+                    "block_kind": "needs_input",
+                },
+            }
+
+        first_attention = blocked_payload(1)
+        second_attention = blocked_payload(4)
+        _db(
+            path,
+            [
+                (
+                    "t-blocked",
+                    "Input",
+                    "blocked",
+                    None,
+                    "needs_input",
+                    0,
+                    0,
+                    None,
+                    None,
+                    "",
+                )
+            ],
+            [
+                ("t-blocked", "blocked", json.dumps({"kind": "needs_input", "reason": "same"}), 200),
+                ("t-blocked", "github_operator_attention", json.dumps(first_attention), 200),
+                ("t-blocked", "github_blocked_resolved", "{}", 200),
+                ("t-blocked", "blocked", json.dumps({"kind": "needs_input", "reason": "same"}), 200),
+                ("t-blocked", "github_operator_attention", json.dumps(second_attention), 200),
+            ],
+        )
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            evidence = overview._load_attention_events(conn, ["t-blocked"])
+        current = json.loads(evidence["t-blocked"]["payload"])
+        assert current["attention_key"] == second_attention["attention_key"]
+        assert overview._semantic_attention_key(current) == current["attention_key"]
+
+
 def test_semantic_attention_reason_change_replaces_previous_generation() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"

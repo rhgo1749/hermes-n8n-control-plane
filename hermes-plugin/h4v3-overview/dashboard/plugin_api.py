@@ -202,17 +202,23 @@ def _semantic_attention_key(
         )
         return f"{reason}:{ref}"
     if source == "blocked_event":
-        blocked_event_id = provenance.get("blocked_event_id")
+        raw_blocked_event_id = provenance.get("blocked_event_id")
+        blocked_event_id = _positive_attention_int(raw_blocked_event_id)
         block_kind = provenance.get("block_kind") or "untyped"
-        if not blocked_event_id:
+        if blocked_event_id is None and not raw_blocked_event_id:
             return None
+        ref_parts: list[Any] = [
+            block_kind,
+            provenance.get("blocked_event_kind") or "untyped",
+            provenance.get("blocked_event_reason") or "unknown",
+            provenance.get("blocked_event_created_at") or 0,
+        ]
+        if blocked_event_id is not None:
+            # New producer rows carry the governing blocked task_events row id
+            # so same-second block generations remain distinct.
+            ref_parts.append(blocked_event_id)
         ref = _attention_ref(
-            (
-                block_kind,
-                provenance.get("blocked_event_kind") or "untyped",
-                provenance.get("blocked_event_reason") or "unknown",
-                provenance.get("blocked_event_created_at") or 0,
-            )
+            ref_parts
         )
         return f"{reason}:{ref}"
     if source == "entry_context":
@@ -230,15 +236,22 @@ def _semantic_attention_key(
     return None
 
 
-def _blocked_event_identity(event: sqlite3.Row) -> str:
+def _blocked_event_identity(
+    event: sqlite3.Row,
+    *,
+    include_row_id: bool = True,
+) -> str:
     payload = _json_payload(event["payload"])
-    return _attention_ref(
-        (
-            payload.get("kind") if payload.get("kind") is not None else "untyped",
-            payload.get("reason") if payload.get("reason") is not None else "unknown",
-            int(event["created_at"] or 0),
-        )
-    )
+    parts: list[Any] = [
+        payload.get("kind") if payload.get("kind") is not None else "untyped",
+        payload.get("reason") if payload.get("reason") is not None else "unknown",
+        int(event["created_at"] or 0),
+    ]
+    if include_row_id:
+        row_id = _positive_attention_int(event["id"])
+        if row_id is not None:
+            parts.append(row_id)
+    return _attention_ref(parts)
 
 
 def _semantic_attention_unresolved(
@@ -278,14 +291,24 @@ def _semantic_attention_unresolved(
     source = str(provenance.get("source") or "")
     if source == "blocked_event":
         row = conn.execute(
-            "SELECT payload, created_at FROM task_events "
+            "SELECT payload, created_at, id FROM task_events "
             "WHERE task_id = ? AND kind = 'blocked' "
             "ORDER BY created_at DESC, id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if row is not None:
-            current_id = _blocked_event_identity(row)
-            if current_id != provenance.get("blocked_event_id"):
+            blocked_event_id = _positive_attention_int(
+                provenance.get("blocked_event_id")
+            )
+            if blocked_event_id is not None:
+                if _positive_attention_int(row["id"]) != blocked_event_id:
+                    return False
+            elif (
+                _blocked_event_identity(row, include_row_id=False)
+                != provenance.get("blocked_event_id")
+            ):
+                # Legacy semantic rows used a payload/timestamp identity and
+                # remain readable without being mistaken for the new format.
                 return False
         # A resolution after this blocked event closes this incident. Ordinary
         # projection/comment events deliberately do not enter this set.
