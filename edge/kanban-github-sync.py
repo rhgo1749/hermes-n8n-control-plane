@@ -4201,64 +4201,306 @@ def _specialist_graph_delivery_run(
     rework_at: int,
     expected_round: int,
 ) -> sqlite3.Row | None:
-    """Inherit delivery provenance from verified descendant specialist workers.
+    """Return a run inherited from the current specialist graph only.
 
-    All seven invariants must hold simultaneously:
-      1. Same rework round
-      2. Same parent-child dependency graph (descendant specialist tasks)
-      3. Completed developer and reviewer specialist tasks (completed_at >= rework_at)
-      4. Reviewer explicit PASS verdict
-      5. Reviewer run references the same exact head SHA
-      6. Parent Lead run completed cleanly
-      7. Non-stale, non-conflicting governing event
+    ``task_links`` is append-only, so a lead can retain reviewer parents from
+    earlier rework rounds.  The current reviewer is selected from the newest
+    terminal reviewer parent completed in this round; older direct parents
+    must be terminal, but they are not allowed to veto that selection.  When a
+    current developer ancestor exists, its explicit validation and the
+    reviewer's exact PASS/head evidence are both required.  The legacy
+    reviewer-direct shape remains supported for already persisted graphs.
     """
-    links = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ?",
+    candidate = _specialist_graph_delivery_candidate(
+        conn,
+        task_id,
+        rework_at,
+        expected_round,
+    )
+    return candidate[0] if candidate is not None else None
+
+
+def _specialist_graph_delivery_candidate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+    expected_round: int,
+) -> tuple[sqlite3.Row, dict[str, Any]] | None:
+    """Select one specialist delivery using graph and run attestations."""
+    if not _positive_rework_int(expected_round):
+        return None
+    try:
+        round_number = int(expected_round)
+        round_at = int(rework_at)
+    except (TypeError, ValueError):
+        return None
+
+    parent_rows = conn.execute(
+        "SELECT id, status, assignee, completed_at, title "
+        "FROM tasks WHERE id IN (SELECT parent_id FROM task_links WHERE child_id = ?)",
         (task_id,),
     ).fetchall()
-    if not links:
+    if not parent_rows:
         return None
 
-    parent_ids = [str(r["parent_id"]) for r in links]
-    has_reviewer_pass = False
-
-    for pid in parent_ids:
-        ptask = conn.execute(
-            "SELECT id, status, assignee, completed_at, title FROM tasks WHERE id = ?",
-            (pid,),
-        ).fetchone()
-        if not ptask or ptask["status"] != "done":
-            return None
-        completed_at = ptask["completed_at"]
-        if not completed_at or int(completed_at) < rework_at:
+    # Historical direct parents remain part of the graph, but an unresolved
+    # parent still makes the graph unsafe.  Do not apply the current-round
+    # completion timestamp requirement to every parent here.
+    for parent in parent_rows:
+        if str(parent["status"] or "").casefold() not in {"done", "archived"}:
             return None
 
-        assignee = str(ptask["assignee"] or "").lower()
-        title = str(ptask["title"] or "").lower()
-        if "review" in assignee or "review" in title:
-            rev_runs = conn.execute(
-                "SELECT summary, error, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC",
-                (pid,),
-            ).fetchall()
-            for rrun in rev_runs:
-                summary = str(rrun["summary"] or "").upper()
-                if "PASS" in summary:
-                    has_reviewer_pass = True
-                    break
-
-    if not has_reviewer_pass:
+    current_reviewers = [
+        parent
+        for parent in parent_rows
+        if str(parent["assignee"] or "").casefold() == "kanban-reviewer"
+        and _specialist_task_completed_in_round(parent, round_at)
+    ]
+    if not current_reviewers:
+        return None
+    reviewer_task = max(
+        current_reviewers,
+        key=lambda row: (_specialist_timestamp(row["completed_at"]), str(row["id"])),
+    )
+    reviewer_run = _latest_specialist_reviewer_run(conn, reviewer_task["id"], round_at)
+    if reviewer_run is None:
+        return None
+    reviewer_heads = _specialist_full_heads(reviewer_run)
+    if len(reviewer_heads) != 1:
         return None
 
+    round_event = _specialist_round_event(conn, task_id, round_at, round_number)
+    requested_head = round_event[0] if round_event is not None else None
+    if requested_head is not None and not _FULL_SHA_RE.fullmatch(requested_head):
+        return None
+
+    developer_tasks = _specialist_current_developer_ancestors(
+        conn,
+        str(reviewer_task["id"]),
+        round_at,
+    )
+    root_run = _latest_specialist_lead_run(conn, task_id, round_at)
+    if root_run is None:
+        return None
+
+    # New specialist graphs must carry an explicit developer validation
+    # attestation.  If there is a current developer ancestor but no valid run,
+    # fail closed rather than falling back to an older reviewer-only path.
+    if developer_tasks:
+        developer_task = max(
+            developer_tasks,
+            key=lambda row: (_specialist_timestamp(row["completed_at"]), str(row["id"])),
+        )
+        developer_run = _latest_specialist_developer_run(
+            conn,
+            developer_task["id"],
+            round_at,
+        )
+        if developer_run is None:
+            return None
+        developer_heads = _specialist_metadata_heads(developer_run)
+        if len(developer_heads) != 1 or developer_heads != reviewer_heads:
+            return None
+        reviewer_done_at = max(
+            _specialist_timestamp(reviewer_task["completed_at"]),
+            _specialist_timestamp(reviewer_run["ended_at"]),
+        )
+        if _specialist_timestamp(root_run["ended_at"]) < reviewer_done_at:
+            return None
+        return developer_run, {
+            "round": round_number,
+            "developer_task_id": str(developer_task["id"]),
+            "reviewer_task_id": str(reviewer_task["id"]),
+            "developer_run_id": int(developer_run["id"]),
+            "reviewer_run_id": int(reviewer_run["id"]),
+            "lead_run_id": int(root_run["id"]),
+            "head_sha": next(iter(developer_heads)),
+            "requested_head_sha": requested_head,
+        }
+
+    # Compatibility for the original reviewer-direct graph.  It still needs a
+    # terminal PASS and an unambiguous head, but its lead run is the delivery
+    # evidence because no developer attestation exists in that old shape.
+    return root_run, {
+        "round": round_number,
+        "reviewer_task_id": str(reviewer_task["id"]),
+        "reviewer_run_id": int(reviewer_run["id"]),
+        "lead_run_id": int(root_run["id"]),
+        "head_sha": next(iter(reviewer_heads)),
+        "requested_head_sha": requested_head,
+        "legacy_reviewer_direct": True,
+    }
+
+
+def _specialist_timestamp(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _specialist_task_completed_in_round(row: sqlite3.Row, rework_at: int) -> bool:
+    completed_at = _specialist_timestamp(row["completed_at"])
+    return completed_at >= rework_at
+
+
+def _specialist_round_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+    expected_round: int,
+) -> tuple[str | None, dict[str, Any]] | None:
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND created_at = ? "
+        "AND kind IN ('github_pr_rework', 'github_pr_rework_retry') "
+        "ORDER BY id DESC",
+        (task_id, rework_at),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("rework_round") != expected_round:
+            continue
+        head = payload.get("head_sha")
+        if head is None:
+            return None, payload
+        return str(head), payload
+    return None
+
+
+def _specialist_current_developer_ancestors(
+    conn: sqlite3.Connection,
+    reviewer_id: str,
+    rework_at: int,
+) -> list[sqlite3.Row]:
+    ancestors: list[sqlite3.Row] = []
+    queue = [reviewer_id]
+    seen = {reviewer_id}
+    while queue:
+        child_id = queue.pop(0)
+        parents = conn.execute(
+            "SELECT t.id, t.status, t.assignee, t.completed_at, t.title "
+            "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+            "WHERE l.child_id = ?",
+            (child_id,),
+        ).fetchall()
+        for parent in parents:
+            parent_id = str(parent["id"])
+            if parent_id in seen:
+                continue
+            seen.add(parent_id)
+            if (
+                str(parent["assignee"] or "").casefold() == "kanban-developer"
+                and str(parent["status"] or "").casefold() in {"done", "archived"}
+                and _specialist_task_completed_in_round(parent, rework_at)
+            ):
+                ancestors.append(parent)
+            queue.append(parent_id)
+    return ancestors
+
+
+def _latest_specialist_reviewer_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+) -> sqlite3.Row | None:
     runs = conn.execute(
         "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
-        "FROM task_runs WHERE task_id = ? AND started_at >= ? "
-        "ORDER BY id DESC",
-        (task_id, max(0, rework_at - 1)),
+        "FROM task_runs WHERE task_id = ? AND started_at >= ? ORDER BY id DESC",
+        (task_id, rework_at),
     ).fetchall()
-    for run in runs:
-        if run["ended_at"] is not None and str(run["outcome"] or "") in {"completed", "done"}:
-            return run
-    return None
+    if not runs:
+        return None
+    run = runs[0]
+    if (
+        run["ended_at"] is None
+        or str(run["outcome"] or "").casefold() not in {"completed", "done"}
+        or not _specialist_review_pass(run)
+    ):
+        return None
+    return run
+
+
+def _latest_specialist_developer_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+) -> sqlite3.Row | None:
+    runs = conn.execute(
+        "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? AND started_at >= ? ORDER BY id DESC",
+        (task_id, rework_at),
+    ).fetchall()
+    if not runs:
+        return None
+    run = runs[0]
+    metadata = _run_metadata(run)
+    if (
+        run["ended_at"] is None
+        or str(run["outcome"] or "").casefold() not in {"completed", "done"}
+        or metadata.get("validation") != "passed"
+    ):
+        return None
+    return run
+
+
+def _latest_specialist_lead_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rework_at: int,
+) -> sqlite3.Row | None:
+    runs = conn.execute(
+        "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+        "FROM task_runs WHERE task_id = ? AND started_at >= ? ORDER BY id DESC",
+        (task_id, rework_at),
+    ).fetchall()
+    if not runs:
+        return None
+    run = runs[0]
+    if (
+        run["ended_at"] is None
+        or str(run["outcome"] or "").casefold() not in {"completed", "done"}
+    ):
+        return None
+    return run
+
+
+def _specialist_review_pass(run: sqlite3.Row) -> bool:
+    metadata = _run_metadata(run)
+    verdict = metadata.get("verdict")
+    if verdict is not None:
+        return isinstance(verdict, str) and verdict.strip().casefold() == "pass"
+    return re.search(r"(?<![A-Z0-9_])PASS(?![A-Z0-9_])", str(run["summary"] or ""), re.I) is not None
+
+
+def _specialist_full_heads(run: sqlite3.Row) -> set[str]:
+    return {
+        candidate.casefold()
+        for candidate in _rework_head_candidates(run)
+        if _FULL_SHA_RE.fullmatch(candidate)
+    }
+
+
+def _specialist_metadata_heads(run: sqlite3.Row) -> set[str]:
+    metadata = _run_metadata(run)
+    candidates: set[str] = set()
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                visit(child_value, str(child_key))
+        elif isinstance(value, (list, tuple)):
+            for child_value in value:
+                visit(child_value, key)
+        elif isinstance(value, str) and key.casefold() in {
+            "head", "head_sha", "pr_head_sha", "commit", "sha", "oid",
+        }:
+            candidates.update(re.findall(r"\b[0-9a-fA-F]{40}\b", value))
+
+    visit(metadata)
+    return {candidate.casefold() for candidate in candidates if _FULL_SHA_RE.fullmatch(candidate)}
 
 
 def _task_run_after_rework(
@@ -4285,7 +4527,8 @@ def _task_run_after_rework(
     ).fetchall()
     if not _positive_rework_int(rework_round):
         return None
-    expected_round = cast(int, rework_round)
+    expected_round = int(str(rework_round))
+    edge_claimed_run: sqlite3.Row | None = None
     for run in runs:
         run_id = int(str(run["id"]))
         provenance_rows = conn.execute(
@@ -4317,11 +4560,22 @@ def _task_run_after_rework(
                     continue
             if provenance.get("phase") not in {"claimed", "spawned"}:
                 continue
-            return run
+            edge_claimed_run = run
+            break
+        if edge_claimed_run is not None:
+            break
 
     # Specialist graph orchestration provenance inheritance:
-    # If Lead run completed cleanly and its child specialist graph proved PASS:
-    return _specialist_graph_delivery_run(conn, task_id, rework_at, expected_round)
+    # If the Lead has a bootstrap run, do not let that incomplete run mask a
+    # verified current-round developer/reviewer graph.  A direct edge run is
+    # the fallback for the ordinary single-worker path.
+    specialist_run = _specialist_graph_delivery_run(
+        conn,
+        task_id,
+        rework_at,
+        expected_round,
+    )
+    return specialist_run if specialist_run is not None else edge_claimed_run
 
 
 def _untrusted_task_run_after_rework(

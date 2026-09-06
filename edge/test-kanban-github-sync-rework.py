@@ -5693,6 +5693,155 @@ def test_137_specialist_graph_provenance_inheritance_accepted() -> None:
         check("137: inherited run is lead run id", inherited_run is not None and int(inherited_run["id"]) == lead_run_id)
 
 
+def _specialist_graph_fixture(tid: str, head: str) -> tuple[int, int, int, int]:
+    """Build a deterministic current graph beside an old direct reviewer parent."""
+    with connect_closing() as conn:
+        rework = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'github_pr_rework' ORDER BY created_at DESC, id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert rework is not None
+        rework_at = int(rework["created_at"])
+        payload = json.loads(rework["payload"] or "{}")
+
+        old_reviewer = kanban_db.create_task(
+            conn,
+            title="historical reviewer",
+            body="historical reviewer handoff",
+            assignee="kanban-reviewer",
+            created_by="specialist-graph-fixture",
+            workspace_kind="scratch",
+            idempotency_key=f"specialist-old-{tid}",
+        )
+        developer = kanban_db.create_task(
+            conn,
+            title="current developer",
+            body="current developer handoff",
+            assignee="kanban-developer",
+            created_by="specialist-graph-fixture",
+            workspace_kind="scratch",
+            idempotency_key=f"specialist-developer-{tid}",
+        )
+        reviewer = kanban_db.create_task(
+            conn,
+            title="current reviewer",
+            body="current reviewer handoff",
+            assignee="kanban-reviewer",
+            created_by="specialist-graph-fixture",
+            workspace_kind="scratch",
+            idempotency_key=f"specialist-reviewer-{tid}",
+            parents=[developer],
+        )
+        kanban_db.link_tasks(conn, old_reviewer, tid)
+        kanban_db.link_tasks(conn, reviewer, tid)
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+            (rework_at - 10, old_reviewer),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+            (rework_at + 30, developer),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+            (rework_at + 40, reviewer),
+        )
+
+        bootstrap = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-main', 'blocked', ?, ?, 'blocked', ?, NULL)",
+            (tid, rework_at + 1, rework_at + 2, "edge bootstrap"),
+        ).lastrowid
+        developer_run = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-developer', 'done', ?, ?, 'completed', ?, ?)",
+            (
+                developer,
+                rework_at + 10,
+                rework_at + 20,
+                "implementation handoff",
+                json.dumps({"validation": "passed", "head_sha": head}),
+            ),
+        ).lastrowid
+        reviewer_run = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-reviewer', 'done', ?, ?, 'completed', ?, ?)",
+            (
+                reviewer,
+                rework_at + 21,
+                rework_at + 29,
+                f"PASS at exact head {head}",
+                json.dumps({"head_sha": head}),
+            ),
+        ).lastrowid
+        lead_run = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+            "VALUES (?, 'kanban-main', 'done', ?, ?, 'completed', ?, ?)",
+            (
+                tid,
+                rework_at + 30,
+                rework_at + 40,
+                "lead provisional handoff",
+                json.dumps({
+                    "validation": {"result": "passed", "head_sha": head},
+                    "handoff": {"head_sha": head},
+                }),
+            ),
+        ).lastrowid
+        assert bootstrap and developer_run and reviewer_run and lead_run
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=?, completed_at=? WHERE id=?",
+            (lead_run, rework_at + 40, tid),
+        )
+        dispatch = {
+            "source": mod.REWORK_DISPATCH_PROVENANCE_SOURCE,
+            "phase": "claimed",
+            "task_id": tid,
+            "run_id": bootstrap,
+            "rework_event_at": rework_at,
+            "rework_round": payload.get("rework_round"),
+            "head_sha": payload.get("head_sha"),
+        }
+        mod._append_sync_event(
+            conn,
+            tid,
+            dispatch,
+            kind=mod.REWORK_DISPATCH_PROVENANCE_KIND,
+            run_id=bootstrap,
+        )
+        conn.commit()
+        return int(developer_run), int(reviewer_run), int(lead_run), rework_at
+
+
+def test_146_current_round_specialist_chain_ignores_historical_direct_parent() -> None:
+    print("146. current developer/reviewer chain wins over historical direct reviewer parent")
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    head = "0123456789abcdef0123456789abcdef00000146"
+    developer_run, reviewer_run, lead_run, rework_at = _specialist_graph_fixture(tid, head)
+
+    with connect_closing() as conn:
+        selected = mod._task_run_after_rework(
+            conn,
+            tid,
+            rework_at,
+            rework_round=1,
+        )
+    check("146: specialist run selected", selected is not None, str(selected))
+    check(
+        "146: developer attestation selected instead of bootstrap/root",
+        selected is not None and int(selected["id"]) == developer_run
+        and int(selected["id"]) != reviewer_run
+        and int(selected["id"]) != lead_run,
+        str(selected),
+    )
+
+
 def _edge_completion_comments(fake: FakeGitHub) -> list[dict[str, Any]]:
     return [
         item for item in fake.issue_comments.get(PR_N, [])
@@ -6072,6 +6221,7 @@ def main() -> int:
         test_135_supersede_lookup_failure_preserves_state,
         test_136_authoritative_done_preserved_when_graphql_empty,
         test_137_specialist_graph_provenance_inheritance_accepted,
+        test_146_current_round_specialist_chain_ignores_historical_direct_parent,
         test_138_edge_owned_completion_marker_is_accepted,
         test_139_edge_owned_stale_run_head_fails_closed,
         test_140_edge_owned_round_mismatch_fails_closed,

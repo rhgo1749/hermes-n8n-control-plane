@@ -57,6 +57,7 @@ def make_db() -> sqlite3.Connection:
         ("old-review", "done", "kanban-reviewer", "R1 reviewer", 50),
         ("r2-review", "done", "kanban-reviewer", "R2 reviewer", 150),
         ("r4-review", "done", "kanban-reviewer", "R4 reviewer", 180),
+        ("current-developer", "done", "kanban-developer", "Current developer", 160),
     ]
     conn.executemany(
         "INSERT INTO tasks(id,status,assignee,title,completed_at) VALUES(?,?,?,?,?)",
@@ -68,15 +69,23 @@ def make_db() -> sqlite3.Connection:
             ("old-review", TASK),
             ("r2-review", TASK),
             ("r4-review", TASK),
+            ("current-developer", "r4-review"),
         ],
     )
 
     runs = [
         (568, TASK, "blocked", "blocked", f"R2 dependency wait head {HEAD}", None, None, 101, 120),
-        (577, TASK, "done", "completed", f"terminal provisional handoff exact head {HEAD}", None, None, 181, 190),
+        (577, TASK, "done", "completed", "terminal provisional handoff", None, json.dumps({
+            "validation": {"result": "passed", "head_sha": HEAD},
+            "handoff": {"head_sha": HEAD},
+        }), 181, 190),
         (700, "old-review", "done", "completed", f"PASS exact head {HEAD}", None, None, 40, 50),
         (701, "r2-review", "done", "completed", f"REWORK exact head {HEAD}", None, None, 140, 150),
         (702, "r4-review", "done", "completed", f"independent PASS exact head {HEAD}", None, None, 170, 180),
+        (703, "current-developer", "done", "completed", "developer validation passed", None, json.dumps({
+            "validation": "passed",
+            "head_sha": HEAD,
+        }), 120, 130),
     ]
     conn.executemany(
         "INSERT INTO task_runs(id,task_id,status,outcome,summary,error,metadata,started_at,ended_at) "
@@ -119,7 +128,7 @@ def make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_core():
+def make_core(*, canonical_returns_root=False):
     core = SimpleNamespace(
         REWORK_DISPATCH_PROVENANCE_KIND="github_pr_rework_dispatch",
         REWORK_DISPATCH_PROVENANCE_SOURCE="github_edge_rework_dispatch",
@@ -132,10 +141,14 @@ def make_core():
         return {item.casefold() for item in re.findall(r"\b[0-9a-fA-F]{40}\b", text)}
 
     def original_task_run_after_rework(conn, task_id, rework_at, *, rework_round=None):
-        # Canonical strict reader sees the edge-provenanced bootstrap first.
+        # Canonical strict reader may see the edge-provenanced bootstrap first
+        # or its completed root provisional fallback.
         if task_id != TASK or rework_at != 100 or rework_round != 1:
             return None
-        return conn.execute("SELECT * FROM task_runs WHERE id = 568").fetchone()
+        run_id = 577 if canonical_returns_root else 568
+        return conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
 
     observed_events = []
 
@@ -194,7 +207,10 @@ def test_same_round_retry_keeps_original_delivery_origin_and_specialist_run():
 
     assert delivered is True
     assert reason == "delivery_complete_verification_only"
-    assert evidence["run_id"] == 577
+    assert evidence["run_id"] == 703
+    assert evidence["developer_task_id"] == "current-developer"
+    assert evidence["developer_run_id"] == 703
+    assert evidence["lead_run_id"] == 577
     assert evidence["reviewer_task_id"] == "r4-review"
     assert evidence["reviewer_run_id"] == 702
     assert evidence["provenance"] == "specialist_reviewer_pass_same_head"
@@ -211,6 +227,52 @@ def test_same_round_retry_keeps_original_delivery_origin_and_specialist_run():
     assert conn.execute(
         "SELECT COUNT(*) FROM task_links WHERE child_id = ?", (TASK,)
     ).fetchone()[0] == 3
+
+
+def test_current_specialists_can_advance_beyond_origin_head():
+    conn = make_db()
+    new_head = "8" * 40
+    conn.execute(
+        "UPDATE task_runs SET summary = ? WHERE id = 702",
+        (f"PASS exact head {new_head}",),
+    )
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = 703",
+        (json.dumps({"validation": "passed", "head_sha": new_head}),),
+    )
+    core = make_core()
+
+    run, evidence = core._rework_specialist_delivery_candidate(
+        conn, TASK, 100, 1, HEAD
+    )
+
+    assert run["id"] == 703
+    assert evidence["head"] == new_head
+    assert evidence["reviewer_run_id"] == 702
+
+
+def test_completed_root_provisional_run_does_not_mask_developer_attestation():
+    conn = make_db()
+    core = make_core(canonical_returns_root=True)
+
+    run = core._task_run_after_rework(conn, TASK, 100, rework_round=1)
+
+    assert run["id"] == 703
+    assert json.loads(run["metadata"])["validation"] == "passed"
+
+
+def test_missing_developer_validation_never_uses_root_provisional_run():
+    conn = make_db()
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = 703",
+        (json.dumps({"validation": "failed", "head_sha": HEAD}),),
+    )
+    core = make_core()
+
+    delivered, reason, _evidence = call_delivery(core, conn)
+
+    assert delivered is False
+    assert reason == "rework_head_unchanged"
 
 
 def test_missing_edge_bootstrap_never_inherits_ordinary_completed_run():
@@ -300,6 +362,9 @@ def test_install_is_idempotent():
 if __name__ == "__main__":
     tests = [
         test_same_round_retry_keeps_original_delivery_origin_and_specialist_run,
+        test_current_specialists_can_advance_beyond_origin_head,
+        test_completed_root_provisional_run_does_not_mask_developer_attestation,
+        test_missing_developer_validation_never_uses_root_provisional_run,
         test_missing_edge_bootstrap_never_inherits_ordinary_completed_run,
         test_latest_current_round_reviewer_must_pass_exact_head,
         test_retry_identity_mismatch_does_not_rebind_to_old_round,
