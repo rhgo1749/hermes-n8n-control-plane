@@ -432,6 +432,53 @@ def test_semantic_attention_rearms_only_for_a_new_rework_round() -> None:
         assert overview._need_you_reason(result["tasks"][0]) == "rework_human_attention"
 
 
+def test_incomplete_rework_attention_with_pr_only_stays_unresolved() -> None:
+    incomplete = {
+        "reason": "rework_human_attention",
+        "attention_key": "rework_human_attention",
+        "incident_unresolved": True,
+        "incident_provenance": {
+            "source": "entry_context",
+            "pr_number": 123,
+            "reason": "rework_human_attention",
+            "incident_ref": None,
+        },
+    }
+    assert overview._semantic_attention_key(incomplete) is None
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kanban.db"
+        _db(
+            path,
+            [
+                (
+                    "t-review",
+                    "Needs maintainer",
+                    "review",
+                    None,
+                    None,
+                    0,
+                    0,
+                    None,
+                    None,
+                    "",
+                )
+            ],
+            [
+                (
+                    "t-review",
+                    "github_operator_attention",
+                    json.dumps(incomplete),
+                    10,
+                ),
+            ],
+        )
+        result = overview._load_board_projection(
+            {"slug": "demo", "name": "Demo", "db_path": str(path)}
+        )
+        assert overview._need_you_reason(result["tasks"][0]) == "rework_human_attention"
+
+
 def test_semantic_blocked_attention_tracks_latest_block_and_resolution() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"

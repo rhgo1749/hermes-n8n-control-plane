@@ -5732,8 +5732,15 @@ def _operator_attention_payload(
     if identity is None and reason in {"needs_input", "capability"}:
         identity = _blocked_attention_identity(conn, entry, reason)
     if identity is None:
+        # PR context alone is not a resolved identity for rework-family
+        # reasons; retain it as provenance while remaining fail-open.
         pr_number = _entry_pr_number(entry)
-        incident_ref = _attention_ref((pr_number,)) if pr_number is not None else None
+        if reason in _REWORK_OPERATOR_ATTENTION_REASONS:
+            incident_ref = None
+        elif pr_number is not None:
+            incident_ref = _attention_ref((pr_number,))
+        else:
+            incident_ref = None
         provenance: dict[str, Any] = {
             "source": "entry_context",
             "pr_number": pr_number,

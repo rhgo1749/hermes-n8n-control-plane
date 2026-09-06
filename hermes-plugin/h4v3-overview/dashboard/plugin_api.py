@@ -216,6 +216,13 @@ def _semantic_attention_key(
         )
         return f"{reason}:{ref}"
     if source == "entry_context":
+        if (
+            payload.get("incident_unresolved")
+            or provenance.get("incident_ref") is None
+        ):
+            # An incomplete identity must remain fail-open; PR context alone
+            # cannot be promoted into a resolved semantic key.
+            return None
         pr_number = _positive_attention_int(provenance.get("pr_number"))
         if pr_number is None:
             return reason

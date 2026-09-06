@@ -364,6 +364,68 @@ def test_rework_attention_does_not_fallback_to_unrelated_block_identity() -> Non
         conn.close()
 
 
+def test_incomplete_rework_identity_with_pr_only_fails_open_then_rearms() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER,
+          kind TEXT, payload TEXT, created_at INTEGER
+        );
+        """
+    )
+    entry: dict[str, Any] = {
+        "task_id": "t1",
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "pr_number": 123,
+        "reason": "rework_human_attention",
+        "status": "blocked",
+    }
+    try:
+        # The PR number is useful context, but without a canonical rework
+        # round it must not become a resolved incident identity.
+        assert edge._record_operator_attention(conn, entry) is True
+        first_payload = json.loads(
+            conn.execute("SELECT payload FROM task_events").fetchone()[0]
+        )
+        assert first_payload["attention_key"] == "rework_human_attention"
+        assert first_payload["incident_unresolved"] is True
+        assert first_payload["incident_provenance"] == {
+            "source": "entry_context",
+            "pr_number": 123,
+            "reason": "rework_human_attention",
+            "incident_ref": None,
+        }
+
+        # A later canonical round on the same PR gets its own generation.
+        rework = {
+            "repository": "rhgo1749/re-bound",
+            "issue_number": 106,
+            "pr_number": 123,
+            "rework_round": 1,
+            "request_comment_id": 7,
+        }
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("t1", "github_pr_rework", json.dumps(rework), 20),
+        )
+        assert edge._record_operator_attention(conn, entry) is True
+        rows = conn.execute(
+            "SELECT payload FROM task_events WHERE kind = ? ORDER BY id",
+            ("github_operator_attention",),
+        ).fetchall()
+        assert len(rows) == 2
+        second_payload = json.loads(rows[1][0])
+        assert second_payload["attention_key"] == (
+            "rework_human_attention:rhgo1749/re-bound|106|123|1|7"
+        )
+        assert "incident_unresolved" not in second_payload
+    finally:
+        conn.close()
+
+
 def test_send_dedup_skip_reports_skipped_and_never_invokes_hermes_send() -> None:
     import shutil
     import tempfile
