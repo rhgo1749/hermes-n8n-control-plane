@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,7 +25,7 @@ sys.modules[edge_spec.name] = edge
 edge_spec.loader.exec_module(edge)
 
 
-def _entry(reason: str, **extra):
+def _entry(reason: str, **extra: Any) -> dict[str, Any]:
     base = {
         "repository": "rhgo1749/re-bound",
         "issue_number": 106,
@@ -134,7 +135,7 @@ def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
             10,
         ),
     )
-    entry = {
+    entry: dict[str, Any] = {
         "task_id": "t1",
         "repository": "rhgo1749/re-bound",
         "issue_number": 106,
@@ -321,6 +322,44 @@ def test_operator_attention_without_identity_fails_open_and_dedupes_exact_key() 
         new_entry["task_id"] = "t2"
         new_entry["pr_number"] = 123
         assert edge._record_operator_attention(conn, new_entry) is True
+    finally:
+        conn.close()
+
+
+def test_rework_attention_does_not_fallback_to_unrelated_block_identity() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER,
+          kind TEXT, payload TEXT, created_at INTEGER
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES ('t1', 'blocked', ?, 10)",
+        (json.dumps({"kind": "needs_input", "reason": "old blocker"}),),
+    )
+    entry: dict[str, Any] = {
+        "task_id": "t1",
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "reason": "rework_human_attention",
+        "status": "blocked",
+        "block_kind": "needs_input",
+    }
+    try:
+        assert edge._record_operator_attention(conn, entry) is True
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE kind = 'github_operator_attention'"
+            ).fetchone()[0]
+        )
+        assert payload["incident_provenance"]["source"] == "entry_context"
+        assert payload["incident_unresolved"] is True
+        assert payload["attention_key"] == "rework_human_attention"
     finally:
         conn.close()
 

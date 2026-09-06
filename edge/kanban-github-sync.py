@@ -5729,10 +5729,7 @@ def _operator_attention_payload(
     identity: Optional[tuple[str, dict[str, Any]]] = None
     if reason in _REWORK_OPERATOR_ATTENTION_REASONS:
         identity = _rework_attention_identity(conn, entry, reason)
-    if identity is None and (
-        reason in {"needs_input", "capability"}
-        or str(entry.get("status") or "") == "blocked"
-    ):
+    if identity is None and reason in {"needs_input", "capability"}:
         identity = _blocked_attention_identity(conn, entry, reason)
     if identity is None:
         pr_number = _entry_pr_number(entry)

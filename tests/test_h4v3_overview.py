@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "hermes-plugin" / "h4v3-overview" / "dashboard" / "plugin_api.py"
@@ -18,7 +18,11 @@ sys.modules[spec.name] = overview
 spec.loader.exec_module(overview)
 
 
-def _db(path: Path, rows: list[tuple], events: Optional[list[tuple]] = None) -> None:
+def _db(
+    path: Path,
+    rows: list[tuple[Any, ...]],
+    events: Optional[list[tuple[Any, ...]]] = None,
+) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(
         """
@@ -355,8 +359,8 @@ def test_semantic_attention_rearms_only_for_a_new_rework_round() -> None:
         second = {**first, "rework_round": 2}
 
         def attention_payload(
-            data: dict, reason: str = "rework_human_attention"
-        ) -> dict:
+            data: dict[str, Any], reason: str = "rework_human_attention"
+        ) -> dict[str, Any]:
             provenance = {
                 "source": "rework_round",
                 **data,
@@ -432,7 +436,7 @@ def test_semantic_blocked_attention_tracks_latest_block_and_resolution() -> None
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "kanban.db"
 
-        def blocked_payload(reason: str, at: int) -> dict:
+        def blocked_payload(reason: str, at: int) -> dict[str, Any]:
             blocked_id = overview._attention_ref(("needs_input", reason, at))
             return {
                 "reason": "needs_input",
