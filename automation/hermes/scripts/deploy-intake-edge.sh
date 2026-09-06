@@ -49,6 +49,7 @@ EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
 EDGE_HEAD_BINDING_SOURCE="$ROOT/edge/kanban_head_binding_feedback.py"
 EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 EDGE_WS_ADMISSION_SOURCE="$ROOT/edge/kanban_workspace_admission.py"
+EDGE_DYNAMIC_SOURCE="$ROOT/edge/kanban_dynamic_resource.py"
 BLOCK_KIND_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
 BLOCK_KIND_CONFIG_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-hook-config.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
@@ -111,6 +112,7 @@ for source in \
   "$EDGE_HEAD_BINDING_SOURCE" \
   "$EDGE_RETRY_GUARD_SOURCE" \
   "$EDGE_WS_ADMISSION_SOURCE" \
+  "$EDGE_DYNAMIC_SOURCE" \
   "$BLOCK_KIND_GUARD_SOURCE" \
   "$BLOCK_KIND_CONFIG_SOURCE" \
   "$REGISTRY_SOURCE" \
@@ -139,6 +141,7 @@ cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
 cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
 cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$EDGE_WS_ADMISSION_SOURCE" "$CANDIDATE/kanban_workspace_admission.py"
+cp -p "$EDGE_DYNAMIC_SOURCE" "$CANDIDATE/kanban_dynamic_resource.py"
 cp -p "$BLOCK_KIND_GUARD_SOURCE" "$CANDIDATE/kanban-block-kind-guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
@@ -176,6 +179,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_head_binding_feedback.py" \
   "$CANDIDATE/kanban_retry_signal_guard.py" \
   "$CANDIDATE/kanban_workspace_admission.py" \
+  "$CANDIDATE/kanban_dynamic_resource.py" \
   "$CANDIDATE/kanban-block-kind-guard.py" \
   "$CANDIDATE/repository_registry.py" \
   "$CANDIDATE/board_identity_migration.py" || {
@@ -207,6 +211,8 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_resource_admission.py"
   echo "dry-run:   $TARGET_DIR/kanban_head_binding_feedback.py"
   echo "dry-run:   $TARGET_DIR/kanban_retry_signal_guard.py"
+  echo "dry-run:   $TARGET_DIR/kanban_workspace_admission.py"
+  echo "dry-run:   $TARGET_DIR/kanban_dynamic_resource.py"
   echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
   echo "dry-run:   $TARGET_DIR/board_identity_migration.py"
@@ -231,6 +237,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
+  kanban_dynamic_resource.py \
   kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py \
@@ -276,6 +283,9 @@ source_path_for() {
     kanban_workspace_admission.py)
       printf '%s\n' "$ROOT/edge/kanban_workspace_admission.py"
       ;;
+    kanban_dynamic_resource.py)
+      printf '%s\n' "$ROOT/edge/kanban_dynamic_resource.py"
+      ;;
     kanban-block-kind-guard.py)
       printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
       ;;
@@ -301,6 +311,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
+  kanban_dynamic_resource.py \
   kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py

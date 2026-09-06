@@ -55,6 +55,79 @@ _IMPL_RE = re.compile(
 )
 _INTAKE_RE = re.compile(r"GitHub Issue intake", re.IGNORECASE)
 
+_PR_URL_RE = re.compile(
+    r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)",
+    re.IGNORECASE,
+)
+_REWORK_TASK_RE = re.compile(
+    r"(rework|재작업|bounded\s+(developer\s+)?rework|DEV\s+Round|round[-_ ]?\d+)",
+    re.IGNORECASE,
+)
+
+
+def _is_rework_task(title: str, body: str) -> bool:
+    hay = f"{title or ''}\n{body or ''}"
+    if _INTAKE_RE.search(hay):
+        return False
+    if _is_guard_card(title, body):
+        return False
+    return bool(_REWORK_TASK_RE.search(hay))
+
+
+def _is_rework_or_unrun_implementation(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    title, body = row["title"] or "", row["body"] or ""
+    if _INTAKE_RE.search(title) or _is_guard_card(title, body):
+        return False
+    if _is_rework_task(title, body):
+        return True
+    if not _is_implementation_task(title, body):
+        return False
+    try:
+        runs_row = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (row["id"],),
+        ).fetchone()
+        return bool(runs_row and runs_row[0] == 0)
+    except Exception:
+        return False
+
+
+def _comment_active_pr_scan(conn: sqlite3.Connection, board: str = "") -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    try:
+        rows = conn.execute(
+            "SELECT id, title, body, status "
+            "FROM tasks WHERE status IN ('todo','ready','blocked') AND claim_lock IS NULL"
+        ).fetchall()
+    except Exception:
+        return []
+    for row in rows:
+        if not _is_rework_or_unrun_implementation(conn, row):
+            continue
+        task_id = str(row["id"])
+        try:
+            comments = conn.execute(
+                "SELECT id, author, body FROM task_comments WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+        except Exception:
+            continue
+        for c in comments:
+            body = str(c["body"] or "")
+            match = _PR_URL_RE.search(body)
+            if match:
+                new_body = _PR_URL_RE.sub(r"\1/\2#\3", body)
+                findings.append({
+                    "task_id": task_id,
+                    "comment_id": int(c["id"]),
+                    "author": str(c["author"] or ""),
+                    "old_snippet": match.group(0),
+                    "new_snippet": f"{match.group(1)}/{match.group(2)}#{match.group(3)}",
+                    "old_body": body,
+                    "new_body": new_body,
+                })
+    return findings
+
 # Durable guard/quarantine cards (Issue #76): manual safety-guard markers that
 # stay blocked forever by design. They are never self-healed nor gated — they
 # keep their original shared/blocked shape until human cleanup.
@@ -550,6 +623,18 @@ def preview_workspace_drift(
             "to": {"kind": "worktree", "path": str(target), "branch": branch},
             "violation": item["violation"],
         })
+    for item in _comment_active_pr_scan(conn, board):
+        predicted.append({
+            "task_id": item["task_id"],
+            "board": board,
+            "reason": "comment_active_pr_selfhealed",
+            "predicted": True,
+            "would_change": True,
+            "changed": False,
+            "comment_id": item["comment_id"],
+            "from": item["old_snippet"],
+            "to": item["new_snippet"],
+        })
     return predicted
 
 
@@ -635,5 +720,49 @@ def repair_workspace_drift(
             "reason": "workspace_selfhealed", "changed": True,
             "from": before, "to": {"kind": "worktree", "path": str(target),
                                    "branch": branch},
+        })
+    for item in _comment_active_pr_scan(conn, board):
+        task_id = item["task_id"]
+        comment_id = item["comment_id"]
+        task_check = conn.execute(
+            "SELECT id FROM tasks WHERE id = ? AND status IN ('todo','ready','blocked') AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if not task_check:
+            continue
+        cur = conn.execute(
+            "UPDATE task_comments SET body = ? WHERE id = ?",
+            (item["new_body"], comment_id),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            continue
+        payload = json.dumps(
+            {
+                "source": "active_pr_comment_selfheal",
+                "task_id": task_id,
+                "comment_id": comment_id,
+                "author": item["author"],
+                "from": item["old_snippet"],
+                "to": item["new_snippet"],
+            },
+            ensure_ascii=False,
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'comment_repaired', ?, ?)",
+            (task_id, payload, _now()),
+        )
+        conn.commit()
+        _log({
+            "ts": time.time(), "board": board, "decision": "comment_repaired",
+            "task_id": task_id, "comment_id": comment_id,
+            "from": item["old_snippet"], "to": item["new_snippet"],
+        })
+        repaired.append({
+            "task_id": task_id, "board": board,
+            "reason": "comment_active_pr_selfhealed", "changed": True,
+            "comment_id": comment_id,
+            "from": item["old_snippet"], "to": item["new_snippet"],
         })
     return repaired
