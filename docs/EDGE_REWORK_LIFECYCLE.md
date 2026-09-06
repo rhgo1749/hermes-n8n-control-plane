@@ -95,6 +95,13 @@ every direct parent as belonging to the current round:
    provenance event for the same rework round before inheriting the developer
    run as delivery evidence.
 
+5. A graph with a developer ancestor must also have the governing
+   `github_pr_rework`/retry event for the requested round.  If that event is
+   missing or belongs to another round, timestamp-matching specialist runs are
+   not reused; the candidate is rejected.  The older reviewer-direct
+   compatibility shape remains available only when no developer ancestor is
+   present.
+
 Titles, substring role matches, stale reviewer runs, mismatched heads, and
 incomplete or ambiguous attestations are never sufficient.  Persisted
 reviewer-direct graphs without a developer ancestor remain readable through

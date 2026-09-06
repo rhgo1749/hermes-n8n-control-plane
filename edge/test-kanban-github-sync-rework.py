@@ -5823,6 +5823,7 @@ def test_146_current_round_specialist_chain_ignores_historical_direct_parent() -
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     head = "0123456789abcdef0123456789abcdef00000146"
+    fake.prs[PR_N]["head"]["sha"] = head
     developer_run, reviewer_run, lead_run, rework_at = _specialist_graph_fixture(tid, head)
 
     with connect_closing() as conn:
@@ -5840,6 +5841,101 @@ def test_146_current_round_specialist_chain_ignores_historical_direct_parent() -
         and int(selected["id"]) != lead_run,
         str(selected),
     )
+    results = run_sync(fake)
+    entries = [entry for entry in results if entry.get("task_id") == tid]
+    markers = _edge_completion_posts(fake)
+    deliveries = [
+        event for event in task_events(tid)
+        if event["kind"] == "github_pr_rework_delivery"
+    ]
+    check(
+        "146: exact current head delivered",
+        task_row(tid)["status"] == "review"
+        and fake.pr_labels.get(PR_N) == ["agent-review-ready"],
+        str({"task": task_row(tid), "labels": fake.pr_labels.get(PR_N), "entries": entries}),
+    )
+    check(
+        "146: edge marker binds exact current head",
+        len(markers) == 1 and f"head={head}" in str(markers[0][1].get("body") or ""),
+        str(markers),
+    )
+    check(
+        "146: one durable delivery event",
+        len(deliveries) == 1 and deliveries[0]["payload"].get("head") == head,
+        str(deliveries),
+    )
+
+
+def _specialist_candidate_fixture(
+    head: str,
+) -> tuple[Any, str, int, int, int, int]:
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    fake.prs[PR_N]["head"]["sha"] = head
+    developer_run, reviewer_run, lead_run, rework_at = _specialist_graph_fixture(tid, head)
+    return fake, tid, developer_run, reviewer_run, lead_run, rework_at
+
+
+def test_147_historical_only_reviewer_is_rejected() -> None:
+    print("147. historical-only reviewer without current reviewer -> fail closed")
+    fake, tid, _developer_run, reviewer_run, _lead_run, rework_at = _specialist_candidate_fixture(
+        "0123456789abcdef0123456789abcdef00000147"
+    )
+    with connect_closing() as conn:
+        reviewer_task = conn.execute(
+            "SELECT task_id FROM task_runs WHERE id = ?", (reviewer_run,)
+        ).fetchone()
+        assert reviewer_task is not None
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (reviewer_task["task_id"], tid),
+        )
+        candidate = mod._specialist_graph_delivery_candidate(
+            conn, tid, rework_at, 1
+        )
+    check("147: no current reviewer candidate", candidate is None, str(candidate))
+
+
+def test_148_current_reviewer_head_mismatch_is_rejected() -> None:
+    print("148. current reviewer head mismatch -> fail closed")
+    head = "0123456789abcdef0123456789abcdef00000148"
+    fake, tid, _developer_run, reviewer_run, _lead_run, rework_at = _specialist_candidate_fixture(head)
+    other_head = "fedcba9876543210fedcba9876543210fedcba98"
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
+            (f"PASS at exact head {other_head}", json.dumps({"head_sha": other_head}), reviewer_run),
+        )
+        candidate = mod._specialist_graph_delivery_candidate(
+            conn, tid, rework_at, 1
+        )
+    check("148: reviewer/developer heads do not bind", candidate is None, str(candidate))
+
+
+def test_149_missing_developer_attestation_is_rejected() -> None:
+    print("149. current developer validation attestation missing -> fail closed")
+    head = "0123456789abcdef0123456789abcdef00000149"
+    fake, tid, developer_run, _reviewer_run, _lead_run, rework_at = _specialist_candidate_fixture(head)
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps({"validation": "failed", "head_sha": head}), developer_run),
+        )
+        candidate = mod._specialist_graph_delivery_candidate(
+            conn, tid, rework_at, 1
+        )
+    check("149: invalid developer validation rejected", candidate is None, str(candidate))
+
+
+def test_150_old_round_cannot_reuse_current_specialist_runs() -> None:
+    print("150. old/missing round event -> current specialist runs not reused")
+    head = "0123456789abcdef0123456789abcdef00000150"
+    fake, tid, _developer_run, _reviewer_run, _lead_run, rework_at = _specialist_candidate_fixture(head)
+    with connect_closing() as conn:
+        candidate = mod._specialist_graph_delivery_candidate(
+            conn, tid, rework_at, 2
+        )
+    check("150: mismatched round rejected", candidate is None, str(candidate))
 
 
 def _edge_completion_comments(fake: FakeGitHub) -> list[dict[str, Any]]:
@@ -6222,6 +6318,10 @@ def main() -> int:
         test_136_authoritative_done_preserved_when_graphql_empty,
         test_137_specialist_graph_provenance_inheritance_accepted,
         test_146_current_round_specialist_chain_ignores_historical_direct_parent,
+        test_147_historical_only_reviewer_is_rejected,
+        test_148_current_reviewer_head_mismatch_is_rejected,
+        test_149_missing_developer_attestation_is_rejected,
+        test_150_old_round_cannot_reuse_current_specialist_runs,
         test_138_edge_owned_completion_marker_is_accepted,
         test_139_edge_owned_stale_run_head_fails_closed,
         test_140_edge_owned_round_mismatch_fails_closed,

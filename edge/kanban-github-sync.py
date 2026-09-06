@@ -4276,11 +4276,27 @@ def _specialist_graph_delivery_candidate(
     ):
         return None
 
-    developer_tasks = _specialist_current_developer_ancestors(
+    developer_ancestors = _specialist_developer_ancestors(
         conn,
         str(reviewer_task["id"]),
-        round_at,
     )
+    developer_tasks = [
+        row
+        for row in developer_ancestors
+        if (
+            str(row["status"] or "").casefold() in {"done", "archived"}
+            and _specialist_task_completed_in_round(row, round_at)
+        )
+    ]
+    # A developer-linked specialist graph must bind to the governing rework
+    # event.  Without this gate, asking for a different round could reuse the
+    # same timestamp-matching developer/reviewer runs when no event exists for
+    # that round.  Preserve the legacy reviewer-direct compatibility path only
+    # when the reviewer has no developer ancestor at all.
+    if developer_ancestors and round_event is None:
+        return None
+    if developer_ancestors and not developer_tasks:
+        return None
     root_run = _latest_specialist_lead_run(conn, task_id, round_at)
     if root_run is None:
         return None
@@ -4378,6 +4394,20 @@ def _specialist_current_developer_ancestors(
     reviewer_id: str,
     rework_at: int,
 ) -> list[sqlite3.Row]:
+    return [
+        row
+        for row in _specialist_developer_ancestors(conn, reviewer_id)
+        if (
+            str(row["status"] or "").casefold() in {"done", "archived"}
+            and _specialist_task_completed_in_round(row, rework_at)
+        )
+    ]
+
+
+def _specialist_developer_ancestors(
+    conn: sqlite3.Connection,
+    reviewer_id: str,
+) -> list[sqlite3.Row]:
     ancestors: list[sqlite3.Row] = []
     queue = [reviewer_id]
     seen = {reviewer_id}
@@ -4394,11 +4424,7 @@ def _specialist_current_developer_ancestors(
             if parent_id in seen:
                 continue
             seen.add(parent_id)
-            if (
-                str(parent["assignee"] or "").casefold() == "kanban-developer"
-                and str(parent["status"] or "").casefold() in {"done", "archived"}
-                and _specialist_task_completed_in_round(parent, rework_at)
-            ):
+            if str(parent["assignee"] or "").casefold() == "kanban-developer":
                 ancestors.append(parent)
             queue.append(parent_id)
     return ancestors
@@ -4530,7 +4556,7 @@ def _task_run_after_rework(
     ).fetchall()
     if not _positive_rework_int(rework_round):
         return None
-    expected_round = int(str(rework_round))
+    expected_round = cast(int, rework_round)
     edge_claimed_run: sqlite3.Row | None = None
     for run in runs:
         run_id = int(str(run["id"]))
@@ -4576,7 +4602,7 @@ def _task_run_after_rework(
         conn,
         task_id,
         rework_at,
-        expected_round,
+        cast(int, expected_round),
     )
     return specialist_run if specialist_run is not None else edge_claimed_run
 
@@ -8287,7 +8313,7 @@ def sync_board(
     try:
         ws_admission = sys.modules.get("kanban_workspace_admission")
         if ws_admission is None:
-            import kanban_workspace_admission as ws_admission  # type: ignore
+            import kanban_workspace_admission as ws_admission  # pyright: ignore[reportImplicitRelativeImport]
         with kanban_db.connect_closing(board=board) as heal_conn:
             if dry_run:
                 selfheal_entries = ws_admission.preview_workspace_drift(
@@ -8857,6 +8883,7 @@ def sync_board(
             # dispatch entry carrying a task id gets its repository/issue
             # number attached via the task body ref.
             for entry in dispatch_entries:
+                entry = cast(dict[str, Any], entry)
                 if not entry.get("task_id"):
                     continue
                 if entry.get("changed") and entry.get("status") == "running":
