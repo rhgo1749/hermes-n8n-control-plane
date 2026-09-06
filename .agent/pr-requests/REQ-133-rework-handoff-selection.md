@@ -1,6 +1,6 @@
 # REQ-133: current-round specialist rework handoff selection
 
-- Status: Implementation complete; PR publication pending
+- Status: Implementation complete; PR #134 open
 - Project: `hermes-n8n-control-plane`
 - Product type: `EDGE_RECONCILIATION`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`
@@ -56,3 +56,4 @@ Run and record exact results for the five required edge regressions, changed-fil
 - Static results: changed Python files compile; focused Ruff undefined-name/import/error checks pass; `git diff --check` passes. Patch-time LSP diagnostics reported no remaining errors for the changed implementation files.
 - Known baseline-only result: `edge/test-kanban-rework-attention-selfheal-label.py` fails identically on `origin/main` and this branch in an unrelated entrypoint self-heal assertion; it is outside this change's call path.
 - PR handoff requirement: include visible plain-text `Closes #133.` in the PR body; merge/auto-merge remains human authority.
+- Final automation stop state: PR #134 is open with implementation evidence delivered; no merge, auto-merge, or CI wait was performed.

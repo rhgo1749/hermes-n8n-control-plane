@@ -425,7 +425,7 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
     def _is_current_round_task(row: Any, rework_at: int) -> bool:
         completed_at = row["completed_at"]
         return (
-            str(row["status"] or "") in {"done", "archived"}
+            str(row["status"] or "").casefold() in {"done", "archived"}
             and completed_at is not None
             and int(completed_at) >= int(rework_at)
         )
@@ -438,7 +438,7 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
         """Select the newest direct reviewer and its current-round PASS run."""
         parents = _direct_parent_rows(conn, task_id)
         if not parents or any(
-            str(row["status"] or "") not in {"done", "archived"}
+            str(row["status"] or "").casefold() not in {"done", "archived"}
             for row in parents
         ):
             return None
@@ -506,42 +506,42 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
             if _is_current_round_task(row, rework_at)
             and str(row["assignee"] or "").casefold() == "kanban-developer"
         ]
-        developers.sort(
+        if not developers:
+            return None
+        developer = max(
+            developers,
             key=lambda row: (int(row["completed_at"] or 0), str(row["id"])),
-            reverse=True,
         )
-        for developer in developers:
-            runs = conn.execute(
-                "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
-                "FROM task_runs WHERE task_id = ? ORDER BY id DESC",
-                (str(developer["id"]),),
-            ).fetchall()
-            if not runs:
-                continue
-            run = runs[0]
-            if run["ended_at"] is None or run["started_at"] is None:
-                continue
-            if int(run["started_at"]) < int(rework_at) or int(run["ended_at"]) < int(rework_at):
-                continue
-            if str(run["outcome"] or "") not in {"completed", "done"}:
-                continue
-            metadata = _run_metadata(run)
-            if metadata.get("validation") != "passed":
-                continue
-            heads = _metadata_head_candidates(run)
-            if len(heads) != 1:
-                continue
-            matching_heads = heads & reviewer_heads
-            if not matching_heads:
-                continue
-            return {
-                "run": run,
-                "developer_task_id": str(developer["id"]),
-                "developer_run_id": int(run["id"]),
-                "head_candidates": heads,
-                "matching_heads": matching_heads,
-            }
-        return None
+        runs = conn.execute(
+            "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+            (str(developer["id"]),),
+        ).fetchall()
+        if not runs:
+            return None
+        run = runs[0]
+        if run["ended_at"] is None or run["started_at"] is None:
+            return None
+        if int(run["started_at"]) < int(rework_at) or int(run["ended_at"]) < int(rework_at):
+            return None
+        if str(run["outcome"] or "").casefold() not in {"completed", "done"}:
+            return None
+        metadata = _run_metadata(run)
+        if metadata.get("validation") != "passed":
+            return None
+        heads = _metadata_head_candidates(run)
+        if len(heads) != 1:
+            return None
+        matching_heads = heads & reviewer_heads
+        if len(matching_heads) != 1:
+            return None
+        return {
+            "run": run,
+            "developer_task_id": str(developer["id"]),
+            "developer_run_id": int(run["id"]),
+            "head_candidates": heads,
+            "matching_heads": matching_heads,
+        }
 
     def _latest_clean_lead_run(
         conn: Any,

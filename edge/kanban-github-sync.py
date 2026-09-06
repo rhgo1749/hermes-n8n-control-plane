@@ -4271,7 +4271,9 @@ def _specialist_graph_delivery_candidate(
 
     round_event = _specialist_round_event(conn, task_id, round_at, round_number)
     requested_head = round_event[0] if round_event is not None else None
-    if requested_head is not None and not _FULL_SHA_RE.fullmatch(requested_head):
+    if round_event is not None and (
+        requested_head is None or not _FULL_SHA_RE.fullmatch(requested_head)
+    ):
         return None
 
     developer_tasks = _specialist_current_developer_ancestors(
@@ -4325,6 +4327,7 @@ def _specialist_graph_delivery_candidate(
         "round": round_number,
         "reviewer_task_id": str(reviewer_task["id"]),
         "reviewer_run_id": int(reviewer_run["id"]),
+        "reviewer_completed_at": _specialist_timestamp(reviewer_task["completed_at"]),
         "lead_run_id": int(root_run["id"]),
         "head_sha": next(iter(reviewer_heads)),
         "requested_head_sha": requested_head,
