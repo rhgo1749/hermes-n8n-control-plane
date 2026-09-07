@@ -124,6 +124,22 @@ def test_attention_line_parser_preserves_delimiters_in_semantic_identity() -> No
     assert intake._telegram_attention_key(line) == key
 
 
+def test_attention_line_parser_uses_trailing_marker_after_display_collision() -> None:
+    key = "needs_input:needs_input|needs_input|operator|200|4"
+    marker = intake._TELEGRAM_INCIDENT_MARKER
+    entry = _entry(
+        "needs_input",
+        issue_title=f"Title{marker}display-decoy",
+        operator_attention={
+            "reason": f"needs_input{marker}reason-decoy",
+            "attention_key": key,
+        },
+    )
+    line = intake._attention_notification_line("re-bound", "Re-Bound", 106, entry)
+    assert line.count(marker) == 3
+    assert intake._telegram_attention_key(line) == key
+
+
 def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(

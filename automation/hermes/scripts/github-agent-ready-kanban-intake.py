@@ -3514,7 +3514,9 @@ _TELEGRAM_INCIDENT_MARKER = " · incident="
 
 def _telegram_attention_key(line: str) -> str | None:
     """Extract the edge-provided semantic key from one notification line."""
-    marker_at = line.find(_TELEGRAM_INCIDENT_MARKER)
+    # Display/reason text is not escaped and may contain the same marker. The
+    # canonical marker is appended last by _attention_notification_line().
+    marker_at = line.rfind(_TELEGRAM_INCIDENT_MARKER)
     if marker_at < 0:
         return None
     key = line[marker_at + len(_TELEGRAM_INCIDENT_MARKER):].strip()
