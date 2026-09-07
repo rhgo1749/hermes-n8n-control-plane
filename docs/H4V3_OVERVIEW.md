@@ -106,8 +106,10 @@ Semantic `github_operator_attention` rows carry an `attention_key` of
 `<reason>:<incident_ref>` plus an `incident_provenance` object. Rework identity
 uses repository, Issue, PR, rework round, and request-comment identity; blocked
 identity uses the latest `blocked` event's payload kind/reason/timestamp,
-durable row id, and `block_kind`; other diagnostics use the canonical entry PR
-number. Multi-field refs use `|`, and no raw task-event cursor is used as
+durable row id, and `block_kind`; board-global dispatch-lock diagnostics retain
+`source=board_context` and `incident_unresolved: true` rather than inheriting a
+task or PR identity, while other task-scoped diagnostics use the canonical entry
+PR number. Multi-field refs use `|`, and no raw task-event cursor is used as
 incident identity. A changed reason, PR/request, blocked event, or rework round
 therefore creates a new incident without re-alerting for ordinary bookkeeping.
 Entries with no canonical identity set `incident_unresolved: true` and remain

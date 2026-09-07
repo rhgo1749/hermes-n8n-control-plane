@@ -1,11 +1,12 @@
 # REQ-104 — operator-attention semantic incident identity
 
 Source Issue: rhgo1749/hermes-n8n-control-plane#104
-Kanban task: t_6b2a4238
+Kanban task: t_6b2a4238 (original implementation)
+Rework Kanban task: t_b2ac963b
 Kanban root: t_5ffdb93b (intake)
 Intake idempotency key: github:rhgo1749/hermes-n8n-control-plane:issue:104
 작업 브랜치: issue104-operator-attention-incident-identity
-기준 브랜치: origin/main @ 76da64e9c11f365d8bb9de3010d65d0862bd70b9 (구현 전 fetch 완료)
+기준 브랜치: origin/main @ 8ce89896209dd0dec2b0cb5e8f9d209569f6c66e9 (rework round 7 fetch 완료)
 
 ## 범위
 
@@ -17,8 +18,9 @@ canonical evidence에서 계산하는 안정적인 semantic incident identity로
   task `block_kind`를 사용한다.
 - rework 사건은 repository, Issue, PR, rework round, request comment identity와
   attention reason을 사용한다.
-- 그 밖의 진단은 entry/rework/evidence에 있는 canonical PR identity와 reason을
-  사용한다.
+- 그 밖의 task-scoped 진단은 entry/rework/evidence에 있는 canonical PR identity와
+  reason을 사용한다. Board-global dispatch-lock 진단은 task/PR identity를
+  상속하지 않고 `incident_unresolved`로 유지한다.
 - provenance를 기존 `task_events` payload에 기록하고, identity가 없으면
   `incident_unresolved`로 표시하여 fail-open한다.
 - Overview는 semantic identity를 해석하고, 일반 bookkeeping event churn에서는

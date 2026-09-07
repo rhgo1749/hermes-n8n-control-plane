@@ -5743,6 +5743,11 @@ _REWORK_OPERATOR_ATTENTION_REASONS = frozenset({
     "review_ready_label_projection_failed",
     "merged_lifecycle_cleanup_failed",
     "stale_review_ready_normalize_failed",
+    "lifecycle_label_conflict",
+})
+_BOARD_OPERATOR_ATTENTION_REASONS = frozenset({
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
 })
 _ATTENTION_COMPONENT_LIMIT = 96
 _ATTENTION_REF_LIMIT = 384
@@ -6005,7 +6010,53 @@ def _operator_attention_payload(
     task_id = str(entry.get("task_id") or "")
     repository = str(entry.get("repository") or "")
     issue_number = _positive_attention_int(entry.get("issue_number"))
-    if reason is None or not task_id or not repository or issue_number is None:
+    board = str(entry.get("board") or "").strip()
+    if reason is None:
+        return None
+
+    def _payload(
+        incident_ref: Optional[str],
+        provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        attention_key = (
+            f"{reason}:{incident_ref}" if incident_ref is not None else reason
+        )
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "attention_key": attention_key,
+            "repository": repository or None,
+            "issue_number": issue_number,
+            "previous_status": entry.get("from_state"),
+            "new_status": entry.get("to_state") or entry.get("status"),
+            "source": "github_edge_operator_attention",
+            "incident_provenance": provenance,
+        }
+        if incident_ref is None:
+            # Do not invent identity from a PR number or task-event cursor.
+            # Board-global lock failures remain visible but unresolved.
+            payload["incident_unresolved"] = True
+        return payload
+
+    if reason in _BOARD_OPERATOR_ATTENTION_REASONS:
+        if not board:
+            return None
+        # Dispatch-lock failures describe the board admission boundary, not
+        # the task/PR that happened to be in the pending batch.  Keep that
+        # scope explicit even when a caller decorates the result with task
+        # context; a PR number is not a governing lock generation.
+        payload = _payload(None, {
+            "source": "board_context",
+            "board": board,
+            "reason": reason,
+            "incident_ref": None,
+        })
+        payload["repository"] = None
+        payload["issue_number"] = None
+        return payload
+
+    if not task_id:
+        return None
+    if not repository or issue_number is None:
         return None
 
     identity: Optional[tuple[str, dict[str, Any]]] = None
@@ -6031,25 +6082,20 @@ def _operator_attention_payload(
         }
     else:
         incident_ref, provenance = identity
+    return _payload(incident_ref, provenance)
 
-    attention_key = (
-        f"{reason}:{incident_ref}" if incident_ref is not None else reason
-    )
-    payload: dict[str, Any] = {
-        "reason": reason,
-        "attention_key": attention_key,
-        "repository": repository,
-        "issue_number": issue_number,
-        "previous_status": entry.get("from_state"),
-        "new_status": entry.get("to_state") or entry.get("status"),
-        "source": "github_edge_operator_attention",
-        "incident_provenance": provenance,
+
+def _attach_operator_attention(
+    entry: dict[str, Any],
+    payload: Mapping[str, Any],
+) -> None:
+    entry["operator_attention"] = {
+        "reason": payload["reason"],
+        "attention_key": payload["attention_key"],
+        "incident_provenance": payload["incident_provenance"],
     }
-    if incident_ref is None:
-        # Do not invent identity from a task-event cursor. This row remains
-        # visible until a canonical PR/block/rework identity is available.
-        payload["incident_unresolved"] = True
-    return payload
+    if payload.get("incident_unresolved"):
+        entry["operator_attention"]["incident_unresolved"] = True
 
 
 def _record_operator_attention(
@@ -6059,7 +6105,15 @@ def _record_operator_attention(
     """Record one deduped operator-attention event in existing task_events."""
     task_id = str(entry.get("task_id") or "")
     payload = _operator_attention_payload(conn, entry)
-    if not task_id or payload is None:
+    if payload is None:
+        return False
+    _attach_operator_attention(entry, payload)
+    if (
+        not task_id
+        or payload["incident_provenance"].get("source") == "board_context"
+    ):
+        # Board-global attention has no task row to own a durable event. Keep
+        # the explicit unresolved observer identity for Telegram delivery.
         return False
     key = str(payload["attention_key"])
     # Keep the task-scoped LIKE lookup for compatibility with existing SQLite
@@ -6083,23 +6137,9 @@ def _record_operator_attention(
             and existing_payload.get("attention_key") == key
             and isinstance(existing_payload.get("incident_provenance"), Mapping)
         ):
-            entry["operator_attention"] = {
-                "reason": payload["reason"],
-                "attention_key": payload["attention_key"],
-                "incident_provenance": payload["incident_provenance"],
-            }
-            if payload.get("incident_unresolved"):
-                entry["operator_attention"]["incident_unresolved"] = True
             return False
     with conn:
         _append_sync_event(conn, task_id, payload, kind="github_operator_attention")
-    entry["operator_attention"] = {
-        "reason": payload["reason"],
-        "attention_key": payload["attention_key"],
-        "incident_provenance": payload["incident_provenance"],
-    }
-    if payload.get("incident_unresolved"):
-        entry["operator_attention"]["incident_unresolved"] = True
     return True
 
 
@@ -9188,6 +9228,7 @@ def sync_board(
                     "task_id": None, "status": None, "changed": False,
                     "reason": "rework_dispatch_failed",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "board": board,
                 }]
             # Structured-result extension (intake Telegram observer): a
             # spawned rework worker is a READY -> RUNNING transition; every
@@ -9195,7 +9236,11 @@ def sync_board(
             # number attached via the task body ref.
             for entry in dispatch_entries:
                 entry = cast(dict[str, Any], entry)
+                entry.setdefault("board", board)
                 if not entry.get("task_id"):
+                    attention_payload = _operator_attention_payload(conn, entry)
+                    if attention_payload is not None:
+                        _attach_operator_attention(entry, attention_payload)
                     continue
                 if entry.get("changed") and entry.get("status") == "running":
                     entry["from_state"] = "ready"
@@ -9210,6 +9255,7 @@ def sync_board(
                             entry["repository"] = dref.repository
                             entry["issue_number"] = dref.issue_number
                             entry["issue_title"] = dref.issue_title
+                _record_operator_attention(conn, entry)
             results.extend(dispatch_entries)
         # Surface the self-healing pass first so operators see what was
         # repaired (real runs) or predicted (dry-run) ahead of any

@@ -24,6 +24,13 @@ edge = importlib.util.module_from_spec(edge_spec)
 sys.modules[edge_spec.name] = edge
 edge_spec.loader.exec_module(edge)
 
+OVERVIEW = ROOT / "hermes-plugin" / "h4v3-overview" / "dashboard" / "plugin_api.py"
+overview_spec = importlib.util.spec_from_file_location("h4v3_overview_policy", OVERVIEW)
+assert overview_spec and overview_spec.loader
+overview = importlib.util.module_from_spec(overview_spec)
+sys.modules[overview_spec.name] = overview
+overview_spec.loader.exec_module(overview)
+
 
 def _entry(reason: str, **extra: Any) -> dict[str, Any]:
     base = {
@@ -360,6 +367,158 @@ def test_operator_attention_rework_round_is_stable_across_retry_event() -> None:
         assert "|106|123|1|7" in keys[0]
         assert "|106|123|1|8" in keys[1]
         assert "|106|123|2|8" in keys[2]
+    finally:
+        conn.close()
+
+
+def test_lifecycle_conflict_binds_round_and_realerts_on_new_round() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER,
+          kind TEXT, payload TEXT, created_at INTEGER
+        );
+        """
+    )
+    entry: dict[str, Any] = {
+        "task_id": "t1",
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "pr_number": 123,
+        "reason": "lifecycle_label_conflict",
+        "status": "review",
+    }
+    round_one = {
+        "repository": "rhgo1749/re-bound",
+        "issue_number": 106,
+        "pr_number": 123,
+        "rework_round": 1,
+        "request_comment_id": 7,
+    }
+    try:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'github_pr_rework', ?, 10)",
+            ("t1", json.dumps(round_one)),
+        )
+        assert edge._record_operator_attention(conn, entry) is True
+        first_payload = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE kind = 'github_operator_attention'"
+            ).fetchone()[0]
+        )
+        first_key = first_payload["attention_key"]
+        assert "|106|123|1|7" in first_key
+        assert overview._semantic_attention_key(first_payload) == first_key
+        first_line = intake._attention_notification_line(
+            "re-bound", "Re-Bound", 106, entry
+        )
+        assert intake._telegram_attention_key(first_line) == first_key
+
+        for kind, created_at in (("heartbeat", 11), ("commented", 12), ("spawned", 13)):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES ('t1', ?, '{}', ?)",
+                (kind, created_at),
+            )
+            assert edge._record_operator_attention(conn, entry) is False
+
+        round_two = dict(round_one, rework_round=2, request_comment_id=8)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'github_pr_rework', ?, 20)",
+            ("t1", json.dumps(round_two)),
+        )
+        assert edge._record_operator_attention(conn, entry) is True
+        rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE kind = 'github_operator_attention' ORDER BY id"
+        ).fetchall()
+        second_payload = json.loads(rows[1][0])
+        second_key = second_payload["attention_key"]
+        assert "|106|123|2|8" in second_key
+        assert second_key != first_key
+        assert overview._semantic_attention_key(second_payload) == second_key
+    finally:
+        conn.close()
+
+
+def test_dispatch_lock_attention_ignores_task_pr_identity() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, "
+        "kind TEXT, payload TEXT, created_at INTEGER)"
+    )
+    try:
+        entry = {
+            "task_id": "t1",
+            "repository": "rhgo1749/re-bound",
+            "issue_number": 106,
+            "pr_number": 123,
+            "reason": "dispatch_lock_failed",
+            "board": "re-bound",
+        }
+        payload = edge._operator_attention_payload(conn, entry)
+        assert payload is not None
+        assert payload["attention_key"] == "dispatch_lock_failed"
+        assert payload["incident_unresolved"] is True
+        assert payload["repository"] is None
+        assert payload["issue_number"] is None
+        assert payload["incident_provenance"]["incident_ref"] is None
+        assert edge._record_operator_attention(conn, entry) is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE kind = 'github_operator_attention'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_board_dispatch_lock_attention_is_keyed_for_telegram_observer() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        entry: dict[str, Any] = {
+            "task_id": None,
+            "board": "re-bound",
+            "reason": "dispatch_lock_unavailable",
+        }
+        assert edge._record_operator_attention(conn, entry) is False
+        payload = entry["operator_attention"]
+        assert payload["attention_key"] == "dispatch_lock_unavailable"
+        assert payload["incident_unresolved"] is True
+        assert payload["incident_provenance"] == {
+            "source": "board_context",
+            "board": "re-bound",
+            "reason": "dispatch_lock_unavailable",
+            "incident_ref": None,
+        }
+        assert overview._semantic_attention_key(payload) is None
+        assert intake._should_notify_entry(entry) is True
+        assert intake._notification_context(entry, ()) == (
+            "re-bound",
+            "Re Bound",
+            None,
+        )
+        predicted_entry = {
+            "task_id": None,
+            "board": "re-bound",
+            "reason": "dispatch_lock_unavailable",
+            "operator_attention_predicted": payload,
+        }
+        assert intake._should_notify_entry(predicted_entry) is True
+        assert intake._notification_context(predicted_entry, ()) == (
+            "re-bound",
+            "Re Bound",
+            None,
+        )
+        line = intake._attention_notification_line(
+            "re-bound", "Re-Bound", None, entry
+        )
+        assert "board" in line
+        assert intake._telegram_attention_key(line) == "dispatch_lock_unavailable"
     finally:
         conn.close()
 

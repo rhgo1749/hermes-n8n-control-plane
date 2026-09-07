@@ -3327,6 +3327,10 @@ _HUMAN_ATTENTION_REASONS = frozenset({
     "dispatch_lock_failed",
     "dispatch_lock_unavailable",
 })
+_BOARD_GLOBAL_ATTENTION_REASONS = frozenset({
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
+})
 _HUMAN_ATTENTION_TEXT_MARKERS = (
     "needs_input",
     "needs maintainer",
@@ -3402,14 +3406,35 @@ def _entry_attention_key(entry: dict[str, Any]) -> str | None:
     return None
 
 
+def _board_global_attention_board(entry: dict[str, Any]) -> str | None:
+    """Return a verified board scope for an unresolved board-level alert."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if not isinstance(value, dict):
+            continue
+        reason = str(value.get("reason") or "")
+        provenance = value.get("incident_provenance")
+        if (
+            reason in _BOARD_GLOBAL_ATTENTION_REASONS
+            and value.get("incident_unresolved") is True
+            and isinstance(provenance, dict)
+            and provenance.get("source") == "board_context"
+        ):
+            board = str(provenance.get("board") or entry.get("board") or "").strip()
+            if board:
+                return board
+    return None
+
+
 def _attention_notification_line(
     board: str,
     short_name: str,
-    issue_number: int,
+    issue_number: int | None,
     entry: dict[str, Any],
 ) -> str:
     reason = _entry_attention_reason(entry) or "human_attention_required"
-    line = f"⚠️ [{board}] {short_name} #{issue_number} · 확인 필요"
+    subject = f"#{issue_number}" if issue_number is not None else "board"
+    line = f"⚠️ [{board}] {short_name} {subject} · 확인 필요"
     pr_number = _entry_pr_number(entry)
     if pr_number is not None:
         line += f" (PR #{pr_number})"
@@ -3484,16 +3509,49 @@ def _entry_attention_reason(entry: dict[str, Any]) -> str | None:
 
 def _should_notify_entry(entry: dict[str, Any]) -> bool:
     """Apply the suppress/send policy to one sync result."""
+    attention_reason = _entry_attention_reason(entry)
+    if attention_reason is not None:
+        if attention_reason in _BOARD_GLOBAL_ATTENTION_REASONS:
+            return _board_global_attention_board(entry) is not None
+        return bool(entry.get("repository") and entry.get("issue_number"))
     if not entry.get("repository") or not entry.get("issue_number"):
         return False
-    if _entry_attention_reason(entry) is not None:
-        return True
     if not entry.get("changed"):
         return False
     transition = (str(entry.get("from_state") or ""), str(entry.get("to_state") or ""))
     # Deliberately return False for unknown transitions too: adding a new edge
     # result cannot silently start a Telegram alert storm.
     return transition not in _SUPPRESSED_TRANSITIONS and False
+
+
+def _notification_context(
+    entry: dict[str, Any],
+    configs: tuple[RepositoryConfig, ...],
+) -> tuple[str, str, int | None]:
+    """Resolve display identity for repository and board-global alerts."""
+    board_context = _board_global_attention_board(entry)
+    if board_context is not None:
+        short_name = board_context.rsplit("/", 1)[-1].replace("-", " ").title()
+        return board_context, short_name, None
+    repository = str(entry.get("repository") or "").strip()
+    board = str(entry.get("board") or "").strip()
+    if repository:
+        board = board or _board_for_repository(repository, configs)
+        short_name = _board_display_name(board, repository, configs)
+    else:
+        board = board or "unknown-board"
+        short_name = board.rsplit("/", 1)[-1].replace("-", " ").title()
+    raw_issue = entry.get("issue_number")
+    if isinstance(raw_issue, bool):
+        issue_number = None
+    elif isinstance(raw_issue, int):
+        issue_number = raw_issue if raw_issue > 0 else None
+    elif isinstance(raw_issue, str) and raw_issue.strip().isdigit():
+        parsed = int(raw_issue.strip())
+        issue_number = parsed if parsed > 0 else None
+    else:
+        issue_number = None
+    return board, short_name, issue_number
 
 
 def _telegram_dedup_state_path() -> Path:
@@ -4364,15 +4422,14 @@ def _run_once(args: argparse.Namespace) -> int:
         for entry in sync_results:
             if not _should_notify_entry(entry):
                 continue
-            board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_display_name(
-                board, str(entry["repository"]), selected_configs
+            board, short_name, issue_number = _notification_context(
+                entry, selected_configs
             )
             predicted.append(
                 _attention_notification_line(
                     board,
                     short_name,
-                    int(entry["issue_number"]),
+                    issue_number,
                     entry,
                 )
             )
@@ -4380,15 +4437,14 @@ def _run_once(args: argparse.Namespace) -> int:
         for entry in sync_results:
             if not _should_notify_entry(entry):
                 continue
-            board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_display_name(
-                board, str(entry["repository"]), selected_configs
+            board, short_name, issue_number = _notification_context(
+                entry, selected_configs
             )
             notification_lines.append(
                 _attention_notification_line(
                     board,
                     short_name,
-                    int(entry["issue_number"]),
+                    issue_number,
                     entry,
                 )
             )
