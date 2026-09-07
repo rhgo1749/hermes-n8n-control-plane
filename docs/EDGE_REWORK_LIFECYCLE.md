@@ -220,18 +220,23 @@ live hook and restarting Hermes remain a separate human validation gate.
 
 ## Transitions implemented
 
+**Lifecycle invariant:** `agent-rework` is a one-shot maintainer command. The
+edge may consume or remove it, but must never create, restore, or self-heal it.
+Durable `github_pr_rework*` events carry retry/hold state after consumption; a
+valid completed round projects `agent-review-ready`.
+
 | Transition | Trigger | Effect |
 |---|---|---|
-| `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; claim is reclaimed and request label restored if claim-time projection fails |
+| `agent-rework` → `agent-working` | dispatcher `claim_task` success | atomic PATCH `labels: [-agent-rework, +agent-working]`; if claim-time projection fails the claim is reclaimed and durable round/projection-failure evidence drives the next retry — the edge never re-creates `agent-rework` |
 | `agent-working` maintained | running task with live claim/run | per-pass label projection (idempotent) |
 | `agent-working` → edge-owned handoff | finished run metadata attests `validation=passed` and the live PR head | edge re-reads the open target PR, source Issue, trusted retry binding, and current round; posts the canonical marker and reads it back; no worker-supplied task/request/head fields are used |
 | `edge-owned handoff` → `agent-review-ready` | read-back marker satisfies the existing delivery gate | DB `→ review` (done/blocked/ready/running sources), label swap, one `github_pr_rework_delivery` event (idempotent by head) |
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
-| `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, restore `agent-rework`, and never project `agent-review-ready` or completion |
-| `agent-working` → `agent-rework` (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | task requeued `→ ready`, `github_pr_rework_retry` event, failure counted against `kanban.failure_limit` (circuit breaker preserved); head-binding rejection additionally posts idempotent reason-aware PR feedback without changing routing |
-| `agent-rework` restored (BLOCKED or operator-recovered REVIEW attention hold) → new round | explicit trusted exact `AGENT_REWORK_RETRY` whole-comment after the current round's attention, Issue open + `agent-ready`, comment id never consumed | the existing `apply_rework` transaction opens READY from the actual prior status and records one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`); the label stays until the existing dispatch claim (see “Explicit maintainer retry”) |
-| `agent-working` → `agent-rework` + attention | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | labels restored, idempotent `HERMES_KANBAN_REWORK_ATTENTION` comment on the PR + Kanban `github_pr_rework_attention` event (per task + reason); the PR comment body carries the exact regeneration/`AGENT_REWORK_RETRY` instructions and reason-specific head-binding guidance where applicable |
+| `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, clear consumed execution/output labels, and never synthesize `agent-rework` or project `agent-review-ready` |
+| `agent-working` → READY (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | clear consumed lifecycle labels; task requeued `→ ready` from durable `github_pr_rework_retry` evidence, failure counted against `kanban.failure_limit` (circuit breaker preserved); the edge never re-creates `agent-rework` |
+| BLOCKED or operator-recovered REVIEW attention hold → new round | explicit trusted exact `AGENT_REWORK_RETRY` whole-comment after the current round's attention, Issue open + `agent-ready`, comment id never consumed | the existing `apply_rework` transaction opens READY from the actual prior status and records one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`); no `agent-rework` label is synthesized, and dispatch projects `agent-working` only after claim |
+| `agent-working` → attention hold | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | clear consumed lifecycle labels; emit idempotent `HERMES_KANBAN_REWORK_ATTENTION` PR feedback + Kanban `github_pr_rework_attention`; only a later trusted maintainer command may open another round |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same pass |
 
 ## Ordering / race safety
@@ -251,8 +256,8 @@ live hook and restarting Hermes remain a separate human validation gate.
    - a false-terminal `DONE + OPEN PR` carrying `agent-rework` (including
      a simultaneous `agent-review-ready`) enters the strict current-round
      delivery/attention gate first; without current edge delivery it repairs
-     to `REVIEW`, restores `agent-rework`, and never projects
-     `agent-review-ready`;
+     to `REVIEW`, clears consumed lifecycle labels, and never synthesizes
+     `agent-rework` or projects `agent-review-ready`;
    - any other ambiguous lifecycle combination still skips with a diagnostic
      (`lifecycle_label_conflict`) and never spawns.
 5. Classic intake (`REVIEW/BLOCKED` + fresh `agent-rework` label), plus a
@@ -261,11 +266,11 @@ live hook and restarting Hermes remain a separate human validation gate.
    path. A label **newer than the governing event** always flows through the
    classic path.
 6. A consumed round with current-round `github_pr_rework_attention` that an
-   operator recovers to `REVIEW` may use the explicit retry admission only
-   while the stale `agent-rework` label is present. Normal `review`/
-   `agent-review-ready` lanes, a missing attention record, an active worker,
-   and any lifecycle-label conflict stay outside that admission and fail
-   closed without a new round.
+   operator recovers to `REVIEW` may use explicit retry admission from that
+   durable attention record; no `agent-rework` label is required. Normal
+   `review`/`agent-review-ready` lanes without matching attention, an active
+   worker, and any lifecycle-label conflict stay outside that admission and
+   fail closed without a new round.
 7. Delivery events are written once per head (`_latest_delivery_head`), so
    repeated reconciliation passes are no-ops after the transition.
 8. `_current_round_delivery` consumes only durable `github_pr_rework_delivery`
@@ -286,8 +291,9 @@ live hook and restarting Hermes remain a separate human validation gate.
     one structured `github_pr_rework_projection_failure` event with the task,
     repository/Issue/PR, `stage=claim`, `operation=lifecycle_label_projection`,
     failure class, HTTP status when available, before/desired/observed labels,
-    and `retryable=true`; the claim is reclaimed, `agent-rework` is restored,
-    and no worker is spawned in that tick.
+    and `retryable=true`; the claim is reclaimed and no worker is spawned in
+    that tick. The durable failure/current-round event owns the later retry; the
+    edge never restores or creates `agent-rework`.
 11. A retryable claim-projection failure remains the rework dispatch gate for a
     later edge wake. The later wake performs one fresh claim/projection attempt;
     a successful swap is the only ownership transition and does not duplicate
@@ -394,13 +400,12 @@ Feedback posting never changes state, labels, failure limits, or retry routing.
 
 ## Explicit maintainer retry (new round ingress)
 
-A consumed rework round whose delivery is incomplete fails closed:
-`BLOCKED` + `rework_human_attention` + the `agent-rework` label restored by
-the self-heal. If an operator later recovers that same lifecycle card from
-`DONE` to ordinary `REVIEW`, the current-round attention record and stale
-label remain the bounded recovery evidence. The restored label alone is
-**never** retry evidence, and no automatic or timer-based retry may start
-from either held state.
+A consumed rework round whose delivery is incomplete fails closed as a
+`BLOCKED`/`REVIEW` `rework_human_attention` hold with durable current-round
+evidence and **without** synthesizing `agent-rework`. If an operator later
+recovers that same lifecycle card from `DONE` to ordinary `REVIEW`, the
+current-round attention record remains the bounded recovery evidence. No
+automatic or timer-based retry may start from either held state.
 
 The **only** signal that opens a NEW rework round from the hold is a
 machine-readable comment on the current PR by a `TRUSTED_GITHUB_ACTORS`
@@ -438,12 +443,11 @@ evidence then records `verification_only: true`.
 This is the canonical recovery policy for Issue #57. A recovered `REVIEW`
 card is eligible only when the latest consumed rework event has a matching
 current-round `github_pr_rework_attention` record, the linked PR is still
-open, and the live PR retains only the request-side `agent-rework` lifecycle
-label. A fresh trusted exact retry comment is consumed by the same
-`_consume_explicit_rework_retry()` helper and the same `apply_rework(...,
-retry_comment_id=...)` transaction used by the `BLOCKED` path. The next
-dispatch tick uses the existing rework dispatch lane and swaps
-`agent-rework` → `agent-working` only after claim.
+open, and there is no active `agent-working` owner. A fresh trusted exact retry
+comment is consumed by the same `_consume_explicit_rework_retry()` helper and
+the same `apply_rework(..., retry_comment_id=...)` transaction used by the
+`BLOCKED` path. The durable new round is sufficient for dispatch; the edge does
+not synthesize `agent-rework`, and projects `agent-working` only after claim.
 
 Normal `REVIEW` / `agent-review-ready` cards, label-only state, stale or
 untrusted comments, wrong-task or malformed comments, already-consumed

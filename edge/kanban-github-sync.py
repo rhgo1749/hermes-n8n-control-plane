@@ -144,9 +144,9 @@ REWORK_ATTENTION_MARKER = "HERMES_KANBAN_REWORK_ATTENTION"
 # comment on the current PR containing exactly ``AGENT_REWORK_RETRY`` plus a
 # ``task=<task_id>`` line, posted AFTER the last rework attention record.
 # It is the ONLY human signal that may start a new rework round from a
-# BLOCKED or operator-recovered REVIEW + rework_human_attention hold (label
-# presence alone is never retry evidence — the edge restores ``agent-rework``
-# during self-heal).
+# BLOCKED or operator-recovered REVIEW + rework_human_attention hold. Label
+# presence alone is never retry evidence; the edge never restores or creates
+# ``agent-rework`` after the one-shot command has been consumed.
 REWORK_RETRY_MARKER = "AGENT_REWORK_RETRY"
 # Machine-readable explicit abandonment of one closed-unmerged PR.  Unlike a
 # plain PR close, this trusted, one-shot signal is the only authorization for
@@ -5579,8 +5579,8 @@ def _post_rework_attention_pr_comment(
     (ctrl-hangul PR #74 round 12 regression: the malformed marker was never
     answered on the PR and the hold sat for two days).  The comment is
     posted at most once per (task, reason) and never changes any state — the
-    fail-closed hold (BLOCKED card + restored agent-rework label, no
-    automatic retry) is untouched.  The exact regeneration templates are
+    fail-closed hold (durable attention evidence, no synthetic command label,
+    no automatic retry) is untouched.  The exact regeneration templates are
     included so the next round can proceed without guessing.
 
     Returns True when a new comment was posted, False when it already
@@ -5802,13 +5802,16 @@ def _record_operator_attention(
     return True
 
 
-def _restore_rework_labels(
+def _clear_rework_execution_labels(
     client: Any,
     context: Mapping[str, Any],
 ) -> tuple[str, dict[str, Any]]:
     pr = context.get("pr")
     if not isinstance(pr, GithubPullRequest):
         raise GithubCompletionError("rework context has no pull request")
+    # ``agent-rework`` is a one-shot maintainer command, never an edge-owned
+    # state label.  Once the round has been consumed, failure/attention cleanup
+    # may clear execution/output labels but must not synthesize a new command.
     _, reason, evidence = _project_pr_lifecycle_labels(
         client,
         GithubTaskRef(
@@ -5816,8 +5819,7 @@ def _restore_rework_labels(
             int(context["issue_number"]),
         ),
         int(pr.number),
-        add=(REWORK_LABEL,),
-        remove=(WORKING_LABEL, REVIEW_READY_LABEL),
+        remove=(REWORK_LABEL, WORKING_LABEL, REVIEW_READY_LABEL),
     )
     return reason, evidence
 
@@ -6182,7 +6184,6 @@ def _normalize_stale_review_ready(
         client,
         ref,
         pr_number,
-        add=(REWORK_LABEL,),
         remove=(REVIEW_READY_LABEL,),
     )
     print(
@@ -6629,17 +6630,16 @@ def _consume_explicit_rework_retry(
             )
     except sqlite3.Error:
         pass  # non-critical; the new round is already open
-    # The request must stay visible until the dispatch claim atomically
-    # swaps it for agent-working (claim-first contract).  The self-heal
-    # already restored the label during the attention hold, so this is
-    # idempotent; a label projection failure never loses the new round.
+    # The retry comment itself is the trusted one-shot command.  Persisted
+    # ``github_pr_rework`` provenance is sufficient for the edge dispatch lane;
+    # never synthesize ``agent-rework`` as an intermediate state label.  Clear
+    # any stale lifecycle projection left by the spent round instead.
     try:
         _, label_reason, label_evidence = _project_pr_lifecycle_labels(
             client,
             ref,
             int(context["pr_number"]),
-            add=(REWORK_LABEL,),
-            remove=(WORKING_LABEL, REVIEW_READY_LABEL),
+            remove=(REWORK_LABEL, WORKING_LABEL, REVIEW_READY_LABEL),
         )
     except GithubCompletionError as exc:
         result["label_action"] = "label_projection_failed"
@@ -6985,10 +6985,10 @@ def _reconcile_rework_lifecycle(
         }
 
     # Operator recovery can move a consumed attention hold back to REVIEW.
-    # Only the current round's attention evidence plus the stale rework label
-    # authorizes this narrow retry ingress.  Normal review-ready cards and
-    # ordinary REVIEW label intake never enter this branch; a lifecycle-label
-    # conflict has already failed closed above.
+    # The durable current-round event plus a trusted retry comment authorizes
+    # this narrow ingress; ``agent-rework`` is not required because it is a
+    # one-shot maintainer command, not persistent round state.  Normal REVIEW
+    # cards without current-round attention/retry evidence simply fall through.
     # A false-terminal DONE card with an OPEN PR also accepts an explicit
     # maintainer retry (RC4, t_aff9017c incident): without this the maintainer
     # re-request is stranded because no lane owns DONE.  The DONE gate does
@@ -7001,7 +7001,6 @@ def _reconcile_rework_lifecycle(
     if (
         status in {"review", "done"}
         and context["pr"].state == "open"
-        and REWORK_LABEL in labels
         and WORKING_LABEL not in labels
     ):
         has_retry_signal = _has_fresh_retry_comment(
@@ -7011,9 +7010,11 @@ def _reconcile_rework_lifecycle(
             None if status == "done"
             else _current_rework_attention_at(conn, task_id, context["event"])
         )
-        if (has_retry_signal) or (
-            status == "review" and attention_at is not None
-        ):
+        retry_lane = (
+            (status == "done" and has_retry_signal)
+            or (status == "review" and attention_at is not None)
+        )
+        if retry_lane:
             retry_result = _consume_explicit_rework_retry(
                 conn, client, ref, decision, task_id, row, context,
                 dry_run=dry_run,
@@ -7049,8 +7050,8 @@ def _reconcile_rework_lifecycle(
         # Explicit maintainer retry (new round ingress): a fresh trusted
         # AGENT_REWORK_RETRY comment on the PR closes the held round and
         # opens a new one through the classic intake contract.  Without it
-        # the card stays BLOCKED with the attention record — the
-        # self-heal-restored agent-rework label is never retry evidence.
+        # the card stays BLOCKED with the durable attention record; no command
+        # label is synthesized by the edge.
         retry_result = _consume_explicit_rework_retry(
             conn, client, ref, decision, task_id, row, context,
             dry_run=dry_run,
@@ -7082,7 +7083,7 @@ def _reconcile_rework_lifecycle(
                     "diagnostic": _delivery_reason, "evidence": evidence,
                 }
             try:
-                label_reason, label_evidence = _restore_rework_labels(client, context)
+                label_reason, label_evidence = _clear_rework_execution_labels(client, context)
             except GithubCompletionError as exc:
                 return {
                     "task_id": task_id, "status": status, "changed": False,
@@ -7263,7 +7264,6 @@ def _reconcile_rework_lifecycle(
             try:
                 _, label_reason, label_evidence = _project_pr_lifecycle_labels(
                     client, ref, int(context["pr_number"]),
-                    add=(REWORK_LABEL,),
                     remove=(WORKING_LABEL, REVIEW_READY_LABEL),
                 )
             except GithubCompletionError as exc:
@@ -7481,7 +7481,7 @@ def _reconcile_rework_lifecycle(
                         conn, task_id, decision, context_block=context_block,
                     )
                 try:
-                    label_reason, label_evidence = _restore_rework_labels(
+                    label_reason, label_evidence = _clear_rework_execution_labels(
                         client, context,
                     )
                 except GithubCompletionError as exc:
@@ -7531,7 +7531,7 @@ def _reconcile_rework_lifecycle(
                     "diagnostic": delivery_reason, "evidence": evidence,
                 }
             try:
-                label_reason, label_evidence = _restore_rework_labels(client, context)
+                label_reason, label_evidence = _clear_rework_execution_labels(client, context)
             except GithubCompletionError as exc:
                 return {
                     "task_id": task_id, "status": status, "changed": False,
@@ -7565,7 +7565,7 @@ def _reconcile_rework_lifecycle(
                 "evidence": evidence,
             }
         try:
-            label_reason, label_evidence = _restore_rework_labels(client, context)
+            label_reason, label_evidence = _clear_rework_execution_labels(client, context)
         except GithubCompletionError as exc:
             return {
                 "task_id": task_id, "status": status, "changed": False,
@@ -8056,9 +8056,9 @@ def _dispatch_pending_rework_locked(
         if on_failure is not None:
             try:
                 on_failure(claimed, "claim_provenance_failed")
-            except Exception as projection_exc:  # noqa: BLE001 - isolate label restore failure
+            except Exception as projection_exc:  # noqa: BLE001 - isolate lifecycle cleanup failure
                 print(
-                    f"kanban-github-sync: failed to restore rework label after "
+                    f"kanban-github-sync: failed to clear rework execution labels after "
                     f"claim provenance failure (task {task_id}): "
                     f"{type(projection_exc).__name__}",
                     file=sys.stderr,
@@ -8093,9 +8093,9 @@ def _dispatch_pending_rework_locked(
             if on_failure is not None:
                 try:
                     on_failure(claimed, "claim")
-                except Exception as exc:  # noqa: BLE001 - isolate label restore failure
+                except Exception as exc:  # noqa: BLE001 - isolate lifecycle cleanup failure
                     print(
-                        f"kanban-github-sync: failed to restore rework label after claim "
+                        f"kanban-github-sync: failed to clear rework execution labels after claim "
                         f"(task {claimed.id}): {type(exc).__name__}",
                         file=sys.stderr,
                     )
@@ -8148,7 +8148,7 @@ def _dispatch_pending_rework_locked(
                 on_failure(claimed, "workspace_resolve_failed")
             except Exception as projection_exc:
                 print(
-                    f"kanban-github-sync: failed to restore rework label after workspace failure: {type(projection_exc).__name__}",
+                    f"kanban-github-sync: failed to clear rework execution labels after workspace failure: {type(projection_exc).__name__}",
                     file=sys.stderr,
                 )
         return [{
@@ -8192,7 +8192,7 @@ def _dispatch_pending_rework_locked(
                 on_failure(claimed, "spawn_failed")
             except Exception as projection_exc:
                 print(
-                    f"kanban-github-sync: failed to restore rework label after spawn failure: {type(projection_exc).__name__}",
+                    f"kanban-github-sync: failed to clear rework execution labels after spawn failure: {type(projection_exc).__name__}",
                     file=sys.stderr,
                 )
         return [{
@@ -8842,10 +8842,10 @@ def sync_board(
                 if not ctx or "_error" in ctx:
                     return
                 try:
-                    _restore_rework_labels(client, ctx)
+                    _clear_rework_execution_labels(client, ctx)
                 except GithubCompletionError as exc:
                     print(
-                        f"kanban-github-sync: failed to restore rework label after {stage} (task {claimed.id}): {type(exc).__name__}",
+                        f"kanban-github-sync: failed to clear rework execution labels after {stage} (task {claimed.id}): {type(exc).__name__}",
                         file=sys.stderr,
                     )
 

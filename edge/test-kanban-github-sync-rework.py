@@ -1541,8 +1541,8 @@ def test_56_local_commit_only_no_review_ready():
     check("human attention recorded", any(
         r.get("reason") == "rework_human_attention" for r in entries
     ), str(entries))
-    check("label retained as agent-rework",
-          fake.pr_labels.get(PR_N, []) == ["agent-rework"], str(fake.pr_labels))
+    check("consumed command is not restored",
+          fake.pr_labels.get(PR_N, []) == [], str(fake.pr_labels))
 
 
 def test_57_push_head_mismatch_no_review_ready():
@@ -1559,7 +1559,7 @@ def test_57_push_head_mismatch_no_review_ready():
     retried = [r for r in entries if r.get("reason") == "rework_retry_scheduled"]
     check("retry scheduled", len(retried) == 1, str(entries))
     check("task back to ready", task_row(tid)["status"] == "ready")
-    check("agent-rework restored", "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    check("consumed agent-rework not restored", "agent-rework" not in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
     check("retry event recorded",
           any(e["kind"] == "github_pr_rework_retry" for e in task_events(tid)), str(task_events(tid)))
 
@@ -1721,7 +1721,7 @@ def test_60c_blocked_validation_not_passed_stays_attention():
 
 
 def test_60_worker_crash_requeues_rework():
-    print("60. crashed worker -> safe requeue to agent-rework (no review-ready)")
+    print("60. crashed worker -> safe durable requeue without synthesizing agent-rework")
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     claimed = _claim_edge_rework(tid)
@@ -1741,7 +1741,7 @@ def test_60_worker_crash_requeues_rework():
     check("no review-ready", not any(r.get("reason") == "agent_review_ready" for r in entries), str(entries))
     check("retry scheduled", any(r.get("reason") == "rework_retry_scheduled" for r in entries), str(entries))
     check("task back to ready", task_row(tid)["status"] == "ready")
-    check("agent-rework restored", "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    check("consumed agent-rework not restored", "agent-rework" not in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
 
 
 def test_61_lifecycle_label_conflict_skip():
@@ -2324,8 +2324,8 @@ def test_77_stale_round1_marker_not_current_round_delivery():
         r.get("reason") == "rework_human_attention"
         and r.get("diagnostic") == "completion_handoff_missing"
         for r in entries), str(entries))
-    check("labels restored to agent-rework",
-          "agent-rework" in fake.pr_labels.get(PR_N, [])
+    check("consumed command not restored on missing current-round marker",
+          "agent-rework" not in fake.pr_labels.get(PR_N, [])
           and "agent-review-ready" not in fake.pr_labels.get(PR_N, []),
           str(fake.pr_labels))
 
@@ -2552,8 +2552,8 @@ def test_80_wrong_task_completion_marker_stays_blocked():
     check("attention comment recorded", any(
         mod.REWORK_ATTENTION_MARKER in c.body for c in comments
     ), str([c.body for c in comments]))
-    check("agent-rework label retained",
-          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    check("consumed agent-rework label absent",
+          "agent-rework" not in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
     attention = len([e for e in events if e["kind"] == "github_pr_rework_attention"])
     results2 = run_sync(fake)
     entries2 = [r for r in results2 if r.get("task_id") == tid]
@@ -2650,8 +2650,8 @@ def _post_retry_comment(
 def _attention_blocked_retry_hold() -> tuple[FakeGitHub, str]:
     """BLOCKED + clean finished run + no marker + one attention tick.
 
-    This is the fail-closed hold state: task BLOCKED, agent-rework label
-    restored by the self-heal, one ``github_pr_rework_attention`` event,
+    This is the fail-closed hold state: task BLOCKED, no synthesized
+    ``agent-rework`` command label, one ``github_pr_rework_attention`` event,
     and the old governing ``github_pr_rework`` event still present.
     """
     fake, tid = _blocked_invalid_delivery_case(marker="none")
@@ -2659,7 +2659,7 @@ def _attention_blocked_retry_hold() -> tuple[FakeGitHub, str]:
     entries = [r for r in results if r.get("task_id") == tid]
     assert any(r.get("reason") == "rework_human_attention" for r in entries), str(entries)
     assert task_row(tid)["status"] == "blocked", str(task_row(tid))
-    assert fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels)
+    assert fake.pr_labels.get(PR_N) == [], str(fake.pr_labels)
     return fake, tid
 
 
@@ -2689,8 +2689,8 @@ def test_83_blocked_attention_hold_no_auto_ready():
         ]) == attention_before, str(task_events(tid)))
         check(f"tick {i + 2} no worker spawn", not any(
             r.get("reason") == "rework_worker_spawned" for r in entries), str(entries))
-        check(f"tick {i + 2} label still agent-rework",
-              fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+        check(f"tick {i + 2} command label stays absent",
+              fake.pr_labels.get(PR_N) == [], str(fake.pr_labels))
 
 
 def test_84_stale_retry_before_attention_ignored():
@@ -2781,8 +2781,8 @@ def test_87_trusted_explicit_retry_opens_new_round():
               and p.get("rework_round") == 2
               and p.get("previous_status") == "blocked"
               and p.get("new_status") == "ready", str(p))
-    check("agent-rework kept visible until claim",
-          "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+    check("retry comment does not synthesize agent-rework",
+          "agent-rework" not in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
     # Next tick: no duplicate rework event, no re-consumption.
     events_before = len(task_events(tid))
     results2 = run_sync(fake)
@@ -2818,8 +2818,7 @@ def test_88_retry_dispatch_claim_running():
 
 
 def test_89_retry_claim_failure_keeps_request():
-    print("89. retry round claim failure -> READY kept, agent-rework retained, "
-          "no spawn, request not lost")
+    print("89. retry round claim failure -> READY kept by durable event; no command restore")
     fake, tid = _attention_blocked_retry_hold()
     _post_retry_comment(fake, tid)
     run_sync(fake)  # consumed -> ready
@@ -2835,17 +2834,18 @@ def test_89_retry_claim_failure_keeps_request():
         check("no spawn", stub.calls == [], str(stub.calls))
         check("task stays ready", task_row(tid)["status"] == "ready",
               str(task_row(tid)))
-        check("agent-rework retained", "agent-rework" in fake.pr_labels.get(PR_N, []),
-              str(fake.pr_labels))
-        # A later tick retries the claim under the same failure; the request
-        # survives and no request/event is lost.
+        check("consumed agent-rework remains absent",
+              "agent-rework" not in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
+        # A later tick retries from the durable github_pr_rework event; no
+        # synthetic command label is needed and no request/event is lost.
         results2 = _run_sync_with_dispatch(fake, stub)
         check("claim retried on next tick", any(
             r.get("reason") == "claim_failed" for r in results2), str(results2))
         check("still no spawn", stub.calls == [], str(stub.calls))
-        check("request not lost (ready + label)",
+        check("request not lost (ready + durable round)",
               task_row(tid)["status"] == "ready"
-              and "agent-rework" in fake.pr_labels.get(PR_N, []),
+              and any(e["kind"] == "github_pr_rework" for e in task_events(tid))
+              and "agent-rework" not in fake.pr_labels.get(PR_N, []),
               str(task_row(tid)))
     finally:
         kanban_db.claim_task = orig_claim
@@ -3145,8 +3145,7 @@ def _assert_recovered_review_retry_rejected(
 
 
 def test_116_operator_recovered_review_retry_opens_and_dispatches_round():
-    print("116. operator-recovered REVIEW + stale label + exact retry -> one round, "
-          "review -> ready, dispatch claim/spawn and idempotency")
+    print("116. operator-recovered REVIEW + exact retry -> durable round, dispatch and idempotency")
     fake, tid = _operator_recovered_review_retry_hold()
     retry_id = _post_retry_comment(fake, tid)
     results = run_sync(fake)
@@ -3166,8 +3165,8 @@ def test_116_operator_recovered_review_retry_opens_and_dispatches_round():
               and payload.get("retry_comment_id") == retry_id
               and payload.get("request_comment_id") == retry_id,
               str(payload))
-    check("stale agent-rework remains until claim",
-          fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+    check("stale command label cleared after retry consumption",
+          fake.pr_labels.get(PR_N) == [], str(fake.pr_labels))
 
     events_before = len(task_events(tid))
     results2 = run_sync(fake)
@@ -4037,7 +4036,7 @@ def test_102_malformed_marker_attention_posts_pr_feedback():
         (ev["payload"].get("evidence") or {}).get("missing_fields", [])) == sorted(
             ["task", "head", "validation", "request_comment"]), str(ev["payload"]))
     check("stays blocked", task_row(tid)["status"] == "blocked", str(task_row(tid)))
-    check("label agent-rework restored", fake.pr_labels.get(PR_N) == ["agent-rework"],
+    check("consumed command label not restored", fake.pr_labels.get(PR_N) == [],
           str(fake.pr_labels))
     posted = _pr_attention_comments(fake, tid, "completion_marker_malformed")
     check("PR feedback comment posted once", len(posted) == 1, str(posted))
@@ -4273,7 +4272,7 @@ def test_109_review_requested_stops_auto_requeue():
         r.get("reason") == "rework_retry_scheduled" for r in entries), str(entries))
     check("task NOT ready (human hold)", task_row(tid)["status"] != "ready",
           str(task_row(tid)))
-    check("agent-rework restored", "agent-rework" in fake.pr_labels.get(PR_N, []),
+    check("consumed agent-rework not restored", "agent-rework" not in fake.pr_labels.get(PR_N, []),
           str(fake.pr_labels))
     # Second immediate dispatcher reconciliation: still no requeue, no respawn.
     stub = StubSpawn()
@@ -4288,8 +4287,7 @@ def test_109_review_requested_stops_auto_requeue():
 
 
 def test_110_ordinary_crash_still_requeues():
-    print("110. crashed worker (outcome=crashed, no marker) -> safe requeue to "
-          "READY + agent-rework (ordinary crash is NOT review_requested)")
+    print("110. crashed worker -> READY via durable retry, without synthesizing agent-rework")
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     with connect_closing() as conn:
@@ -4309,7 +4307,7 @@ def test_110_ordinary_crash_still_requeues():
     check("requeue scheduled (crash is recoverable)", any(
         r.get("reason") == "rework_retry_scheduled" for r in entries), str(entries))
     check("back to ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
-    check("agent-rework restored", "agent-rework" in fake.pr_labels.get(PR_N, []),
+    check("consumed agent-rework not restored", "agent-rework" not in fake.pr_labels.get(PR_N, []),
           str(fake.pr_labels))
     check("no review-ready", not any(r.get("reason") == "agent_review_ready"
                                      for r in entries), str(entries))
@@ -4361,8 +4359,7 @@ def test_112_malformed_marker_still_fail_closed():
 
 
 def test_113_claim_failure_label_recoverable():
-    print("113. claim failure -> task stays READY, agent-rework label retained, "
-          "no spawn (recoverable on next tick)")
+    print("113. claim failure -> task stays READY; durable round retries without label restore")
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws113-"))
@@ -4386,7 +4383,7 @@ def test_113_claim_failure_label_recoverable():
         os.environ.pop(mod.REWORK_DISPATCH_ENV, None)
     check("no spawn on claim failure", stub.calls == [], str(stub.calls))
     check("task stays ready", task_row(tid)["status"] == "ready", str(task_row(tid)))
-    check("agent-rework retained (recoverable)",
+    check("human command remains only if claim never consumed it",
           "agent-rework" in fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
 
 
@@ -4660,8 +4657,8 @@ def test_120_done_open_pr_incomplete_delivery_repairs_to_review():
         r.get("reason") == "rework_human_attention"
         and r.get("diagnostic") == "completion_marker_malformed"
         for r in entries), str(entries))
-    check("120: agent-rework retained for explicit retry",
-          fake.pr_labels.get(PR_N, []) == ["agent-rework"], str(fake.pr_labels))
+    check("120: consumed command is not restored",
+          fake.pr_labels.get(PR_N, []) == [], str(fake.pr_labels))
     check("120: no review-ready projection", "agent-review-ready" not in
           fake.pr_labels.get(PR_N, []), str(fake.pr_labels))
     row = task_row(tid)
@@ -4862,7 +4859,7 @@ def test_125_claim_patch_failure_is_durable_and_retries_once():
 
 
 def test_126_claim_readback_failure_is_durable_and_retries_once():
-    print("126. stale claim read-back -> durable evidence, READY + rework, later one-shot retry")
+    print("126. stale claim read-back -> durable evidence, READY without command restore, later retry")
     fake = fresh_env()
     tid = _rework_ready_task(fake)
     _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws126-"))
@@ -4878,7 +4875,7 @@ def test_126_claim_readback_failure_is_durable_and_retries_once():
     check("126: no spawn on read-back failure", stub.calls == [], str(failed_results))
     check("126: task reclaimed READY", task_row(tid)["status"] == "ready",
           str(task_row(tid)))
-    check("126: agent-rework restored", fake.pr_labels[PR_N] == ["agent-rework"],
+    check("126: consumed command not restored", fake.pr_labels[PR_N] == [],
           str(fake.pr_labels))
     check("126: exactly one durable failure event", len(failures) == 1,
           str(task_events(tid)))
@@ -5137,8 +5134,8 @@ def test_done_open_conflicting_rework_labels_missing_delivery_attention():
         and event["payload"].get("diagnostic") == "delivery_run_missing"
         for event in events
     ), str(events))
-    check("conflict-shape: retry-visible labels restored",
-          fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
+    check("conflict-shape: no command label synthesized",
+          fake.pr_labels.get(PR_N) == [], str(fake.pr_labels))
     check("conflict-shape: GitHub attention feedback posted", len(attention_posts) == 1
           and f"{mod.REWORK_ATTENTION_MARKER} task={tid} "
           "reason=delivery_run_missing" in str(attention_posts[0].get("body")),
@@ -5194,9 +5191,9 @@ def test_done_open_without_current_round_delivery_never_projects_review_ready():
     check("missing-delivery: no review-ready result", not any(
         item.get("reason") == "agent_review_ready" for item in entries),
         str(entries))
-    check("missing-delivery: no review-ready label and rework retained",
+    check("missing-delivery: no review-ready and no command label synthesized",
           "agent-review-ready" not in fake.pr_labels.get(PR_N, [])
-          and "agent-rework" in fake.pr_labels.get(PR_N, []),
+          and "agent-rework" not in fake.pr_labels.get(PR_N, []),
           str(fake.pr_labels))
     check("missing-delivery: no forged delivery event", not any(
         item["kind"] == "github_pr_rework_delivery" for item in events),
