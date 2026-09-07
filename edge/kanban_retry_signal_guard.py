@@ -262,7 +262,7 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
     })
 
     def _run_metadata(run: Any) -> dict[str, Any]:
-        if run is None or "metadata" not in run.keys():
+        if run is None:
             return {}
         return _json_payload(run["metadata"])
 
@@ -358,6 +358,14 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
         rework_at: int,
         rework_round: Any,
     ) -> bool:
+        if (
+            not isinstance(rework_at, int)
+            or isinstance(rework_at, bool)
+            or not isinstance(rework_round, int)
+            or isinstance(rework_round, bool)
+            or rework_round <= 0
+        ):
+            return False
         rows = conn.execute(
             "SELECT run_id, payload FROM task_events "
             "WHERE task_id = ? AND kind = ? ORDER BY id ASC",
@@ -371,14 +379,21 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
                 continue
             if payload.get("phase") not in {"claimed", "spawned"}:
                 continue
-            try:
-                if int(str(payload.get("rework_event_at"))) != int(rework_at):
-                    continue
-                if int(str(payload.get("rework_round"))) != int(rework_round):
-                    continue
-            except (TypeError, ValueError):
+            payload_event_at = payload.get("rework_event_at")
+            payload_round = payload.get("rework_round")
+            payload_run_id = payload.get("run_id")
+            if (
+                not isinstance(payload_event_at, int)
+                or isinstance(payload_event_at, bool)
+                or payload_event_at != int(rework_at)
+                or not isinstance(payload_round, int)
+                or isinstance(payload_round, bool)
+                or payload_round != int(rework_round)
+                or not isinstance(payload_run_id, int)
+                or isinstance(payload_run_id, bool)
+            ):
                 continue
-            if row["run_id"] is None:
+            if row["run_id"] is None or int(row["run_id"]) != payload_run_id:
                 continue
             return True
         return False
@@ -410,7 +425,7 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
     def _is_current_round_task(row: Any, rework_at: int) -> bool:
         completed_at = row["completed_at"]
         return (
-            str(row["status"] or "") in {"done", "archived"}
+            str(row["status"] or "").casefold() in {"done", "archived"}
             and completed_at is not None
             and int(completed_at) >= int(rework_at)
         )
@@ -423,14 +438,14 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
         """Select the newest direct reviewer and its current-round PASS run."""
         parents = _direct_parent_rows(conn, task_id)
         if not parents or any(
-            str(row["status"] or "") not in {"done", "archived"}
+            str(row["status"] or "").casefold() not in {"done", "archived"}
             for row in parents
         ):
             return None
         reviewers = [
             row for row in parents
             if _is_current_round_task(row, rework_at)
-            and "review" in f"{row['assignee'] or ''} {row['title'] or ''}".casefold()
+            and str(row["assignee"] or "").casefold() == "kanban-reviewer"
         ]
         if not reviewers:
             return None
@@ -443,31 +458,41 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
             "FROM task_runs WHERE task_id = ? ORDER BY id DESC",
             (str(reviewer["id"]),),
         ).fetchall()
-        for run in runs:
-            if run["ended_at"] is None or run["started_at"] is None:
-                continue
-            if int(run["started_at"]) < int(rework_at):
-                continue
-            if int(run["ended_at"]) < int(rework_at):
-                continue
-            if str(run["outcome"] or "") not in {"completed", "done"}:
-                continue
-            summary = str(run["summary"] or "")
-            if re.search(r"(?<![A-Z0-9_])PASS(?![A-Z0-9_])", summary.upper()) is None:
-                continue
-            heads = {
-                head for head in core._rework_head_candidates(run)
-                if re.fullmatch(r"[0-9a-f]{40}", head)
-            }
-            if not heads:
-                continue
-            return {
-                "reviewer_task_id": str(reviewer["id"]),
-                "reviewer_run_id": int(run["id"]),
-                "reviewer_completed_at": int(reviewer["completed_at"]),
-                "head_candidates": heads,
-            }
-        return None
+        if not runs:
+            return None
+        run = runs[0]
+        if run["ended_at"] is None or run["started_at"] is None:
+            return None
+        if int(run["started_at"]) < int(rework_at) or int(run["ended_at"]) < int(rework_at):
+            return None
+        if str(run["outcome"] or "") not in {"completed", "done"}:
+            return None
+        metadata = _run_metadata(run)
+        verdict = metadata.get("verdict")
+        if verdict is not None:
+            passed = isinstance(verdict, str) and verdict.strip().casefold() == "pass"
+        else:
+            passed = re.search(
+                r"(?<![A-Z0-9_])PASS(?![A-Z0-9_])",
+                str(run["summary"] or ""),
+                re.IGNORECASE,
+            ) is not None
+        if not passed:
+            return None
+        heads = {
+            head.casefold()
+            for head in core._rework_head_candidates(run)
+            if re.fullmatch(r"[0-9a-fA-F]{40}", head)
+        }
+        if len(heads) != 1:
+            return None
+        return {
+            "reviewer_task_id": str(reviewer["id"]),
+            "reviewer_run_id": int(run["id"]),
+            "reviewer_completed_at": int(reviewer["completed_at"]),
+            "reviewer_run_ended_at": int(run["ended_at"]),
+            "head_candidates": heads,
+        }
 
     def _latest_current_round_developer_validation(
         conn: Any,
@@ -479,42 +504,44 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
         developers = [
             row for row in _ancestor_rows(conn, reviewer_task_id)
             if _is_current_round_task(row, rework_at)
-            and "developer" in f"{row['assignee'] or ''} {row['title'] or ''}".casefold()
+            and str(row["assignee"] or "").casefold() == "kanban-developer"
         ]
-        developers.sort(
+        if not developers:
+            return None
+        developer = max(
+            developers,
             key=lambda row: (int(row["completed_at"] or 0), str(row["id"])),
-            reverse=True,
         )
-        for developer in developers:
-            runs = conn.execute(
-                "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
-                "FROM task_runs WHERE task_id = ? ORDER BY id DESC",
-                (str(developer["id"]),),
-            ).fetchall()
-            for run in runs:
-                if run["ended_at"] is None or run["started_at"] is None:
-                    continue
-                if int(run["started_at"]) < int(rework_at):
-                    continue
-                if int(run["ended_at"]) < int(rework_at):
-                    continue
-                if str(run["outcome"] or "") not in {"completed", "done"}:
-                    continue
-                metadata = _run_metadata(run)
-                if metadata.get("validation") != "passed":
-                    continue
-                heads = _metadata_head_candidates(run)
-                matching_heads = heads & reviewer_heads
-                if not matching_heads:
-                    continue
-                return {
-                    "run": run,
-                    "developer_task_id": str(developer["id"]),
-                    "developer_run_id": int(run["id"]),
-                    "head_candidates": heads,
-                    "matching_heads": matching_heads,
-                }
-        return None
+        runs = conn.execute(
+            "SELECT id, status, outcome, summary, error, metadata, started_at, ended_at "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+            (str(developer["id"]),),
+        ).fetchall()
+        if not runs:
+            return None
+        run = runs[0]
+        if run["ended_at"] is None or run["started_at"] is None:
+            return None
+        if int(run["started_at"]) < int(rework_at) or int(run["ended_at"]) < int(rework_at):
+            return None
+        if str(run["outcome"] or "").casefold() not in {"completed", "done"}:
+            return None
+        metadata = _run_metadata(run)
+        if metadata.get("validation") != "passed":
+            return None
+        heads = _metadata_head_candidates(run)
+        if len(heads) != 1:
+            return None
+        matching_heads = heads & reviewer_heads
+        if len(matching_heads) != 1:
+            return None
+        return {
+            "run": run,
+            "developer_task_id": str(developer["id"]),
+            "developer_run_id": int(run["id"]),
+            "head_candidates": heads,
+            "matching_heads": matching_heads,
+        }
 
     def _latest_clean_lead_run(
         conn: Any,
@@ -528,14 +555,16 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
             "FROM task_runs WHERE task_id = ? AND started_at >= ? ORDER BY id DESC",
             (task_id, int(rework_at)),
         ).fetchall()
-        for run in runs:
-            if run["ended_at"] is None:
-                continue
-            if int(run["ended_at"]) < int(reviewer_completed_at):
-                continue
-            if str(run["outcome"] or "") in {"completed", "done"}:
-                return run
-        return None
+        if not runs:
+            return None
+        run = runs[0]
+        if run["ended_at"] is None:
+            return None
+        if int(run["ended_at"]) < int(reviewer_completed_at):
+            return None
+        if str(run["outcome"] or "") not in {"completed", "done"}:
+            return None
+        return run
 
     def _specialist_delivery_candidate(
         conn: Any,
@@ -544,10 +573,39 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
         rework_round: Any,
         requested_head: str,
     ) -> tuple[Any, dict[str, Any]] | None:
-        if re.fullmatch(r"[0-9a-f]{40}", requested_head) is None:
+        if re.fullmatch(r"[0-9a-fA-F]{40}", requested_head) is None:
             return None
         if not _has_round_bootstrap(conn, task_id, rework_at, rework_round):
             return None
+
+        # The canonical module now performs the same graph/run selection.  Use
+        # that implementation when deployed, while retaining the local
+        # fallback for isolated compatibility tests and older core modules.
+        canonical_selector = getattr(core, "_specialist_graph_delivery_candidate", None)
+        if callable(canonical_selector):
+            try:
+                round_number = int(rework_round)
+            except (TypeError, ValueError):
+                return None
+            selected = canonical_selector(conn, task_id, int(rework_at), round_number)
+            if not isinstance(selected, tuple) or len(selected) != 2:
+                return None
+            run, specialist = selected
+            if not isinstance(specialist, dict):
+                return None
+            head = str(specialist.get("head_sha") or "").casefold()
+            if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+                return None
+            return run, {
+                "developer_task_id": specialist.get("developer_task_id"),
+                "developer_run_id": specialist.get("developer_run_id"),
+                "lead_run_id": specialist.get("lead_run_id"),
+                "reviewer_task_id": specialist.get("reviewer_task_id"),
+                "reviewer_run_id": specialist.get("reviewer_run_id"),
+                "reviewer_completed_at": specialist.get("reviewer_completed_at"),
+                "head": head,
+            }
+
         reviewer = _latest_current_round_reviewer_pass(
             conn, task_id, rework_at
         )
@@ -613,7 +671,15 @@ def install_rework_delivery_provenance_guard(core: Any) -> Any:
             # provisional run.  Specialist evidence is authoritative once
             # the current-round graph has passed all of its gates.
             return candidate[0]
-        if direct is None:
+        if (
+            direct is not None
+            and direct["ended_at"] is not None
+            and str(direct["outcome"] or "") in {"completed", "done"}
+            and not _has_round_bootstrap(conn, task_id, rework_at, rework_round)
+        ):
+            # A completed run without an edge claim is not delivery evidence;
+            # in particular, do not let the canonical graph fallback bypass
+            # this overlay's ownership gate.
             return None
         return direct
 
