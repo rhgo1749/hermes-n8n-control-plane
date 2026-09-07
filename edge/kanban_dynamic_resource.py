@@ -37,6 +37,7 @@ import io
 import ipaddress
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -1229,6 +1230,58 @@ def _install_cli_dispatch_overlay() -> None:
     setattr(cli_module, "_cmd_dispatch", guarded_cmd_dispatch)
 
 
+_REWORK_MARKER_RE = re.compile(
+    r"(rework|재작업|bounded\s+(developer\s+)?rework|DEV\s+Round|round[-_ ]?\d+)",
+    re.IGNORECASE,
+)
+_INTAKE_MARKER_RE = re.compile(r"GitHub Issue intake", re.IGNORECASE)
+
+
+def _install_respawn_guard_overlay() -> None:
+    """Waive active_pr respawn guard for rework/unrun tasks in the dispatcher."""
+    try:
+        from hermes_cli import kanban_db_dispatch as kbd
+
+        orig = getattr(kbd, "check_respawn_guard", None)
+        if not callable(orig) or getattr(orig, "_h4v3_rework_respawn_overlay_installed", False):
+            return
+
+        def guarded_check_respawn_guard(
+            conn: sqlite3.Connection,
+            task_id: str,
+            *,
+            lane: str = "ready",
+        ) -> Optional[str]:
+            reason = orig(conn, task_id, lane=lane)
+            if reason == "active_pr":
+                try:
+                    row = conn.execute(
+                        "SELECT title, body FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if row is not None:
+                        title = str(row[0] or "")
+                        body = str(row[1] or "")
+                        if not _INTAKE_MARKER_RE.search(title):
+                            if _REWORK_MARKER_RE.search(f"{title}\n{body}"):
+                                return None
+                            runs_row = conn.execute(
+                                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+                                (task_id,),
+                            ).fetchone()
+                            if runs_row and runs_row[0] == 0:
+                                return None
+                except Exception:
+                    pass
+            return cast(Optional[str], reason)
+
+        guarded_check_respawn_guard._h4v3_rework_respawn_overlay_installed = True  # type: ignore[attr-defined]
+        guarded_check_respawn_guard._h4v3_rework_respawn_overlay_orig = orig  # type: ignore[attr-defined]
+        setattr(kbd, "check_respawn_guard", guarded_check_respawn_guard)
+    except Exception:
+        pass
+
+
 def install_core_claim_admission(kanban_db: Any, admission_module: Any) -> None:
     """Gate normal READY/REVIEW claims with the same resource policies.
 
@@ -1241,6 +1294,7 @@ def install_core_claim_admission(kanban_db: Any, admission_module: Any) -> None:
     _install_resource_health_probes(kanban_db, admission_module)
     _install_dispatch_overlay(kanban_db, admission_module)
     _install_cli_dispatch_overlay()
+    _install_respawn_guard_overlay()
 
     for attr in ("claim_task", "claim_review_task"):
         original = getattr(kanban_db, attr, None)
@@ -1407,5 +1461,6 @@ def install_everywhere(admission_module: Any, kanban_db: Any | None = None) -> N
     """Install dynamic matching + corrected helpers, optionally core gating."""
     install_dynamic_resource_policy(admission_module)
     install_cross_board_helpers(admission_module)
+    _install_respawn_guard_overlay()
     if kanban_db is not None:
         install_core_claim_admission(kanban_db, admission_module)

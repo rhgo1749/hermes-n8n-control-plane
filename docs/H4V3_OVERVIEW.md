@@ -184,7 +184,8 @@ Independent from the n8n service-auth installer: `configure-hermes-service-auth.
 never installs the Overview, so an Overview failure cannot block legacy service-auth
 provisioning. The installer validates the backend (`py_compile`), installs the
 plugin into `$HERMES_HOME/plugins/h4v3-overview/` atomically (previous version
-kept as `h4v3-overview.bak-<ts>`), and runs
+kept outside the plugin scan root at
+`$HERMES_HOME/plugin-backups/h4v3-overview/h4v3-overview.bak-<ts>`), and runs
 `hermes plugins enable h4v3-overview --no-allow-tool-override` (dashboard
 plugins only load when enabled). Restart the existing Hermes dashboard with
 its current supervisor, then open the **H4V3 Overview** tab.
@@ -225,7 +226,7 @@ overwritten in place; the plugin enablement flag is untouched).
 Overview:
 
 ```bash
-mv "$HERMES_HOME/plugins/h4v3-overview.bak-<ts>" "$HERMES_HOME/plugins/h4v3-overview"
+mv "$HERMES_HOME/plugin-backups/h4v3-overview/h4v3-overview.bak-<ts>" "$HERMES_HOME/plugins/h4v3-overview"
 hermes plugins disable h4v3-overview   # 또는 enable 유지 후 재시작
 ```
 

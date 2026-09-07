@@ -1,4 +1,16 @@
 # Host-specific n8n configuration and durable runtime data
+.env
+.env.local
+.env.*.local
+automation/n8n/state/
+automation/n8n/secrets/
+.n8n/
+
+# Runtime logs and local databases
+*.log
+*.db
+*.sqlite
+*.sqlite3
 
 # Generated or local Python state
 __pycache__/
@@ -8,4 +20,6 @@ __pycache__/
 # Never track bearer credentials or local copies of them
 *.token
 *.secret
+*.pem
+*.key
 .n8n-cron-token

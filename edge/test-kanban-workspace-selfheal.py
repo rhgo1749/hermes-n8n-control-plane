@@ -64,6 +64,19 @@ def make_db(path: Path) -> sqlite3.Connection:
             payload TEXT,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT,
+            ended_at INTEGER,
+            outcome TEXT
+        );
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT,
+            author TEXT,
+            body TEXT,
+            created_at INTEGER NOT NULL
+        );
         """
     )
     return conn
@@ -256,6 +269,75 @@ def main() -> int:
     ).fetchall()
     vals = [(r["created_at"], r["id"]) for r in ordered]
     check("ordering consumer sees ascending (created_at, id)", vals == sorted(vals))
+
+    # --- active_pr comment drift self-healing regressions ---
+    db_c = tmp / "comments.db"
+    cc = make_db(db_c)
+    # 1. Bounded rework task with raw PR URL in comment (incident shape)
+    insert(cc, "t_rework_c", "Issue #104 bounded rework: incomplete rework identity on PR #129",
+           body="Bounded rework of existing PR #129 only")
+    cc.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('t_rework_c', 'kanban-main', "
+        "'Source Issue: #104. Existing PR #129: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/129.', 100)"
+    )
+    # 2. Unrun implementation task with PR URL in contract comment
+    insert(cc, "t_unrun_c", "구현: Issue #105 신규 기능")
+    cc.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('t_unrun_c', 'kanban-main', "
+        "'Spec reference: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/125', 100)"
+    )
+    # 3. Intake root card with PR URL (must NOT be touched)
+    insert(cc, "t_intake_c", "GitHub Issue intake: rhgo1749/hermes-n8n-control-plane#104")
+    cc.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('t_intake_c', 'github-issue-intake', "
+        "'PR: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/129', 100)"
+    )
+    # 4. Impl card that actually ran and opened a PR (must NOT be touched - genuine active_pr)
+    insert(cc, "t_ran_c", "구현: Issue #106 일반 기능")
+    cc.execute("INSERT INTO task_runs (task_id, ended_at, outcome) VALUES ('t_ran_c', 1000, 'completed')")
+    cc.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('t_ran_c', 'kanban-developer', "
+        "'Opened PR: https://github.com/rhgo1749/hermes-n8n-control-plane/pull/129', 100)"
+    )
+
+    # Dry-run preview observation
+    prev_c = admission.preview_workspace_drift(cc, "test-board")
+    prev_c_map = {e.get("task_id"): e for e in prev_c if e.get("reason") == "comment_active_pr_selfhealed"}
+    check("preview predicts rework comment selfheal", "t_rework_c" in prev_c_map and prev_c_map["t_rework_c"]["predicted"] is True)
+    check("preview predicts unrun impl comment selfheal", "t_unrun_c" in prev_c_map)
+    check("preview never touches intake root", "t_intake_c" not in prev_c_map)
+    check("preview never touches ran impl task", "t_ran_c" not in prev_c_map)
+
+    # Real repair run
+    repaired_c = admission.repair_workspace_drift(cc, None, "test-board")
+    rep_c_map = {e.get("task_id"): e for e in repaired_c if e.get("reason") == "comment_active_pr_selfhealed"}
+    check("rework task comment repaired", "t_rework_c" in rep_c_map and rep_c_map["t_rework_c"]["changed"] is True)
+    check("unrun task comment repaired", "t_unrun_c" in rep_c_map and rep_c_map["t_unrun_c"]["changed"] is True)
+
+    # Verify sanitized content
+    row_rework = cc.execute("SELECT body FROM task_comments WHERE task_id = 't_rework_c'").fetchone()
+    check("rework comment sanitized to owner/repo#pr", "rhgo1749/hermes-n8n-control-plane#129" in row_rework["body"] and "https://github.com" not in row_rework["body"])
+    row_unrun = cc.execute("SELECT body FROM task_comments WHERE task_id = 't_unrun_c'").fetchone()
+    check("unrun comment sanitized to owner/repo#pr", "rhgo1749/hermes-n8n-control-plane#125" in row_unrun["body"])
+
+    # Verify intake and ran cards were NOT modified
+    row_intake = cc.execute("SELECT body FROM task_comments WHERE task_id = 't_intake_c'").fetchone()
+    check("intake comment kept raw PR URL", "https://github.com/rhgo1749/hermes-n8n-control-plane/pull/129" in row_intake["body"])
+    row_ran = cc.execute("SELECT body FROM task_comments WHERE task_id = 't_ran_c'").fetchone()
+    check("ran impl comment kept raw PR URL", "https://github.com/rhgo1749/hermes-n8n-control-plane/pull/129" in row_ran["body"])
+
+    # Verify audit event
+    ev_c = cc.execute("SELECT kind, payload FROM task_events WHERE task_id = 't_rework_c' AND kind = 'comment_repaired'").fetchone()
+    check("comment_repaired audit event recorded", ev_c is not None and "active_pr_comment_selfheal" in ev_c["payload"])
+
+    # Idempotence: second repair run produces 0 comment repairs
+    repaired_c2 = admission.repair_workspace_drift(cc, None, "test-board")
+    rep_c_map2 = {e.get("task_id"): e for e in repaired_c2 if e.get("reason") == "comment_active_pr_selfhealed"}
+    check("second comment repair pass is idempotent", len(rep_c_map2) == 0)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0

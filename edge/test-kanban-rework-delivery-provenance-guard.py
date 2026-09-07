@@ -319,6 +319,36 @@ def test_retry_identity_mismatch_does_not_rebind_to_old_round():
     assert evidence["rework_at"] == 200
 
 
+def test_delivery_evidence_forwards_kwargs_and_open_pr_count():
+    conn = make_db()
+    core = make_core()
+
+    observed_kwargs = {}
+
+    def mock_original_delivery(conn, client, ref, task_id, pr, event, *args, **kwargs):
+        observed_kwargs.update(kwargs)
+        return False, "rework_head_unchanged", {"head": HEAD}
+
+    core._rework_delivery_evidence = mock_original_delivery
+    core._rework_delivery_provenance_guard_installed = False
+    install_rework_delivery_provenance_guard(core)
+
+    core._rework_delivery_evidence(
+        conn,
+        object(),
+        SimpleNamespace(repository="rhgo1749/ctrl-hangul", issue_number=100),
+        TASK,
+        SimpleNamespace(number=103, head_sha=HEAD),
+        retry_event(conn),
+        open_pr_count=2,
+        allow_edge_creation=False,
+        custom_extra="test",
+    )
+    assert observed_kwargs.get("open_pr_count") == 2
+    assert observed_kwargs.get("allow_edge_creation") is False
+    assert observed_kwargs.get("custom_extra") == "test"
+
+
 def test_install_is_idempotent():
     core = make_core()
     first_task_reader = core._task_run_after_rework
@@ -337,6 +367,7 @@ if __name__ == "__main__":
         test_missing_edge_bootstrap_never_inherits_ordinary_completed_run,
         test_latest_current_round_reviewer_must_pass_exact_head,
         test_retry_identity_mismatch_does_not_rebind_to_old_round,
+        test_delivery_evidence_forwards_kwargs_and_open_pr_count,
         test_install_is_idempotent,
     ]
     for test in tests:

@@ -338,6 +338,43 @@ def test_stray_archived_db_does_not_poison_admission() -> None:
         archived_conn.close()
 
 
+def test_respawn_guard_overlay_waives_rework_active_pr() -> None:
+    """Regression: respawn guard overlay must waive active_pr for rework/unrun tasks,
+    while keeping active_pr intact for intake roots and previously-run impl tasks."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, last_failure_error TEXT)")
+    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, ended_at INTEGER, outcome TEXT)")
+    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at INTEGER)")
+    conn.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, created_at INTEGER, body TEXT)")
+
+    # 1. Intake card with PR URL
+    conn.execute("INSERT INTO tasks VALUES ('t_intake', 'GitHub Issue intake: test#104', 'body', NULL)")
+    conn.execute("INSERT INTO task_comments VALUES (1, 't_intake', 2000000000, 'PR: https://github.com/foo/bar/pull/1')")
+
+    # 2. Impl card that ran outside window and opened a PR
+    conn.execute("INSERT INTO tasks VALUES ('t_impl', 'Implement feature X', 'body', NULL)")
+    conn.execute("INSERT INTO task_runs VALUES (1, 't_impl', 1000, 'completed')")
+    conn.execute("INSERT INTO task_comments VALUES (2, 't_impl', 2000000000, 'PR: https://github.com/foo/bar/pull/1')")
+
+    # 3. Bounded rework card with PR URL (incident shape)
+    conn.execute("INSERT INTO tasks VALUES ('t_rework', 'Issue #104 bounded rework: fix PR #129', 'Bounded rework of existing PR #129', NULL)")
+    conn.execute("INSERT INTO task_comments VALUES (3, 't_rework', 2000000000, 'Existing PR: https://github.com/foo/bar/pull/129')")
+
+    # 4. Unrun impl card with PR URL in spec
+    conn.execute("INSERT INTO tasks VALUES ('t_unrun', '구현: Issue #105 spec', 'body', NULL)")
+    conn.execute("INSERT INTO task_comments VALUES (4, 't_unrun', 2000000000, 'Spec PR: https://github.com/foo/bar/pull/125')")
+
+    dynamic._install_respawn_guard_overlay()
+
+    check("intake root active_pr remains intact", kbd.check_respawn_guard(conn, "t_intake") == "active_pr")
+    check("ran impl task active_pr remains intact", kbd.check_respawn_guard(conn, "t_impl") == "active_pr")
+    check("rework task active_pr is waived", kbd.check_respawn_guard(conn, "t_rework") is None)
+    check("unrun impl task active_pr is waived", kbd.check_respawn_guard(conn, "t_unrun") is None)
+
+
 def main() -> int:
     test_same_profile_changes_resource_with_backend()
     test_legacy_policy_remains_assignee_only()
@@ -345,6 +382,7 @@ def main() -> int:
     test_core_claim_gate_separates_local_from_cloud()
     test_local_claim_becomes_cross_board_reservation()
     test_stray_archived_db_does_not_poison_admission()
+    test_respawn_guard_overlay_waives_rework_active_pr()
     print(f"\n{len(PASS)} passed; {len(FAIL)} failed")
     return 1 if FAIL else 0
 

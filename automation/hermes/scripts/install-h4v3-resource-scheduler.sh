@@ -60,6 +60,7 @@ python3 -m py_compile \
   }
 
 TARGET_PLUGIN="$HERMES_HOME/plugins/h4v3-resource-scheduler"
+PLUGIN_BACKUP_ROOT="$HERMES_HOME/plugin-backups/h4v3-resource-scheduler"
 TARGET_ADMISSION="$HERMES_HOME/scripts/kanban_resource_admission.py"
 TARGET_DYNAMIC="$HERMES_HOME/scripts/kanban_dynamic_resource.py"
 
@@ -93,7 +94,8 @@ install_script "$ADMISSION_SOURCE" "$TARGET_ADMISSION"
 install_script "$DYNAMIC_SOURCE" "$TARGET_DYNAMIC"
 
 if [[ -d "$TARGET_PLUGIN" ]]; then
-  backup="${TARGET_PLUGIN}.bak-${TS}"
+  install -d -m 700 "$PLUGIN_BACKUP_ROOT"
+  backup="$PLUGIN_BACKUP_ROOT/h4v3-resource-scheduler.bak-${TS}"
   mv "$TARGET_PLUGIN" "$backup"
   BACKUPS+=("$backup")
 fi
