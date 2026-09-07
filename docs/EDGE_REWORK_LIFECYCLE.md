@@ -73,6 +73,41 @@ Rules:
   never a rework owner: the label projection keeps `agent-review-ready` and
   never downgrades to `agent-working`.
 
+### Specialist-graph delivery inheritance (Issue #133)
+
+The lead task's `task_links` graph is append-only, so a historical reviewer
+may remain a direct parent after a fresh rework graph is created.  Delivery
+selection therefore follows durable graph and run evidence instead of treating
+every direct parent as belonging to the current round:
+
+1. Every direct parent must be terminal, but only an exact
+   `kanban-reviewer` parent with `completed_at >= rework_event_at` is a
+   current-round reviewer candidate.  The newest candidate is selected by
+   `(completed_at, task_id)`; an older direct reviewer cannot veto it.
+2. The selected reviewer's newest current-round terminal run must carry an
+   explicit `PASS` verdict (structured `metadata.verdict` or a standalone
+   `PASS` token) and an unambiguous full 40-character head attestation.
+3. A current developer ancestor must be an exact `kanban-developer` task with
+   terminal completion and a current-round terminal run whose metadata says
+   `validation=passed`.  Its metadata head must equal the reviewer's head.
+4. The lead run must be terminal and end after the specialist review.  The
+   deployed edge overlay additionally requires a run-linked dispatch
+   provenance event for the same rework round before inheriting the developer
+   run as delivery evidence.
+
+5. A graph with a developer ancestor must also have the governing
+   `github_pr_rework`/retry event for the requested round.  If that event is
+   missing or belongs to another round, timestamp-matching specialist runs are
+   not reused; the candidate is rejected.  The older reviewer-direct
+   compatibility shape remains available only when no developer ancestor is
+   present.
+
+Titles, substring role matches, stale reviewer runs, mismatched heads, and
+incomplete or ambiguous attestations are never sufficient.  Persisted
+reviewer-direct graphs without a developer ancestor remain readable through
+the compatibility path, but newly chained developer/reviewer graphs require
+the developer validation attestation above.
+
 ## Block-kind gate and blocked read projection (Issue #92)
 
 Hermes core retains its backwards-compatible nullable `kanban_block(kind=...)`
