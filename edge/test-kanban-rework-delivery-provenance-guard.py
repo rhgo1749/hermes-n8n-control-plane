@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 from kanban_retry_signal_guard import install_rework_delivery_provenance_guard
 
-
 HEAD = "7d575644fef2ed40a6473e75a9c03ab2a991673a"
 TASK = "t_ac34f08d"
 

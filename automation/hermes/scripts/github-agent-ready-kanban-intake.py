@@ -3327,6 +3327,10 @@ _HUMAN_ATTENTION_REASONS = frozenset({
     "dispatch_lock_failed",
     "dispatch_lock_unavailable",
 })
+_BOARD_GLOBAL_ATTENTION_REASONS = frozenset({
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
+})
 _HUMAN_ATTENTION_TEXT_MARKERS = (
     "needs_input",
     "needs maintainer",
@@ -3393,14 +3397,44 @@ def _truncate_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
+def _entry_attention_key(entry: dict[str, Any]) -> str | None:
+    """Return the edge's semantic identity for notification dedupe."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if isinstance(value, dict) and value.get("attention_key"):
+            return str(value["attention_key"])
+    return None
+
+
+def _board_global_attention_board(entry: dict[str, Any]) -> str | None:
+    """Return a verified board scope for an unresolved board-level alert."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if not isinstance(value, dict):
+            continue
+        reason = str(value.get("reason") or "")
+        provenance = value.get("incident_provenance")
+        if (
+            reason in _BOARD_GLOBAL_ATTENTION_REASONS
+            and value.get("incident_unresolved") is True
+            and isinstance(provenance, dict)
+            and provenance.get("source") == "board_context"
+        ):
+            board = str(provenance.get("board") or entry.get("board") or "").strip()
+            if board:
+                return board
+    return None
+
+
 def _attention_notification_line(
     board: str,
     short_name: str,
-    issue_number: int,
+    issue_number: int | None,
     entry: dict[str, Any],
 ) -> str:
     reason = _entry_attention_reason(entry) or "human_attention_required"
-    line = f"⚠️ [{board}] {short_name} #{issue_number} · 확인 필요"
+    subject = f"#{issue_number}" if issue_number is not None else "board"
+    line = f"⚠️ [{board}] {short_name} {subject} · 확인 필요"
     pr_number = _entry_pr_number(entry)
     if pr_number is not None:
         line += f" (PR #{pr_number})"
@@ -3408,6 +3442,11 @@ def _attention_notification_line(
     title = str(entry.get("issue_title") or "").strip()
     if title:
         line += f" — {_truncate_title(title)}"
+    attention_key = _entry_attention_key(entry)
+    if attention_key is not None:
+        # Keep the exact edge identity at the end of the delivered body so
+        # title/reason punctuation cannot make extraction ambiguous.
+        line += f" · incident={attention_key}"
     return line
 
 
@@ -3470,10 +3509,13 @@ def _entry_attention_reason(entry: dict[str, Any]) -> str | None:
 
 def _should_notify_entry(entry: dict[str, Any]) -> bool:
     """Apply the suppress/send policy to one sync result."""
+    attention_reason = _entry_attention_reason(entry)
+    if attention_reason is not None:
+        if attention_reason in _BOARD_GLOBAL_ATTENTION_REASONS:
+            return _board_global_attention_board(entry) is not None
+        return bool(entry.get("repository") and entry.get("issue_number"))
     if not entry.get("repository") or not entry.get("issue_number"):
         return False
-    if _entry_attention_reason(entry) is not None:
-        return True
     if not entry.get("changed"):
         return False
     transition = (str(entry.get("from_state") or ""), str(entry.get("to_state") or ""))
@@ -3482,15 +3524,120 @@ def _should_notify_entry(entry: dict[str, Any]) -> bool:
     return transition not in _SUPPRESSED_TRANSITIONS and False
 
 
+def _notification_context(
+    entry: dict[str, Any],
+    configs: tuple[RepositoryConfig, ...],
+) -> tuple[str, str, int | None]:
+    """Resolve display identity for repository and board-global alerts."""
+    board_context = _board_global_attention_board(entry)
+    if board_context is not None:
+        short_name = board_context.rsplit("/", 1)[-1].replace("-", " ").title()
+        return board_context, short_name, None
+    repository = str(entry.get("repository") or "").strip()
+    board = str(entry.get("board") or "").strip()
+    if repository:
+        board = board or _board_for_repository(repository, configs)
+        short_name = _board_display_name(board, repository, configs)
+    else:
+        board = board or "unknown-board"
+        short_name = board.rsplit("/", 1)[-1].replace("-", " ").title()
+    raw_issue = entry.get("issue_number")
+    if isinstance(raw_issue, bool):
+        issue_number = None
+    elif isinstance(raw_issue, int):
+        issue_number = raw_issue if raw_issue > 0 else None
+    elif isinstance(raw_issue, str) and raw_issue.strip().isdigit():
+        parsed = int(raw_issue.strip())
+        issue_number = parsed if parsed > 0 else None
+    else:
+        issue_number = None
+    return board, short_name, issue_number
+
+
 def _telegram_dedup_state_path() -> Path:
-    """State file for full-body delivery dedup (observer layer only).
+    """State file for semantic delivery dedup (observer layer only).
 
     This is NOT a reconciliation correctness cache: GitHub issue identity
     and the Kanban idempotency key remain the only correctness boundary.
-    The file records the last delivered notification body so an unchanged
-    attention set stops re-alerting on every five-minute cron tick.
+    The file records delivered ``attention_key`` generations so an active
+    attention set can grow or change its display text without re-delivering
+    already-seen incidents.
     """
     return _hermes_home() / "state" / "kanban-intake-last-sent.txt"
+
+
+_TELEGRAM_DEDUP_STATE_VERSION = 2
+_TELEGRAM_INCIDENT_MARKER = " · incident="
+
+
+def _telegram_attention_key(line: str) -> str | None:
+    """Extract the edge-provided semantic key from one notification line."""
+    # Display/reason text is not escaped and may contain the same marker. The
+    # canonical marker is appended last by _attention_notification_line().
+    marker_at = line.rfind(_TELEGRAM_INCIDENT_MARKER)
+    if marker_at < 0:
+        return None
+    key = line[marker_at + len(_TELEGRAM_INCIDENT_MARKER):].strip()
+    return key or None
+
+
+def _read_telegram_dedup_keys(state_path: Path) -> set[str]:
+    """Read semantic delivery history, failing open for legacy/corrupt state."""
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        print(
+            "kanban-intake: dedup state unreadable "
+            f"(warning only): {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return set()
+    try:
+        state = json.loads(raw)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        # The pre-semantic state file contained a full body. It cannot safely
+        # identify generations, so migrate by sending and overwriting it after
+        # a successful keyed delivery.
+        print(
+            "kanban-intake: legacy or invalid dedup state "
+            f"(warning only): {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return set()
+    if not isinstance(state, dict) or state.get("version") != _TELEGRAM_DEDUP_STATE_VERSION:
+        print(
+            "kanban-intake: unsupported dedup state version (warning only)",
+            file=sys.stderr,
+        )
+        return set()
+    raw_keys = state.get("attention_keys")
+    if not isinstance(raw_keys, list):
+        print(
+            "kanban-intake: invalid dedup state keys (warning only)",
+            file=sys.stderr,
+        )
+        return set()
+    return {
+        value.strip()
+        for value in raw_keys
+        if isinstance(value, str) and value.strip()
+    }
+
+
+def _write_telegram_dedup_keys(state_path: Path, keys: set[str]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_path.with_name(state_path.name + ".tmp")
+    payload = {
+        "attention_keys": sorted(keys),
+        "version": _TELEGRAM_DEDUP_STATE_VERSION,
+    }
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, state_path)
 
 
 def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
@@ -3501,30 +3648,39 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
     installed Hermes platform/Gateway configuration.  Delivery is an observer
     side effect: a failure warns but never rolls back reconciliation.
 
-    Full-body dedup: when the assembled notification text exactly matches
-    the previously delivered body, the batch is skipped so an unchanged
-    attention set does not re-alert every tick.  State read failures fail
-    open (send); state write failures warn but never fail the send.
+    Semantic dedup: each line carries the edge's ``attention_key``. Already
+    delivered keys are removed from the outgoing batch, while a new key is
+    sent even when an old incident remains active or its display text changes.
+    Lines without a key fail open and are sent without being persisted. State
+    read failures fail open (send); state write failures warn but never fail
+    the send.
 
     Returns ``"sent"`` when the batch was delivered, ``"skipped"`` when
     the dedup suppressed a duplicate, and ``False`` on any delivery failure.
     """
     chat_id, thread_id = cfg
-    text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
     state_path = _telegram_dedup_state_path()
-    try:
-        if state_path.is_file() and state_path.read_text(encoding="utf-8") == text:
-            print(
-                "kanban-intake: identical notification body already sent; skipping",
-                file=sys.stderr,
-            )
-            return "skipped"
-    except OSError as exc:
+    delivered_keys = _read_telegram_dedup_keys(state_path)
+    selected_lines: list[str] = []
+    selected_keys: set[str] = set()
+    for line in lines:
+        key = _telegram_attention_key(line)
+        if key is None:
+            # A missing semantic identity is an upstream evidence problem;
+            # observer delivery remains fail-open rather than guessing a key.
+            selected_lines.append(line)
+            continue
+        if key in delivered_keys or key in selected_keys:
+            continue
+        selected_lines.append(line)
+        selected_keys.add(key)
+    if not selected_lines:
         print(
-            "kanban-intake: dedup state unreadable "
-            f"(warning only): {type(exc).__name__}",
+            "kanban-intake: semantic notification generations already sent; skipping",
             file=sys.stderr,
         )
+        return "skipped"
+    text = "🤖 Hermes Kanban\n\n" + "\n".join(selected_lines)
     target = f"telegram:{chat_id}"
     if thread_id:
         target += f":{thread_id}"
@@ -3541,17 +3697,18 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
             check=False,
         )
         if proc.returncode == 0:
-            try:
-                state_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = state_path.with_name(state_path.name + ".tmp")
-                tmp_path.write_text(text, encoding="utf-8")
-                os.replace(tmp_path, state_path)
-            except OSError as exc:
-                print(
-                    "kanban-intake: dedup state write failed "
-                    f"(warning only): {type(exc).__name__}",
-                    file=sys.stderr,
-                )
+            if selected_keys:
+                try:
+                    _write_telegram_dedup_keys(
+                        state_path,
+                        delivered_keys | selected_keys,
+                    )
+                except OSError as exc:
+                    print(
+                        "kanban-intake: dedup state write failed "
+                        f"(warning only): {type(exc).__name__}",
+                        file=sys.stderr,
+                    )
             return "sent"
         print(
             f"kanban-intake: Hermes send skipped (warning only): exit={proc.returncode}",
@@ -4265,15 +4422,14 @@ def _run_once(args: argparse.Namespace) -> int:
         for entry in sync_results:
             if not _should_notify_entry(entry):
                 continue
-            board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_display_name(
-                board, str(entry["repository"]), selected_configs
+            board, short_name, issue_number = _notification_context(
+                entry, selected_configs
             )
             predicted.append(
                 _attention_notification_line(
                     board,
                     short_name,
-                    int(entry["issue_number"]),
+                    issue_number,
                     entry,
                 )
             )
@@ -4281,15 +4437,14 @@ def _run_once(args: argparse.Namespace) -> int:
         for entry in sync_results:
             if not _should_notify_entry(entry):
                 continue
-            board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_display_name(
-                board, str(entry["repository"]), selected_configs
+            board, short_name, issue_number = _notification_context(
+                entry, selected_configs
             )
             notification_lines.append(
                 _attention_notification_line(
                     board,
                     short_name,
-                    int(entry["issue_number"]),
+                    issue_number,
                     entry,
                 )
             )
