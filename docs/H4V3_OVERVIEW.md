@@ -166,13 +166,20 @@ not explicitly classified can never silently start an alert storm.
 * Rework attention keeps its existing round-aware `github_pr_rework_attention`
   writer (deduped per round/diagnostic).
 * The intake reuses the existing
-  `state/kanban-intake-last-sent.txt` surface as a versioned set of delivered
-  semantic keys. Each batch sends only lines whose key has not been delivered,
-  so adding incident B while A remains active sends B alone, and a title or
-  display-name change for A does not re-send it. Lines without a key fail open
-  and are sent without being persisted as a guessed generation.
-* `hermes send` failures are observer-only warnings; they never fail or roll
-  back reconciliation.
+  `state/kanban-intake-last-sent.txt` surface as versioned JSON. Persistent
+  `attention_keys` contain only resolved semantic generations: each batch sends
+  only a resolved line whose key has not been delivered, so adding incident B
+  while A remains active sends B alone, and a title or display-name change for
+  A does not re-send it. Unresolved lines carry the canonical suffix
+  `incident_unresolved=true · incident=<attention_key>` and are deduped only
+  against the replace-on-tick `active_unresolved_keys` snapshot. The snapshot
+  is replaced by each configured observer tick (including an empty/deduped
+  tick), so an unresolved board diagnostic can alert again after it disappears.
+  Lines without a key fail open and are sent without being persisted as a
+  guessed generation; legacy v2 or corrupt state also fails open.
+* Empty or fully deduped batches never invoke `hermes send`, and a failed send
+  never marks new delivery state. `hermes send` failures are observer-only
+  warnings; they never fail or roll back reconciliation.
 
 ## Installation / update / rollback
 

@@ -147,6 +147,43 @@ def test_attention_line_parser_uses_trailing_marker_after_display_collision() ->
     assert intake._telegram_attention_key(line) == key
 
 
+def test_attention_line_marks_unresolved_before_trailing_marker() -> None:
+    key = "dispatch_lock_unavailable:dispatch_lock_unavailable|board"
+    marker = intake._TELEGRAM_INCIDENT_MARKER
+    entry = _entry(
+        "dispatch_lock_unavailable",
+        issue_title=f"Title{marker}display-decoy",
+        operator_attention={
+            "reason": f"dispatch_lock_unavailable{marker}reason-decoy",
+            "attention_key": key,
+            "incident_unresolved": True,
+        },
+    )
+    line = intake._attention_notification_line("re-bound", "Re-Bound", 106, entry)
+    assert line.endswith(
+        f"incident_unresolved=true{marker}{key}"
+    ), line
+    assert intake._telegram_attention_key(line) == key
+    assert intake._telegram_attention_is_unresolved(line) is True
+
+
+def test_attention_line_escapes_unresolved_marker_decoys_in_display_text() -> None:
+    key = "needs_input:rhgo1749/re-bound|106|123|1|8"
+    marker = intake._TELEGRAM_INCIDENT_UNRESOLVED_MARKER
+    entry = _entry(
+        "needs_input",
+        issue_title=f"Title{marker}",
+        operator_attention={
+            "reason": f"needs_input{marker}",
+            "attention_key": key,
+        },
+    )
+    line = intake._attention_notification_line("re-bound", "Re-Bound", 106, entry)
+    assert line.endswith(f"incident={key}")
+    assert intake._telegram_attention_is_unresolved(line) is False
+    assert marker not in line[: -len(f" · incident={key}")]
+
+
 def test_operator_attention_dedupe_and_resend_after_new_event() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
@@ -705,6 +742,42 @@ def test_send_dedup_skip_reports_skipped_and_never_invokes_hermes_send() -> None
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_send_corrupt_state_fails_open_and_replaces_it_after_delivery() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-corrupt-state-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        state_path = home / "state" / "kanban-intake-last-sent.txt"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text("legacy non-json body", encoding="utf-8")
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        key = "needs_input:rhgo1749/re-bound|106|123|1|9"
+        line = f"⚠️ board · incident={key}"
+        assert intake._send_telegram_batch([line], ("123", "")) == "sent"
+        assert len(captured) == 1
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state == {
+            "active_unresolved_keys": [],
+            "attention_keys": [key],
+            "version": 3,
+        }
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_send_delivery_reports_sent_and_writes_state() -> None:
     import shutil
     import tempfile
@@ -733,7 +806,11 @@ def test_send_delivery_reports_sent_and_writes_state() -> None:
         state = json.loads(
             (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
         )
-        assert state == {"attention_keys": [key], "version": 2}, state
+        assert state == {
+            "active_unresolved_keys": [],
+            "attention_keys": [key],
+            "version": 3,
+        }, state
     finally:
         setattr(intake, "_hermes_home", original_home)
         setattr(intake.subprocess, "run", original_run)
@@ -823,6 +900,150 @@ def test_send_dedup_sends_genuinely_new_semantic_key_once() -> None:
         assert intake._send_telegram_batch([line_b], ("123", "")) == "skipped"
         assert len(captured) == 2
         assert captured[1] == "🤖 Hermes Kanban\n\n" + line_b
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_unresolved_dedup_uses_active_snapshot_not_persistent_keys() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-unresolved-active-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        key = "dispatch_lock_failed"
+        first = (
+            "⚠️ [re-bound] Re-Bound board · 확인 필요 — dispatch_lock_failed — old "
+            f"· incident_unresolved=true · incident={key}"
+        )
+        changed = (
+            "⚠️ [re-bound] Renamed board · 확인 필요 — dispatch_lock_failed — new "
+            f"· incident_unresolved=true · incident={key}"
+        )
+        assert intake._send_telegram_batch([first], ("123", "")) == "sent"
+        state = json.loads(
+            (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
+        )
+        assert state == {
+            "active_unresolved_keys": [key],
+            "attention_keys": [],
+            "version": 3,
+        }, state
+        assert intake._send_telegram_batch([changed], ("123", "")) == "skipped"
+        assert len(captured) == 1
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_unresolved_realerts_after_empty_configured_tick() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-unresolved-rearm-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        key = "dispatch_lock_unavailable"
+        line = (
+            "⚠️ [re-bound] Re-Bound board · 확인 필요 — dispatch_lock_unavailable "
+            f"· incident_unresolved=true · incident={key}"
+        )
+        assert intake._send_telegram_batch([line], ("123", "")) == "sent"
+        assert intake._send_telegram_batch([], ("123", "")) == "skipped"
+        state = json.loads(
+            (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
+        )
+        assert state["active_unresolved_keys"] == []
+        assert state["attention_keys"] == []
+        assert intake._send_telegram_batch([line], ("123", "")) == "sent"
+        assert len(captured) == 2
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_empty_or_dedup_batch_never_invokes_hermes_send() -> None:
+    import shutil
+    import tempfile
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-empty-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        state_path = home / "state" / "kanban-intake-last-sent.txt"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "attention_keys": ["resolved"],
+                    "active_unresolved_keys": ["active"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("hermes send must not run for empty/dedup batches")
+
+        setattr(intake.subprocess, "run", fail_if_called)
+        assert intake._send_telegram_batch(
+            ["⚠️ board · incident_unresolved=true · incident=active"],
+            ("123", ""),
+        ) == "skipped"
+        assert intake._send_telegram_batch([], ("123", "")) == "skipped"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["attention_keys"] == ["resolved"]
+        assert state["active_unresolved_keys"] == []
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_failure_does_not_mark_new_delivery_state() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-send-failure-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+
+        def failed_run(*_args, **_kwargs):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="send failed")
+
+        setattr(intake.subprocess, "run", failed_run)
+        line = "⚠️ board · incident_unresolved=true · incident=unresolved-new"
+        assert intake._send_telegram_batch([line], ("123", "")) is False
+        assert not (home / "state" / "kanban-intake-last-sent.txt").exists()
     finally:
         setattr(intake, "_hermes_home", original_home)
         setattr(intake.subprocess, "run", original_run)
