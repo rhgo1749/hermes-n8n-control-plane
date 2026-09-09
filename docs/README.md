@@ -24,7 +24,8 @@ Do not preload every document. Use the narrowest route that covers the change su
 | Rework dispatch, retry, verification-only handling, terminal/review transitions | [`EDGE_REWORK_LIFECYCLE.md`](EDGE_REWORK_LIFECYCLE.md) |
 | `kanban_block` kind validation and blocked-state provenance projection | [`EDGE_REWORK_LIFECYCLE.md`](EDGE_REWORK_LIFECYCLE.md) |
 | Worker slot/resource admission and dispatch capacity | [`EDGE_WORKER_RESOURCE_ADMISSION.md`](EDGE_WORKER_RESOURCE_ADMISSION.md) |
-| Worker completion vs GitHub review/done projection | [`GITHUB_COMPLETION_LIFECYCLE.md`](GITHUB_COMPLETION_LIFECYCLE.md) |
+| Worker completion vs GitHub review/done projection, including completion-wake liveness | [`GITHUB_COMPLETION_LIFECYCLE.md`](GITHUB_COMPLETION_LIFECYCLE.md) |
+| Completion dispatcher safety-wake implementation detail | [`GITHUB_COMPLETION_LIFECYCLE.md`](GITHUB_COMPLETION_LIFECYCLE.md) is canonical; [`GITHUB_COMPLETION_DISPATCH_SAFETY_WAKE.md`](GITHUB_COMPLETION_DISPATCH_SAFETY_WAKE.md) is a focused implementation note |
 | Kanban role ownership and role-specific authority | [`KANBAN_ROLE_CONTRACTS.md`](KANBAN_ROLE_CONTRACTS.md) |
 | `hermes-agent` discovery, checkout/board authority, bootstrap and registry semantics | [`REPOSITORY_REGISTRY.md`](REPOSITORY_REGISTRY.md) |
 | Repository-derived board identity cutover (migration/transition/rollback) | [`BOARD_IDENTITY_MIGRATION.md`](BOARD_IDENTITY_MIGRATION.md) |
@@ -36,6 +37,7 @@ Do not preload every document. Use the narrowest route that covers the change su
 
 - `README.md` is the current topology/entry overview, not a duplicate owner of every subsystem rule.
 - `docs/*.md` documents own durable architecture, lifecycle and operations contracts.
+- Focused incident/hotfix notes do not become parallel canonical owners; their durable contract must be represented in the owning lifecycle/operations document and they should link back to it.
 - Source and tests remain authoritative for executable behavior; if a document and implementation disagree, stop and reconcile the mismatch instead of silently inventing a merged rule.
 - GitHub Issues, PR descriptions, Kanban state, logs and one-off incident reports are task evidence, not durable documentation unless a lasting contract change is extracted from them.
 
