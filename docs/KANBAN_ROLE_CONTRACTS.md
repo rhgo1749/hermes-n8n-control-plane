@@ -145,6 +145,18 @@ When a reviewer reports `REWORK`:
 5. **Attach review context by reference**: "Attach review dependency" means referencing the reviewer task ID and findings in the developer task body, comments, and metadata—not creating a blocking dependency link from a non-terminal task.
 6. **No forced promotion loops**: Never use repeated `promote --force` to bypass `parents_not_done`. Repair the task dependency topology using canonical Kanban/control-plane dependency operations (e.g. `unlink`/`link`/`reassign`), and reserve direct database interventions exclusively for explicit manual operator recovery.
 
+### Internal `REWORK` verdict is not the GitHub `agent-rework` command
+
+The specialist verdict `REWORK` above is an **internal Kanban review result**. It
+authorizes Main to recreate the bounded specialist graph described here; it does
+not authorize any worker, reviewer, or controller to create, restore, or infer
+the PR label `agent-rework`.
+
+The PR-side `agent-rework` label is a separate trusted maintainer one-shot
+control-plane command owned by the GitHub ↔ Kanban edge lifecycle in
+`EDGE_REWORK_LIFECYCLE.md`. Internal reviewer output must never be translated
+into that label merely because both use the word “rework”.
+
 ## GitHub-backed lifecycle invariant
 
 For an Issue-backed root card with a linked PR:
@@ -154,7 +166,7 @@ For an Issue-backed root card with a linked PR:
 3. the root worker terminates with core `kanban_complete` when its required internal graph is satisfied;
 4. that core `done` is provisional and is not GitHub merge evidence. Main Agent must not declare work "merged" or "delivered" based on internal graph completion;
 5. edge reconciliation projects an OPEN or closed-unmerged required PR to parked `review` and clears worker ownership;
-6. only trusted rework makes the card runnable again;
+6. only trusted PR-side rework admission may make the GitHub-backed card runnable again; an internal specialist `REWORK` verdict does not synthesize that GitHub signal;
 7. fresh GitHub evidence that every required PR merged into the target branch permits authoritative `done`.
 
 This separation keeps scarce worker slots tied to active work rather than external waiting.
