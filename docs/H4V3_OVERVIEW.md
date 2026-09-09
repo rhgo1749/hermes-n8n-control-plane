@@ -152,10 +152,10 @@ not explicitly classified can never silently start an alert storm.
 
 * The edge records a durable `github_operator_attention` event in the
   existing `task_events` table (no new notification DB) only for the first
-  tick of an incident. The dedupe key is
+  reconciliation pass of an incident. The dedupe key is
   `reason:<max-event-id-excluding-operator-attention>`, so an unchanged
-  incident stays quiet on every five-minute tick, while a **new** ordinary
-  lifecycle event (incident resolved/recurred) permits a re-send.
+  incident stays quiet on repeated reconciliation passes, while a **new**
+  ordinary lifecycle event (incident resolved/recurred) permits a re-send.
 * Rework attention keeps its existing round-aware `github_pr_rework_attention`
   writer (deduped per round/diagnostic).
 * `hermes send` failures are observer-only warnings; they never fail or roll

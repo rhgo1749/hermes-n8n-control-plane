@@ -18,8 +18,13 @@ consumes registry entries with `ready=true` for task creation and, for the
 first-intake path, idempotently provisions a missing canonical board through
 the existing `hermes kanban boards create` surface before the first task is
 written. Event routing is repository-scoped through `github-router`; there is
-no five-minute polling workflow. A full-registry intake remains available only
-as an explicit operator `/fallback` action.
+no five-minute polling workflow. Full-registry intake has two bounded ingress
+paths that reuse the same canonical intake authority: an explicit operator
+`/fallback` recovery action, and the router-local low-frequency safety wake
+(default hourly) that enqueues the same durable full-intake scope after a full
+interval. The safety wake is a liveness backstop for missed webhooks; it does
+not call `/reconcile`, inspect lifecycle labels itself, create a second state
+store, or become a lifecycle owner.
 
 ## App-delivery onboarding
 
@@ -269,7 +274,9 @@ the intake script, or set the explicit environment path.
 A scoped `--repository owner/repo` wake fails closed when the repository is not
 discovered or is not ready. An explicit full-registry fallback processes every
 ready entry and reports unready entries in `registry_unready` without guessing
-associations.
+associations. The router safety wake reaches the same full-intake processing
+path by enqueueing the canonical durable full scope; it is not a second
+registry or provisioning implementation.
 
 ## Event-driven webhook router
 
@@ -288,6 +295,8 @@ GitHub webhook
                  -> kanban-github-sync.py --board <slug> --json
        -> other intake event -> enqueue repository scope
             -> lease-controller -> existing Hermes job default:bf431b2a6ba6
+       -> hourly safety tick -> enqueue durable full-intake scope
+            -> same lease-controller -> same Hermes intake job
 ```
 
 The router's webhook inventory is reconciled from the registry with:
@@ -304,7 +313,9 @@ ingress, not the registry.
 
 The authenticated `/fallback` endpoint remains an intentional operator recovery
 path for a full-registry sweep. It is not scheduled automatically and is not
-called by the tracked edge-sync Webhook.
+called by the tracked edge-sync Webhook. Separately, the router-local safety
+tick enqueues the same canonical full-intake scope without calling `/fallback`
+or `/reconcile`; signed webhook delivery remains the primary path.
 
 ## Onboarding gate for a new repository
 

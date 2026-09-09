@@ -63,17 +63,39 @@ worker core kanban_complete
   -> existing edge DONE -> REVIEW / REVIEW -> DONE decision
 ```
 
-`hermes-plugin/github-completion-edge-wake/` is an observer/trigger only. It
-reads the already-committed task row and wakes the deployed canonical/live edge
-path when the importer-owned provenance contains `source: github-issue` or
-`completion contract: github-pr` before the canonical Issue-body boundary.
-Ordinary tasks, missing or ambiguous board/runtime evidence, and non-`DONE`
-rows do not wake the edge. The observer never calls a Kanban mutator, parses the
-untrusted Issue body as instructions, or duplicates the edge transition logic.
+`hermes-plugin/github-completion-edge-wake/` is the primary completion
+observer/trigger. It reads the already-committed task row and wakes the deployed
+canonical/live edge path when the importer-owned provenance contains
+`source: github-issue` or `completion contract: github-pr` before the canonical
+Issue-body boundary. Ordinary tasks, missing or ambiguous board/runtime
+evidence, and non-`DONE` rows do not wake the edge. The observer never calls a
+Kanban mutator, parses the untrusted Issue body as instructions, or duplicates
+the edge transition logic.
 
-The actuator and this direct completion wake share the same edge single-flight
-boundary. Before the canonical edge reads GitHub/Kanban state, it acquires the
-guarded runtime lock at
+### Dispatcher-tick completion safety wake
+
+`hermes-plugin/github-completion-dispatch-safety-wake/` is a bounded liveness
+backstop for a silently missed primary completion observer. It uses the
+already-running Kanban dispatcher tick only as a trigger; it is not another
+scheduler, does not poll GitHub, and does not own completion state.
+
+On a dispatcher tick it reads the current board and selects recent `completed`
+events whose task is still `done` and whose importer-owned provenance says
+`source: github-issue` or `completion contract: github-pr`. It replays the
+primary completion observer for at most one eligible task, and the canonical
+edge reconciles the board under the same edge lock and idempotency rules.
+
+The safety wake has no direct Kanban status write, no GitHub polling, no cron or
+sleep loop, and no second durable state store. It ignores ordinary tasks,
+stale historical completions, and tasks already projected away from `done`.
+Replay attempts are bounded per completion event/process. Its focused
+implementation note is
+[`GITHUB_COMPLETION_DISPATCH_SAFETY_WAKE.md`](GITHUB_COMPLETION_DISPATCH_SAFETY_WAKE.md);
+this document remains the canonical completion lifecycle owner.
+
+The actuator, primary completion wake, and dispatcher safety wake all converge
+through the same edge single-flight boundary. Before the canonical edge reads
+GitHub/Kanban state, it acquires the guarded runtime lock at
 `$HERMES_HOME/kanban/.resource-locks/github-edge-sync.lock` with Linux
 `fcntl.flock(LOCK_EX)`. A completion wake waits behind an in-flight webhook or
 another completion wake rather than running concurrently. Kernel lock ownership
@@ -81,14 +103,14 @@ releases on a crashed process, and no queue database, polling loop, or second
 transition owner is introduced.
 
 A single outer deadline is not allowed to turn lock contention into a lost
-completion signal. The first completion child uses the normal bounded edge
-budget. If that child times out—possibly because the preceding owner consumed
-most of the deadline while the child was blocked in `flock()`—the observer does
-not accept that timeout as the completion handoff. It re-reads the committed
-task state. When the earlier owner already moved the card away from `DONE`, the
-observer stops without launching a duplicate edge process. When the task is
-still an eligible GitHub-backed `DONE`, or the post-timeout read itself fails
-closed, the observer launches exactly one second fixed-argv child with a
+completion signal. The first primary completion child uses the normal bounded
+edge budget. If that child times out—possibly because the preceding owner
+consumed most of the deadline while the child was blocked in `flock()`—the
+observer does not accept that timeout as the completion handoff. It re-reads the
+committed task state. When the earlier owner already moved the card away from
+`DONE`, the observer stops without launching a duplicate edge process. When the
+task is still an eligible GitHub-backed `DONE`, or the post-timeout read itself
+fails closed, the observer launches exactly one second fixed-argv child with a
 completely fresh deadline. Only a second timeout becomes the final bounded
 `edge_retry_timeout` diagnostic. Non-timeout failures are not retried. There is
 no sleep, retry loop, Schedule Trigger, or polling fallback.
@@ -104,20 +126,22 @@ Merely recording a timeout diagnostic is explicitly not success evidence.
 
 The callback uses a fixed argument vector with `shell=False`, bounded per-attempt
 timeout/output budgets, and stable diagnostics that do not include task body,
-summary, command output, or credentials. Both wake paths load the shared
-`automation/hermes/edge_sync_timeout.py` contract at installation time:
-`HERMES_EDGE_SYNC_TIMEOUT_SECONDS` defaults to `120` seconds and must be finite,
-positive, and no greater than `3600`; the completion observer adds its bounded
-`5`-second grace to each attempt. Combined child output is capped at `64 KiB`;
-invalid timeout configuration or oversized output fails closed before any edge
-success is reported.
+summary, command output, or credentials. Both primary completion attempts load
+the shared `automation/hermes/edge_sync_timeout.py` contract at installation
+time: `HERMES_EDGE_SYNC_TIMEOUT_SECONDS` defaults to `120` seconds and must be
+finite, positive, and no greater than `3600`; the completion observer adds its
+bounded `5`-second grace to each attempt. Combined child output is capped at
+`64 KiB`; invalid timeout configuration or oversized output fails closed before
+any edge success is reported.
 
-A final failed wake is observable and fail-closed: the core completion remains
-provisional `DONE` and is never treated as merge evidence. Under ordinary
-contention, however, the first timeout is followed by committed-state
+A final failed primary wake is observable and fail-closed: the core completion
+remains provisional `DONE` and is never treated as merge evidence. Under
+ordinary contention, however, the first timeout is followed by committed-state
 revalidation and, when necessary, the mandatory fresh retry rather than leaving
 the card stranded. If the edge already moved the card, the observer suppresses
-the duplicate run instead of relying only on downstream idempotency.
+the duplicate run instead of relying only on downstream idempotency. The
+separate dispatcher safety wake covers the distinct liveness case where the
+primary observer hook was missed entirely.
 
 ## `review` means parked: the parking marker contract
 
@@ -147,8 +171,8 @@ comment to the card:
 - `reason=<evaluate_completion reason>` — the exact fail-closed decision
   reason, matching the `github_pr_sync` event payload.
 - `pr=#74[,#75…]` — the linked PR numbers known at parking time.
-- `next=github-edge(...)` — the single automatic trigger that will lift the
-  park (merge detection, or PR-link detection for `awaiting-pr`).
+- `next=github-edge(...)` — the automatic reconciliation owner that will lift
+the park when relevant fresh GitHub evidence is observed.
 - `사람 행동 불필요.` — explicit no-human-action statement.
 
 The marker is idempotent by its exact rendered body: repeated syncs over an
@@ -224,20 +248,27 @@ clearing `agent-ready` from an Issue.
 
 The canonical intake source remains `automation/hermes/scripts/github-agent-ready-kanban-intake.py`. The live wrapper fail-closed overlays two rendered blocks: the GitHub completion contract and the Kanban lead orchestration contract, and verifies the shared GitHub PR closing-reference contract section in the rendered body. If any canonical source block drifts unexpectedly, the wrapper refuses to emit an unverified lifecycle contract.
 
-Install the completion observer separately on the Hermes runtime that starts
-workers; this is a manual host activation gate, not an automatic repository
-deployment step:
+Install the completion observers separately on the Hermes runtime that starts
+workers / runs the dispatcher; this is a manual host activation gate, not an
+automatic repository deployment step:
 
 ```bash
 automation/hermes/scripts/install-github-completion-edge-wake.sh \
   --hermes-home "$HOME/.hermes"
+
+automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
+  --hermes-home "$HOME/.hermes"
 ```
 
-The installer validates the candidate, atomically replaces the user plugin,
-keeps a timestamped backup, enables only
-`github-completion-edge-wake`, and prints an exact rollback command. Deploy the
-edge runtime first with `deploy-intake-edge.sh`, then restart the existing
-Hermes worker/dashboard supervisor so the plugin is loaded in worker
-processes. Host installation, plugin activation/restart, and a signed live
-canary remain separate `HOST_VALIDATION_REQUIRED` gates; repository tests do
-not claim those operations were performed.
+The primary installer validates the candidate, atomically replaces the user
+plugin, keeps a timestamped backup, enables only `github-completion-edge-wake`,
+and prints an exact rollback command. The safety-wake installer similarly
+installs/enables only its bounded companion plugin and depends on the primary
+completion observer plus deployed edge runtime. Deploy the edge runtime first
+with `deploy-intake-edge.sh`, then restart the existing Hermes worker/gateway/
+dispatcher supervisor as required so both hooks are loaded in the long-lived
+processes.
+
+Host installation, plugin activation/restart, and a signed live canary remain
+separate `HOST_VALIDATION_REQUIRED` gates; repository tests do not claim those
+operations were performed.

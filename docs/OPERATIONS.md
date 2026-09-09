@@ -72,6 +72,8 @@ GitHub signed webhook
        -> other intake event -> durable FIFO scope queue
             -> lease-controller 127.0.0.1:5680
                  -> existing Hermes trigger route for default:bf431b2a6ba6
+       -> hourly safety tick -> durable full-intake scope
+            -> same lease-controller -> same Hermes intake job
 ```
 
 The tracked workflow is `automation/n8n/workflows/github-pr-edge-sync.json`.
@@ -83,7 +85,11 @@ n8n Schedule Trigger and no direct GitHub webhook registration to n8n. No n8n
 UI setup is part of the deployment path.
 
 The authenticated router `/fallback` endpoint remains available for deliberate
-operator recovery/full-registry intake. It is not called periodically.
+operator recovery/full-registry intake. It is not called periodically. The
+router-local safety tick is separate: after one full configured interval it
+enqueues the same canonical durable full-intake scope directly, without calling
+`/fallback` or webhook reconciliation. Signed GitHub delivery remains the
+primary intake path; the safety tick is only a missed-webhook liveness backstop.
 
 ## 3. Host prerequisites
 
@@ -132,35 +138,52 @@ boundary rather than polling:
 
 ```text
 core kanban_complete (commit provisional DONE)
-  -> kanban_task_completed observer
+  -> kanban_task_completed primary observer
   -> fixed live edge: kanban-github-sync.py --board <slug> --json
   -> existing edge projection (DONE -> REVIEW for an open/unmerged PR)
+
+if that primary observer hook is silently missed:
+existing dispatcher tick
+  -> github-completion-dispatch-safety-wake
+  -> replay primary completion observer for one eligible still-DONE task
+  -> same fixed live edge / same edge lock
 ```
 
-Install and activate the repository-owned observer manually in the Hermes
-runtime namespace (the edge runtime deployment is a separate step):
+Install and activate the repository-owned completion observers manually in the
+Hermes runtime namespace (the edge runtime deployment is a separate first
+step):
 
 ```bash
 automation/hermes/scripts/deploy-intake-edge.sh \
   --hermes-home "$HOME/.hermes"
 automation/hermes/scripts/install-github-completion-edge-wake.sh \
   --hermes-home "$HOME/.hermes"
+automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
+  --hermes-home "$HOME/.hermes"
 ```
 
 `install-github-completion-edge-wake.sh` validates a candidate copy before an
 atomic plugin-directory switch, retains a timestamped backup, enables only the
-named plugin, and prints rollback commands. Restart the existing Hermes worker
-supervisor after activation; a plugin installed on disk but not loaded by the
-worker is not runtime evidence.
+named primary plugin, and prints rollback commands. The safety-wake installer
+installs/enables only its bounded companion plugin; it requires the primary
+completion plugin and deployed edge runtime to be present.
 
-The observer is not a completion/state owner. It reads the committed task row,
-skips ordinary tasks, validates the authoritative board/runtime paths, and
-uses one fixed `shell=False` command with bounded timeout/output. Invalid input
-or a wake failure logs a bounded diagnostic and leaves provisional `DONE`; it
-does not claim a merge or mutate Kanban. The existing edge remains the sole
-`DONE`/`REVIEW` transition owner and optimistic updates make repeated
-observations idempotent. No n8n workflow, Schedule Trigger, cron edit, or
-public endpoint is added by this path.
+Restart the existing Hermes worker process after primary-observer activation,
+and restart the long-lived Hermes gateway/dispatcher after safety-wake
+activation so the dispatcher hook is registered. A plugin installed on disk
+but not loaded by its owning long-lived process is not runtime evidence.
+
+Neither observer is a completion/state owner. The primary observer reads the
+committed task row, skips ordinary tasks, validates the authoritative
+board/runtime paths, and uses one fixed `shell=False` command with bounded
+timeout/output. The safety wake reads only recent eligible completion evidence
+on the current board and replays the primary observer; it does not write Kanban
+state or poll GitHub. Invalid input or a wake failure leaves provisional
+`DONE`; it does not claim a merge. The existing edge remains the sole
+`DONE`/`REVIEW` transition owner and optimistic updates plus the shared edge
+single-flight lock make repeated observations idempotent. No n8n Schedule
+Trigger, cron edit, second state store, or public endpoint is added by either
+completion-wake path.
 
 ## 5. Router credentials and public ingress
 
@@ -283,6 +306,7 @@ repositories that are no longer managed. It does not change Kanban or Hermes
 cron state.
 
 There is intentionally no five-minute reconciliation scheduler in this scope.
+The router-local intake safety wake does not call webhook reconciliation.
 
 ## 7. Importing the on-demand edge-sync workflow
 
@@ -381,7 +405,9 @@ A successful event canary must establish all of these facts:
 - the active n8n workflow has one Webhook execution for the canary and one
   actuator call for a supported PR event; unsupported PR actions are no-ops.
 
-A build/static check is not runtime evidence.
+A build/static check is not runtime evidence. The router-local hourly safety
+wake is an additional liveness path, not a substitute for this signed-delivery
+primary-path canary.
 
 ## 10. Recovery and deliberate full intake
 
@@ -390,7 +416,10 @@ It performs webhook reconciliation, enqueues a full-registry scope, and wakes
 the same preserved Hermes job. No schedule calls this endpoint automatically.
 
 Prefer the normal signed GitHub event path. Use `/fallback` only when a full
-re-scan is intentionally required.
+re-scan plus reconciliation is intentionally required. The router-local safety
+wake may independently enqueue the same canonical full-intake scope after its
+configured interval, but it does not call `/fallback` or `/reconcile` and does
+not create another intake implementation.
 
 If router/lease state is unhealthy, do not recreate the Hermes job. Repair the
 control plane, verify the allowlisted job still exists uniquely, and retry the
@@ -420,6 +449,8 @@ python3 tests/test_github_intake_actuator.py
 python3 tests/test_intake_completion_contract_entrypoint.py
 PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 \
   tests/test_completion_edge_wake_plugin.py
+PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 \
+  tests/test_completion_dispatch_safety_wake.py
 python3 tests/test_intake_lease_controller.py
 /ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
 /ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py

@@ -14,9 +14,11 @@ PR guidance without changing rework transitions, the retry-signal guard
 prevents edge-owned help text from being consumed as a fresh maintainer retry,
 the rework-delivery provenance guard preserves specialist delivery ownership,
 and attention recovery re-evaluates that same strict delivery evidence before
-requiring a new human-authorized retry round. The trusted completed-Issue
-fallback terminalizes only stale ``review/no_linked_pr`` cards explicitly
-closed as completed by a trusted maintainer.
+requiring a new human-authorized retry round. The rework-context overlay only
+normalizes stale worker-facing handoff prose and does not change lifecycle
+state. The trusted completed-Issue fallback terminalizes only stale
+``review/no_linked_pr`` cards explicitly closed as completed by a trusted
+maintainer.
 """
 from __future__ import annotations
 
@@ -431,6 +433,45 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
     core._rework_attention_delivery_recovery_installed = True
 
 
+def _install_rework_context_contract(core: ModuleType) -> None:
+    """Normalize the worker-facing rework handoff text without changing state.
+
+    The canonical core still contains an older prose sentence telling a worker
+    to hand back for review by blocking with ``review-required``. The current
+    lifecycle instead requires ordinary Kanban completion with durable
+    ``validation=passed`` + full ``head_sha`` metadata; the edge then creates
+    and reads back the canonical completion marker before projecting
+    ``agent-review-ready``. This wrapper changes only that rendered text.
+    """
+    if getattr(core, "_rework_context_contract_installed", False):
+        return
+
+    original_render = core._render_sync_context
+    stale = (
+        "Rework contract: this is a rework of the EXISTING PR above — "
+        "update the SAME PR/branch (resolve the trusted review feedback); "
+        "do NOT create a new PR; re-run the repository gates; then hand back "
+        "for review (block with review-required)."
+    )
+    current = (
+        "Rework contract: this is a rework of the EXISTING PR above — "
+        "update the SAME PR/branch (resolve the trusted review feedback); "
+        "do NOT create a new PR; re-run the repository gates; complete through "
+        "the normal Kanban completion surface; record validation=passed and the "
+        "full validated head_sha in run metadata. The edge owns the canonical "
+        "completion marker and agent-review-ready projection."
+    )
+
+    def render_sync_context(*args, **kwargs):
+        rendered = original_render(*args, **kwargs)
+        if not isinstance(rendered, str):
+            return rendered
+        return rendered.replace(stale, current)
+
+    core._render_sync_context = render_sync_context
+    core._rework_context_contract_installed = True
+
+
 def _core_path() -> Path:
     here = Path(__file__).resolve()
     deployed = here.with_name("kanban-github-sync-core.py")
@@ -454,6 +495,10 @@ def _load_core() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
+
+    # Patch worker-facing prose before any overlay can capture the renderer.
+    # This changes no lifecycle transition or evidence gate.
+    _install_rework_context_contract(module)
 
     # Patch policy parsing and cross-board helpers before the legacy edge
     # admission wrapper captures them. Core READY/REVIEW claim admission is
