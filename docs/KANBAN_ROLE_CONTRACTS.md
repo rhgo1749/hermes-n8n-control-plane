@@ -35,6 +35,22 @@ Waiting rule:
 
 Normal implementation graph is `kanban-developer -> kanban-reviewer`. Add `kanban-designer` only when a material product/UX decision or design review is actually required.
 
+### Specialist completion-contract boundary
+
+Hermes core supports PR-aware `completion_contract` values for standalone Kanban tasks whose **own terminal condition** is exact-head GitHub acceptance. That is a different lifecycle from an H4V3 specialist phase.
+
+For tasks assigned to the dedicated H4V3 specialist profiles `kanban-developer`, `kanban-reviewer`, or `kanban-designer`:
+
+- create the task with `completion_contract=local-only`, or omit the field because Hermes normalizes omission to `local-only`;
+- never attach `OWNER/REPO` or an exact GitHub PR URL as that specialist task's completion contract, including bounded rework on an existing PR;
+- preserve repository, PR URL, branch, and exact head SHA in the task body and structured handoff metadata as evidence, not as terminal policy;
+- a specialist's `done` means that specialist phase completed its bounded internal responsibility; it does **not** mean the PR was accepted, reviewed, or merged;
+- future GitHub checks, human review, and merge remain external state and must not prevent the specialist from terminating once its required executable work and evidence are complete.
+
+The restriction is role/task-specific, not profile-global GitHub disablement. `kanban-main` is not automatically a PR-acceptance owner merely because it is Main, and ordinary standalone Kanban tasks outside the H4V3 specialist graph may still use Hermes core PR-aware completion contracts when their actual terminal condition is remote PR acceptance.
+
+The deployed control plane enforces this boundary with a fail-closed `pre_tool_call` guard on `kanban_create` (plus the literal terminal create path). A rejected create call performs no task mutation and must be retried with `local-only`; it must not be worked around by changing assignees or moving the PR contract to a different H4V3 graph node.
+
 ## 2. Hermes Kanban Controller
 
 Controller is deterministic lifecycle/reconciliation logic, not the default reasoning agent.
