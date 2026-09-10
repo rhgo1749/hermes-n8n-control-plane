@@ -6,20 +6,23 @@ shell-hook allowlist. Keep that exact command path stable and route both
 lifecycle policies behind it:
 
 * ``kanban_block`` -> the preserved block-kind core guard;
-* ``kanban_create`` -> the specialist completion-contract guard;
-* ``terminal`` -> block-kind core first, then specialist completion guard.
+* ``kanban_create`` -> the specialist completion-contract policy in-process;
+* ``terminal`` -> block-kind core first, then specialist completion policy.
 
 Keeping one approved ``pre_tool_call`` command avoids introducing a second
-shell-hook consent boundary during a hotfix. A child guard failure is converted
-to a fail-closed exit-2 block instead of relying on the outer shell-hook parser
-to interpret an arbitrary nonzero exit.
+shell-hook consent boundary during a hotfix. The specialist policy is imported
+in-process so terminal calls spawn at most the one preserved block-kind core
+subprocess.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 BLOCK_KIND_CORE = HERE / "kanban-block-kind-guard-core.py"
@@ -39,12 +42,35 @@ def _hard_block(message: str) -> int:
     return 2
 
 
-def _run_guard(path: Path, raw: str) -> tuple[int, str, str]:
-    if not path.is_file():
-        return 127, "", f"guard dependency missing: {path.name}"
+def _load_specialist_policy() -> ModuleType:
+    if not SPECIALIST_COMPLETION_GUARD.is_file():
+        raise RuntimeError(
+            f"guard dependency missing: {SPECIALIST_COMPLETION_GUARD.name}"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "h4v3_specialist_completion_guard",
+        SPECIALIST_COMPLETION_GUARD,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"cannot load guard dependency: {SPECIALIST_COMPLETION_GUARD.name}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, "evaluate_payload", None)):
+        raise RuntimeError(
+            f"guard dependency has no evaluate_payload: {SPECIALIST_COMPLETION_GUARD.name}"
+        )
+    return module
+
+
+def _run_block_kind(raw: str) -> tuple[int, str, str]:
+    if not BLOCK_KIND_CORE.is_file():
+        return 127, "", f"guard dependency missing: {BLOCK_KIND_CORE.name}"
     try:
         result = subprocess.run(
-            [sys.executable, str(path)],
+            [sys.executable, str(BLOCK_KIND_CORE)],
             input=raw,
             text=True,
             capture_output=True,
@@ -52,15 +78,13 @@ def _run_guard(path: Path, raw: str) -> tuple[int, str, str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return 126, "", f"{path.name}: {type(exc).__name__}: {exc}"
+        return 126, "", f"{BLOCK_KIND_CORE.name}: {type(exc).__name__}: {exc}"
     return result.returncode, result.stdout or "", result.stderr or ""
 
 
-def _delegate(path: Path, raw: str) -> int:
-    returncode, stdout, stderr = _run_guard(path, raw)
+def _delegate_block_kind(raw: str) -> int:
+    returncode, stdout, stderr = _run_block_kind(raw)
     if returncode == 0:
-        # A successful guard should normally emit nothing. Preserve any valid
-        # response it deliberately returned so the outer hook can parse it.
         if stdout:
             sys.stdout.write(stdout)
         return 0
@@ -68,8 +92,20 @@ def _delegate(path: Path, raw: str) -> int:
         if stdout:
             sys.stdout.write(stdout)
             return 2
-        return _hard_block(stderr.strip() or f"{path.name} blocked without a diagnostic")
-    return _hard_block(stderr.strip() or f"{path.name} exited {returncode}")
+        return _hard_block(
+            stderr.strip() or f"{BLOCK_KIND_CORE.name} blocked without a diagnostic"
+        )
+    return _hard_block(stderr.strip() or f"{BLOCK_KIND_CORE.name} exited {returncode}")
+
+
+def _run_specialist_policy(payload: dict[str, Any]) -> int:
+    try:
+        module = _load_specialist_policy()
+        return int(module.evaluate_payload(payload))
+    except Exception as exc:
+        return _hard_block(
+            f"{SPECIALIST_COMPLETION_GUARD.name}: {type(exc).__name__}: {exc}"
+        )
 
 
 def main() -> int:
@@ -77,21 +113,24 @@ def main() -> int:
     try:
         payload = json.loads(raw or "{}")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        return _hard_block(f"malformed pre_tool_call payload: {type(exc).__name__}: {exc}")
+        return _hard_block(
+            f"malformed pre_tool_call payload: {type(exc).__name__}: {exc}"
+        )
     if not isinstance(payload, dict):
         return 0
 
     tool_name = str(payload.get("tool_name") or "")
     if tool_name == "kanban_block":
-        return _delegate(BLOCK_KIND_CORE, raw)
+        return _delegate_block_kind(raw)
     if tool_name == "kanban_create":
-        return _delegate(SPECIALIST_COMPLETION_GUARD, raw)
+        return _run_specialist_policy(payload)
     if tool_name != "terminal":
         return 0
 
-    # terminal is shared by both policies. The first guard returns zero/no
-    # output for unrelated commands; only then is the second policy evaluated.
-    returncode, stdout, stderr = _run_guard(BLOCK_KIND_CORE, raw)
+    # terminal is shared by both policies. The historical block-kind policy
+    # runs first; only if it allows the command do we evaluate specialist task
+    # creation semantics.
+    returncode, stdout, stderr = _run_block_kind(raw)
     if returncode != 0:
         if returncode == 2 and stdout:
             sys.stdout.write(stdout)
@@ -107,7 +146,7 @@ def main() -> int:
         if isinstance(directive, dict) and directive.get("action") == "block":
             sys.stdout.write(stdout)
             return 2
-    return _delegate(SPECIALIST_COMPLETION_GUARD, raw)
+    return _run_specialist_policy(payload)
 
 
 if __name__ == "__main__":
