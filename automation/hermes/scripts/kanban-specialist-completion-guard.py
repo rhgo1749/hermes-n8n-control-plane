@@ -14,12 +14,12 @@ new task is assigned to an H4V3 specialist profile. Omitted
 PR URLs, repository names, and head SHAs remain valid task-body / handoff
 provenance; they are not specialist terminal policy.
 
-The structured ``kanban_create`` tool is the canonical path. The ``terminal``
-policy also closes the ordinary literal/shell-wrapped ``hermes kanban create``
-bypass. It recognizes the real ``--assignee`` option rather than arbitrary
-profile text, and rejects if any supplied completion-contract value is non-local
-(or cannot be parsed). Unrelated terminal commands and non-specialist PR-aware
-tasks remain untouched.
+The structured ``kanban_create`` tool is the canonical creation path. The
+``terminal`` policy closes ordinary literal/shell-wrapped ``hermes kanban
+create`` bypasses and also rejects ``assign``/``reassign`` attempts that would
+move an already PR-aware task to a specialist. Reassignment reads only the
+canonical task row; unreadable/ambiguous state fails closed and is never
+rewritten by this guard.
 
 ``evaluate_payload`` is intentionally importable by the already-approved
 lifecycle hook wrapper so this policy does not need a second shell-hook command
@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from collections.abc import Mapping
@@ -60,6 +61,18 @@ _COMPLETION_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _COMPLETION_FLAG_RE = re.compile(r"--completion-contract(?:=|\s+)", re.IGNORECASE)
+_ASSIGN_RE = re.compile(
+    r"\bhermes\b[\s\S]*?\bkanban\b"
+    r"(?P<prefix>[\s\S]*?)\b(?P<verb>assign|reassign)\b\s+"
+    r"[\"']?(?P<task>[A-Za-z0-9_.:-]+)[\"']?\s+"
+    r"[\"']?(?P<profile>kanban-(?:developer|reviewer|designer))[\"']?"
+    r"(?=\s|[\"']|$)",
+    re.IGNORECASE,
+)
+_BOARD_RE = re.compile(
+    r"(?:^|\s)--board(?:=|\s+)[\"']?(?P<board>[A-Za-z0-9._-]+)[\"']?(?=\s|[\"']|$)",
+    re.IGNORECASE,
+)
 
 
 def _log(entry: Mapping[str, Any]) -> None:
@@ -96,15 +109,84 @@ def _contract_is_local(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == LOCAL_ONLY)
 
 
-def _diagnostic(assignee: str) -> str:
+def _diagnostic(assignee: str, *, action: str = "create") -> str:
+    retry = (
+        "Retry the create call with local-only."
+        if action == "create"
+        else "Keep the task on a non-specialist profile or recover its completion contract through an explicit operator procedure before reassignment."
+    )
     return (
         f"H4V3 specialist task '{assignee}' must use completion_contract=local-only "
-        "(or omit the field, which defaults to local-only). Developer/Reviewer/Designer "
-        "done is an internal specialist terminal state; GitHub PR acceptance/merge is "
-        "owned by root-card edge reconciliation. Keep PR URL/head/repository as body or "
-        "completion metadata evidence instead. Retry the create call with local-only. "
-        "No task mutation was performed."
+        "(or omit the field at creation, which defaults to local-only). "
+        "Developer/Reviewer/Designer done is an internal specialist terminal state; "
+        "GitHub PR acceptance/merge is owned by root-card edge reconciliation. "
+        "Keep PR URL/head/repository as body or completion metadata evidence instead. "
+        f"{retry} No task mutation was performed."
     )
+
+
+def _homes() -> list[Path]:
+    root = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    homes = [root]
+    if root.parent.name == "profiles":
+        homes.append(root.parent.parent)
+    homes.append(Path.home() / ".hermes")
+    return list(dict.fromkeys(homes))
+
+
+def _current_slug(home: Path) -> str | None:
+    try:
+        value = (home / "kanban" / "current").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _board_db_path(board: str) -> Path:
+    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if pinned:
+        path = Path(pinned).expanduser()
+        if path.is_file():
+            return path
+        raise RuntimeError(f"HERMES_KANBAN_DB does not point to a readable DB: {path}")
+
+    requested = board.strip() or os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    for home in _homes():
+        slug = requested or _current_slug(home) or "default"
+        candidate = (
+            home / "kanban.db"
+            if slug == "default"
+            else home / "kanban" / "boards" / slug / "kanban.db"
+        )
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"could not resolve board DB for board '{requested or 'default'}'")
+
+
+def _task_completion_contract(task_id: str, board: str) -> str | None:
+    path = _board_db_path(board)
+    uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")}
+            if not {"id", "completion_contract"}.issubset(columns):
+                raise RuntimeError("board DB tasks schema has no completion_contract")
+            row = conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"task '{task_id}' was not found on the resolved board")
+            value = row["completion_contract"]
+            return None if value is None else str(value)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"could not read completion contract for task '{task_id}': {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _evaluate_structured(payload: Mapping[str, Any]) -> int:
@@ -124,23 +206,59 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
     return _block(_diagnostic(assignee), assignee=assignee, source="kanban_create")
 
 
-def _evaluate_terminal(payload: Mapping[str, Any]) -> int:
-    raw_input = payload.get("tool_input")
-    if not isinstance(raw_input, Mapping):
-        return 0
-    command = str(raw_input.get("command") or "")
+def _evaluate_terminal_create(command: str) -> int | None:
     if not _CREATE_FAMILY_RE.search(command):
-        return 0
+        return None
     assignee_match = _ASSIGNEE_RE.search(command)
     if assignee_match is None:
-        return 0
+        return None
     assignee = assignee_match.group(1).casefold()
     if not _COMPLETION_FLAG_RE.search(command):
         return 0
     contracts = [value.strip() for value in _COMPLETION_VALUE_RE.findall(command)]
     if contracts and all(value == LOCAL_ONLY for value in contracts):
         return 0
-    return _block(_diagnostic(assignee), assignee=assignee, source="terminal")
+    return _block(_diagnostic(assignee), assignee=assignee, source="terminal:create")
+
+
+def _evaluate_terminal_assignment(command: str) -> int | None:
+    match = _ASSIGN_RE.search(command)
+    if match is None:
+        return None
+    task_id = match.group("task").strip()
+    assignee = match.group("profile").casefold()
+    prefix = match.group("prefix") or ""
+    board_match = _BOARD_RE.search(prefix)
+    board = board_match.group("board") if board_match is not None else ""
+    try:
+        contract = _task_completion_contract(task_id, board)
+    except (OSError, RuntimeError) as exc:
+        return _block(
+            "H4V3 specialist completion-contract gate failed closed while validating "
+            f"{match.group('verb').casefold()} of {task_id}: {type(exc).__name__}: {exc}. "
+            "No task mutation was performed.",
+            assignee=assignee,
+            source=f"terminal:{match.group('verb').casefold()}",
+        )
+    if _contract_is_local(contract):
+        return 0
+    return _block(
+        _diagnostic(assignee, action="assign"),
+        assignee=assignee,
+        source=f"terminal:{match.group('verb').casefold()}",
+    )
+
+
+def _evaluate_terminal(payload: Mapping[str, Any]) -> int:
+    raw_input = payload.get("tool_input")
+    if not isinstance(raw_input, Mapping):
+        return 0
+    command = str(raw_input.get("command") or "")
+    create = _evaluate_terminal_create(command)
+    if create is not None:
+        return create
+    assignment = _evaluate_terminal_assignment(command)
+    return 0 if assignment is None else assignment
 
 
 def evaluate_payload(payload: Mapping[str, Any]) -> int:
