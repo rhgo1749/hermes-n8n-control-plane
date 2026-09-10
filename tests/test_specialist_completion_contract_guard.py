@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,10 +29,15 @@ def _load(name: str, path: Path) -> Any:
     return module
 
 
-def _run(payload: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+def _run(
+    payload: dict[str, Any],
+    *,
+    env_updates: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory(prefix="specialist-contract-guard-") as directory:
         env = os.environ.copy()
         env["KANBAN_SPECIALIST_COMPLETION_GUARD_LOG"] = str(Path(directory) / "guard.log")
+        env.update(env_updates or {})
         return subprocess.run(
             [sys.executable, str(GUARD)],
             input=json.dumps(payload),
@@ -40,6 +46,19 @@ def _run(payload: dict[str, Any]) -> subprocess.CompletedProcess[str]:
             env=env,
             check=False,
         )
+
+
+def _task_db(path: Path, task_id: str, contract: str | None) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, completion_contract TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, completion_contract) VALUES (?, ?)",
+            (task_id, contract),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _assert_blocked(result: subprocess.CompletedProcess[str], assignee: str) -> None:
@@ -154,6 +173,87 @@ def test_terminal_mixed_contract_values_cannot_hide_nonlocal_create() -> None:
     )
     result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
     _assert_blocked(result, "kanban-developer")
+
+
+def test_terminal_assignment_to_specialist_rejects_existing_pr_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-assign-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_praware", "https://github.com/rhgo1749/ctrl-hangul/pull/111")
+        result = _run(
+            {
+                "tool_name": "terminal",
+                "tool_input": {"command": "hermes kanban assign t_praware kanban-developer"},
+            },
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+    _assert_blocked(result, "kanban-developer")
+
+
+def test_terminal_reassign_to_specialist_rejects_repository_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-reassign-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_repoaware", "rhgo1749/ctrl-hangul")
+        result = _run(
+            {
+                "tool_name": "terminal",
+                "tool_input": {
+                    "command": "bash -lc 'hermes kanban reassign t_repoaware kanban-reviewer --reclaim'"
+                },
+            },
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+    _assert_blocked(result, "kanban-reviewer")
+
+
+def test_terminal_assignment_to_specialist_allows_local_only_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-local-assign-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_local", "local-only")
+        result = _run(
+            {
+                "tool_name": "terminal",
+                "tool_input": {"command": "hermes kanban assign t_local kanban-designer"},
+            },
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+def test_terminal_assignment_uses_explicit_board_read_only() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-board-assign-") as directory:
+        home = Path(directory) / ".hermes"
+        db = home / "kanban" / "boards" / "ctrl-hangul" / "kanban.db"
+        db.parent.mkdir(parents=True)
+        _task_db(db, "t_board", "rhgo1749/ctrl-hangul")
+        result = _run(
+            {
+                "tool_name": "terminal",
+                "tool_input": {
+                    "command": "hermes kanban --board ctrl-hangul assign t_board kanban-developer"
+                },
+            },
+            env_updates={"HERMES_HOME": str(home), "HERMES_KANBAN_DB": ""},
+        )
+    _assert_blocked(result, "kanban-developer")
+
+
+def test_terminal_assignment_with_unreadable_task_state_fails_closed() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-missing-assign-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_other", "local-only")
+        result = _run(
+            {
+                "tool_name": "terminal",
+                "tool_input": {"command": "hermes kanban assign t_missing kanban-developer"},
+            },
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "failed closed" in body["message"]
+    assert "t_missing" in body["message"]
+    assert "No task mutation was performed" in body["message"]
 
 
 def test_terminal_profile_text_without_specialist_assignee_is_not_a_false_positive() -> None:
