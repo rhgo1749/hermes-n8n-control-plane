@@ -778,6 +778,112 @@ def test_send_corrupt_state_fails_open_and_replaces_it_after_delivery() -> None:
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_send_invalid_utf8_state_fails_open_and_replaces_it_after_delivery() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-invalid-utf8-state-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        state_path = home / "state" / "kanban-intake-last-sent.txt"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_bytes(
+            b'{"version":3,"attention_keys":["old"],'
+            b'"active_unresolved_keys":[]}\xff'
+        )
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        key = "needs_input:rhgo1749/re-bound|106|123|1|9"
+        line = f"⚠️ board · incident={key}"
+        assert intake._send_telegram_batch([line], ("123", "")) == "sent"
+        assert captured == ["🤖 Hermes Kanban\n\n" + line]
+        assert json.loads(state_path.read_text(encoding="utf-8")) == {
+            "active_unresolved_keys": [],
+            "attention_keys": [key],
+            "version": 3,
+        }
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_mixed_key_list_fails_open_without_partial_suppression() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-mixed-key-state-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        state_path = home / "state" / "kanban-intake-last-sent.txt"
+        state_path.parent.mkdir(parents=True)
+        resolved_key = "needs_input:rhgo1749/re-bound|106|123|1|9"
+        unresolved_key = "dispatch_lock_failed"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "attention_keys": [resolved_key, 42],
+                    "active_unresolved_keys": [unresolved_key, 43],
+                }
+            ),
+            encoding="utf-8",
+        )
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        resolved_line = f"⚠️ board · incident={resolved_key}"
+        assert intake._send_telegram_batch([resolved_line], ("123", "")) == "sent"
+        assert captured == ["🤖 Hermes Kanban\n\n" + resolved_line]
+        assert json.loads(state_path.read_text(encoding="utf-8")) == {
+            "active_unresolved_keys": [],
+            "attention_keys": [resolved_key],
+            "version": 3,
+        }
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "attention_keys": [resolved_key, 42],
+                    "active_unresolved_keys": [unresolved_key, 43],
+                }
+            ),
+            encoding="utf-8",
+        )
+        unresolved_line = (
+            "⚠️ board · incident_unresolved=true · incident=" + unresolved_key
+        )
+        assert intake._send_telegram_batch([unresolved_line], ("123", "")) == "sent"
+        assert captured == [
+            "🤖 Hermes Kanban\n\n" + resolved_line,
+            "🤖 Hermes Kanban\n\n" + unresolved_line,
+        ]
+        assert json.loads(state_path.read_text(encoding="utf-8")) == {
+            "active_unresolved_keys": [unresolved_key],
+            "attention_keys": [],
+            "version": 3,
+        }
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_send_delivery_reports_sent_and_writes_state() -> None:
     import shutil
     import tempfile

@@ -3608,6 +3608,30 @@ def _telegram_attention_is_unresolved(line: str) -> bool:
     return line[:marker_at].endswith(_TELEGRAM_INCIDENT_UNRESOLVED_MARKER)
 
 
+def _parse_telegram_dedup_key_list(
+    raw_keys: Any,
+    field_name: str,
+) -> set[str] | None:
+    """Validate one persisted semantic-key list without partial recovery."""
+    if not isinstance(raw_keys, list):
+        print(
+            f"kanban-intake: invalid dedup state {field_name} (warning only)",
+            file=sys.stderr,
+        )
+        return None
+    parsed: set[str] = set()
+    for value in raw_keys:
+        if not isinstance(value, str) or not value.strip():
+            print(
+                f"kanban-intake: invalid dedup state {field_name} "
+                "entry (warning only)",
+                file=sys.stderr,
+            )
+            return None
+        parsed.add(value.strip())
+    return parsed
+
+
 def _read_telegram_dedup_state(state_path: Path) -> tuple[set[str], set[str]]:
     """Read resolved history and the current unresolved snapshot.
 
@@ -3619,7 +3643,7 @@ def _read_telegram_dedup_state(state_path: Path) -> tuple[set[str], set[str]]:
         raw = state_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return set(), set()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         print(
             "kanban-intake: dedup state unreadable "
             f"(warning only): {type(exc).__name__}",
@@ -3645,41 +3669,27 @@ def _read_telegram_dedup_state(state_path: Path) -> tuple[set[str], set[str]]:
         )
         return set(), set()
     version = state.get("version")
-    raw_active: list[Any]
     if version == _TELEGRAM_LEGACY_DEDUP_STATE_VERSION:
-        raw_active = []
+        active_unresolved_keys = set()
     elif version == _TELEGRAM_DEDUP_STATE_VERSION:
-        candidate_active = state.get("active_unresolved_keys")
-        if not isinstance(candidate_active, list):
-            print(
-                "kanban-intake: invalid active unresolved keys (warning only)",
-                file=sys.stderr,
-            )
+        active_unresolved_keys = _parse_telegram_dedup_key_list(
+            state.get("active_unresolved_keys"),
+            "active_unresolved_keys",
+        )
+        if active_unresolved_keys is None:
             return set(), set()
-        raw_active = candidate_active
     else:
         print(
             "kanban-intake: unsupported dedup state version (warning only)",
             file=sys.stderr,
         )
         return set(), set()
-    raw_keys = state.get("attention_keys")
-    if not isinstance(raw_keys, list):
-        print(
-            "kanban-intake: invalid dedup state keys (warning only)",
-            file=sys.stderr,
-        )
+    delivered_keys = _parse_telegram_dedup_key_list(
+        state.get("attention_keys"),
+        "attention_keys",
+    )
+    if delivered_keys is None:
         return set(), set()
-    delivered_keys = {
-        value.strip()
-        for value in raw_keys
-        if isinstance(value, str) and value.strip()
-    }
-    active_unresolved_keys = {
-        value.strip()
-        for value in raw_active
-        if isinstance(value, str) and value.strip()
-    }
     return delivered_keys, active_unresolved_keys
 
 
