@@ -37,7 +37,8 @@
 #   * timestamped backup of the previous files (existing .bak-* convention)
 #   * rollback = restore the backup (exact command printed)
 #   * NEVER touches cron jobs.json / job id / schedule / enabled state
-#   * the block-kind guard is installed before its config hook is activated
+#   * lifecycle guard dependencies are installed before the approved wrapper
+#   * the existing approved shell-hook command path stays unchanged
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -51,6 +52,8 @@ EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 EDGE_WS_ADMISSION_SOURCE="$ROOT/edge/kanban_workspace_admission.py"
 EDGE_DYNAMIC_SOURCE="$ROOT/edge/kanban_dynamic_resource.py"
 BLOCK_KIND_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
+BLOCK_KIND_GUARD_CORE_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard-core.py"
+SPECIALIST_COMPLETION_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-specialist-completion-guard.py"
 BLOCK_KIND_CONFIG_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-hook-config.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
 MIGRATION_SOURCE="$ROOT/automation/n8n/scripts/board_identity_migration.py"
@@ -87,10 +90,16 @@ For the current containerized deployment:
 
 The Hermes cron job definition (id/schedule/enabled) is never modified.
 
-The deployment also installs the fail-closed kanban_block guard and atomically
-registers its pre_tool_call matchers for kanban_block and terminal in
-config.yaml. Use --dry-run for candidate validation only; applying the live
-config hook is a human validation gate.
+The deployment keeps the already-approved
+$HERMES_HOME/scripts/kanban-block-kind-guard.py shell-hook command stable. That
+wrapper now covers three fail-closed pre_tool_call matchers:
+  * kanban_block -> explicit block-kind policy
+  * kanban_create -> H4V3 specialist local-only completion-contract policy
+  * terminal -> both policies
+Its block-kind and specialist policy implementations are deployed beside the
+wrapper before it is switched. This avoids a new shell-hook consent boundary.
+Use --dry-run for candidate validation only; applying the live config hook is a
+human validation gate.
 EOF
 }
 
@@ -114,6 +123,8 @@ for source in \
   "$EDGE_WS_ADMISSION_SOURCE" \
   "$EDGE_DYNAMIC_SOURCE" \
   "$BLOCK_KIND_GUARD_SOURCE" \
+  "$BLOCK_KIND_GUARD_CORE_SOURCE" \
+  "$SPECIALIST_COMPLETION_GUARD_SOURCE" \
   "$BLOCK_KIND_CONFIG_SOURCE" \
   "$REGISTRY_SOURCE" \
   "$MIGRATION_SOURCE"
@@ -142,6 +153,8 @@ cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
 cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$EDGE_WS_ADMISSION_SOURCE" "$CANDIDATE/kanban_workspace_admission.py"
 cp -p "$EDGE_DYNAMIC_SOURCE" "$CANDIDATE/kanban_dynamic_resource.py"
+cp -p "$BLOCK_KIND_GUARD_CORE_SOURCE" "$CANDIDATE/kanban-block-kind-guard-core.py"
+cp -p "$SPECIALIST_COMPLETION_GUARD_SOURCE" "$CANDIDATE/kanban-specialist-completion-guard.py"
 cp -p "$BLOCK_KIND_GUARD_SOURCE" "$CANDIDATE/kanban-block-kind-guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
@@ -158,15 +171,18 @@ entries = config.get("hooks", {}).get("pre_tool_call", [])
 guard_entries = [
     entry for entry in entries
     if isinstance(entry, dict)
-    and entry.get("matcher") in {"kanban_block", "terminal"}
+    and entry.get("matcher") in {"kanban_block", "kanban_create", "terminal"}
     and "kanban-block-kind-guard.py" in str(entry.get("command", ""))
 ]
 if {
     entry.get("matcher") for entry in guard_entries
-} != {"kanban_block", "terminal"} or any(
+} != {"kanban_block", "kanban_create", "terminal"} or any(
     entry.get("fail_closed") is not True for entry in guard_entries
 ):
-    raise SystemExit("candidate config is missing fail-closed block-kind hook entries")
+    raise SystemExit("candidate config is missing fail-closed H4V3 lifecycle guard entries")
+commands = {str(entry.get("command", "")) for entry in guard_entries}
+if len(commands) != 1:
+    raise SystemExit("candidate config must reuse one approved lifecycle guard command")
 PY
 
 # 2) validation: compile + argparse smoke (--help exits 0)
@@ -180,6 +196,8 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_retry_signal_guard.py" \
   "$CANDIDATE/kanban_workspace_admission.py" \
   "$CANDIDATE/kanban_dynamic_resource.py" \
+  "$CANDIDATE/kanban-block-kind-guard-core.py" \
+  "$CANDIDATE/kanban-specialist-completion-guard.py" \
   "$CANDIDATE/kanban-block-kind-guard.py" \
   "$CANDIDATE/repository_registry.py" \
   "$CANDIDATE/board_identity_migration.py" || {
@@ -213,15 +231,19 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_retry_signal_guard.py"
   echo "dry-run:   $TARGET_DIR/kanban_workspace_admission.py"
   echo "dry-run:   $TARGET_DIR/kanban_dynamic_resource.py"
+  echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard-core.py"
+  echo "dry-run:   $TARGET_DIR/kanban-specialist-completion-guard.py"
   echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
   echo "dry-run:   $TARGET_DIR/board_identity_migration.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake-core.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
-  echo "dry-run: would atomically replace $CONFIG_TARGET with config hook entries"
-  echo "dry-run:   pre_tool_call matcher=kanban_block (fail_closed=true)"
-  echo "dry-run:   pre_tool_call matcher=terminal (fail_closed=true)"
+  echo "dry-run: would atomically replace $CONFIG_TARGET with lifecycle hook entries"
+  echo "dry-run:   lifecycle-guard matcher=kanban_block (fail_closed=true)"
+  echo "dry-run:   lifecycle-guard matcher=kanban_create (fail_closed=true)"
+  echo "dry-run:   lifecycle-guard matcher=terminal (fail_closed=true)"
+  echo "dry-run: shell-hook command path unchanged; no second consent command added"
   rm -rf "$CANDIDATE"
   exit 0
 fi
@@ -238,6 +260,8 @@ for name in \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
   kanban_dynamic_resource.py \
+  kanban-block-kind-guard-core.py \
+  kanban-specialist-completion-guard.py \
   kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py \
@@ -286,6 +310,12 @@ source_path_for() {
     kanban_dynamic_resource.py)
       printf '%s\n' "$ROOT/edge/kanban_dynamic_resource.py"
       ;;
+    kanban-block-kind-guard-core.py)
+      printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-block-kind-guard-core.py"
+      ;;
+    kanban-specialist-completion-guard.py)
+      printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-specialist-completion-guard.py"
+      ;;
     kanban-block-kind-guard.py)
       printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
       ;;
@@ -312,6 +342,8 @@ for name in \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
   kanban_dynamic_resource.py \
+  kanban-block-kind-guard-core.py \
+  kanban-specialist-completion-guard.py \
   kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py
@@ -324,8 +356,9 @@ do
   }
 done
 
-echo "Deployed intake/edge/registry and block-kind hook to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
-echo "Config hook installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
+echo "Deployed intake/edge/registry and lifecycle guards to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
+echo "Config hooks installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
+echo "Shell-hook command remains $TARGET_DIR/kanban-block-kind-guard.py (existing consent identity preserved)."
 echo "Cron job bf431b2a6ba6 is untouched (id/schedule/enabled unchanged)."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Rollback:"
@@ -335,4 +368,4 @@ if [[ ${#BACKUPS[@]} -gt 0 ]]; then
     echo "  mv \"$backup\" \"$TARGET_DIR/$name\""
   done
 fi
-echo "  mv \"$CONFIG_BACKUP\" \"$CONFIG_TARGET\""
+echo "  mv \"$CONFIG_BACKUP\" \"$CONFIG_TARGET\""}

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Render the Kanban block-kind shell-hook entries into config.yaml.
+"""Render fail-closed H4V3 Kanban lifecycle guard entries into config.yaml.
 
 This helper preserves the existing YAML text and comments instead of loading
-and dumping the whole Hermes configuration.  It writes a candidate path only;
-the deployer decides whether to atomically install it.  Re-running it replaces
-only entries for the same guard, so deployment is idempotent.
+and dumping the whole Hermes configuration. It writes a candidate path only;
+the deployer decides whether to atomically install it. Re-running it replaces
+only entries for the same approved guard command, so deployment is idempotent.
+
+The historical ``kanban-block-kind-guard.py`` command path remains stable for
+shell-hook consent. The command is now a small lifecycle wrapper and is
+registered for ``kanban_block``, ``kanban_create``, and ``terminal``; this adds
+the specialist completion-contract boundary without introducing a second
+allowlist approval.
 """
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 GUARD_FILENAME = "kanban-block-kind-guard.py"
-_MATCHERS = ("kanban_block", "terminal")
+_MATCHERS = ("kanban_block", "kanban_create", "terminal")
 
 
 def _render_entry_block(command: str) -> list[str]:
@@ -39,21 +45,19 @@ def _pre_tool_call_end(lines: list[str], start: int) -> int:
 
     The range stops at the next *sibling* key that sits at the same two-space
     indentation under ``hooks:`` (for example ``post_tool_call:``) or at the
-    next unindented top-level key (for example ``logging:``).  A blank line or
+    next unindented top-level key (for example ``logging:``). A blank line or
     a comment that belongs to the following section does not terminate the
-    range.  Terminating only at the next top-level key made a valid config with
-    a ``post_tool_call`` sibling swallow that sibling (and its entries) into
-    the ``pre_tool_call`` range, so the guard entries were appended at the end
-    of a range that already contained the sibling — and the YAML parser then
-    attached the new entries to ``post_tool_call`` instead of ``pre_tool_call``.
+    range.
     """
     for index in range(start + 1, len(lines)):
         line = lines[index]
-        # A two-space-indented key that is NOT the deeper four-space entry
-        # form (``    - ``) is a sibling hook key and terminates the range.
-        if line.startswith("  ") and not line.startswith(("    ", "  \t")) and line.lstrip() and line.lstrip()[0] not in "#-":
+        if (
+            line.startswith("  ")
+            and not line.startswith(("    ", "  \t"))
+            and line.lstrip()
+            and line.lstrip()[0] not in "#-"
+        ):
             return index
-        # An unindented top-level key also terminates the range.
         if line.strip() and not line.startswith(" "):
             return index
     return len(lines)
@@ -80,7 +84,7 @@ def _entry_ranges(lines: list[str], start: int, end: int) -> list[tuple[int, int
 
 def _is_guard_entry(lines: list[str], start: int, end: int) -> bool:
     block = "".join(lines[start:end])
-    return any(f"matcher: {matcher}" in block for matcher in _MATCHERS) and GUARD_FILENAME in block
+    return GUARD_FILENAME in block
 
 
 def render(text: str, command: str) -> str:
@@ -97,8 +101,8 @@ def render(text: str, command: str) -> str:
                 kept.extend(lines[entry_start:entry_end])
             elif position == len(ranges) - 1:
                 # The final entry range includes the blank separator before
-                # the next top-level key.  Keep that separator when replacing
-                # an existing guard, otherwise a second render drifts.
+                # the next sibling/top-level key. Preserve it while replacing
+                # old lifecycle-guard entries.
                 suffix: list[str] = []
                 for line in reversed(lines[entry_start:entry_end]):
                     if line.strip():
@@ -107,8 +111,6 @@ def render(text: str, command: str) -> str:
                 kept.extend(suffix)
             cursor = entry_end
         kept.extend(lines[cursor:end])
-        # Insert at the end of the existing pre_tool_call list.  A final blank
-        # line is retained as-is; the next top-level key remains untouched.
         insertion = len(kept)
         while insertion > 0 and not kept[insertion - 1].strip():
             insertion -= 1
@@ -118,7 +120,12 @@ def render(text: str, command: str) -> str:
     hook_indices = [index for index, line in enumerate(lines) if line == "hooks:\n"]
     if hook_indices:
         index = hook_indices[-1] + 1
-        return "".join(lines[:index] + ["  pre_tool_call:\n"] + _render_entry_block(command) + lines[index:])
+        return "".join(
+            lines[:index]
+            + ["  pre_tool_call:\n"]
+            + _render_entry_block(command)
+            + lines[index:]
+        )
 
     separator = "" if not text or text.endswith("\n") else "\n"
     return text + separator + "hooks:\n  pre_tool_call:\n" + "".join(_render_entry_block(command))
