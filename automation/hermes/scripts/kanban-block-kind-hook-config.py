@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Render the Kanban block-kind shell-hook entries into config.yaml.
+"""Render fail-closed Kanban lifecycle guard entries into config.yaml.
 
 This helper preserves the existing YAML text and comments instead of loading
-and dumping the whole Hermes configuration.  It writes a candidate path only;
-the deployer decides whether to atomically install it.  Re-running it replaces
+and dumping the whole Hermes configuration. It writes a candidate path only;
+the deployer decides whether to atomically install it. Re-running it replaces
 only entries for the same guard, so deployment is idempotent.
+
+The historical block-kind guard remains unchanged. An optional specialist
+completion-contract guard can be rendered in the same pass so deployment never
+needs a lossy second YAML reserialization step.
 """
 from __future__ import annotations
 
@@ -15,14 +19,21 @@ import stat
 import tempfile
 from pathlib import Path
 
-GUARD_FILENAME = "kanban-block-kind-guard.py"
-_MATCHERS = ("kanban_block", "terminal")
+BLOCK_GUARD_FILENAME = "kanban-block-kind-guard.py"
+SPECIALIST_GUARD_FILENAME = "kanban-specialist-completion-guard.py"
+_BLOCK_MATCHERS = ("kanban_block", "terminal")
+_SPECIALIST_MATCHERS = ("kanban_create", "terminal")
+
+# Compatibility names kept for focused tests/tools that imported the original
+# helper before the specialist guard was added.
+GUARD_FILENAME = BLOCK_GUARD_FILENAME
+_MATCHERS = _BLOCK_MATCHERS
 
 
-def _render_entry_block(command: str) -> list[str]:
+def _render_entry_block(command: str, matchers: tuple[str, ...]) -> list[str]:
     command_text = shlex.join(shlex.split(command))
     lines: list[str] = []
-    for matcher in _MATCHERS:
+    for matcher in matchers:
         lines.extend(
             [
                 f"    - matcher: {matcher}\n",
@@ -39,21 +50,19 @@ def _pre_tool_call_end(lines: list[str], start: int) -> int:
 
     The range stops at the next *sibling* key that sits at the same two-space
     indentation under ``hooks:`` (for example ``post_tool_call:``) or at the
-    next unindented top-level key (for example ``logging:``).  A blank line or
+    next unindented top-level key (for example ``logging:``). A blank line or
     a comment that belongs to the following section does not terminate the
-    range.  Terminating only at the next top-level key made a valid config with
-    a ``post_tool_call`` sibling swallow that sibling (and its entries) into
-    the ``pre_tool_call`` range, so the guard entries were appended at the end
-    of a range that already contained the sibling — and the YAML parser then
-    attached the new entries to ``post_tool_call`` instead of ``pre_tool_call``.
+    range.
     """
     for index in range(start + 1, len(lines)):
         line = lines[index]
-        # A two-space-indented key that is NOT the deeper four-space entry
-        # form (``    - ``) is a sibling hook key and terminates the range.
-        if line.startswith("  ") and not line.startswith(("    ", "  \t")) and line.lstrip() and line.lstrip()[0] not in "#-":
+        if (
+            line.startswith("  ")
+            and not line.startswith(("    ", "  \t"))
+            and line.lstrip()
+            and line.lstrip()[0] not in "#-"
+        ):
             return index
-        # An unindented top-level key also terminates the range.
         if line.strip() and not line.startswith(" "):
             return index
     return len(lines)
@@ -78,12 +87,25 @@ def _entry_ranges(lines: list[str], start: int, end: int) -> list[tuple[int, int
     ]
 
 
-def _is_guard_entry(lines: list[str], start: int, end: int) -> bool:
+def _is_guard_entry(
+    lines: list[str],
+    start: int,
+    end: int,
+    *,
+    guard_filename: str,
+    matchers: tuple[str, ...],
+) -> bool:
     block = "".join(lines[start:end])
-    return any(f"matcher: {matcher}" in block for matcher in _MATCHERS) and GUARD_FILENAME in block
+    return any(f"matcher: {matcher}" in block for matcher in matchers) and guard_filename in block
 
 
-def render(text: str, command: str) -> str:
+def _render_guard(
+    text: str,
+    command: str,
+    *,
+    guard_filename: str,
+    matchers: tuple[str, ...],
+) -> str:
     lines = text.splitlines(keepends=True)
     found = _pre_tool_call_range(lines)
     if found is not None:
@@ -93,12 +115,18 @@ def render(text: str, command: str) -> str:
         cursor = start + 1
         for position, (entry_start, entry_end) in enumerate(ranges):
             kept.extend(lines[cursor:entry_start])
-            if not _is_guard_entry(lines, entry_start, entry_end):
+            if not _is_guard_entry(
+                lines,
+                entry_start,
+                entry_end,
+                guard_filename=guard_filename,
+                matchers=matchers,
+            ):
                 kept.extend(lines[entry_start:entry_end])
             elif position == len(ranges) - 1:
                 # The final entry range includes the blank separator before
-                # the next top-level key.  Keep that separator when replacing
-                # an existing guard, otherwise a second render drifts.
+                # the next sibling/top-level key. Preserve it while replacing
+                # the old guard entries.
                 suffix: list[str] = []
                 for line in reversed(lines[entry_start:entry_end]):
                     if line.strip():
@@ -107,28 +135,58 @@ def render(text: str, command: str) -> str:
                 kept.extend(suffix)
             cursor = entry_end
         kept.extend(lines[cursor:end])
-        # Insert at the end of the existing pre_tool_call list.  A final blank
-        # line is retained as-is; the next top-level key remains untouched.
         insertion = len(kept)
         while insertion > 0 and not kept[insertion - 1].strip():
             insertion -= 1
-        kept[insertion:insertion] = _render_entry_block(command)
+        kept[insertion:insertion] = _render_entry_block(command, matchers)
         return "".join(lines[: start + 1] + kept + lines[end:])
 
     hook_indices = [index for index, line in enumerate(lines) if line == "hooks:\n"]
     if hook_indices:
         index = hook_indices[-1] + 1
-        return "".join(lines[:index] + ["  pre_tool_call:\n"] + _render_entry_block(command) + lines[index:])
+        return "".join(
+            lines[:index]
+            + ["  pre_tool_call:\n"]
+            + _render_entry_block(command, matchers)
+            + lines[index:]
+        )
 
     separator = "" if not text or text.endswith("\n") else "\n"
-    return text + separator + "hooks:\n  pre_tool_call:\n" + "".join(_render_entry_block(command))
+    return (
+        text
+        + separator
+        + "hooks:\n  pre_tool_call:\n"
+        + "".join(_render_entry_block(command, matchers))
+    )
 
 
-def write_candidate(source: Path, destination: Path, command: str) -> None:
+def render(text: str, command: str, specialist_command: str | None = None) -> str:
+    rendered = _render_guard(
+        text,
+        command,
+        guard_filename=BLOCK_GUARD_FILENAME,
+        matchers=_BLOCK_MATCHERS,
+    )
+    if specialist_command:
+        rendered = _render_guard(
+            rendered,
+            specialist_command,
+            guard_filename=SPECIALIST_GUARD_FILENAME,
+            matchers=_SPECIALIST_MATCHERS,
+        )
+    return rendered
+
+
+def write_candidate(
+    source: Path,
+    destination: Path,
+    command: str,
+    specialist_command: str | None = None,
+) -> None:
     if not source.is_file():
         raise SystemExit(f"config.yaml not found: {source}")
     original = source.read_text(encoding="utf-8")
-    rendered = render(original, command)
+    rendered = render(original, command, specialist_command)
     destination.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(source.stat().st_mode)
     fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
@@ -150,9 +208,13 @@ def main() -> int:
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--guard", type=Path, required=True)
+    parser.add_argument("--specialist-guard", type=Path)
     args = parser.parse_args()
     command = f"python3 {args.guard}"
-    write_candidate(args.source, args.destination, command)
+    specialist_command = (
+        f"python3 {args.specialist_guard}" if args.specialist_guard is not None else None
+    )
+    write_candidate(args.source, args.destination, command, specialist_command)
     return 0
 
 
