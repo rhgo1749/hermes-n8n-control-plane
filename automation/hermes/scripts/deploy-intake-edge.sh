@@ -50,6 +50,7 @@ EDGE_ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
 EDGE_HEAD_BINDING_SOURCE="$ROOT/edge/kanban_head_binding_feedback.py"
 EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 EDGE_WS_ADMISSION_SOURCE="$ROOT/edge/kanban_workspace_admission.py"
+EDGE_DYNAMIC_CORE_SOURCE="$ROOT/edge/kanban_dynamic_resource_core.py"
 EDGE_DYNAMIC_SOURCE="$ROOT/edge/kanban_dynamic_resource.py"
 BLOCK_KIND_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
 BLOCK_KIND_GUARD_CORE_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard-core.py"
@@ -77,12 +78,12 @@ projection from fresh GitHub state.
 
 The live kanban-github-sync.py is a small overlay entrypoint. The canonical
 reconciliation implementation is deployed beside it as kanban-github-sync-core.py,
-plus kanban_resource_admission.py, kanban_head_binding_feedback.py, and
-kanban_retry_signal_guard.py. If no kanban.worker_resources are configured,
-scheduling behavior is unchanged. All wrapper dependencies are replaced before
-the corresponding live entrypoint, so a cron invocation during deploy sees either
-the old standalone script or a fully backed new wrapper — never a wrapper whose
-imports have not been installed.
+plus kanban_resource_admission.py, kanban_head_binding_feedback.py,
+kanban_retry_signal_guard.py, and the dynamic resource core/wrapper pair. If no
+kanban.worker_resources are configured, scheduling behavior is unchanged. All
+wrapper dependencies are replaced before the corresponding live entrypoint, so
+a cron invocation during deploy sees either the old standalone script or a
+fully backed new wrapper — never a wrapper whose imports have not been installed.
 
 Run this where the supplied --hermes-home path is the active Hermes runtime.
 For the current containerized deployment:
@@ -121,6 +122,7 @@ for source in \
   "$EDGE_HEAD_BINDING_SOURCE" \
   "$EDGE_RETRY_GUARD_SOURCE" \
   "$EDGE_WS_ADMISSION_SOURCE" \
+  "$EDGE_DYNAMIC_CORE_SOURCE" \
   "$EDGE_DYNAMIC_SOURCE" \
   "$BLOCK_KIND_GUARD_SOURCE" \
   "$BLOCK_KIND_GUARD_CORE_SOURCE" \
@@ -152,6 +154,8 @@ cp -p "$EDGE_ADMISSION_SOURCE" "$CANDIDATE/kanban_resource_admission.py"
 cp -p "$EDGE_HEAD_BINDING_SOURCE" "$CANDIDATE/kanban_head_binding_feedback.py"
 cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$EDGE_WS_ADMISSION_SOURCE" "$CANDIDATE/kanban_workspace_admission.py"
+# The implementation must land before the stable wrapper that imports it.
+cp -p "$EDGE_DYNAMIC_CORE_SOURCE" "$CANDIDATE/kanban_dynamic_resource_core.py"
 cp -p "$EDGE_DYNAMIC_SOURCE" "$CANDIDATE/kanban_dynamic_resource.py"
 cp -p "$BLOCK_KIND_GUARD_CORE_SOURCE" "$CANDIDATE/kanban-block-kind-guard-core.py"
 cp -p "$SPECIALIST_COMPLETION_GUARD_SOURCE" "$CANDIDATE/kanban-specialist-completion-guard.py"
@@ -195,6 +199,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_head_binding_feedback.py" \
   "$CANDIDATE/kanban_retry_signal_guard.py" \
   "$CANDIDATE/kanban_workspace_admission.py" \
+  "$CANDIDATE/kanban_dynamic_resource_core.py" \
   "$CANDIDATE/kanban_dynamic_resource.py" \
   "$CANDIDATE/kanban-block-kind-guard-core.py" \
   "$CANDIDATE/kanban-specialist-completion-guard.py" \
@@ -230,6 +235,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_head_binding_feedback.py"
   echo "dry-run:   $TARGET_DIR/kanban_retry_signal_guard.py"
   echo "dry-run:   $TARGET_DIR/kanban_workspace_admission.py"
+  echo "dry-run:   $TARGET_DIR/kanban_dynamic_resource_core.py"
   echo "dry-run:   $TARGET_DIR/kanban_dynamic_resource.py"
   echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard-core.py"
   echo "dry-run:   $TARGET_DIR/kanban-specialist-completion-guard.py"
@@ -259,6 +265,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
+  kanban_dynamic_resource_core.py \
   kanban_dynamic_resource.py \
   kanban-block-kind-guard-core.py \
   kanban-specialist-completion-guard.py \
@@ -307,6 +314,9 @@ source_path_for() {
     kanban_workspace_admission.py)
       printf '%s\n' "$ROOT/edge/kanban_workspace_admission.py"
       ;;
+    kanban_dynamic_resource_core.py)
+      printf '%s\n' "$ROOT/edge/kanban_dynamic_resource_core.py"
+      ;;
     kanban_dynamic_resource.py)
       printf '%s\n' "$ROOT/edge/kanban_dynamic_resource.py"
       ;;
@@ -341,6 +351,7 @@ for name in \
   kanban_head_binding_feedback.py \
   kanban_retry_signal_guard.py \
   kanban_workspace_admission.py \
+  kanban_dynamic_resource_core.py \
   kanban_dynamic_resource.py \
   kanban-block-kind-guard-core.py \
   kanban-specialist-completion-guard.py \
@@ -368,4 +379,4 @@ if [[ ${#BACKUPS[@]} -gt 0 ]]; then
     echo "  mv \"$backup\" \"$TARGET_DIR/$name\""
   done
 fi
-echo "  mv \"$CONFIG_BACKUP\" \"$CONFIG_TARGET\""}
+echo "  mv \"$CONFIG_BACKUP\" \"$CONFIG_TARGET\""
