@@ -5,19 +5,21 @@ Hermes core supports PR-aware ``completion_contract`` values because some
 standalone Kanban tasks are terminal only after exact-head GitHub acceptance.
 H4V3 specialist tasks have a different lifecycle boundary: Developer,
 Reviewer, and Designer own bounded internal work and must be able to finish
-while the linked PR is still open.  GitHub merge/review state is projected by
+while the linked PR is still open. GitHub merge/review state is projected by
 the canonical edge on the Issue-backed root card.
 
 This pre-tool hook therefore rejects non-local completion contracts when a new
-task is assigned to an H4V3 specialist profile.  Omitted
+task is assigned to an H4V3 specialist profile. Omitted
 ``completion_contract`` is safe because Hermes normalizes it to ``local-only``.
 PR URLs, repository names, and head SHAs remain valid task-body / handoff
 provenance; they are not specialist terminal policy.
 
-The structured ``kanban_create`` tool is the canonical path.  The ``terminal``
-matcher also closes the ordinary literal ``hermes kanban create`` bypass for
-specialist assignees, including shell-wrapped command strings.  Unrelated
-terminal commands and non-specialist PR-aware tasks remain untouched.
+The structured ``kanban_create`` tool is the canonical path. The ``terminal``
+matcher also closes the ordinary literal/shell-wrapped ``hermes kanban create``
+bypass. It recognizes the real ``--assignee`` option rather than arbitrary
+profile text, and rejects if any supplied completion-contract value is non-local
+(or cannot be parsed). Unrelated terminal commands and non-specialist PR-aware
+tasks remain untouched.
 """
 from __future__ import annotations
 
@@ -44,15 +46,16 @@ _CREATE_FAMILY_RE = re.compile(
     r"\bhermes\b[\s\S]*?\bkanban\b[\s\S]*?\bcreate\b",
     re.IGNORECASE,
 )
-_SPECIALIST_TOKEN_RE = re.compile(
-    r"\bkanban-(?:developer|reviewer|designer)\b",
+_ASSIGNEE_RE = re.compile(
+    r"--assignee(?:=|\s+)[\"']?(kanban-(?:developer|reviewer|designer))[\"']?"
+    r"(?=\s|[\"']|$)",
+    re.IGNORECASE,
+)
+_COMPLETION_VALUE_RE = re.compile(
+    r"--completion-contract(?:=|\s+)[\"']?([^\s\"']+)[\"']?",
     re.IGNORECASE,
 )
 _COMPLETION_FLAG_RE = re.compile(r"--completion-contract(?:=|\s+)", re.IGNORECASE)
-_LOCAL_ONLY_FLAG_RE = re.compile(
-    r"--completion-contract(?:=|\s+)[\"']?local-only[\"']?(?=\s|[\"']|$)",
-    re.IGNORECASE,
-)
 
 
 def _log(entry: Mapping[str, Any]) -> None:
@@ -124,13 +127,14 @@ def _evaluate_terminal(payload: Mapping[str, Any]) -> int:
     command = str(raw_input.get("command") or "")
     if not _CREATE_FAMILY_RE.search(command):
         return 0
-    specialist_match = _SPECIALIST_TOKEN_RE.search(command)
-    if specialist_match is None:
+    assignee_match = _ASSIGNEE_RE.search(command)
+    if assignee_match is None:
         return 0
-    assignee = specialist_match.group(0).casefold()
+    assignee = assignee_match.group(1).casefold()
     if not _COMPLETION_FLAG_RE.search(command):
         return 0
-    if _LOCAL_ONLY_FLAG_RE.search(command):
+    contracts = [value.strip() for value in _COMPLETION_VALUE_RE.findall(command)]
+    if contracts and all(value == LOCAL_ONLY for value in contracts):
         return 0
     return _block(_diagnostic(assignee), assignee=assignee, source="terminal")
 
