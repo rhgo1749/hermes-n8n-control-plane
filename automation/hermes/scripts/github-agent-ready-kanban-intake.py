@@ -3652,7 +3652,7 @@ def _read_telegram_dedup_state(state_path: Path) -> tuple[set[str], set[str]]:
         return set(), set()
     try:
         state = json.loads(raw)
-    except (TypeError, ValueError, UnicodeError) as exc:
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
         # The pre-semantic state file contained a full body. It cannot safely
         # identify generations, so migrate by sending and overwriting it after
         # a successful keyed delivery.
