@@ -37,7 +37,7 @@
 #   * timestamped backup of the previous files (existing .bak-* convention)
 #   * rollback = restore the backup (exact command printed)
 #   * NEVER touches cron jobs.json / job id / schedule / enabled state
-#   * the block-kind guard is installed before its config hook is activated
+#   * lifecycle guards are installed before their config hooks are activated
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -51,6 +51,7 @@ EDGE_RETRY_GUARD_SOURCE="$ROOT/edge/kanban_retry_signal_guard.py"
 EDGE_WS_ADMISSION_SOURCE="$ROOT/edge/kanban_workspace_admission.py"
 EDGE_DYNAMIC_SOURCE="$ROOT/edge/kanban_dynamic_resource.py"
 BLOCK_KIND_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
+SPECIALIST_COMPLETION_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-specialist-completion-guard.py"
 BLOCK_KIND_CONFIG_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-hook-config.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
 MIGRATION_SOURCE="$ROOT/automation/n8n/scripts/board_identity_migration.py"
@@ -87,10 +88,12 @@ For the current containerized deployment:
 
 The Hermes cron job definition (id/schedule/enabled) is never modified.
 
-The deployment also installs the fail-closed kanban_block guard and atomically
-registers its pre_tool_call matchers for kanban_block and terminal in
-config.yaml. Use --dry-run for candidate validation only; applying the live
-config hook is a human validation gate.
+The deployment installs two fail-closed lifecycle guards and atomically
+registers their pre_tool_call hooks in config.yaml:
+  * kanban_block / terminal -> explicit block-kind guard
+  * kanban_create / terminal -> H4V3 specialist local-only completion guard
+Use --dry-run for candidate validation only; applying the live config hook is a
+human validation gate.
 EOF
 }
 
@@ -114,6 +117,7 @@ for source in \
   "$EDGE_WS_ADMISSION_SOURCE" \
   "$EDGE_DYNAMIC_SOURCE" \
   "$BLOCK_KIND_GUARD_SOURCE" \
+  "$SPECIALIST_COMPLETION_GUARD_SOURCE" \
   "$BLOCK_KIND_CONFIG_SOURCE" \
   "$REGISTRY_SOURCE" \
   "$MIGRATION_SOURCE"
@@ -143,10 +147,12 @@ cp -p "$EDGE_RETRY_GUARD_SOURCE" "$CANDIDATE/kanban_retry_signal_guard.py"
 cp -p "$EDGE_WS_ADMISSION_SOURCE" "$CANDIDATE/kanban_workspace_admission.py"
 cp -p "$EDGE_DYNAMIC_SOURCE" "$CANDIDATE/kanban_dynamic_resource.py"
 cp -p "$BLOCK_KIND_GUARD_SOURCE" "$CANDIDATE/kanban-block-kind-guard.py"
+cp -p "$SPECIALIST_COMPLETION_GUARD_SOURCE" "$CANDIDATE/kanban-specialist-completion-guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
 python3 "$BLOCK_KIND_CONFIG_SOURCE" "$CONFIG_TARGET" "$CANDIDATE/config.yaml" \
-  --guard "$TARGET_DIR/kanban-block-kind-guard.py"
+  --guard "$TARGET_DIR/kanban-block-kind-guard.py" \
+  --specialist-guard "$TARGET_DIR/kanban-specialist-completion-guard.py"
 python3 - "$CANDIDATE/config.yaml" <<'PY'
 import sys
 from pathlib import Path
@@ -155,18 +161,32 @@ import yaml
 
 config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
 entries = config.get("hooks", {}).get("pre_tool_call", [])
-guard_entries = [
+
+block_entries = [
     entry for entry in entries
     if isinstance(entry, dict)
     and entry.get("matcher") in {"kanban_block", "terminal"}
     and "kanban-block-kind-guard.py" in str(entry.get("command", ""))
 ]
 if {
-    entry.get("matcher") for entry in guard_entries
+    entry.get("matcher") for entry in block_entries
 } != {"kanban_block", "terminal"} or any(
-    entry.get("fail_closed") is not True for entry in guard_entries
+    entry.get("fail_closed") is not True for entry in block_entries
 ):
     raise SystemExit("candidate config is missing fail-closed block-kind hook entries")
+
+specialist_entries = [
+    entry for entry in entries
+    if isinstance(entry, dict)
+    and entry.get("matcher") in {"kanban_create", "terminal"}
+    and "kanban-specialist-completion-guard.py" in str(entry.get("command", ""))
+]
+if {
+    entry.get("matcher") for entry in specialist_entries
+} != {"kanban_create", "terminal"} or any(
+    entry.get("fail_closed") is not True for entry in specialist_entries
+):
+    raise SystemExit("candidate config is missing fail-closed specialist completion hook entries")
 PY
 
 # 2) validation: compile + argparse smoke (--help exits 0)
@@ -181,6 +201,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_workspace_admission.py" \
   "$CANDIDATE/kanban_dynamic_resource.py" \
   "$CANDIDATE/kanban-block-kind-guard.py" \
+  "$CANDIDATE/kanban-specialist-completion-guard.py" \
   "$CANDIDATE/repository_registry.py" \
   "$CANDIDATE/board_identity_migration.py" || {
   rm -rf "$CANDIDATE"; echo "candidate validation failed (py_compile)" >&2; exit 1;
@@ -214,14 +235,17 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_workspace_admission.py"
   echo "dry-run:   $TARGET_DIR/kanban_dynamic_resource.py"
   echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard.py"
+  echo "dry-run:   $TARGET_DIR/kanban-specialist-completion-guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
   echo "dry-run:   $TARGET_DIR/board_identity_migration.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake-core.py"
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
   echo "dry-run: would atomically replace $CONFIG_TARGET with config hook entries"
-  echo "dry-run:   pre_tool_call matcher=kanban_block (fail_closed=true)"
-  echo "dry-run:   pre_tool_call matcher=terminal (fail_closed=true)"
+  echo "dry-run:   block-kind matcher=kanban_block (fail_closed=true)"
+  echo "dry-run:   block-kind matcher=terminal (fail_closed=true)"
+  echo "dry-run:   specialist-completion matcher=kanban_create (fail_closed=true)"
+  echo "dry-run:   specialist-completion matcher=terminal (fail_closed=true)"
   rm -rf "$CANDIDATE"
   exit 0
 fi
@@ -239,6 +263,7 @@ for name in \
   kanban_workspace_admission.py \
   kanban_dynamic_resource.py \
   kanban-block-kind-guard.py \
+  kanban-specialist-completion-guard.py \
   repository_registry.py \
   board_identity_migration.py \
   github-agent-ready-kanban-intake-core.py \
@@ -289,6 +314,9 @@ source_path_for() {
     kanban-block-kind-guard.py)
       printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
       ;;
+    kanban-specialist-completion-guard.py)
+      printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-specialist-completion-guard.py"
+      ;;
     repository_registry.py)
       printf '%s\n' "$ROOT/automation/n8n/scripts/repository_registry.py"
       ;;
@@ -313,6 +341,7 @@ for name in \
   kanban_workspace_admission.py \
   kanban_dynamic_resource.py \
   kanban-block-kind-guard.py \
+  kanban-specialist-completion-guard.py \
   repository_registry.py \
   board_identity_migration.py
 do
@@ -324,8 +353,8 @@ do
   }
 done
 
-echo "Deployed intake/edge/registry and block-kind hook to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
-echo "Config hook installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
+echo "Deployed intake/edge/registry and lifecycle guards to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
+echo "Config hooks installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
 echo "Cron job bf431b2a6ba6 is untouched (id/schedule/enabled unchanged)."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Rollback:"
