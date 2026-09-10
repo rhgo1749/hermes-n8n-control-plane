@@ -8,18 +8,22 @@ Reviewer, and Designer own bounded internal work and must be able to finish
 while the linked PR is still open. GitHub merge/review state is projected by
 the canonical edge on the Issue-backed root card.
 
-This pre-tool hook therefore rejects non-local completion contracts when a new
-task is assigned to an H4V3 specialist profile. Omitted
+This pre-tool policy therefore rejects non-local completion contracts when a
+new task is assigned to an H4V3 specialist profile. Omitted
 ``completion_contract`` is safe because Hermes normalizes it to ``local-only``.
 PR URLs, repository names, and head SHAs remain valid task-body / handoff
 provenance; they are not specialist terminal policy.
 
 The structured ``kanban_create`` tool is the canonical path. The ``terminal``
-matcher also closes the ordinary literal/shell-wrapped ``hermes kanban create``
+policy also closes the ordinary literal/shell-wrapped ``hermes kanban create``
 bypass. It recognizes the real ``--assignee`` option rather than arbitrary
 profile text, and rejects if any supplied completion-contract value is non-local
 (or cannot be parsed). Unrelated terminal commands and non-specialist PR-aware
 tasks remain untouched.
+
+``evaluate_payload`` is intentionally importable by the already-approved
+lifecycle hook wrapper so this policy does not need a second shell-hook command
+or a second child Python process.
 """
 from __future__ import annotations
 
@@ -139,6 +143,16 @@ def _evaluate_terminal(payload: Mapping[str, Any]) -> int:
     return _block(_diagnostic(assignee), assignee=assignee, source="terminal")
 
 
+def evaluate_payload(payload: Mapping[str, Any]) -> int:
+    """Evaluate one already-decoded pre_tool_call payload."""
+    tool_name = str(payload.get("tool_name") or "")
+    if tool_name == "kanban_create":
+        return _evaluate_structured(payload)
+    if tool_name == "terminal":
+        return _evaluate_terminal(payload)
+    return 0
+
+
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -150,13 +164,7 @@ def main() -> int:
         )
     if not isinstance(payload, Mapping):
         return 0
-
-    tool_name = str(payload.get("tool_name") or "")
-    if tool_name == "kanban_create":
-        return _evaluate_structured(payload)
-    if tool_name == "terminal":
-        return _evaluate_terminal(payload)
-    return 0
+    return evaluate_payload(payload)
 
 
 if __name__ == "__main__":
