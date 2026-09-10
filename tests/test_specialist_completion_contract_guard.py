@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-GUARD = ROOT / "automation/hermes/scripts/kanban-specialist-completion-guard.py"
+GUARD = ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
 CONFIG_HELPER = ROOT / "automation/hermes/scripts/kanban-block-kind-hook-config.py"
 DEPLOYER = ROOT / "automation/hermes/scripts/deploy-intake-edge.sh"
 
@@ -176,7 +176,7 @@ def test_unrelated_terminal_and_non_create_tools_remain_fail_open() -> None:
         assert result.returncode == 0, (result.stdout, result.stderr)
 
 
-def test_hook_config_renders_both_guards_idempotently_without_losing_siblings() -> None:
+def test_hook_config_reuses_one_approved_command_idempotently_without_losing_siblings() -> None:
     helper = _load("specialist_contract_hook_config", CONFIG_HELPER)
     original = (
         "hooks:\n"
@@ -190,26 +190,27 @@ def test_hook_config_renders_both_guards_idempotently_without_losing_siblings() 
         "logging:\n"
         "  level: INFO\n"
     )
-    block_command = "python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
-    specialist_command = (
-        "python3 /home/hermes/.hermes/scripts/kanban-specialist-completion-guard.py"
-    )
-    rendered = helper.render(original, block_command, specialist_command)
-    again = helper.render(rendered, block_command, specialist_command)
+    command = "python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+    rendered = helper.render(original, command)
+    again = helper.render(rendered, command)
     assert rendered == again
     parsed = yaml.safe_load(rendered)
     entries = parsed["hooks"]["pre_tool_call"]
-    block_entries = [
+    guard_entries = [
         entry for entry in entries
         if "kanban-block-kind-guard.py" in str(entry.get("command", ""))
     ]
-    specialist_entries = [
-        entry for entry in entries
-        if "kanban-specialist-completion-guard.py" in str(entry.get("command", ""))
-    ]
-    assert {entry["matcher"] for entry in block_entries} == {"kanban_block", "terminal"}
-    assert {entry["matcher"] for entry in specialist_entries} == {"kanban_create", "terminal"}
-    assert all(entry["fail_closed"] is True for entry in block_entries + specialist_entries)
+    assert {entry["matcher"] for entry in guard_entries} == {
+        "kanban_block",
+        "kanban_create",
+        "terminal",
+    }
+    assert {entry["command"] for entry in guard_entries} == {command}
+    assert all(entry["fail_closed"] is True for entry in guard_entries)
+    assert not any(
+        "kanban-specialist-completion-guard.py" in str(entry.get("command", ""))
+        for entry in entries
+    )
     assert parsed["hooks"]["post_tool_call"][0]["matcher"] == "post"
     assert parsed["logging"]["level"] == "INFO"
 
@@ -229,8 +230,9 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
             check=False,
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "kanban-block-kind-guard-core.py" in result.stdout
         assert "kanban-specialist-completion-guard.py" in result.stdout
-        assert "specialist-completion matcher=kanban_create (fail_closed=true)" in result.stdout
-        assert "specialist-completion matcher=terminal (fail_closed=true)" in result.stdout
+        assert "lifecycle-guard matcher=kanban_create (fail_closed=true)" in result.stdout
+        assert "shell-hook command path unchanged; no second consent command added" in result.stdout
         assert config.read_text(encoding="utf-8") == original
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
