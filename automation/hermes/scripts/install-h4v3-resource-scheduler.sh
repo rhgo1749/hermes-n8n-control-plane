@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Install the H4V3 backend-aware Kanban resource scheduler into the live Hermes
-# default profile. This is external to Hermes core: two helper modules are
-# copied under $HERMES_HOME/scripts and a tiny user plugin patches the core
-# claim boundary when the dispatcher process loads enabled plugins.
+# default profile. This is external to Hermes core: helper modules are copied
+# under $HERMES_HOME/scripts and a tiny user plugin patches the core claim
+# boundary when the dispatcher process loads enabled plugins.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ADMISSION_SOURCE="$ROOT/edge/kanban_resource_admission.py"
+DYNAMIC_CORE_SOURCE="$ROOT/edge/kanban_dynamic_resource_core.py"
 DYNAMIC_SOURCE="$ROOT/edge/kanban_dynamic_resource.py"
 PLUGIN_SOURCE="$ROOT/hermes-plugin/h4v3-resource-scheduler"
 
@@ -20,6 +21,7 @@ Usage: install-h4v3-resource-scheduler.sh [--hermes-home PATH] [--hermes-bin PAT
 
 Installs:
   $HERMES_HOME/scripts/kanban_resource_admission.py
+  $HERMES_HOME/scripts/kanban_dynamic_resource_core.py
   $HERMES_HOME/scripts/kanban_dynamic_resource.py
   $HERMES_HOME/plugins/h4v3-resource-scheduler/
 
@@ -43,6 +45,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$ADMISSION_SOURCE" ]] || { echo "missing: $ADMISSION_SOURCE" >&2; exit 1; }
+[[ -f "$DYNAMIC_CORE_SOURCE" ]] || { echo "missing: $DYNAMIC_CORE_SOURCE" >&2; exit 1; }
 [[ -f "$DYNAMIC_SOURCE" ]] || { echo "missing: $DYNAMIC_SOURCE" >&2; exit 1; }
 [[ -f "$PLUGIN_SOURCE/plugin.yaml" && -f "$PLUGIN_SOURCE/__init__.py" ]] || {
   echo "resource scheduler plugin source missing: $PLUGIN_SOURCE" >&2
@@ -53,6 +56,7 @@ done
 
 python3 -m py_compile \
   "$ADMISSION_SOURCE" \
+  "$DYNAMIC_CORE_SOURCE" \
   "$DYNAMIC_SOURCE" \
   "$PLUGIN_SOURCE/__init__.py" || {
     echo "candidate validation failed (py_compile)" >&2
@@ -62,10 +66,12 @@ python3 -m py_compile \
 TARGET_PLUGIN="$HERMES_HOME/plugins/h4v3-resource-scheduler"
 PLUGIN_BACKUP_ROOT="$HERMES_HOME/plugin-backups/h4v3-resource-scheduler"
 TARGET_ADMISSION="$HERMES_HOME/scripts/kanban_resource_admission.py"
+TARGET_DYNAMIC_CORE="$HERMES_HOME/scripts/kanban_dynamic_resource_core.py"
 TARGET_DYNAMIC="$HERMES_HOME/scripts/kanban_dynamic_resource.py"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run: would install $ADMISSION_SOURCE -> $TARGET_ADMISSION"
+  echo "dry-run: would install $DYNAMIC_CORE_SOURCE -> $TARGET_DYNAMIC_CORE"
   echo "dry-run: would install $DYNAMIC_SOURCE -> $TARGET_DYNAMIC"
   echo "dry-run: would install $PLUGIN_SOURCE -> $TARGET_PLUGIN"
   echo "dry-run: would enable plugin:"
@@ -91,6 +97,8 @@ install_script() {
 }
 
 install_script "$ADMISSION_SOURCE" "$TARGET_ADMISSION"
+# Core must land before the stable wrapper that imports it.
+install_script "$DYNAMIC_CORE_SOURCE" "$TARGET_DYNAMIC_CORE"
 install_script "$DYNAMIC_SOURCE" "$TARGET_DYNAMIC"
 
 if [[ -d "$TARGET_PLUGIN" ]]; then
@@ -110,6 +118,7 @@ HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" plugins enable \
 
 for pair in \
   "$ADMISSION_SOURCE|$TARGET_ADMISSION" \
+  "$DYNAMIC_CORE_SOURCE|$TARGET_DYNAMIC_CORE" \
   "$DYNAMIC_SOURCE|$TARGET_DYNAMIC" \
   "$PLUGIN_SOURCE/plugin.yaml|$TARGET_PLUGIN/plugin.yaml" \
   "$PLUGIN_SOURCE/__init__.py|$TARGET_PLUGIN/__init__.py"
@@ -126,7 +135,7 @@ done
 
 echo "H4V3 resource scheduler installed."
 echo "Plugin: $TARGET_PLUGIN"
-echo "Helpers: $TARGET_ADMISSION ; $TARGET_DYNAMIC"
+echo "Helpers: $TARGET_ADMISSION ; $TARGET_DYNAMIC_CORE ; $TARGET_DYNAMIC"
 echo "Restart the dispatcher-owning Hermes gateway after updating kanban config."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Backups:"
