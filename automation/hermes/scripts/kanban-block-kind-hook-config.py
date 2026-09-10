@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Render fail-closed Kanban lifecycle guard entries into config.yaml.
+"""Render fail-closed H4V3 Kanban lifecycle guard entries into config.yaml.
 
 This helper preserves the existing YAML text and comments instead of loading
 and dumping the whole Hermes configuration. It writes a candidate path only;
 the deployer decides whether to atomically install it. Re-running it replaces
-only entries for the same guard, so deployment is idempotent.
+only entries for the same approved guard command, so deployment is idempotent.
 
-The historical block-kind guard remains unchanged. An optional specialist
-completion-contract guard can be rendered in the same pass so deployment never
-needs a lossy second YAML reserialization step.
+The historical ``kanban-block-kind-guard.py`` command path remains stable for
+shell-hook consent. The command is now a small lifecycle wrapper and is
+registered for ``kanban_block``, ``kanban_create``, and ``terminal``; this adds
+the specialist completion-contract boundary without introducing a second
+allowlist approval.
 """
 from __future__ import annotations
 
@@ -19,21 +21,14 @@ import stat
 import tempfile
 from pathlib import Path
 
-BLOCK_GUARD_FILENAME = "kanban-block-kind-guard.py"
-SPECIALIST_GUARD_FILENAME = "kanban-specialist-completion-guard.py"
-_BLOCK_MATCHERS = ("kanban_block", "terminal")
-_SPECIALIST_MATCHERS = ("kanban_create", "terminal")
-
-# Compatibility names kept for focused tests/tools that imported the original
-# helper before the specialist guard was added.
-GUARD_FILENAME = BLOCK_GUARD_FILENAME
-_MATCHERS = _BLOCK_MATCHERS
+GUARD_FILENAME = "kanban-block-kind-guard.py"
+_MATCHERS = ("kanban_block", "kanban_create", "terminal")
 
 
-def _render_entry_block(command: str, matchers: tuple[str, ...]) -> list[str]:
+def _render_entry_block(command: str) -> list[str]:
     command_text = shlex.join(shlex.split(command))
     lines: list[str] = []
-    for matcher in matchers:
+    for matcher in _MATCHERS:
         lines.extend(
             [
                 f"    - matcher: {matcher}\n",
@@ -87,25 +82,12 @@ def _entry_ranges(lines: list[str], start: int, end: int) -> list[tuple[int, int
     ]
 
 
-def _is_guard_entry(
-    lines: list[str],
-    start: int,
-    end: int,
-    *,
-    guard_filename: str,
-    matchers: tuple[str, ...],
-) -> bool:
+def _is_guard_entry(lines: list[str], start: int, end: int) -> bool:
     block = "".join(lines[start:end])
-    return any(f"matcher: {matcher}" in block for matcher in matchers) and guard_filename in block
+    return GUARD_FILENAME in block
 
 
-def _render_guard(
-    text: str,
-    command: str,
-    *,
-    guard_filename: str,
-    matchers: tuple[str, ...],
-) -> str:
+def render(text: str, command: str) -> str:
     lines = text.splitlines(keepends=True)
     found = _pre_tool_call_range(lines)
     if found is not None:
@@ -115,18 +97,12 @@ def _render_guard(
         cursor = start + 1
         for position, (entry_start, entry_end) in enumerate(ranges):
             kept.extend(lines[cursor:entry_start])
-            if not _is_guard_entry(
-                lines,
-                entry_start,
-                entry_end,
-                guard_filename=guard_filename,
-                matchers=matchers,
-            ):
+            if not _is_guard_entry(lines, entry_start, entry_end):
                 kept.extend(lines[entry_start:entry_end])
             elif position == len(ranges) - 1:
                 # The final entry range includes the blank separator before
                 # the next sibling/top-level key. Preserve it while replacing
-                # the old guard entries.
+                # old lifecycle-guard entries.
                 suffix: list[str] = []
                 for line in reversed(lines[entry_start:entry_end]):
                     if line.strip():
@@ -138,7 +114,7 @@ def _render_guard(
         insertion = len(kept)
         while insertion > 0 and not kept[insertion - 1].strip():
             insertion -= 1
-        kept[insertion:insertion] = _render_entry_block(command, matchers)
+        kept[insertion:insertion] = _render_entry_block(command)
         return "".join(lines[: start + 1] + kept + lines[end:])
 
     hook_indices = [index for index, line in enumerate(lines) if line == "hooks:\n"]
@@ -147,46 +123,19 @@ def _render_guard(
         return "".join(
             lines[:index]
             + ["  pre_tool_call:\n"]
-            + _render_entry_block(command, matchers)
+            + _render_entry_block(command)
             + lines[index:]
         )
 
     separator = "" if not text or text.endswith("\n") else "\n"
-    return (
-        text
-        + separator
-        + "hooks:\n  pre_tool_call:\n"
-        + "".join(_render_entry_block(command, matchers))
-    )
+    return text + separator + "hooks:\n  pre_tool_call:\n" + "".join(_render_entry_block(command))
 
 
-def render(text: str, command: str, specialist_command: str | None = None) -> str:
-    rendered = _render_guard(
-        text,
-        command,
-        guard_filename=BLOCK_GUARD_FILENAME,
-        matchers=_BLOCK_MATCHERS,
-    )
-    if specialist_command:
-        rendered = _render_guard(
-            rendered,
-            specialist_command,
-            guard_filename=SPECIALIST_GUARD_FILENAME,
-            matchers=_SPECIALIST_MATCHERS,
-        )
-    return rendered
-
-
-def write_candidate(
-    source: Path,
-    destination: Path,
-    command: str,
-    specialist_command: str | None = None,
-) -> None:
+def write_candidate(source: Path, destination: Path, command: str) -> None:
     if not source.is_file():
         raise SystemExit(f"config.yaml not found: {source}")
     original = source.read_text(encoding="utf-8")
-    rendered = render(original, command, specialist_command)
+    rendered = render(original, command)
     destination.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(source.stat().st_mode)
     fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
@@ -208,13 +157,9 @@ def main() -> int:
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--guard", type=Path, required=True)
-    parser.add_argument("--specialist-guard", type=Path)
     args = parser.parse_args()
     command = f"python3 {args.guard}"
-    specialist_command = (
-        f"python3 {args.specialist_guard}" if args.specialist_guard is not None else None
-    )
-    write_candidate(args.source, args.destination, command, specialist_command)
+    write_candidate(args.source, args.destination, command)
     return 0
 
 
