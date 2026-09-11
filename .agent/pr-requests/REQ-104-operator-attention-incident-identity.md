@@ -1,17 +1,17 @@
 # REQ-104 — scoped Telegram attention and taxonomy parity
 
-- Status: Implementation handoff
+- Status: Fresh round-16 integration handoff
 - Product type: `EDGE_RECONCILIATION` / `CONTROL_PLANE_AUTOMATION`
 - Source Issue: `rhgo1749/hermes-n8n-control-plane#104`
 - Existing delivery: PR #129, branch `issue104-operator-attention-incident-identity`
-- Kanban task: `t_9318cfed`; investigator handoff: `t_2b3f2754`; intake root: `t_5ffdb93b`
+- Kanban task: `t_9aaec83c`; investigator handoff: `t_5bbd549b`; prior implementation: `t_9318cfed`; intake root: `t_5ffdb93b`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:104`
-- Authoritative base: fetched `origin/main` @ `b3fc50b76cd00c951b33831045ea58d01c4ac620`
-- Required delivery: update existing PR #129 only; no new PR, merge, or force-push
+- Authoritative base: freshly fetched `origin/main` @ `2ab75f2e8b26eeb7066986b0da5ea7f939bcd670`
+- Required delivery: update existing PR #129 only; no new PR, GitHub merge/auto-merge, or force-push
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
 - Automation stop state: `HUMAN_VALIDATION_REQUIRED` (real Telegram/deployed runtime remain outside this worker)
-- Implementation commit / verified PR head: `4ac0297de593c61111d8fb03581d9d8a32835667`
-- PR read-back: PR #129, base `main`, branch `issue104-operator-attention-incident-identity`, `Closes #104.`
+- Round-16 integration: prior PR head `fdd91736fee7f5542f63a62ce288f90b4c1a7d0a` merged with the authoritative base above; this request intentionally records the resulting merge as `this commit` rather than a self-referential SHA
+- PR read-back target: PR #129, base `main`, branch `issue104-operator-attention-incident-identity`, visible `Closes #104.` and GraphQL `closingIssuesReferences=[104]`
 
 ## Objective
 
@@ -48,18 +48,27 @@ helper contract, whose `_MATCHERS` and documentation include `kanban_create`.
 
 Canonical route: `AGENTS.md` → `README.md` → `docs/README.md` →
 `docs/H4V3_OVERVIEW.md` and `docs/EDGE_REWORK_LIFECYCLE.md` → affected source/tests.
-Run focused notification/Overview regressions, exact edge rework harness, split-API
-and related canonical suites named by the task, compile/import, Ruff, BasedPyright/
-LSP, documentation/link, sabotage, and `git diff --check` gates. RED evidence was
-captured before implementation: the new direct harness exited non-zero at the
-missing edge reason registry. Final local evidence: notification direct 38 tests;
-notification/Overview pytest 65; edge recovery 5, provenance 9, label history 4,
-retry 8, block-kind 62, and terminal convergence 95; py_compile, Ruff, and
-BasedPyright all pass. A broader 20-file edge sweep was 17/20: two resource
-admission files require the profile runtime/config environment, and the unchanged
-self-heal-label fixture still fails its pre-existing expected reason. The full
-pytest sweep reached 383 passes but has 23 unrelated legacy `tmp` fixture errors
-and 4 completion-wake board-pin/module-environment failures. Push a real commit to
-the existing PR branch, read back the exact full head plus closing reference
-`closingIssuesReferences=[104]`/`Closes #104.`, and hand off without merge or runtime
-claims that were not executed.
+Run focused notification/Overview regressions, exact edge rework/canonical suites,
+the #145 dependency-wait and #144 split-API regressions, compile/import, Ruff,
+BasedPyright/LSP, documentation/link, sabotage where behavior changes, and
+`git diff --check` gates. Prior round RED evidence remains historical: the round-14
+direct harness failed before the edge reason registry fix; round 16 changes only
+integration parentage and stale provenance, so no new behavior RED is justified.
+The fresh round-16 handoff records exact commands/results, preserves the baseline
+Ruff findings on current-main-only paths, and keeps deployed representative-board
+read-back and real Telegram delivery as external `HUMAN_VALIDATION_REQUIRED` /
+`NOT RUN` gates. Push a real merge/update commit to the existing PR branch, read
+back the exact full head plus `closingIssuesReferences=[104]`/`Closes #104.`, and
+hand off without merge or runtime claims that were not executed.
+
+Fresh round-16 local results: focused notification/Overview/#145/#144 pytest
+`83 passed`; edge rework `925 passed`; attention recovery `8 passed`; delivery
+provenance `9 passed`; projection label history `4 passed`; retry guard `8 passed`;
+block-kind `62 passed`; terminal convergence `95 passed`; compileall, n8n
+validation, Ruff selected checks, documentation/link checks, and diff checks all
+passed. BasedPyright reported `3` candidate errors versus `5` on the exact fetched
+base with no candidate-only errors; the configured Pyright LSP didOpen/
+publishDiagnostics probe reported `0` error-severity diagnostics on all 10 files.
+No new RED/sabotage is applicable because round 16 changes only integration
+parentage and provenance; deployed representative-board read-back and real
+Telegram delivery remain `HUMAN_VALIDATION_REQUIRED` / `NOT RUN`.
