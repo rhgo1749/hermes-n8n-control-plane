@@ -71,6 +71,77 @@ def _assert_blocked(result: subprocess.CompletedProcess[str], assignee: str) -> 
     assert "No task mutation was performed" in body["message"]
 
 
+def _assert_dependency_wait_blocked(
+    result: subprocess.CompletedProcess[str], assignee: str
+) -> None:
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert assignee in body["message"]
+    assert "initial_status=blocked" in body["message"]
+    assert "normal todo dependency path" in body["message"]
+    assert "human/operator hold" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+
+
+def test_structured_specialists_reject_parent_dependency_preblocked_shape() -> None:
+    for parents in (["t_dev"], "t_dev"):
+        result = _run(
+            {
+                "tool_name": "kanban_create",
+                "tool_input": {
+                    "title": "fresh review after developer",
+                    "assignee": "kanban-reviewer",
+                    "parents": parents,
+                    "initial_status": "blocked",
+                },
+            }
+        )
+        _assert_dependency_wait_blocked(result, "kanban-reviewer")
+
+    singular = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": {
+                "title": "fresh review after developer",
+                "assignee": "kanban-reviewer",
+                "parent": "t_dev",
+                "initial_status": "blocked",
+            },
+        }
+    )
+    _assert_dependency_wait_blocked(singular, "kanban-reviewer")
+
+
+def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_distinct() -> None:
+    normal_wait = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": {
+                "title": "fresh review after developer",
+                "assignee": "kanban-reviewer",
+                "parents": ["t_dev"],
+            },
+        }
+    )
+    assert normal_wait.returncode == 0, (normal_wait.stdout, normal_wait.stderr)
+
+    explicit_ops_hold = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": {
+                "title": "operator-gated specialist",
+                "assignee": "kanban-reviewer",
+                "initial_status": "blocked",
+            },
+        }
+    )
+    assert explicit_ops_hold.returncode == 0, (
+        explicit_ops_hold.stdout,
+        explicit_ops_hold.stderr,
+    )
+
+
 def test_structured_specialists_reject_repository_contract() -> None:
     for assignee in ("kanban-developer", "kanban-reviewer", "kanban-designer"):
         result = _run(
@@ -159,6 +230,26 @@ def test_terminal_specialist_local_only_or_omitted_contract_is_allowed() -> None
         "hermes kanban create x --assignee kanban-developer --completion-contract local-only",
         "bash -lc 'hermes kanban create x --assignee=kanban-reviewer --completion-contract=local-only'",
         "hermes kanban create x --assignee kanban-designer",
+    )
+    for command in commands:
+        result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
+        assert result.returncode == 0, (command, result.stdout, result.stderr)
+
+
+def test_terminal_parent_dependency_preblocked_specialist_is_blocked() -> None:
+    commands = (
+        "hermes kanban create review --assignee kanban-reviewer --parent t_dev --initial-status blocked",
+        "bash -lc 'hermes kanban create review --assignee=kanban-reviewer --parent=t_dev --initial-status=blocked'",
+    )
+    for command in commands:
+        result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
+        _assert_dependency_wait_blocked(result, "kanban-reviewer")
+
+
+def test_terminal_dependency_wait_without_preblock_and_explicit_ops_hold_are_allowed() -> None:
+    commands = (
+        "hermes kanban create review --assignee kanban-reviewer --parent t_dev",
+        "hermes kanban create ops --assignee kanban-reviewer --initial-status blocked",
     )
     for command in commands:
         result = _run({"tool_name": "terminal", "tool_input": {"command": command}})

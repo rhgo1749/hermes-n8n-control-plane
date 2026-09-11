@@ -31,6 +31,8 @@ Does not own:
 Waiting rule:
 
 - Kanban dependencies are the waiting mechanism.
+- A downstream specialist that is waiting only for parent completion stays on the normal dependency path (`todo` until dependency-ready); Main must not pre-create it as `blocked` merely because a parent is open.
+- `blocked` is reserved for an explicit human/operator hold or another non-dependency condition that ordinary parent completion will not resolve.
 - Main must not consume an active worker slot by sleeping or polling while a dependency is running.
 - Resume only when durable dependency state provides new evidence.
 
