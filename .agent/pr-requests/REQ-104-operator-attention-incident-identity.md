@@ -10,7 +10,7 @@
 - Required delivery: update existing PR #129 only; no new PR, merge, or force-push
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
 - Automation stop state: `HUMAN_VALIDATION_REQUIRED` (real Telegram/deployed runtime remain outside this worker)
-- Implementation commit / verified PR head: `164aeb947709ae466b59219a90c57a6e503b4bc1`
+- Implementation commit / verified PR head: `4ac0297de593c61111d8fb03581d9d8a32835667`
 - PR read-back: PR #129, base `main`, branch `issue104-operator-attention-incident-identity`, `Closes #104.`
 
 ## Objective
