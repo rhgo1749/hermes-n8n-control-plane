@@ -89,6 +89,13 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
             assert soul.count(deployer.MARKER_END) == 1
             assert "H4V3" in soul
 
+        main_soul = (home / "profiles/kanban-main/SOUL.md").read_text(encoding="utf-8")
+        assert "### Edge-admitted rework boundary" in main_soul
+        assert "edge has already decided rework admission for that round" in main_soul
+        assert "do not block solely because `AGENT_REWORK_RETRY` is absent" in main_soul
+        assert "fresh trusted PR-side `agent-rework` command intentionally opens a label-origin round" in main_soul
+        assert "`AGENT_REWORK_RETRY` is a different one-shot recovery signal" in main_soul
+
         investigator = (home / "profiles/kanban-investigator/SOUL.md").read_text(encoding="utf-8")
         expected = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8").rstrip() + "\n"
         assert investigator == expected
@@ -118,6 +125,8 @@ def test_profile_deployer_updates_managed_block_idempotently() -> None:
         refreshed = main.read_text(encoding="utf-8")
         assert "STALE CONTRACT" not in refreshed
         assert "When operating as `kanban-main`" in refreshed
+        assert "edge has already decided rework admission for that round" in refreshed
+        assert "do not block solely because `AGENT_REWORK_RETRY` is absent" in refreshed
         assert refreshed.count(deployer.MARKER_BEGIN) == 1
         assert refreshed.count(deployer.MARKER_END) == 1
 
