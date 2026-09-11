@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -30,7 +31,7 @@ def load_installer():
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
-    namespace = {"ModuleType": ModuleType}
+    namespace = {"ModuleType": ModuleType, "json": json}
     exec(compile(module, str(ENTRYPOINT), "exec"), namespace)
     return namespace["_install_rework_attention_delivery_recovery"]
 
@@ -38,12 +39,37 @@ def load_installer():
 install = load_installer()
 
 
+class DummyRows:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+
 class DummyConn:
+    def __init__(self, event_rows=()):
+        self._event_rows = list(event_rows)
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+    def execute(self, _sql, _params=()):
+        return DummyRows(self._event_rows)
+
+
+class DummyClient:
+    def __init__(self, timeline=()):
+        self.timeline = list(timeline)
+
+    def get_paginated(self, path, params=None, *, max_pages=10):
+        del params, max_pages
+        if path.endswith("/timeline"):
+            return list(self.timeline)
+        return []
 
 
 def make_context():
@@ -51,7 +77,12 @@ def make_context():
         "labels": {"agent-rework"},
         "pr": SimpleNamespace(state="open"),
         "pr_number": 103,
-        "event": ({"rework_round": 1}, 100, "github_pr_rework_retry"),
+        "event": ({
+            "rework_round": 1,
+            "pr_number": 103,
+            "head_sha": "7d575644fef2ed40a6473e75a9c03ab2a991673a",
+            "label_added_at": 90,
+        }, 100, "github_pr_rework"),
     }
 
 
@@ -110,17 +141,19 @@ def make_core(*, original_reason="rework_retry_pending", delivered=True):
         REWORK_LABEL="agent-rework",
         WORKING_LABEL="agent-working",
         REVIEW_READY_LABEL="agent-review-ready",
+        TRUSTED_GITHUB_ACTORS={"rhgo1749"},
+        _parse_iso_ts=lambda value: int(value) if value is not None else None,
         GithubCompletionError=RuntimeError,
     )
     install(core)
     return core, calls
 
 
-def invoke(core, *, dry_run):
+def invoke(core, *, dry_run, timeline=(), event_rows=()):
     return core._reconcile_rework_lifecycle(
-        DummyConn(),
+        DummyConn(event_rows),
         object(),
-        object(),
+        DummyClient(timeline),
         SimpleNamespace(repository="rhgo1749/ctrl-hangul"),
         object(),
         {"id": "t_ac34f08d", "status": "review"},
@@ -167,6 +200,76 @@ def test_invalid_delivery_keeps_retry_pending_fail_closed():
     assert calls["events"] == []
 
 
+def test_fresh_trusted_rework_label_bypasses_attention_retry_comment():
+    core, calls = make_core(delivered=True)
+    result = invoke(
+        core,
+        dry_run=False,
+        timeline=[{
+            "event": "labeled",
+            "label": {"name": "agent-rework"},
+            "created_at": "300",
+            "actor": {"login": "rhgo1749"},
+        }],
+    )
+    assert result is None
+    assert calls["delivery"] == 0
+    assert calls["projection"] == 0
+    assert calls["events"] == []
+
+
+def test_untrusted_rework_label_does_not_bypass_attention():
+    core, calls = make_core(delivered=True)
+    result = invoke(
+        core,
+        dry_run=False,
+        timeline=[{
+            "event": "labeled",
+            "label": {"name": "agent-rework"},
+            "created_at": "300",
+            "actor": {"login": "someone-else"},
+        }],
+    )
+    assert result["reason"] == "agent_review_ready"
+    assert calls["delivery"] == 1
+
+
+def test_edge_owned_rework_projection_does_not_open_new_round():
+    core, calls = make_core(delivered=True)
+    timeline = [
+        {
+            "event": "unlabeled",
+            "label": {"name": "agent-working"},
+            "created_at": "300",
+            "actor": {"login": "rhgo1749"},
+        },
+        {
+            "event": "labeled",
+            "label": {"name": "agent-rework"},
+            "created_at": "300",
+            "actor": {"login": "rhgo1749"},
+        },
+    ]
+    event_rows = [{
+        "kind": "github_pr_rework_attention",
+        "payload": (
+            '{"rework_round": 1, "pr_number": 103, '
+            '"head_sha": "7d575644fef2ed40a6473e75a9c03ab2a991673a", '
+            '"source": "github_edge_rework_reconciliation", '
+            '"reason": "rework_human_attention"}'
+        ),
+        "created_at": 305,
+    }]
+    result = invoke(
+        core,
+        dry_run=False,
+        timeline=timeline,
+        event_rows=event_rows,
+    )
+    assert result["reason"] == "agent_review_ready"
+    assert calls["delivery"] == 1
+
+
 def test_explicit_retry_result_keeps_precedence():
     core, calls = make_core(original_reason="maintainer_retry_consumed", delivered=True)
     result = invoke(core, dry_run=False)
@@ -188,6 +291,9 @@ if __name__ == "__main__":
         test_dry_run_predicts_review_ready_from_recovered_delivery,
         test_real_recovery_projects_label_and_records_delivery_event,
         test_invalid_delivery_keeps_retry_pending_fail_closed,
+        test_fresh_trusted_rework_label_bypasses_attention_retry_comment,
+        test_untrusted_rework_label_does_not_bypass_attention,
+        test_edge_owned_rework_projection_does_not_open_new_round,
         test_explicit_retry_result_keeps_precedence,
         test_install_is_idempotent,
     ]
