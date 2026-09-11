@@ -26,6 +26,12 @@ If trustworthy edge-dispatch provenance for the current round is missing, malfor
 
 Developer task context should reference the completed Investigator task/handoff and retain exact source provenance. Raw transcripts are not the handoff.
 
+### Dependency waiting state
+
+When Main creates a downstream specialist that must wait for one or more parent tasks, encode that wait with `parents` and leave the child on the normal dependency path. Do not use `initial_status=blocked` merely because a parent is still open. Hermes resolves that ordinary dependency wait as `todo` and the controller promotes it when the parents become terminal.
+
+`blocked` is not a synonym for "not runnable yet". Reserve an initially blocked specialist for an explicit human/operator hold that is independent of ordinary parent completion. In particular, the normal `Developer -> Reviewer` graph is `Developer running` plus `Reviewer todo (parent=Developer)`, not a pre-blocked Reviewer.
+
 Investigator may be omitted only for a genuinely mechanical task with no meaningful Issue/PR/history synthesis and no implementation decision that investigation could change. Never omit it for regressions, existing-PR rework, runtime-vs-test mismatch, a failed prior root-cause hypothesis, or repeated implementation rounds.
 
 If Reviewer returns REWORK because of a clear local implementation mistake while the root-cause model remains valid, Main may send bounded rework directly to Developer using the existing Investigator handoff. If runtime evidence contradicts tests, the failure boundary remains unclear, the prior hypothesis failed, or the same problem survives rework, create a fresh Investigator phase before another Developer round.

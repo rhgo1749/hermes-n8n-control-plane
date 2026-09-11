@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed H4V3 guard for specialist Kanban completion contracts.
+"""Fail-closed H4V3 guard for specialist Kanban creation contracts.
 
 Hermes core supports PR-aware ``completion_contract`` values because some
 standalone Kanban tasks are terminal only after exact-head GitHub acceptance.
@@ -13,6 +13,12 @@ assigned to an H4V3 specialist profile. Omitted ``completion_contract`` is safe
 because Hermes normalizes it to ``local-only``. PR URLs, repository names, and
 head SHAs remain valid task-body / handoff provenance; they are not specialist
 terminal policy.
+
+It also rejects the ambiguous ``parents + initial_status=blocked`` creation
+shape for specialists. An open parent is an ordinary dependency wait: Hermes
+keeps that child on the ``todo`` path and promotes it when dependencies resolve.
+``blocked`` is reserved for a separate human/operator hold, not a belt-and-
+suspenders synonym for "not runnable yet".
 
 The structured ``kanban_create`` tool is the canonical creation path. The
 ``terminal`` policy recognizes executable ``hermes kanban`` command segments
@@ -97,6 +103,33 @@ def _specialist(value: Any) -> str | None:
 
 def _contract_is_local(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == LOCAL_ONLY)
+
+
+def _initial_status_is_blocked(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().casefold() == "blocked"
+
+
+def _structured_has_parent(raw_input: Mapping[str, Any]) -> bool:
+    parent = raw_input.get("parent")
+    if isinstance(parent, str) and parent.strip():
+        return True
+    parents = raw_input.get("parents")
+    if isinstance(parents, str):
+        return bool(parents.strip())
+    if isinstance(parents, (list, tuple, set, frozenset)):
+        return any(isinstance(value, str) and value.strip() for value in parents)
+    return False
+
+
+def _dependency_wait_diagnostic(assignee: str) -> str:
+    return (
+        f"H4V3 specialist task '{assignee}' must not use initial_status=blocked merely "
+        "because it has an open parent dependency. Keep the parent relationship and omit "
+        "initial_status=blocked; Hermes will keep the child on the normal todo dependency "
+        "path and promote it when parents resolve. blocked is reserved for an explicit "
+        "human/operator hold that ordinary parent completion will not resolve. "
+        "No task mutation was performed."
+    )
 
 
 def _diagnostic(assignee: str, *, action: str = "create") -> str:
@@ -360,6 +393,14 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
     assignee = _specialist(raw_input.get("assignee"))
     if assignee is None:
         return 0
+    if _structured_has_parent(raw_input) and _initial_status_is_blocked(
+        raw_input.get("initial_status")
+    ):
+        return _block(
+            _dependency_wait_diagnostic(assignee),
+            assignee=assignee,
+            source="kanban_create:dependency_wait",
+        )
     contract = raw_input.get("completion_contract")
     if _contract_is_local(contract):
         return 0
@@ -367,11 +408,19 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
 
 
 def _evaluate_terminal_create(args: list[str], board: str) -> int:
-    del board  # completion policy is creation-local; no DB lookup is needed.
+    del board  # creation policy is local; no DB lookup is needed.
     assignees = _option_values(args, "--assignee")
     specialist = next((_specialist(value) for value in assignees if _specialist(value)), None)
     if specialist is None:
         return 0
+    parents = _option_values(args, "--parent")
+    initial_statuses = _option_values(args, "--initial-status")
+    if parents and any(_initial_status_is_blocked(value) for value in initial_statuses):
+        return _block(
+            _dependency_wait_diagnostic(specialist),
+            assignee=specialist,
+            source="terminal:create:dependency_wait",
+        )
     contracts = _option_values(args, "--completion-contract")
     if not contracts or all(_contract_is_local(value) for value in contracts):
         return 0
