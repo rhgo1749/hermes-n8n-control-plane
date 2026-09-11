@@ -2063,6 +2063,24 @@ def _import_kanban_db():
         ) from exc
 
 
+def _import_kanban_db_connect():
+    """Import the canonical Hermes DB connection module.
+
+    ``connect_closing`` moved out of ``hermes_cli.kanban_db`` and its plugin
+    compatibility alias is removed on 2026-09-14.  Keep the edge on the
+    supported split-module boundary instead of depending on that shim.
+    """
+    try:
+        from hermes_cli import kanban_db_connect  # type: ignore
+        return kanban_db_connect
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise SyncError(
+            "hermes_cli.kanban_db_connect is not importable from this interpreter "
+            f"({sys.executable}): {exc}. Run with the Hermes venv python "
+            "(e.g. /ws/hermes-agent/venv/bin/python3) or fix the environment."
+        ) from exc
+
+
 def verify_schema(conn: sqlite3.Connection, kanban_db: Any) -> None:
     """Fail-closed schema compatibility check.  No write may happen after a
     mismatch — callers must abort the whole run."""
@@ -8132,7 +8150,7 @@ def _dispatch_pending_rework_locked(
                 claimed, board=board
             )
         else:
-            workspace = kanban_db.resolve_workspace(claimed, board=board)
+            workspace = kanban_db_workspace.resolve_workspace(claimed, board=board)
             resolved_branch = None
     except Exception as exc:
         auto_blocked = bool(kanban_db_dispatch._record_task_failure(
@@ -8159,9 +8177,9 @@ def _dispatch_pending_rework_locked(
             "error": str(exc),
             "auto_blocked": auto_blocked,
         }]
-    kanban_db.set_workspace_path(conn, claimed.id, str(workspace))
+    kanban_db_workspace.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
-        kanban_db.set_branch_name(
+        kanban_db_workspace.set_branch_name(
             conn, claimed.id,
             resolved_branch or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
@@ -8301,6 +8319,7 @@ def sync_board(
     GitHub query error) never aborts the rest of the board.
     """
     kanban_db = _import_kanban_db()
+    kanban_db_connect = _import_kanban_db_connect()
 
     # Self-healing workspace drift repair (Issue #76) — runs before any
     # reconciliation or dispatch so repaired bindings are what the rest of
@@ -8314,7 +8333,7 @@ def sync_board(
         ws_admission = sys.modules.get("kanban_workspace_admission")
         if ws_admission is None:
             import kanban_workspace_admission as ws_admission  # pyright: ignore[reportImplicitRelativeImport]
-        with kanban_db.connect_closing(board=board) as heal_conn:
+        with kanban_db_connect.connect_closing(board=board) as heal_conn:
             if dry_run:
                 selfheal_entries = ws_admission.preview_workspace_drift(
                     heal_conn, board
@@ -8355,7 +8374,7 @@ def sync_board(
                 entry["operator_attention"] = {"reason": attention_reason}
         return entry
 
-    with kanban_db.connect_closing(board=board) as conn:
+    with kanban_db_connect.connect_closing(board=board) as conn:
         verify_schema(conn, kanban_db)
         requested = {str(tid) for tid in task_ids} if task_ids else None
         rows = conn.execute(

@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, "/ws/hermes-agent")
-from hermes_cli import kanban_db  # type: ignore[import-not-found]
+from hermes_cli import kanban_db, kanban_db_connect  # type: ignore[import-not-found]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD = REPO_ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
@@ -44,8 +44,8 @@ overview = _load("issue92_overview", OVERVIEW_PATH)
 def board_db() -> Iterator[tuple[Path, str, str]]:
     with tempfile.TemporaryDirectory(prefix="issue92-board-") as directory:
         path = Path(directory) / "kanban.db"
-        kanban_db.init_db(path)
-        with kanban_db.connect_closing(path) as conn:
+        kanban_db_connect.init_db(path)
+        with kanban_db_connect.connect_closing(path) as conn:
             parent = kanban_db.create_task(
                 conn, title="parent", assignee="worker", initial_status="running"
             )
@@ -89,14 +89,14 @@ def _assert_blocked(result: subprocess.CompletedProcess[str], text: str) -> None
 
 def test_missing_kind_with_pending_parent_fails_closed_without_mutation(board_db):
     path, parent, child = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         before_events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
     result = _run_guard(
         path,
         {"tool_name": "kanban_block", "tool_input": {"task_id": child}},
     )
     _assert_blocked(result, f"{parent}(ready)")
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         row = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
         ).fetchone()
@@ -108,7 +108,7 @@ def test_missing_kind_with_pending_parent_fails_closed_without_mutation(board_db
 def test_pre_fix_bite_proof_core_accepts_legacy_omitted_kind(board_db):
     """The guard regression is meaningful because core still accepts None."""
     path, _, child = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         assert kanban_db.block_task(conn, child, reason="legacy caller", kind=None)
         row = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
@@ -118,14 +118,14 @@ def test_pre_fix_bite_proof_core_accepts_legacy_omitted_kind(board_db):
 
 def test_missing_kind_without_pending_parent_requests_explicit_choice(board_db):
     path, _, child = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         kanban_db.block_task(conn, child, reason="operator decision", kind="needs_input")
         before = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (child,)
         ).fetchone()
     # Remove the only parent after the durable blocked row exists; this keeps
     # the fixture's schema real while exercising the no-pending diagnostic.
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         conn.execute("DELETE FROM task_links WHERE child_id = ?", (child,))
         conn.commit()
     result = _run_guard(
@@ -133,7 +133,7 @@ def test_missing_kind_without_pending_parent_requests_explicit_choice(board_db):
         {"tool_name": "kanban_block", "tool_input": {"task_id": child, "kind": ""}},
     )
     _assert_blocked(result, "pick an explicit kind")
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         after = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (child,)
         ).fetchone()
@@ -158,7 +158,7 @@ def test_explicit_dependency_preserves_core_todo_then_ready_route(board_db):
         {"tool_name": "kanban_block", "tool_input": {"task_id": child, "kind": "dependency"}},
     )
     assert result.returncode == 0
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         assert kanban_db.block_task(conn, child, reason="wait for parent", kind="dependency")
         waiting = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
@@ -178,7 +178,7 @@ def test_explicit_human_kind_is_distinct_from_dependency_wait(board_db):
         {"tool_name": "kanban_block", "tool_input": {"task_id": child, "kind": "needs_input"}},
     )
     assert result.returncode == 0
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         assert kanban_db.block_task(conn, child, reason="needs decision", kind="needs_input")
         row = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
@@ -274,7 +274,7 @@ def test_compound_followup_kind_does_not_leak_into_block_segment(board_db):
             {"tool_name": "terminal", "tool_input": {"command": command}},
         )
         _assert_blocked(result, "explicit kind")
-        with kanban_db.connect_closing(path) as conn:
+        with kanban_db_connect.connect_closing(path) as conn:
             row = conn.execute(
                 "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
             ).fetchone()
@@ -390,7 +390,7 @@ def test_shell_wrapper_depth_limit_fails_closed_without_mutation(board_db):
         {"tool_name": "terminal", "tool_input": {"command": command}},
     )
     _assert_blocked(result, "maximum depth")
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         row = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
         ).fetchone()
@@ -490,7 +490,7 @@ def test_dynamic_and_indirect_block_forms_fail_closed(board_db, command):
     assert body["action"] == "block"
     assert "No task mutation was performed" in body["message"]
     # No task mutation was performed.
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         row = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
         ).fetchone()
@@ -499,7 +499,7 @@ def test_dynamic_and_indirect_block_forms_fail_closed(board_db, command):
 
 def test_block_projection_and_sync_context_keep_kind_and_parent_provenance(board_db):
     path, parent, child = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         kanban_db.block_task(conn, child, reason="needs maintainer", kind="capability")
         projection = sync._blocked_state_projection(conn, child, "capability")
     assert projection["block_kind"] == "capability"
@@ -516,7 +516,7 @@ def test_block_projection_and_sync_context_keep_kind_and_parent_provenance(board
 
 def test_overview_projects_blocked_task_as_untyped_when_legacy_kind_is_null(board_db):
     path, _, child = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         kanban_db.block_task(conn, child, reason="legacy", kind=None)
     metadata = {"slug": "issue92", "db_path": str(path), "name": "Issue 92"}
     board = overview._load_board_projection(metadata)
@@ -609,7 +609,7 @@ def test_history_read_back_preserves_block_kind_across_blocked_runs(board_db):
     # several distinct block kinds (including a legacy None block) and assert the
     # historical read-back preserves each block_kind + dependency provenance.
     path, _, _ = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         # A no-parent task cycles cleanly through ready <-> blocked for the
         # truly-blocked kinds, so each block lands in `blocked` with an
         # outcome=blocked run and a distinct payload.kind.
@@ -657,7 +657,7 @@ def test_dependency_block_history_reachable_in_todo_and_after_promotion(board_db
     # parent resolves (auto-promotion), not only while it sits in a human
     # `blocked` state.
     path, parent, child = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         # Canonical dependency block on a task with a pending parent.
         assert kanban_db.block_task(conn, child, reason="waiting on parent", kind="dependency")
         row = conn.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (child,)).fetchone()
@@ -701,7 +701,7 @@ def test_dependency_and_human_blocks_stay_distinct_in_history(board_db):
     # A dependency hold and a human-attention hold must never collapse into
     # each other on the historical read surface (Issue #92 invariant).
     path, _, _ = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         task = kanban_db.create_task(conn, title="dep-vs-human", assignee="worker")
         # Parent-less task starts ready; a dependency block routes it to todo.
         assert kanban_db.block_task(conn, task, reason="dependency wait", kind="dependency")
@@ -726,7 +726,7 @@ def test_history_run_id_binding_prevents_cross_run_summary_leakage(board_db):
     # back to ITS OWN run's summary and must NOT inherit the newer run's
     # summary (the pre-fix query selected the latest blocked run regardless).
     path, _, _ = board_db
-    with kanban_db.connect_closing(path) as conn:
+    with kanban_db_connect.connect_closing(path) as conn:
         task = kanban_db.create_task(conn, title="run-binding", assignee="worker")
         # Two blocked runs with distinct summaries.
         run1 = conn.execute(

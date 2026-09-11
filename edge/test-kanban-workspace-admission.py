@@ -445,7 +445,7 @@ def _actual_core_regression(tmp: Path) -> None:
 
     try:
         from hermes_cli import kanban_db, kanban_db_dispatch
-        from hermes_cli.kanban_db import connect_closing, init_db
+        from hermes_cli.kanban_db_connect import connect_closing, init_db
 
         check("actual-core: entrypoint installed the workspace-admission wrapper",
               getattr(core._dispatch_pending_rework,

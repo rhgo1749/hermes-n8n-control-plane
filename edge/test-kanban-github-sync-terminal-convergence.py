@@ -53,7 +53,7 @@ sys.modules["kanban_github_sync_tc"] = mod
 spec.loader.exec_module(mod)
 
 from hermes_cli import kanban_db  # type: ignore  # noqa: E402
-from hermes_cli.kanban_db import connect_closing, init_db  # type: ignore  # noqa: E402
+from hermes_cli.kanban_db_connect import connect_closing, init_db  # type: ignore  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Isolated environment (real Kanban DB layer, no real GitHub call)

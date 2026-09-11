@@ -605,11 +605,11 @@ def test_cli_dry_run_formatter_reports_busy() -> None:
         sys.path.insert(0, hermes_root)
     from hermes_cli import config as config_module
     from hermes_cli import kanban as cli_module
-    from hermes_cli import kanban_db as core_db
+    from hermes_cli import kanban_db_connect, kanban_db_dispatch
 
     dynamic._install_cli_dispatch_overlay()
-    old_connect = core_db.connect_closing
-    old_dispatch = core_db.dispatch_once
+    old_connect = kanban_db_connect.connect_closing
+    old_dispatch = kanban_db_dispatch.dispatch_once
     old_load_config = config_module.load_config
 
     @contextlib.contextmanager
@@ -618,7 +618,7 @@ def test_cli_dry_run_formatter_reports_busy() -> None:
 
     def fake_dispatch(conn, **kwargs):
         del conn, kwargs
-        dynamic._last_resource_diagnostics = [{
+        dynamic._core._last_resource_diagnostics = [{
             "task_id": "t-ready",
             "lane": "ready",
             "reason": "resource_busy",
@@ -640,8 +640,8 @@ def test_cli_dry_run_formatter_reports_busy() -> None:
             auto_assigned_default=[],
         )
 
-    core_db.connect_closing = fake_connect
-    core_db.dispatch_once = fake_dispatch
+    kanban_db_connect.connect_closing = fake_connect
+    kanban_db_dispatch.dispatch_once = fake_dispatch
     config_module.load_config = lambda: {"kanban": {}}
     try:
         output = io.StringIO()
@@ -658,8 +658,8 @@ def test_cli_dry_run_formatter_reports_busy() -> None:
         )
         check("CLI dry-run does not list busy as spawned", payload.get("spawned") == [], str(payload))
     finally:
-        core_db.connect_closing = old_connect
-        core_db.dispatch_once = old_dispatch
+        kanban_db_connect.connect_closing = old_connect
+        kanban_db_dispatch.dispatch_once = old_dispatch
         config_module.load_config = old_load_config
 
 
