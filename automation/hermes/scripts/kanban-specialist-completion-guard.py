@@ -3,10 +3,10 @@
 
 Hermes core supports PR-aware ``completion_contract`` values because some
 standalone Kanban tasks are terminal only after exact-head GitHub acceptance.
-H4V3 specialist tasks have a different lifecycle boundary: Developer,
-Reviewer, and Designer own bounded internal work and must be able to finish
-while the linked PR is still open. GitHub merge/review state is projected by
-the canonical edge on the Issue-backed root card.
+H4V3 specialist tasks have a different lifecycle boundary: Investigator,
+Developer, Reviewer, and Designer own bounded internal work and must be able to
+finish while the linked PR is still open. GitHub merge/review state is
+projected by the canonical edge on the Issue-backed root card.
 
 This pre-tool policy rejects non-local completion contracts when a new task is
 assigned to an H4V3 specialist profile. Omitted ``completion_contract`` is safe
@@ -39,7 +39,12 @@ from pathlib import Path
 from typing import Any
 
 SPECIALIST_ASSIGNEES = frozenset(
-    {"kanban-developer", "kanban-reviewer", "kanban-designer"}
+    {
+        "kanban-investigator",
+        "kanban-developer",
+        "kanban-reviewer",
+        "kanban-designer",
+    }
 )
 LOCAL_ONLY = "local-only"
 _LOG_PATH = Path(
@@ -103,7 +108,7 @@ def _diagnostic(assignee: str, *, action: str = "create") -> str:
     return (
         f"H4V3 specialist task '{assignee}' must use completion_contract=local-only "
         "(or omit the field at creation, which defaults to local-only). "
-        "Developer/Reviewer/Designer done is an internal specialist terminal state; "
+        "Investigator/Developer/Reviewer/Designer done is an internal specialist terminal state; "
         "GitHub PR acceptance/merge is owned by root-card edge reconciliation. "
         "Keep PR URL/head/repository as body or completion metadata evidence instead. "
         f"{retry} No task mutation was performed."
