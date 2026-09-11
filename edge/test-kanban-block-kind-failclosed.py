@@ -536,7 +536,7 @@ def test_hook_config_render_is_idempotent_and_fail_closed():
     assert rendered == again
     assert rendered.count("matcher: kanban_block") == 1
     assert rendered.count("matcher: terminal") == 1
-    assert rendered.count("fail_closed: true") == 2
+    assert rendered.count("fail_closed: true") == 3
     assert "command: python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py" in rendered
     assert "logging:\n" in rendered
 
@@ -588,14 +588,18 @@ def test_hook_config_preserves_following_sibling_hook():
     post = config["hooks"]["post_tool_call"]
     pre_matchers = {entry["matcher"] for entry in pre}
     post_matchers = {entry["matcher"] for entry in post}
-    assert pre_matchers == {"other", "kanban_block", "terminal"}
+    assert pre_matchers == {"other", "kanban_block", "kanban_create", "terminal"}
     assert post_matchers == {"audit"}
     guard_entries = [
         entry
         for entry in pre
         if "kanban-block-kind-guard.py" in str(entry.get("command", ""))
     ]
-    assert {entry["matcher"] for entry in guard_entries} == {"kanban_block", "terminal"}
+    assert {entry["matcher"] for entry in guard_entries} == {
+        "kanban_block",
+        "kanban_create",
+        "terminal",
+    }
     assert all(entry.get("fail_closed") is True for entry in guard_entries)
     # the sibling entry and its command survive byte-for-byte
     assert "  post_tool_call:\n" in rendered

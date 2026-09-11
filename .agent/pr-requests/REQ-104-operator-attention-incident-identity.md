@@ -1,55 +1,63 @@
-# REQ-104 — operator-attention semantic incident identity
+# REQ-104 — scoped Telegram attention and taxonomy parity
 
-Source Issue: rhgo1749/hermes-n8n-control-plane#104
-Kanban task: t_6b2a4238 (original implementation)
-Rework Kanban task: t_b2ac963b
-Kanban root: t_5ffdb93b (intake)
-Intake idempotency key: github:rhgo1749/hermes-n8n-control-plane:issue:104
-작업 브랜치: issue104-operator-attention-incident-identity
-기준 브랜치: origin/main @ 8ce89896209dd0dec2b0cb5e8f9d209569f6c66e9 (rework round 7 fetch 완료)
+- Status: Implementation handoff
+- Product type: `EDGE_RECONCILIATION` / `CONTROL_PLANE_AUTOMATION`
+- Source Issue: `rhgo1749/hermes-n8n-control-plane#104`
+- Existing delivery: PR #129, branch `issue104-operator-attention-incident-identity`
+- Kanban task: `t_9318cfed`; investigator handoff: `t_2b3f2754`; intake root: `t_5ffdb93b`
+- Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:104`
+- Authoritative base: fetched `origin/main` @ `b3fc50b76cd00c951b33831045ea58d01c4ac620`
+- Required delivery: update existing PR #129 only; no new PR, merge, or force-push
+- Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `HERMES_PLUGIN`
+- Automation stop state: `HUMAN_VALIDATION_REQUIRED` (real Telegram/deployed runtime remain outside this worker)
 
-## 범위
+## Objective
 
-`github_operator_attention`의 raw event-id cursor 기반 중복 제거를 현재
-canonical evidence에서 계산하는 안정적인 semantic incident identity로 교체한다.
+Repair only the two round-14 defects confirmed by the Investigator: retain canonical
+`board_context` scope for unresolved `dispatch_lock_failed` and
+`dispatch_lock_unavailable` Telegram observer state, and classify
+`rework_attention_label_projection_failed` plus
+`rework_retry_label_projection_failed` identically in edge and intake.
 
-- Edge 이벤트 키는 `attention_key = reason:incident_ref`로 유지한다.
-- blocked/human-input 사건은 최신 `blocked` 이벤트의 payload kind/reason/created_at와
-  task `block_kind`를 사용한다.
-- rework 사건은 repository, Issue, PR, rework round, request comment identity와
-  attention reason을 사용한다.
-- 그 밖의 task-scoped 진단은 entry/rework/evidence에 있는 canonical PR identity와
-  reason을 사용한다. Board-global dispatch-lock 진단은 task/PR identity를
-  상속하지 않고 `incident_unresolved`로 유지한다.
-- provenance를 기존 `task_events` payload에 기록하고, identity가 없으면
-  `incident_unresolved`로 표시하여 fail-open한다.
-- Overview는 semantic identity를 해석하고, 일반 bookkeeping event churn에서는
-  Need You를 잃지 않으며, semantic provenance가 없는 기존 `reason:<cursor>` row는
-  legacy cursor 경로로 계속 읽는다.
-- Telegram line에도 동일한 semantic `attention_key`를 포함해 event와 전달 dedupe의
-  generation 규칙을 일치시킨다.
+## Required behavior
 
-## 명시적 비목표
+- Structured notification scope must be canonical board context, never parsed from
+  display text or borrowed from task/PR context.
+- Same unresolved reason on two boards sends independently; repeated same-scope
+  incidents and display-only changes stay suppressed while active.
+- A successful empty observation replaces only its observed scope. Unobserved or
+  failed scopes stay active; a later disappearance/reappearance alerts once again.
+- Extend the existing Telegram state file with safe versioned scope ownership.
+  Legacy unscoped active state must fail open and never suppress a new scoped alert.
+- Both label-projection reasons must use current canonical rework identity when the
+  round exists, and remain visibly unresolved/fail-open without PR-only identity.
 
-Hermes core, Kanban lifecycle state-machine, GitHub label/state ownership, n8n
-transporter contract, Telegram credential/configuration, merge/auto-merge 동작은
-변경하지 않는다. 새 notification 저장소를 만들지 않으며, raw task-event cursor를
-incident identity로 사용하지 않는다.
+## Ownership and non-goals
 
-## 검증
+Preserve edge lifecycle/H4V3 contracts, observer-only send failures, semantic
+rework identity, missing-round fail-open behavior, and existing task-event dedupe.
+Do not change Hermes core, n8n transport, Kanban DB/schema, lifecycle labels,
+notification transport, or add a second store. Do not alter existing tests except
+to express the superseding scoped-state contract, and do not weaken assertions.
+The three block-kind matcher assertions were aligned with the current canonical
+helper contract, whose `_MATCHERS` and documentation include `kanban_create`.
 
-Focused edge/rework/blocker/notification/Overview 회귀 테스트, Python
-compile/import 및 diff hygiene, static diagnostics를 실행한다. GitHub Actions가
-비활성화된 저장소 정책에 따라 로컬 검증 결과와 원격 PR 상태를 분리해 보고한다.
+## Evidence route and validation
 
-## 중단 조건
-
-canonical blocked/rework identity의 source-of-truth가 충돌하거나, Hermes core
-수정·외부 state migration·lifecycle 소유권 변경이 필요하면 구현을 중단하고
-근거를 남긴다.
-
-## 최종 자동화 상태
-
-로컬 검증, commit, push, PR read-back까지 완료한 뒤 구현 증거를 인계한다.
-사람의 review, merge, runtime/device/manual acceptance는 이 요청의 자동화 범위
-밖이다.
+Canonical route: `AGENTS.md` → `README.md` → `docs/README.md` →
+`docs/H4V3_OVERVIEW.md` and `docs/EDGE_REWORK_LIFECYCLE.md` → affected source/tests.
+Run focused notification/Overview regressions, exact edge rework harness, split-API
+and related canonical suites named by the task, compile/import, Ruff, BasedPyright/
+LSP, documentation/link, sabotage, and `git diff --check` gates. RED evidence was
+captured before implementation: the new direct harness exited non-zero at the
+missing edge reason registry. Final local evidence: notification direct 38 tests;
+notification/Overview pytest 65; edge recovery 5, provenance 9, label history 4,
+retry 8, block-kind 62, and terminal convergence 95; py_compile, Ruff, and
+BasedPyright all pass. A broader 20-file edge sweep was 17/20: two resource
+admission files require the profile runtime/config environment, and the unchanged
+self-heal-label fixture still fails its pre-existing expected reason. The full
+pytest sweep reached 383 passes but has 23 unrelated legacy `tmp` fixture errors
+and 4 completion-wake board-pin/module-environment failures. Push a real commit to
+the existing PR branch, read back the exact full head plus closing reference
+`closingIssuesReferences=[104]`/`Closes #104.`, and hand off without merge or runtime
+claims that were not executed.

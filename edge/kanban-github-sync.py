@@ -5727,6 +5727,8 @@ def _rework_provenance_attention(
 
 _OPERATOR_ATTENTION_REASONS = frozenset({
     "rework_retry_blocked",
+    "rework_attention_label_projection_failed",
+    "rework_retry_label_projection_failed",
     "rework_dispatch_failed",
     "claim_projection_reclaim_failed",
     "workspace_resolve_failed",
@@ -5752,6 +5754,8 @@ _REWORK_OPERATOR_ATTENTION_REASONS = frozenset({
     "rework_human_attention",
     "rework_threshold_exceeded",
     "rework_retry_blocked",
+    "rework_attention_label_projection_failed",
+    "rework_retry_label_projection_failed",
     "rework_dispatch_failed",
     "claim_projection_reclaim_failed",
     "workspace_resolve_failed",
