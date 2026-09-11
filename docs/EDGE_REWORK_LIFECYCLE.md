@@ -235,7 +235,7 @@ valid completed round projects `agent-review-ready`.
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, clear consumed execution/output labels, and never synthesize `agent-rework` or project `agent-review-ready` |
 | `agent-working` → READY (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | clear consumed lifecycle labels; task requeued `→ ready` from durable `github_pr_rework_retry` evidence, failure counted against `kanban.failure_limit` (circuit breaker preserved); the edge never re-creates `agent-rework` |
-| BLOCKED or operator-recovered REVIEW attention hold → new round | explicit trusted exact `AGENT_REWORK_RETRY` whole-comment after the current round's attention, Issue open + `agent-ready`, comment id never consumed | the existing `apply_rework` transaction opens READY from the actual prior status and records one fresh `github_pr_rework` event (`trigger: maintainer_retry`, `retry_comment_id`); no `agent-rework` label is synthesized, and dispatch projects `agent-working` only after claim |
+| BLOCKED or operator-recovered REVIEW attention hold → new round | preferred: a fresh trusted `agent-rework` label addition after the current round's attention; compatibility fallback: an exact trusted `AGENT_REWORK_RETRY` whole-comment; source Issue open + `agent-ready` | the fresh label returns to the classic `apply_rework` intake and opens an ordinary label-requested round; the fallback comment opens `trigger: maintainer_retry` with `retry_comment_id`; stale/untrusted/edge-owned label projections do not qualify, and dispatch projects `agent-working` only after claim |
 | `agent-working` → attention hold | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | clear consumed lifecycle labels; emit idempotent `HERMES_KANBAN_REWORK_ATTENTION` PR feedback + Kanban `github_pr_rework_attention`; only a later trusted maintainer command may open another round |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same pass |
 
@@ -260,17 +260,19 @@ valid completed round projects `agent-review-ready`.
      `agent-rework` or projects `agent-review-ready`;
    - any other ambiguous lifecycle combination still skips with a diagnostic
      (`lifecycle_label_conflict`) and never spawns.
-5. Classic intake (`REVIEW/BLOCKED` + fresh `agent-rework` label), plus a
-   false-terminal `DONE + OPEN PR` card with a fresh trusted
-   `AGENT_REWORK_RETRY`, flows through the bounded `DONE -> REVIEW -> READY`
-   path. A label **newer than the governing event** always flows through the
-   classic path.
-6. A consumed round with current-round `github_pr_rework_attention` that an
-   operator recovers to `REVIEW` may use explicit retry admission from that
-   durable attention record; no `agent-rework` label is required. Normal
-   `review`/`agent-review-ready` lanes without matching attention, an active
-   worker, and any lifecycle-label conflict stay outside that admission and
-   fail closed without a new round.
+5. Classic intake (`REVIEW/BLOCKED` + fresh trusted `agent-rework` label)
+   is the preferred one-shot maintainer command, including after a current-round
+   attention hold. The label addition must be **newer than the governing
+   round/attention evidence**; stale, untrusted, or edge-owned same-round label
+   projections do not qualify. A qualifying label returns to the classic path
+   in the same wake and opens an ordinary label-requested round.
+6. `AGENT_REWORK_RETRY` remains a backwards-compatible fallback for a consumed
+   round with current-round `github_pr_rework_attention`, including an
+   operator-recovered `REVIEW`. Its exact trusted comment id is consumed
+   one-shot and is also the binding used by the verification-only same-head
+   compatibility path. Normal `review`/`agent-review-ready` lanes without
+   matching attention, an active worker, and any lifecycle-label conflict stay
+   outside both admission paths and fail closed without a new round.
 7. Delivery events are written once per head (`_latest_delivery_head`), so
    repeated reconciliation passes are no-ops after the transition.
 8. `_current_round_delivery` consumes only durable `github_pr_rework_delivery`
@@ -398,7 +400,7 @@ emits a head-binding warning: acceptance remains authoritative in
 `_rework_delivery_evidence` and proceeds directly to `agent-review-ready`.
 Feedback posting never changes state, labels, failure limits, or retry routing.
 
-## Explicit maintainer retry (new round ingress)
+## Maintainer retry after attention (new round ingress)
 
 A consumed rework round whose delivery is incomplete fails closed as a
 `BLOCKED`/`REVIEW` `rework_human_attention` hold with durable current-round
@@ -407,16 +409,24 @@ recovers that same lifecycle card from `DONE` to ordinary `REVIEW`, the
 current-round attention record remains the bounded recovery evidence. No
 automatic or timer-based retry may start from either held state.
 
-The **only** signal that opens a NEW rework round from the hold is a
-machine-readable comment on the current PR by a `TRUSTED_GITHUB_ACTORS`
-maintainer:
+The preferred maintainer action is to apply a **fresh** `agent-rework` label
+to the current PR. The edge accepts it as a new one-shot command only when the
+latest trusted label-addition event is newer than the governing round/attention
+baseline. A stale label, an untrusted label event, or a same-round label
+projection proven to have been emitted by the edge itself is not fresh retry
+evidence. A qualifying fresh label returns to the classic rework intake and
+opens an ordinary label-requested round; the maintainer does not also need to
+post `AGENT_REWORK_RETRY`.
+
+For backwards compatibility, a trusted maintainer may instead post the exact
+machine-readable fallback comment:
 
 ```text
 AGENT_REWORK_RETRY
 task=<task_id>
 ```
 
-Acceptance requires ALL of:
+Fallback acceptance requires ALL of:
 
 - author in `TRUSTED_GITHUB_ACTORS`;
 - the whole non-empty comment is exactly the two lines
@@ -427,35 +437,40 @@ Acceptance requires ALL of:
 - the comment id was never consumed before;
 - source Issue still OPEN with `agent-ready`.
 
-When accepted, the existing `apply_rework` transaction writes exactly one
-fresh `github_pr_rework` event with `trigger: "maintainer_retry"` (+
-`retry_comment_id`), and the task goes from its actual held state
-(`BLOCKED` or recovered `REVIEW`) to `READY`. The event's
-`previous_status` records that source state. The edge dispatch lane then
-claims it like a label-requested round. For this trusted retry only, if the
-requested fixes are already present at the live head, a same-head completion
-is valid **only when** the marker is bound to the retry comment and the
-current round's finished worker run attests that exact live head. Delivery
-evidence then records `verification_only: true`.
+When the fallback comment is accepted, the existing `apply_rework` transaction
+writes exactly one fresh `github_pr_rework` event with
+`trigger: "maintainer_retry"` (+ `retry_comment_id`), and the task goes from
+its actual held state (`BLOCKED` or recovered `REVIEW`) to `READY`. The
+event's `previous_status` records that source state. The edge dispatch lane
+then claims it like a label-requested round.
+
+The fallback comment retains one compatibility-only behavior that the normal
+fresh-label path does not imply: if the requested fixes are already present at
+the live head, a same-head completion is valid **only when** the marker is
+bound to that retry comment and the current round's finished worker run attests
+that exact live head. Delivery evidence then records `verification_only: true`.
 
 ### Operator-recovered `REVIEW` admission (Option A)
 
 This is the canonical recovery policy for Issue #57. A recovered `REVIEW`
 card is eligible only when the latest consumed rework event has a matching
 current-round `github_pr_rework_attention` record, the linked PR is still
-open, and there is no active `agent-working` owner. A fresh trusted exact retry
-comment is consumed by the same `_consume_explicit_rework_retry()` helper and
-the same `apply_rework(..., retry_comment_id=...)` transaction used by the
-`BLOCKED` path. The durable new round is sufficient for dispatch; the edge does
-not synthesize `agent-rework`, and projects `agent-working` only after claim.
+open, and there is no active `agent-working` owner. A fresh trusted
+`agent-rework` label addition after that attention is the preferred ingress and
+returns to the classic `apply_rework` path. The exact trusted
+`AGENT_REWORK_RETRY` comment remains a compatibility fallback consumed by
+`_consume_explicit_rework_retry()` and
+`apply_rework(..., retry_comment_id=...)`. Either accepted path creates one
+durable new round; `agent-working` is projected only after claim.
 
-Normal `REVIEW` / `agent-review-ready` cards, label-only state, stale or
-untrusted comments, wrong-task or malformed comments, already-consumed
-comment ids, active workers, and lifecycle-label conflicts remain
-fail-closed: the card stays in its current state, no duplicate
-`github_pr_rework` event is written, and no worker is spawned. Option B —
-forcing recovered `REVIEW` back to `BLOCKED` — is intentionally rejected so
-the normal review lane does not acquire a new state transition.
+Normal `REVIEW` / `agent-review-ready` cards without matching attention,
+stale/untrusted/edge-owned label projections, stale or untrusted retry
+comments, wrong-task or malformed comments, already-consumed comment ids,
+active workers, and lifecycle-label conflicts remain fail-closed: the card
+stays in its current state, no duplicate `github_pr_rework` event is written,
+and no worker is spawned. Option B — forcing recovered `REVIEW` back to
+`BLOCKED` — is intentionally rejected so the normal review lane does not
+acquire a new state transition.
 
 
 ## Explicit closed-unmerged PR supersede (Issue #96)
@@ -629,6 +644,12 @@ classic fresh-label path. Tests 125–127 pin claim-time PATCH/read-back failure
 classification and durable evidence, READY + `agent-rework` preservation with
 one later retry/spawn, and `github_pr_sync`-provenance stale review-ready
 normalization before claim.
+
+`python3 edge/test-kanban-rework-attention-delivery-recovery.py` pins the
+deployed attention overlay, including fresh trusted `agent-rework` admission
+without a retry comment, untrusted-label rejection, edge-owned same-round label
+projection rejection, explicit retry precedence, delivery recovery, and
+idempotent overlay installation.
 
 `/ws/hermes-agent/venv/bin/python3 edge/test-kanban-head-binding-feedback.py`
 installs the production head-binding overlay, first exercises focused
