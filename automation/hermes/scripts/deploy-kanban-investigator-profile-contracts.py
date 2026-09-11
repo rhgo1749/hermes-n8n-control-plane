@@ -186,7 +186,7 @@ def deploy(hermes_home: Path, *, dry_run: bool = False) -> list[PlannedWrite]:
             print("already_converged=true")
         return plans
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
     backups: list[tuple[Path, Path]] = []
     try:
         for plan in changed:
