@@ -102,13 +102,19 @@ contract prose ("keep HUMAN_VALIDATION_REQUIRED / HOST_VALIDATION_REQUIRED /
 BLOCKED states honest") that would false-positive every card.
 The board's 200-row recent-activity window does not expire attention evidence:
 active tasks query their newest explicit human-attention event separately.
-That evidence is still required to be unresolved: the existing
-`github_operator_attention` `attention_key` points to the latest event cursor
-excluding prior `github_operator_attention` rows, so a later lifecycle event
-(for example REVIEW → READY/RUNNING) stales the prior incident. A new
-attention event keyed to the new cursor makes Need You actionable again.
-Legacy rework-attention rows use their event id against a lifecycle cursor that
-excludes attention rows, without deleting or rewriting any history.
+Semantic `github_operator_attention` rows carry an `attention_key` of
+`<reason>:<incident_ref>` plus an `incident_provenance` object. Rework identity
+uses repository, Issue, PR, rework round, and request-comment identity; blocked
+identity uses the latest `blocked` event's payload kind/reason/timestamp,
+durable row id, and `block_kind`; board-global dispatch-lock diagnostics retain
+`source=board_context` and `incident_unresolved: true` rather than inheriting a
+task or PR identity, while other task-scoped diagnostics use the canonical entry
+PR number. Multi-field refs use `|`, and no raw task-event cursor is used as
+incident identity. A changed reason, PR/request, blocked event, or rework round
+therefore creates a new incident without re-alerting for ordinary bookkeeping.
+Entries with no canonical identity set `incident_unresolved: true` and remain
+visible (fail-open) until stronger evidence is available. Legacy rows without
+`incident_provenance` retain their cursor fallback.
 
 ### Source of truth
 
@@ -152,14 +158,28 @@ not explicitly classified can never silently start an alert storm.
 
 * The edge records a durable `github_operator_attention` event in the
   existing `task_events` table (no new notification DB) only for the first
-  reconciliation pass of an incident. The dedupe key is
-  `reason:<max-event-id-excluding-operator-attention>`, so an unchanged
-  incident stays quiet on repeated reconciliation passes, while a **new**
-  ordinary lifecycle event (incident resolved/recurred) permits a re-send.
+  tick of a semantic incident generation. The semantic key is
+  `reason:incident_ref`; it is reused by the edge result, the Overview
+  projection, and the Telegram line as `incident=<attention_key>`. A task with
+  no canonical identity is marked `incident_unresolved: true` rather than
+  being assigned an event-id cursor.
 * Rework attention keeps its existing round-aware `github_pr_rework_attention`
   writer (deduped per round/diagnostic).
-* `hermes send` failures are observer-only warnings; they never fail or roll
-  back reconciliation.
+* The intake reuses the existing
+  `state/kanban-intake-last-sent.txt` surface as versioned JSON. Persistent
+  `attention_keys` contain only resolved semantic generations: each batch sends
+  only a resolved line whose key has not been delivered, so adding incident B
+  while A remains active sends B alone, and a title or display-name change for
+  A does not re-send it. Unresolved lines carry the canonical suffix
+  `incident_unresolved=true · incident=<attention_key>` and are deduped only
+  against the replace-on-tick `active_unresolved_keys` snapshot. The snapshot
+  is replaced by each configured observer tick (including an empty/deduped
+  tick), so an unresolved board diagnostic can alert again after it disappears.
+  Lines without a key fail open and are sent without being persisted as a
+  guessed generation; legacy v2 or corrupt state also fails open.
+* Empty or fully deduped batches never invoke `hermes send`, and a failed send
+  never marks new delivery state. `hermes send` failures are observer-only
+  warnings; they never fail or roll back reconciliation.
 
 ## Installation / update / rollback
 
