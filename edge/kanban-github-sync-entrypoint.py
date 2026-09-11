@@ -58,10 +58,12 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
     delivery branch gets a chance to re-evaluate it.
 
     This wrapper runs only after the canonical function returns exactly
-    ``rework_retry_pending``. A real fresh retry therefore keeps precedence.
-    The held round is recovered only when the already-installed strict delivery
-    evidence function accepts it; no timestamp-only or ordinary core run can
-    enter this path.
+    ``rework_retry_pending``. A genuine fresh trusted ``agent-rework`` label
+    addition takes precedence and is handed back to the classic intake in the
+    same wake; the explicit ``AGENT_REWORK_RETRY`` comment remains a backwards-
+    compatible fallback. The held round is recovered only when the already-
+    installed strict delivery evidence function accepts it; no timestamp-only
+    or ordinary core run can enter this path.
 
     Edge recovery may restore ``agent-rework`` more than once during one
     immutable rework round: once for an automatic same-round retry and again
@@ -301,6 +303,80 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
         })
         return True, reason, recovered_evidence
 
+    def _fresh_maintainer_rework_label(conn, client, ref, task_id, context):
+        """Return True only for a new trusted rework command after this round.
+
+        REVIEW attention currently runs before the classic label intake, unlike
+        BLOCKED.  That ordering must not force maintainers to add a second
+        ``AGENT_REWORK_RETRY`` comment after they have already re-applied the
+        one-shot command label.
+
+        Edge-owned same-round label projections are filtered with the existing
+        paired timeline + durable-event proof before freshness is considered.
+        Ambiguous/missing timeline evidence fails closed to the legacy retry
+        comment / delivery-recovery path.
+        """
+        event = context.get("event")
+        if not isinstance(event, tuple) or len(event) != 3:
+            return False
+        payload, event_at, _kind = event
+        if not isinstance(payload, dict):
+            return False
+        parse_ts = getattr(core, "_parse_iso_ts", None)
+        trusted = set(getattr(core, "TRUSTED_GITHUB_ACTORS", ()))
+        if parse_ts is None or not trusted:
+            return False
+        try:
+            pr_number = int(context["pr_number"])
+            baseline = max(
+                int(event_at or 0),
+                int(payload.get("label_added_at") or 0),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        timeline_path = f"/repos/{ref.repository}/issues/{pr_number}/timeline"
+        try:
+            timeline_items = client.get_paginated(
+                timeline_path,
+                {"per_page": 100},
+            )
+        except core.GithubCompletionError:
+            return False
+
+        edge_label_times = _edge_projection_label_times(
+            conn,
+            task_id,
+            event,
+            event,
+            timeline_items,
+            parse_ts,
+        )
+        rework_events = []
+        for item in timeline_items:
+            if not isinstance(item, dict) or item.get("event") != "labeled":
+                continue
+            label = item.get("label")
+            if (
+                not isinstance(label, dict)
+                or str(label.get("name") or "") != core.REWORK_LABEL
+            ):
+                continue
+            labeled_at = parse_ts(item.get("created_at"))
+            if labeled_at is None:
+                continue
+            actor = str((item.get("actor") or {}).get("login") or "")
+            rework_events.append((int(labeled_at), actor))
+
+        if not rework_events:
+            return False
+        labeled_at, actor = max(rework_events, key=lambda item: item[0])
+        return (
+            labeled_at > baseline
+            and actor in trusted
+            and labeled_at not in edge_label_times
+        )
+
     def reconcile_rework_lifecycle(
         conn,
         kanban_db,
@@ -342,6 +418,17 @@ def _install_rework_attention_delivery_recovery(core: ModuleType) -> None:
             return result
 
         task_id = str(row["id"])
+
+        # A fresh trusted label is itself the one-shot maintainer command.
+        # REVIEW attention used to intercept this state and demand the legacy
+        # retry comment, while BLOCKED already honored fresh label ingress.
+        # Restore parity and let the classic intake validate Issue readiness,
+        # write the new round, and dispatch it in this same wake.
+        if _fresh_maintainer_rework_label(
+            conn, client, ref, task_id, context,
+        ):
+            return None
+
         try:
             delivered, delivery_reason, evidence = core._rework_delivery_evidence(
                 conn,
