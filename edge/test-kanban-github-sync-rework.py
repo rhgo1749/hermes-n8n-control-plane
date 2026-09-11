@@ -56,8 +56,12 @@ wake_plugin: Any = importlib.util.module_from_spec(wake_spec)
 sys.modules[wake_spec.name] = wake_plugin
 wake_spec.loader.exec_module(wake_plugin)
 
-from hermes_cli import kanban_db, kanban_db_dispatch  # type: ignore  # noqa: E402
-from hermes_cli.kanban_db import connect_closing, init_db  # type: ignore  # noqa: E402
+from hermes_cli import (  # type: ignore  # noqa: E402
+    kanban_db,
+    kanban_db_dispatch,
+    kanban_db_workspace,
+)
+from hermes_cli.kanban_db_connect import connect_closing, init_db  # type: ignore  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1980,7 +1984,7 @@ def test_68_ready_open_pr_no_rework_respawn_guard():
         or r.get("reason") == "lifecycle_label_conflict"], str(results))
     check("task stays ready", task_row(tid)["status"] == "ready")
     with connect_closing() as conn:
-        guard = kanban_db.check_respawn_guard(conn, tid)
+        guard = kanban_db_dispatch.check_respawn_guard(conn, tid)
     check("core active_pr respawn guard intact", guard == "active_pr", str(guard))
 
 
@@ -3820,13 +3824,13 @@ def test_50_workspace_failure_honors_failure_limit_and_state():
     tid = _rework_ready_task(fake)
     _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws50-"))
     _make_profile_dir()
-    original_resolve = kanban_db.resolve_workspace
+    original_resolve = kanban_db_workspace.resolve_workspace
 
     def fail_resolve(*args, **kwargs):
         raise RuntimeError("simulated workspace failure")
 
     results: list[list[dict]] = []
-    kanban_db.resolve_workspace = fail_resolve
+    kanban_db_workspace.resolve_workspace = fail_resolve
     try:
         for _ in range(5):
             with connect_closing() as conn:
@@ -3841,7 +3845,7 @@ def test_50_workspace_failure_honors_failure_limit_and_state():
                     },
                 ))
     finally:
-        kanban_db.resolve_workspace = original_resolve
+        kanban_db_workspace.resolve_workspace = original_resolve
     statuses = [batch[0]["status"] for batch in results]
     final = results[-1][0]
     check("first four failures remain ready", statuses[:4] == ["ready"] * 4,

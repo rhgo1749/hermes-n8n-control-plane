@@ -255,7 +255,7 @@ def _real_intake_body() -> str:
 def _create_real_edge_fixture(root: Path) -> str:
     """Create a real Hermes board row that starts in REVIEW."""
     sys.path.insert(0, "/ws/hermes-agent")
-    from hermes_cli import kanban_db  # type: ignore
+    from hermes_cli import kanban_db, kanban_db_connect  # type: ignore
 
     previous = {
         key: os.environ.get(key)
@@ -271,8 +271,8 @@ def _create_real_edge_fixture(root: Path) -> str:
     os.environ.pop("HERMES_KANBAN_DB", None)
     os.environ.pop("HERMES_KANBAN_INTAKE_HOME", None)
     try:
-        kanban_db.init_db(board="default")
-        with kanban_db.connect_closing(board="default") as conn:
+        kanban_db_connect.init_db(board="default")
+        with kanban_db_connect.connect_closing(board="default") as conn:
             task_id = kanban_db.create_task(
                 conn,
                 title="GitHub contention completion fixture",
@@ -295,7 +295,7 @@ def _create_real_edge_fixture(root: Path) -> str:
 
 def _commit_real_provisional_done(root: Path, task_id: str) -> None:
     sys.path.insert(0, "/ws/hermes-agent")
-    from hermes_cli import kanban_db  # type: ignore
+    from hermes_cli import kanban_db, kanban_db_connect  # type: ignore
 
     previous = {
         key: os.environ.get(key)
@@ -311,7 +311,7 @@ def _commit_real_provisional_done(root: Path, task_id: str) -> None:
     os.environ.pop("HERMES_KANBAN_DB", None)
     os.environ.pop("HERMES_KANBAN_INTAKE_HOME", None)
     try:
-        with kanban_db.connect_closing(board="default") as conn:
+        with kanban_db_connect.connect_closing(board="default") as conn:
             updated = conn.execute(
                 "UPDATE tasks SET status = 'done', completed_at = ? "
                 "WHERE id = ? AND status = 'review'",
@@ -329,7 +329,7 @@ def _commit_real_provisional_done(root: Path, task_id: str) -> None:
 
 def _read_real_task(root: Path, task_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     sys.path.insert(0, "/ws/hermes-agent")
-    from hermes_cli import kanban_db  # type: ignore
+    from hermes_cli import kanban_db, kanban_db_connect  # type: ignore
 
     previous = {
         key: os.environ.get(key)
@@ -345,7 +345,7 @@ def _read_real_task(root: Path, task_id: str) -> tuple[dict[str, Any], list[dict
     os.environ.pop("HERMES_KANBAN_DB", None)
     os.environ.pop("HERMES_KANBAN_INTAKE_HOME", None)
     try:
-        with kanban_db.connect_closing(board="default") as conn:
+        with kanban_db_connect.connect_closing(board="default") as conn:
             row = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
             events = [
                 {

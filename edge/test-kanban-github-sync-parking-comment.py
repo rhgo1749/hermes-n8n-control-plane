@@ -38,7 +38,8 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
-from hermes_cli.kanban_db import connect_closing, create_task, init_db  # type: ignore  # noqa: E402
+from hermes_cli.kanban_db import create_task  # type: ignore  # noqa: E402
+from hermes_cli.kanban_db_connect import connect_closing, init_db  # type: ignore  # noqa: E402
 
 
 def kanban_db_create(title: str, body: str, idem: str) -> str:
