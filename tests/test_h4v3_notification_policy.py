@@ -43,6 +43,22 @@ def _entry(reason: str, **extra: Any) -> dict[str, Any]:
     return base
 
 
+def _scoped_unresolved_notification(
+    board: str,
+    key: str = "dispatch_lock_failed",
+    title: str = "old",
+) -> Any:
+    return intake._TelegramNotification(
+        line=(
+            f"⚠️ [{board}] {board} board · 확인 필요 — {key} — {title} · "
+            f"incident_unresolved=true · incident={key}"
+        ),
+        attention_key=key,
+        unresolved=True,
+        scope=board,
+    )
+
+
 def test_suppress_normal_lifecycle_transitions() -> None:
     for from_state, to_state in (
         ("ready", "running"),
@@ -560,6 +576,165 @@ def test_board_dispatch_lock_attention_is_keyed_for_telegram_observer() -> None:
         conn.close()
 
 
+def test_send_unresolved_same_reason_is_scoped_by_board_context() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-scoped-boards-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        board_a = _scoped_unresolved_notification("board-a")
+        board_b = _scoped_unresolved_notification("board-b")
+        observed = {"board-a", "board-b"}
+        assert intake._send_telegram_batch(
+            [board_a, board_b],
+            ("123", ""),
+            observed_scopes=observed,
+        ) == "sent"
+        assert len(captured) == 1
+        assert board_a.line in captured[0]
+        assert board_b.line in captured[0]
+        state = json.loads(
+            (home / "state" / "kanban-intake-last-sent.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert state == {
+            "active_unresolved_by_scope": {
+                "board-a": ["dispatch_lock_failed"],
+                "board-b": ["dispatch_lock_failed"],
+            },
+            "attention_keys": [],
+            "version": 4,
+        }
+        assert intake._send_telegram_batch(
+            [board_a, board_b],
+            ("123", ""),
+            observed_scopes=observed,
+        ) == "skipped"
+        assert len(captured) == 1
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_send_unresolved_empty_observation_replaces_only_owned_scope() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-scoped-empty-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        board_a = _scoped_unresolved_notification("board-a")
+        board_b = _scoped_unresolved_notification("board-b", title="first")
+        assert intake._send_telegram_batch(
+            [board_a, board_b],
+            ("123", ""),
+            observed_scopes={"board-a", "board-b"},
+        ) == "sent"
+        captured.clear()
+
+        # A successful event-scoped empty observation belongs only to board-a.
+        assert intake._send_telegram_batch(
+            [],
+            ("123", ""),
+            observed_scopes={"board-a"},
+        ) == "skipped"
+        state = json.loads(
+            (home / "state" / "kanban-intake-last-sent.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert state["active_unresolved_by_scope"] == {
+            "board-b": ["dispatch_lock_failed"]
+        }
+
+        # The unobserved board remains suppressed, including a display change.
+        changed_b = _scoped_unresolved_notification("board-b", title="renamed")
+        assert intake._send_telegram_batch(
+            [changed_b],
+            ("123", ""),
+            observed_scopes={"board-b"},
+        ) == "skipped"
+        assert captured == []
+
+        # Board-a disappeared in its observed tick and therefore re-alerts when
+        # the same unresolved incident reappears.
+        assert intake._send_telegram_batch(
+            [board_a],
+            ("123", ""),
+            observed_scopes={"board-a"},
+        ) == "sent"
+        assert captured == ["🤖 Hermes Kanban\n\n" + board_a.line]
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_legacy_unscoped_unresolved_state_cannot_suppress_new_board_scope() -> None:
+    import shutil
+    import tempfile
+    import types
+
+    home = Path(tempfile.mkdtemp(prefix="intake-policy-legacy-scope-"))
+    original_home = intake._hermes_home
+    original_run = intake.subprocess.run
+    try:
+        setattr(intake, "_hermes_home", lambda: home)
+        state_path = home / "state" / "kanban-intake-last-sent.txt"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "attention_keys": [],
+                    "active_unresolved_keys": ["dispatch_lock_failed"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        captured: list[str] = []
+
+        def fake_run(_cmd, input, **_kwargs):
+            captured.append(input)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        setattr(intake.subprocess, "run", fake_run)
+        notification = _scoped_unresolved_notification("board-new")
+        assert intake._send_telegram_batch(
+            [notification],
+            ("123", ""),
+            observed_scopes={"board-new"},
+        ) == "sent"
+        assert captured == ["🤖 Hermes Kanban\n\n" + notification.line]
+    finally:
+        setattr(intake, "_hermes_home", original_home)
+        setattr(intake.subprocess, "run", original_run)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_operator_attention_without_identity_fails_open_and_dedupes_exact_key() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
@@ -709,6 +884,98 @@ def test_incomplete_rework_identity_with_pr_only_fails_open_then_rearms() -> Non
         conn.close()
 
 
+def test_label_projection_attention_reason_parity_and_rework_identity() -> None:
+    reasons = (
+        "rework_attention_label_projection_failed",
+        "rework_retry_label_projection_failed",
+    )
+    for reason in reasons:
+        assert reason in edge._OPERATOR_ATTENTION_REASONS
+        assert reason in edge._REWORK_OPERATOR_ATTENTION_REASONS
+        assert reason in intake._HUMAN_ATTENTION_REASONS
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE task_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, "
+            "kind TEXT, payload TEXT, created_at INTEGER)"
+        )
+        try:
+            rework = {
+                "repository": "rhgo1749/re-bound",
+                "issue_number": 106,
+                "pr_number": 123,
+                "rework_round": 4,
+                "request_comment_id": 555,
+            }
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES ('t1', 'github_pr_rework', ?, 40)",
+                (json.dumps(rework),),
+            )
+            entry: dict[str, Any] = {
+                "task_id": "t1",
+                "repository": "rhgo1749/re-bound",
+                "issue_number": 106,
+                "pr_number": 123,
+                "reason": reason,
+                "status": "review",
+            }
+            assert edge._operator_attention_reason(entry) == reason
+            assert intake._entry_attention_reason(entry) == reason
+            payload = edge._operator_attention_payload(conn, entry)
+            assert payload is not None
+            assert payload["reason"] == reason
+            assert payload["attention_key"] == (
+                f"{reason}:rhgo1749/re-bound|106|123|4|555"
+            )
+            assert "incident_unresolved" not in payload
+            assert payload["incident_provenance"]["source"] == "rework_round"
+        finally:
+            conn.close()
+
+        # Missing the governing round stays visibly unresolved and cannot use
+        # the PR number as a resolved identity.
+        missing_conn = sqlite3.connect(":memory:")
+        try:
+            missing_conn.execute(
+                "CREATE TABLE task_events ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, "
+                "kind TEXT, payload TEXT, created_at INTEGER)"
+            )
+            missing_entry = {
+                "task_id": "t1",
+                "repository": "rhgo1749/re-bound",
+                "issue_number": 106,
+                "pr_number": 123,
+                "reason": reason,
+                "status": "review",
+            }
+            missing_payload = edge._operator_attention_payload(
+                missing_conn,
+                missing_entry,
+            )
+            assert missing_payload == {
+                "reason": reason,
+                "attention_key": reason,
+                "repository": "rhgo1749/re-bound",
+                "issue_number": 106,
+                "previous_status": None,
+                "new_status": "review",
+                "source": "github_edge_operator_attention",
+                "incident_provenance": {
+                    "source": "entry_context",
+                    "pr_number": 123,
+                    "reason": reason,
+                    "incident_ref": None,
+                },
+                "incident_unresolved": True,
+            }
+            assert intake._entry_attention_reason(missing_entry) == reason
+        finally:
+            missing_conn.close()
+
+
 def test_send_dedup_skip_reports_skipped_and_never_invokes_hermes_send() -> None:
     import shutil
     import tempfile
@@ -768,9 +1035,9 @@ def test_send_corrupt_state_fails_open_and_replaces_it_after_delivery() -> None:
         assert len(captured) == 1
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert state == {
-            "active_unresolved_keys": [],
+            "active_unresolved_by_scope": {},
             "attention_keys": [key],
-            "version": 3,
+            "version": 4,
         }
     finally:
         setattr(intake, "_hermes_home", original_home)
@@ -806,9 +1073,9 @@ def test_send_invalid_utf8_state_fails_open_and_replaces_it_after_delivery() -> 
         assert intake._send_telegram_batch([line], ("123", "")) == "sent"
         assert captured == ["🤖 Hermes Kanban\n\n" + line]
         assert json.loads(state_path.read_text(encoding="utf-8")) == {
-            "active_unresolved_keys": [],
+            "active_unresolved_by_scope": {},
             "attention_keys": [key],
-            "version": 3,
+            "version": 4,
         }
     finally:
         setattr(intake, "_hermes_home", original_home)
@@ -848,9 +1115,9 @@ def test_send_recursion_error_state_fails_open_and_replaces_it_after_delivery() 
         assert intake._send_telegram_batch([line], ("123", "")) == "sent"
         assert captured == ["🤖 Hermes Kanban\n\n" + line]
         assert json.loads(state_path.read_text(encoding="utf-8")) == {
-            "active_unresolved_keys": [],
+            "active_unresolved_by_scope": {},
             "attention_keys": [key],
-            "version": 3,
+            "version": 4,
         }
     finally:
         setattr(intake, "_hermes_home", original_home)
@@ -893,9 +1160,9 @@ def test_send_mixed_key_list_fails_open_without_partial_suppression() -> None:
         assert intake._send_telegram_batch([resolved_line], ("123", "")) == "sent"
         assert captured == ["🤖 Hermes Kanban\n\n" + resolved_line]
         assert json.loads(state_path.read_text(encoding="utf-8")) == {
-            "active_unresolved_keys": [],
+            "active_unresolved_by_scope": {},
             "attention_keys": [resolved_key],
-            "version": 3,
+            "version": 4,
         }
         state_path.write_text(
             json.dumps(
@@ -916,9 +1183,9 @@ def test_send_mixed_key_list_fails_open_without_partial_suppression() -> None:
             "🤖 Hermes Kanban\n\n" + unresolved_line,
         ]
         assert json.loads(state_path.read_text(encoding="utf-8")) == {
-            "active_unresolved_keys": [unresolved_key],
+            "active_unresolved_by_scope": {"": [unresolved_key]},
             "attention_keys": [],
-            "version": 3,
+            "version": 4,
         }
     finally:
         setattr(intake, "_hermes_home", original_home)
@@ -955,9 +1222,9 @@ def test_send_delivery_reports_sent_and_writes_state() -> None:
             (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
         )
         assert state == {
-            "active_unresolved_keys": [],
+            "active_unresolved_by_scope": {},
             "attention_keys": [key],
-            "version": 3,
+            "version": 4,
         }, state
     finally:
         setattr(intake, "_hermes_home", original_home)
@@ -1085,9 +1352,9 @@ def test_send_unresolved_dedup_uses_active_snapshot_not_persistent_keys() -> Non
             (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
         )
         assert state == {
-            "active_unresolved_keys": [key],
+            "active_unresolved_by_scope": {"": [key]},
             "attention_keys": [],
-            "version": 3,
+            "version": 4,
         }, state
         assert intake._send_telegram_batch([changed], ("123", "")) == "skipped"
         assert len(captured) == 1
@@ -1124,7 +1391,7 @@ def test_send_unresolved_realerts_after_empty_configured_tick() -> None:
         state = json.loads(
             (home / "state" / "kanban-intake-last-sent.txt").read_text(encoding="utf-8")
         )
-        assert state["active_unresolved_keys"] == []
+        assert state["active_unresolved_by_scope"] == {}
         assert state["attention_keys"] == []
         assert intake._send_telegram_batch([line], ("123", "")) == "sent"
         assert len(captured) == 2
@@ -1148,9 +1415,9 @@ def test_send_empty_or_dedup_batch_never_invokes_hermes_send() -> None:
         state_path.write_text(
             json.dumps(
                 {
-                    "version": 3,
+                    "version": 4,
                     "attention_keys": ["resolved"],
-                    "active_unresolved_keys": ["active"],
+                    "active_unresolved_by_scope": {"": ["active"]},
                 }
             ),
             encoding="utf-8",
@@ -1167,7 +1434,7 @@ def test_send_empty_or_dedup_batch_never_invokes_hermes_send() -> None:
         assert intake._send_telegram_batch([], ("123", "")) == "skipped"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert state["attention_keys"] == ["resolved"]
-        assert state["active_unresolved_keys"] == []
+        assert state["active_unresolved_by_scope"] == {}
     finally:
         setattr(intake, "_hermes_home", original_home)
         setattr(intake.subprocess, "run", original_run)

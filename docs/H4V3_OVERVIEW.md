@@ -172,11 +172,13 @@ not explicitly classified can never silently start an alert storm.
   while A remains active sends B alone, and a title or display-name change for
   A does not re-send it. Unresolved lines carry the canonical suffix
   `incident_unresolved=true · incident=<attention_key>` and are deduped only
-  against the replace-on-tick `active_unresolved_keys` snapshot. The snapshot
-  is replaced by each configured observer tick (including an empty/deduped
-  tick), so an unresolved board diagnostic can alert again after it disappears.
-  Lines without a key fail open and are sent without being persisted as a
-  guessed generation; legacy v2 or corrupt state also fails open.
+  against the version-4 `active_unresolved_by_scope` snapshot. Its keys are
+  owned by canonical `board_context` scope when present; a successful empty
+  observation replaces only the observed scope, preserving failed or
+  unobserved scopes so an unresolved board diagnostic can alert again after it
+  disappears. Lines without a key fail open and are sent without being
+  persisted as a guessed generation; legacy v2/v3 or corrupt state also fails
+  open and cannot suppress a newly scoped incident.
 * Empty or fully deduped batches never invoke `hermes send`, and a failed send
   never marks new delivery state. `hermes send` failures are observer-only
   warnings; they never fail or roll back reconciliation.
