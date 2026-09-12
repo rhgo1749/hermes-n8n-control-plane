@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Deploy the read-only H4V3 Overview dashboard plugin to an existing Hermes home.
-# Run this on the host as the account that owns the Hermes installation.
-# Independent from configure-hermes-service-auth.sh: the n8n service-auth
-# installer no longer forces the Overview onto the host.
+# Run this in the namespace that owns the active Hermes runtime. In the current
+# containerized deployment that means hermes-cloudcli-agent with
+# --hermes-home /home/hermes/.hermes; do not target an unrelated host $HOME/.hermes.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -21,7 +21,9 @@ and enables it (no tool-override permission). Files are replaced atomically
 previous plugin directory is kept as a timestamped backup for rollback.
 
 A dashboard restart is required after installation so the plugin tab
-(/h4v3-overview) registers. Rollback:
+(/h4v3-overview) registers. Run this command in the active Hermes runtime
+namespace; the current containerized deployment uses hermes-cloudcli-agent.
+Rollback:
   mv "$HERMES_HOME/plugin-backups/h4v3-overview/h4v3-overview.bak-<ts>" "$HERMES_HOME/plugins/h4v3-overview"
   hermes plugins enable h4v3-overview --no-allow-tool-override
 EOF

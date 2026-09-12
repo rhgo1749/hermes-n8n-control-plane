@@ -2084,22 +2084,22 @@ def test_71_stale_review_ready_normalized_then_rework_round():
     fake.pr_timeline[PR_N] = labeled_timeline(future_label_ts)
     fake.pr_labels[PR_N] = ["agent-rework", "agent-review-ready"]
     # Section D: the stale agent-review-ready is normalized AND the new
-    # round's REVIEW -> READY intake completes in the SAME tick (no second
-    # cron tick).  The label-only removal does not invalidate the task state,
-    # PR decision, or governing event, so the same reconciliation pass falls
-    # through to the classic intake with a freshly refetched label set.
-    results2 = run_sync(fake)  # tick: normalize + REVIEW -> READY same tick
+    # round's REVIEW -> READY intake completes in the SAME reconciliation pass
+    # (no second event wake). The label-only removal does not invalidate the
+    # task state, PR decision, or governing event, so the same reconciliation
+    # pass falls through to the classic intake with a freshly refetched label set.
+    results2 = run_sync(fake)  # one pass: normalize + REVIEW -> READY
     ready = [r for r in results2
              if r.get("reason") == "agent_rework" and r.get("changed")]
-    check("review -> ready round 2 (same tick as normalization)",
+    check("review -> ready round 2 (same pass as normalization)",
           len(ready) == 1, str(results2))
-    check("card ready after one tick",
+    check("card ready after one pass",
           task_row(tid)["status"] == "ready", str(task_row(tid)))
     check("agent-rework kept, review-ready removed",
           fake.pr_labels.get(PR_N) == ["agent-rework"], str(fake.pr_labels))
     # The single transition is deterministic: no duplicate agent_rework entry
-    # and no stale-normalization-only entry is emitted for this tick.
-    check("single transition entry in same tick",
+    # and no stale-normalization-only entry is emitted for this pass.
+    check("single transition entry in same pass",
           sum(1 for r in results2 if r.get("reason") == "agent_rework") == 1
           and not [r for r in results2
                    if r.get("reason") == "stale_review_ready_normalized"],
