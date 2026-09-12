@@ -1235,10 +1235,80 @@ _REWORK_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _INTAKE_MARKER_RE = re.compile(r"GitHub Issue intake", re.IGNORECASE)
+_REWORK_REQUEUE_EVENT_KINDS = ("github_pr_rework", "github_pr_rework_retry")
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _positive_json_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _valid_rework_requeue_after_completed(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether canonical rework evidence deliberately re-queues a completed task.
+
+    Hermes core knows only its generic requeue event kinds.  The control-plane edge
+    owns two additional durable requeue kinds for GitHub-backed PR rework.  Treat the
+    newest such event as authorization only when it is newer than the newest completed
+    run and its round/head/PR provenance has the canonical shape.  Malformed evidence
+    fails closed and never weakens the core duplicate-work guards.
+    """
+    completed = conn.execute(
+        "SELECT ended_at FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'completed' AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if completed is None:
+        return False
+    completed_at = int(completed[0] or 0)
+    row = conn.execute(
+        "SELECT payload, created_at, kind FROM task_events "
+        "WHERE task_id = ? AND created_at >= ? "
+        "AND kind IN ('github_pr_rework', 'github_pr_rework_retry') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, completed_at),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if row[2] not in _REWORK_REQUEUE_EVENT_KINDS:
+        return False
+    repository = payload.get("repository")
+    if not isinstance(repository, str) or "/" not in repository or repository.startswith("/") or repository.endswith("/"):
+        return False
+    if not _positive_json_int(payload.get("issue_number")):
+        return False
+    if not _positive_json_int(payload.get("pr_number")):
+        return False
+    if not _positive_json_int(payload.get("rework_round")):
+        return False
+    head_sha = payload.get("head_sha")
+    if not isinstance(head_sha, str) or _FULL_SHA_RE.fullmatch(head_sha) is None:
+        return False
+    request_comment_id = payload.get("request_comment_id")
+    if request_comment_id is not None and not _positive_json_int(request_comment_id):
+        return False
+    retry_comment_id = payload.get("retry_comment_id")
+    if retry_comment_id is not None:
+        if not _positive_json_int(retry_comment_id):
+            return False
+        if request_comment_id != retry_comment_id:
+            return False
+    if payload.get("trigger") == "maintainer_retry" and retry_comment_id is None:
+        return False
+    return True
 
 
 def _install_respawn_guard_overlay() -> None:
-    """Waive active_pr respawn guard for rework/unrun tasks in the dispatcher."""
+    """Waive only control-plane-authorized duplicate-work guards in the dispatcher."""
     try:
         from hermes_cli import kanban_db_dispatch as kbd
 
@@ -1253,6 +1323,12 @@ def _install_respawn_guard_overlay() -> None:
             lane: str = "ready",
         ) -> Optional[str]:
             reason = orig(conn, task_id, lane=lane)
+            if reason in {"recent_success", "active_pr"}:
+                try:
+                    if _valid_rework_requeue_after_completed(conn, task_id):
+                        return None
+                except Exception:
+                    pass
             if reason == "active_pr":
                 try:
                     row = conn.execute(

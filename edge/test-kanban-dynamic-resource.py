@@ -2,8 +2,10 @@
 """Regression tests for dynamic backend-aware Kanban resource admission."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 import kanban_dynamic_resource as dynamic
@@ -347,7 +349,7 @@ def test_respawn_guard_overlay_waives_rework_active_pr() -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, last_failure_error TEXT)")
     conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, ended_at INTEGER, outcome TEXT)")
-    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at INTEGER)")
+    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at INTEGER, payload TEXT)")
     conn.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, created_at INTEGER, body TEXT)")
 
     # 1. Intake card with PR URL
@@ -367,12 +369,51 @@ def test_respawn_guard_overlay_waives_rework_active_pr() -> None:
     conn.execute("INSERT INTO tasks VALUES ('t_unrun', '구현: Issue #105 spec', 'body', NULL)")
     conn.execute("INSERT INTO task_comments VALUES (4, 't_unrun', 2000000000, 'Spec PR: https://github.com/foo/bar/pull/125')")
 
+    now = int(time.time())
+    valid_rework = {
+        "repository": "foo/bar",
+        "issue_number": 138,
+        "pr_number": 149,
+        "rework_round": 2,
+        "head_sha": "5" * 40,
+        "request_comment_id": None,
+    }
+
+    # 5. Intake root completed recently, then edge deliberately requeued it.
+    conn.execute("INSERT INTO tasks VALUES ('t_retry', 'GitHub Issue intake: foo/bar#138', 'body', NULL)")
+    conn.execute("INSERT INTO task_runs VALUES (2, 't_retry', ?, 'completed')", (now - 30,))
+    conn.execute(
+        "INSERT INTO task_events VALUES (1, 't_retry', 'github_pr_rework_retry', ?, ?)",
+        (now - 10, json.dumps(valid_rework)),
+    )
+    conn.execute("INSERT INTO task_comments VALUES (5, 't_retry', ?, 'Existing PR: https://github.com/foo/bar/pull/149')", (now - 5,))
+
+    # 6. Malformed edge-looking event must not waive the core guard.
+    conn.execute("INSERT INTO tasks VALUES ('t_bad_retry', 'GitHub Issue intake: foo/bar#138', 'body', NULL)")
+    conn.execute("INSERT INTO task_runs VALUES (3, 't_bad_retry', ?, 'completed')", (now - 30,))
+    bad_rework = dict(valid_rework, head_sha="not-a-full-sha")
+    conn.execute(
+        "INSERT INTO task_events VALUES (2, 't_bad_retry', 'github_pr_rework_retry', ?, ?)",
+        (now - 10, json.dumps(bad_rework)),
+    )
+
+    # 7. A valid but stale rework event before the completed run is not a new rerun.
+    conn.execute("INSERT INTO tasks VALUES ('t_stale_retry', 'GitHub Issue intake: foo/bar#138', 'body', NULL)")
+    conn.execute("INSERT INTO task_runs VALUES (4, 't_stale_retry', ?, 'completed')", (now - 10,))
+    conn.execute(
+        "INSERT INTO task_events VALUES (3, 't_stale_retry', 'github_pr_rework_retry', ?, ?)",
+        (now - 30, json.dumps(valid_rework)),
+    )
+
     dynamic._install_respawn_guard_overlay()
 
     check("intake root active_pr remains intact", kbd.check_respawn_guard(conn, "t_intake") == "active_pr")
     check("ran impl task active_pr remains intact", kbd.check_respawn_guard(conn, "t_impl") == "active_pr")
     check("rework task active_pr is waived", kbd.check_respawn_guard(conn, "t_rework") is None)
     check("unrun impl task active_pr is waived", kbd.check_respawn_guard(conn, "t_unrun") is None)
+    check("fresh canonical rework retry waives recent_success and active_pr", kbd.check_respawn_guard(conn, "t_retry") is None)
+    check("malformed rework retry keeps recent_success", kbd.check_respawn_guard(conn, "t_bad_retry") == "recent_success")
+    check("stale rework retry keeps recent_success", kbd.check_respawn_guard(conn, "t_stale_retry") == "recent_success")
 
 
 def main() -> int:
