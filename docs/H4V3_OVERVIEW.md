@@ -187,13 +187,21 @@ not explicitly classified can never silently start an alert storm.
 
 ### Overview plugin (separate installer)
 
+For the current containerized deployment, run the installer from the Ubuntu
+host but execute it inside the Hermes runtime container:
+
 ```bash
-automation/hermes/scripts/install-h4v3-overview.sh --hermes-home "$HOME/.hermes"
+docker exec hermes-cloudcli-agent bash -lc '
+  cd /ws/projects/hermes-n8n-control-plane &&
+  automation/hermes/scripts/install-h4v3-overview.sh \
+    --hermes-home /home/hermes/.hermes \
+    --hermes-bin /home/hermes/.local/bin/hermes
+'
 ```
 
-Independent from the n8n service-auth installer: `configure-hermes-service-auth.sh`
-never installs the Overview, so an Overview failure cannot block legacy service-auth
-provisioning. The installer validates the backend (`py_compile`), installs the
+The Overview installer is independent of the n8n host control-plane install.
+The retired cron-auth/service-auth integration is not part of the current
+runtime. The installer validates the backend (`py_compile`), installs the
 plugin into `$HERMES_HOME/plugins/h4v3-overview/` atomically (previous version
 kept outside the plugin scan root at
 `$HERMES_HOME/plugin-backups/h4v3-overview/h4v3-overview.bak-<ts>`), and runs
@@ -211,9 +219,18 @@ and the intake resolves its edge counterpart as a sibling
 job is retired and is not required on current hosts, so deployed runtime files
 must be updated and hash-verified together.
 
+For the current containerized deployment, run from the Ubuntu host:
+
 ```bash
-automation/hermes/scripts/deploy-intake-edge.sh --hermes-home "$HOME/.hermes"
+docker exec hermes-cloudcli-agent bash -lc '
+  cd /ws/projects/hermes-n8n-control-plane &&
+  automation/hermes/scripts/deploy-intake-edge.sh \
+    --hermes-home /home/hermes/.hermes
+'
 ```
+
+A host-side `$HOME/.hermes` is not the live target unless the host itself owns
+that Hermes runtime.
 
 The deploy script provides:
 

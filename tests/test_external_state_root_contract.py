@@ -122,3 +122,30 @@ def test_state_root_shell_scripts_parse() -> None:
             check=False,
         )
         assert result.returncode == 0, f"{name}: {result.stderr}"
+
+
+def test_current_runtime_namespace_contract_rejects_retired_cron_assumptions() -> None:
+    operations = (ROOT / "docs" / "OPERATIONS.md").read_text(encoding="utf-8")
+    overview_doc = (ROOT / "docs" / "H4V3_OVERVIEW.md").read_text(encoding="utf-8")
+    overview_installer = (
+        ROOT / "automation" / "hermes" / "scripts" / "install-h4v3-overview.sh"
+    ).read_text(encoding="utf-8")
+    intake_core = (
+        ROOT
+        / "automation"
+        / "hermes"
+        / "scripts"
+        / "github-agent-ready-kanban-intake.py"
+    ).read_text(encoding="utf-8")
+    router_entrypoint = (
+        ROOT / "automation" / "n8n" / "github-router" / "router_entrypoint.py"
+    ).read_text(encoding="utf-8")
+
+    assert "configure-hermes-service-auth.sh" not in overview_doc
+    assert "configure-hermes-service-auth.sh" not in overview_installer
+    assert 'configure-github-router-secrets.sh \\\n  --hermes-home' not in operations
+    assert "docker exec hermes-cloudcli-agent" in operations
+    assert "docker exec hermes-cloudcli-agent" in overview_doc
+    assert "The cron job invokes this file" not in intake_core
+    assert "FIRST GitHub step of the cron tick" not in intake_core
+    assert "wakes the preserved Hermes intake job" not in router_entrypoint

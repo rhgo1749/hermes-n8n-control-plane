@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic GitHub ``agent-ready`` issue -> Hermes Kanban intake.
 
-The cron job invokes this file without an agent.  GitHub's issue identity and
-Hermes Kanban's idempotency key are the only deduplication boundary; the local
-filesystem is not used as a correctness cache.
+The fixed loopback intake actuator invokes the deployed intake runtime without
+an agent. GitHub's issue identity and Hermes Kanban's idempotency key are the
+only deduplication boundary; the local filesystem is not used as a correctness
+cache.
 
 Closed-Issue label cleanup is the FIRST GitHub step of every tick: closed
 Issues (PR payloads excluded) have ALL labels atomically replaced with an
@@ -3463,7 +3464,7 @@ def _run_closed_issue_cleanup(
     *,
     dry_run: bool,
 ) -> list[dict[str, Any]]:
-    """Closed-Issue label cleanup — the FIRST GitHub step of the cron tick.
+    """Closed-Issue label cleanup — the FIRST GitHub step of the intake pass.
 
     Every selected repository is queried for closed Issues (PR payloads
     excluded); closed Issues carrying at least one label have ALL labels

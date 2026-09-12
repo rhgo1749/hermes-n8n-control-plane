@@ -9,12 +9,21 @@ contract visibility before reading registry board intent or touching
 `/ws/projects/<repository-name.casefold()>`.
 It never relies on a manual webhook reconciliation for first discovery.
 
-Run the read-only diagnostic from the repository root when investigating a
-canary or a partial onboarding:
+Run the read-only diagnostic in the namespace that owns the active Hermes
+runtime. For the current containerized deployment, invoke it from the Ubuntu
+host through `hermes-cloudcli-agent`:
 
 ```bash
-automation/n8n/scripts/diagnose-github-onboarding.sh --hermes-home "$HOME/.hermes"
+docker exec hermes-cloudcli-agent bash -lc '
+  cd /ws/projects/hermes-n8n-control-plane &&
+  automation/n8n/scripts/diagnose-github-onboarding.sh \
+    --hermes-home /home/hermes/.hermes
+'
 ```
+
+Do not substitute the Ubuntu user's `$HOME/.hermes` unless that path is itself
+the active Hermes runtime. In the current deployment it is not; the container
+runtime owns `/home/hermes/.hermes`.
 
 The command verifies that the deployed intake wrapper/core expose all required
 onboarding entrypoints and that the current intake execution contract is the
@@ -99,9 +108,13 @@ primary intake path; the safety tick is only a missed-webhook liveness backstop.
 
 ## 3. Host prerequisites
 
-Run host operations on the Ubuntu host, not inside the Hermes worker container.
-The worker container has no host Docker socket, sudo, systemd, or host SSH
-authority.
+Run **control-plane host operations** on the Ubuntu host, not inside the Hermes
+worker container. The worker container has no host Docker socket, sudo, systemd,
+or host SSH authority. Conversely, operations that install or validate Hermes
+runtime scripts/plugins must run in the namespace that owns the active Hermes
+runtime; in the current deployment that is `hermes-cloudcli-agent` with
+`/home/hermes/.hermes`. Do not treat the Ubuntu user's unrelated `$HOME/.hermes`
+as the live runtime.
 
 Install/start the control plane:
 
@@ -150,15 +163,20 @@ existing dispatcher tick
 
 Install and activate the repository-owned completion observers manually in the
 Hermes runtime namespace (the edge runtime deployment is a separate first
-step):
+step). For the current containerized deployment, run from the Ubuntu host:
 
 ```bash
-automation/hermes/scripts/deploy-intake-edge.sh \
-  --hermes-home "$HOME/.hermes"
-automation/hermes/scripts/install-github-completion-edge-wake.sh \
-  --hermes-home "$HOME/.hermes"
-automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
-  --hermes-home "$HOME/.hermes"
+docker exec hermes-cloudcli-agent bash -lc '
+  cd /ws/projects/hermes-n8n-control-plane &&
+  automation/hermes/scripts/deploy-intake-edge.sh \
+    --hermes-home /home/hermes/.hermes &&
+  automation/hermes/scripts/install-github-completion-edge-wake.sh \
+    --hermes-home /home/hermes/.hermes \
+    --hermes-bin /home/hermes/.local/bin/hermes &&
+  automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
+    --hermes-home /home/hermes/.hermes \
+    --hermes-bin /home/hermes/.local/bin/hermes
+'
 ```
 
 `install-github-completion-edge-wake.sh` validates a candidate copy before an
@@ -190,9 +208,13 @@ Copy the current GitHub credential and Hermes service token into the protected
 router secret directory and create a stable webhook HMAC secret:
 
 ```bash
-automation/n8n/scripts/configure-github-router-secrets.sh \
-  --hermes-home "$HOME/.hermes"
+automation/n8n/scripts/configure-github-router-secrets.sh
 ```
+
+This is a host control-plane operation. The script resolves the protected
+external n8n state root and does not need a Hermes home. A hidden
+`--hermes-home` compatibility argument is accepted only for older operator
+notes and is intentionally ignored; new procedures must not use it.
 
 Set the reviewed public HTTPS endpoint for the router in the runtime `.env`:
 

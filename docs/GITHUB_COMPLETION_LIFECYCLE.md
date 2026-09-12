@@ -248,17 +248,25 @@ clearing `agent-ready` from an Issue.
 
 The canonical intake source remains `automation/hermes/scripts/github-agent-ready-kanban-intake.py`. The live wrapper fail-closed overlays two rendered blocks: the GitHub completion contract and the Kanban lead orchestration contract, and verifies the shared GitHub PR closing-reference contract section in the rendered body. If any canonical source block drifts unexpectedly, the wrapper refuses to emit an unverified lifecycle contract.
 
-Install the completion observers separately on the Hermes runtime that starts
-workers / runs the dispatcher; this is a manual host activation gate, not an
-automatic repository deployment step:
+Install the completion observers separately in the namespace that owns the
+Hermes runtime that starts workers / runs the dispatcher; this is a manual
+runtime activation gate, not an automatic repository deployment step. For the
+current containerized deployment, run from the Ubuntu host:
 
 ```bash
-automation/hermes/scripts/install-github-completion-edge-wake.sh \
-  --hermes-home "$HOME/.hermes"
-
-automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
-  --hermes-home "$HOME/.hermes"
+docker exec hermes-cloudcli-agent bash -lc '
+  cd /ws/projects/hermes-n8n-control-plane &&
+  automation/hermes/scripts/install-github-completion-edge-wake.sh \
+    --hermes-home /home/hermes/.hermes \
+    --hermes-bin /home/hermes/.local/bin/hermes &&
+  automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
+    --hermes-home /home/hermes/.hermes \
+    --hermes-bin /home/hermes/.local/bin/hermes
+'
 ```
+
+Do not target an unrelated Ubuntu-host `$HOME/.hermes` when Hermes is running
+inside `hermes-cloudcli-agent`.
 
 The primary installer validates the candidate, atomically replaces the user
 plugin, keeps a timestamped backup, enables only `github-completion-edge-wake`,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ensure rollback rejects snapshots outside the current one-job migration scope."""
+"""Preserve the historical one-job rollback boundary without reviving it."""
 from __future__ import annotations
 
 import json
