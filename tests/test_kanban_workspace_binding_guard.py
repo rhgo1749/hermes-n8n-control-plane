@@ -35,6 +35,36 @@ def _load_guard() -> Any:
     return module
 
 
+def _load_stable_guard() -> Any:
+    spec = importlib.util.spec_from_file_location("stable_workspace_guard_test", STABLE_GUARD)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_stable_guard_uses_python_beside_resolved_hermes_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    guard = _load_stable_guard()
+    venv_bin = tmp_path / "runtime" / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    real_launcher = venv_bin / "hermes"
+    real_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_launcher.chmod(0o755)
+    python = venv_bin / "python3"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+    exposed_bin = tmp_path / "exposed"
+    exposed_bin.mkdir()
+    exposed_launcher = exposed_bin / "hermes"
+    exposed_launcher.symlink_to(real_launcher)
+    monkeypatch.setattr(guard.shutil, "which", lambda name: str(exposed_launcher) if name == "hermes" else None)
+
+    assert guard._hermes_python() == python
+
+
 class FakeAdapter:
     def __init__(self, guard: Any, db_path: Path, *, corrupt_field: str | None = None) -> None:
         self.guard = guard

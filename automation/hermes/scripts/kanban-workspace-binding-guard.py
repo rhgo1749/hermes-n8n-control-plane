@@ -846,7 +846,8 @@ def evaluate_payload(payload: Mapping[str, Any]) -> int:
     return 0
 
 
-# Kept importable for focused tests and for the stable wrapper's in-process call.
+# Kept importable for focused tests; the stable wrapper invokes this file under
+# the Python interpreter that owns the active Hermes installation.
 __all__ = [
     "BindingError",
     "RepoBinding",

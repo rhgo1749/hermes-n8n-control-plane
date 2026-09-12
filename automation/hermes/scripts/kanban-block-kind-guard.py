@@ -10,14 +10,18 @@ lifecycle policies behind it:
 * ``terminal`` -> block-kind core first, then both specialist policies.
 
 Keeping one approved ``pre_tool_call`` command avoids introducing a second
-shell-hook consent boundary during a hotfix. Both specialist policies are
-imported in-process so terminal calls spawn at most the one preserved
-block-kind core subprocess.
+shell-hook consent boundary during a hotfix. The completion policy stays
+in-process. The workspace-binding policy runs under the Python interpreter
+beside the active ``hermes`` launcher so its canonical ``hermes_cli`` DB/parser
+imports do not depend on the shell-hook subprocess cwd or the generic
+``python3`` selected by PATH.
 """
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -109,34 +113,56 @@ def _run_specialist_policy(payload: dict[str, Any]) -> int:
         )
 
 
+def _hermes_python() -> Path:
+    """Resolve the interpreter that owns the active Hermes installation.
+
+    Shell hooks intentionally keep the historical command ``python3 <guard>``
+    for consent identity. In the container runtime that generic ``python3`` is
+    not the Hermes venv and cannot import ``hermes_cli``. The launcher itself
+    is stable and resolves into its owning venv, so use its sibling interpreter
+    for the workspace policy that must call the canonical Kanban DB owner.
+    """
+    launcher = shutil.which("hermes")
+    if not launcher:
+        raise RuntimeError("active hermes launcher is not on PATH")
+    bin_dir = Path(launcher).resolve().parent
+    for name in ("python3", "python"):
+        candidate = bin_dir / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError(f"Hermes Python interpreter is missing beside {bin_dir / 'hermes'}")
+
+
 def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
+    if not WORKSPACE_BINDING_GUARD.is_file():
+        return _hard_block(f"guard dependency missing: {WORKSPACE_BINDING_GUARD.name}")
     try:
-        if not WORKSPACE_BINDING_GUARD.is_file():
-            raise RuntimeError(f"guard dependency missing: {WORKSPACE_BINDING_GUARD.name}")
-        spec = importlib.util.spec_from_file_location(
-            "h4v3_workspace_binding_guard",
-            WORKSPACE_BINDING_GUARD,
+        result = subprocess.run(
+            [str(_hermes_python()), str(WORKSPACE_BINDING_GUARD)],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
         )
-        if spec is None or spec.loader is None:
-            raise RuntimeError(
-                f"cannot load guard dependency: {WORKSPACE_BINDING_GUARD.name}"
-            )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        evaluate = getattr(module, "evaluate_payload", None)
-        if not callable(evaluate):
-            raise RuntimeError(
-                f"guard dependency has no evaluate_payload: {WORKSPACE_BINDING_GUARD.name}"
-            )
-        decision = evaluate(payload)
-        if not isinstance(decision, int):
-            raise RuntimeError("workspace-binding guard returned a non-integer decision")
-        return decision
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         return _hard_block(
             f"{WORKSPACE_BINDING_GUARD.name}: {type(exc).__name__}: {exc}"
         )
+    stdout = result.stdout or ""
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 0:
+        if stdout.strip():
+            return _hard_block(
+                f"{WORKSPACE_BINDING_GUARD.name} emitted unexpected output on allow"
+            )
+        return 0
+    if result.returncode == 2 and stdout:
+        sys.stdout.write(stdout)
+        return 2
+    return _hard_block(
+        stderr or f"{WORKSPACE_BINDING_GUARD.name} exited {result.returncode}"
+    )
 
 
 def _run_specialist_policies(payload: dict[str, Any]) -> int:
