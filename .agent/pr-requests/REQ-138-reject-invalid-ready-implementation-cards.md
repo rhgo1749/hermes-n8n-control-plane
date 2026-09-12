@@ -30,7 +30,13 @@
 - Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/issue-138-rework-round-8`; requested branch `wt/t_b7258023`
 - Delivery branch: `fix/issue-138-ready-binding-preflight`
 - Delivery PR: PR #149 — `Issue #138: 구현·재작업 카드 생성 전 작업공간 바인딩 검증` — `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/149`
-- Automation stop state: `NONE` — local validation complete; no live deployment/config mutation, GitHub lifecycle mutation, merge/auto-merge, new PR, or build artifact. Human merge authority remains unchanged.
+- Automation stop state: `NONE` after requested host/runtime deployment and canary verification; merge/auto-merge remains human/user authority.
+
+## 0. Current hotfix addendum — CtrlHangul #113 live binding failure
+
+On 2026-09-13, CtrlHangul Issue #113 intake exposed a deployment gap not covered by the earlier PR-only validation. The live Hermes config still registered the superseded `/home/hermes/.hermes/scripts/kanban-workspace-guard.py` for structured `kanban_create`. That 2026-08-26 guard reads legacy/non-schema keys `workspace` and `branch`, while the live Hermes structured schema exposes `workspace_kind`, `workspace_path`, and `project`; structured specialist creates were therefore misclassified as scratch/no-workspace before the repository-owned workspace-binding preflight could run. Main then explored CLI/manual worktree fallback, which is explicitly the wrong recovery boundary.
+
+This hotfix keeps PR #149 and the existing `fix/issue-138-ready-binding-preflight` branch. It retires only the superseded hook entries during repository-owned config rendering, leaves the old runtime file untouched for rollback archaeology, verifies the candidate config contains exactly the stable approved lifecycle wrapper and no legacy workspace hook, and teaches the Main profile/canonical role contract to use structured `kanban_create` with `workspace_kind="worktree"` + canonical `project` + stable `idempotency_key` while omitting `workspace_path`/branch fields. The current host base was freshly fetched at `origin/main=c585d168cf5f6d3be8b714520b09d9cbb3e720b8`; the pre-hotfix PR #149 head observed from GitHub was `9858882e2f7017096e34b2608705b499857ec850`.
 
 ## 1. Objective and confirmed cause
 
@@ -52,12 +58,15 @@ Explicit non-goals: Hermes core/product edits, a second parser/dispatcher/store,
 
 ## 3. Changed files
 
-Current round:
+Current hotfix round:
 
-- `automation/hermes/scripts/kanban-specialist-completion-guard.py`
-- `tests/test_specialist_completion_contract_parser.py`
-- `tests/test_kanban_workspace_binding_guard.py`
-- `.agent/pr-requests/REQ-138-reject-invalid-ready-implementation-cards.md`
+- `automation/hermes/scripts/kanban-block-kind-hook-config.py` — retire superseded live workspace-hook entries during config render.
+- `automation/hermes/scripts/deploy-intake-edge.sh` — reject candidate configs that still reference the superseded hook and report the migration.
+- `automation/hermes/profile-contracts/kanban-main-investigator.md` — structured specialist workspace creation contract; no CLI/manual worktree fallback.
+- `docs/KANBAN_ROLE_CONTRACTS.md` — durable Main creation boundary.
+- `tests/test_specialist_completion_contract_guard.py` — legacy-hook config migration/deployer regression.
+- `tests/test_kanban_investigator_role.py` — deployed Main contract regression.
+- `.agent/pr-requests/REQ-138-reject-invalid-ready-implementation-cards.md` — current runtime evidence and provenance.
 
 Cumulative PR allowlist additionally includes earlier-round files:
 

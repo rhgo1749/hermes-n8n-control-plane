@@ -388,6 +388,14 @@ def test_hook_config_reuses_one_approved_command_idempotently_without_losing_sib
         "    - matcher: other\n"
         "      command: python3 /tmp/other.py\n"
         "      timeout: 5\n"
+        "    - matcher: kanban_create\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: true\n"
+        "    - matcher: terminal\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: false\n"
         "  post_tool_call:\n"
         "    - matcher: post\n"
         "      command: python3 /tmp/post.py\n"
@@ -415,6 +423,10 @@ def test_hook_config_reuses_one_approved_command_idempotently_without_losing_sib
         "kanban-specialist-completion-guard.py" in str(entry.get("command", ""))
         for entry in entries
     )
+    assert not any(
+        "kanban-workspace-guard.py" in str(entry.get("command", ""))
+        for entry in entries
+    )
     assert parsed["hooks"]["post_tool_call"][0]["matcher"] == "post"
     assert parsed["logging"]["level"] == "INFO"
 
@@ -425,7 +437,16 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
         scripts = home / "scripts"
         scripts.mkdir()
         config = home / "config.yaml"
-        original = "hooks:\n  pre_tool_call:\n    - matcher: other\n      command: python3 /tmp/other.py\n"
+        original = (
+            "hooks:\n"
+            "  pre_tool_call:\n"
+            "    - matcher: other\n"
+            "      command: python3 /tmp/other.py\n"
+            "    - matcher: kanban_create\n"
+            "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+            "      timeout: 10\n"
+            "      fail_closed: true\n"
+        )
         config.write_text(original, encoding="utf-8")
         result = subprocess.run(
             ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
@@ -438,6 +459,7 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
         assert "kanban-specialist-completion-guard.py" in result.stdout
         assert "kanban-workspace-binding-guard.py" in result.stdout
         assert "lifecycle-guard matcher=kanban_create (fail_closed=true)" in result.stdout
+        assert "superseded kanban-workspace-guard.py hooks would be retired from config" in result.stdout
         assert "shell-hook command path unchanged; no second consent command added" in result.stdout
         assert config.read_text(encoding="utf-8") == original
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())

@@ -191,6 +191,14 @@ if {
 commands = {str(entry.get("command", "")) for entry in guard_entries}
 if len(commands) != 1:
     raise SystemExit("candidate config must reuse one approved lifecycle guard command")
+if any(
+    "kanban-workspace-guard.py" in str(entry.get("command", ""))
+    for entry in entries
+    if isinstance(entry, dict)
+):
+    raise SystemExit(
+        "candidate config still references superseded kanban-workspace-guard.py"
+    )
 PY
 
 # 2) validation: compile + argparse smoke (--help exits 0)
@@ -255,6 +263,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   lifecycle-guard matcher=kanban_block (fail_closed=true)"
   echo "dry-run:   lifecycle-guard matcher=kanban_create (fail_closed=true)"
   echo "dry-run:   lifecycle-guard matcher=terminal (fail_closed=true)"
+  echo "dry-run: superseded kanban-workspace-guard.py hooks would be retired from config"
   echo "dry-run: shell-hook command path unchanged; no second consent command added"
   rm -rf "$CANDIDATE"
   exit 0
@@ -381,6 +390,7 @@ done
 echo "Deployed intake/edge/registry and lifecycle guards to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
 echo "Config hooks installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
 echo "Shell-hook command remains $TARGET_DIR/kanban-block-kind-guard.py (existing consent identity preserved)."
+echo "Superseded kanban-workspace-guard.py hook entries are retired from live config; the old file is left untouched for rollback archaeology."
 echo "Cron job bf431b2a6ba6 is untouched (id/schedule/enabled unchanged)."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Rollback:"

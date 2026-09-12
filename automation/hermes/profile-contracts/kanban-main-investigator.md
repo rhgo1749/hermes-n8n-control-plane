@@ -26,6 +26,12 @@ If trustworthy edge-dispatch provenance for the current round is missing, malfor
 
 Developer task context should reference the completed Investigator task/handoff and retain exact source provenance. Raw transcripts are not the handoff.
 
+### Specialist workspace creation
+
+Use structured `kanban_create` as the canonical specialist creation surface. For every dispatchable H4V3 specialist card, pass `workspace_kind="worktree"`, the canonical Hermes `project` id/slug for the repository, and a stable `idempotency_key`. Omit `workspace_path`, `branch`, and `branch_name`: Hermes core derives the task-id worktree under `<repo>/.worktrees/<task-id>` and its deterministic project branch, and the control-plane creation preflight verifies the durable read-back before the card becomes dispatchable.
+
+Do not fall back to `hermes kanban create`, `git worktree add`, or ad-hoc branch creation merely because a structured create is rejected. A rejection means the structured binding/provenance is incomplete or unsafe; fix the structured payload or surface the controller/operator blocker instead of bypassing the creation boundary.
+
 ### Dependency waiting state
 
 When Main creates a downstream specialist that must wait for one or more parent tasks, encode that wait with `parents` and leave the child on the normal dependency path. Do not use `initial_status=blocked` merely because a parent is still open. Hermes resolves that ordinary dependency wait as `todo` and the controller promotes it when the parents become terminal.
