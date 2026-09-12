@@ -20,9 +20,11 @@ policies remain separate defenses.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -400,6 +402,27 @@ def _verify_readback(
     parent_statuses = adapter.parent_statuses(parents)
     if set(parent_statuses) != set(parents):
         raise BindingError("durable parent topology contains an unreadable parent")
+
+
+def _verify_initial_status(
+    adapter: _TaskAdapter,
+    raw: Mapping[str, Any],
+    task_id: str,
+) -> None:
+    """Check creation placement only for a newly materialized task.
+
+    Idempotent replay must validate the immutable binding/topology above while
+    leaving the task's current lifecycle state alone.  A replay can legitimately
+    observe a task after the dispatcher has claimed it or after edge lifecycle
+    reconciliation has moved it to review/done.
+    """
+    row = adapter.read(task_id)
+    if row is None:
+        raise BindingError("created task disappeared before initial status read-back")
+    parents = _parents(raw)
+    parent_statuses = adapter.parent_statuses(parents)
+    if set(parent_statuses) != set(parents):
+        raise BindingError("durable parent topology contains an unreadable parent")
     expected_status = _expected_status(raw, parent_statuses)
     if str(_value(row, "status") or "") != expected_status:
         raise BindingError(f"durable status read-back is not {expected_status!r}")
@@ -478,12 +501,19 @@ class _CoreTaskAdapter:
             ) from exc
 
     def find_idempotent(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
+        rows = self._conn.execute(
+            "SELECT id, created_at FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC",
             (key,),
-        ).fetchone()
-        return None if row is None else str(row["id"])
+        ).fetchall()
+        if not rows:
+            return None
+        newest_created_at = rows[0]["created_at"]
+        if sum(row["created_at"] == newest_created_at for row in rows) > 1:
+            raise BindingError(
+                "same-key legacy rows have tied creation timestamps; replay is ambiguous"
+            )
+        return str(rows[0]["id"])
 
     def create(self, raw: Mapping[str, Any], binding: RepoBinding) -> str:
         parents = _parents(raw)
@@ -493,7 +523,9 @@ class _CoreTaskAdapter:
                 title=str(raw["title"]).strip(),
                 body=raw.get("body"),
                 assignee=str(raw["assignee"]),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(str(raw["created_by"]) if raw.get("created_by") else None)
+                or os.environ.get("HERMES_PROFILE")
+                or "worker",
                 workspace_kind="worktree",
                 workspace_path=None,
                 project_id=binding.project_id,
@@ -506,6 +538,7 @@ class _CoreTaskAdapter:
                     raw.get("max_runtime_seconds"), field="max_runtime_seconds"
                 ),
                 skills=raw.get("skills"),
+                max_retries=_as_optional_int(raw.get("max_retries"), field="max_retries"),
                 model_override=raw.get("model"),
                 provider_override=raw.get("provider"),
                 goal_mode=_as_bool(raw.get("goal_mode"), field="goal_mode"),
@@ -599,6 +632,8 @@ def _materialize_and_verify(raw: Mapping[str, Any], binding: RepoBinding) -> Non
                 task_id = existing or adapter.create(raw, binding)
                 try:
                     _verify_readback(adapter, raw, binding, task_id)
+                    if existing is None:
+                        _verify_initial_status(adapter, raw, task_id)
                 except BindingError as exc:
                     if existing is None:
                         raise
@@ -627,16 +662,94 @@ def _option_values(args: list[str], option: str) -> list[str]:
     return values
 
 
-def _first_option(args: list[str], option: str) -> str | None:
-    values = _option_values(args, option)
-    if len(set(values)) > 1:
-        raise BindingError(f"{option} was supplied with conflicting values")
-    return values[0] if values else None
+def _parse_terminal_create_args(args: list[str]) -> argparse.Namespace:
+    """Parse a terminal create tail with the authoritative Hermes CLI parser."""
+    try:
+        from hermes_cli import kanban_parser  # pyright: ignore[reportMissingImports]
+
+        wrapper = argparse.ArgumentParser(add_help=False)
+        wrapper.exit_on_error = False  # type: ignore[attr-defined]
+        parser = kanban_parser.build_parser(wrapper.add_subparsers(dest="_top"))
+        parser.exit_on_error = False  # type: ignore[attr-defined]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            parsed = parser.parse_args(["create", *args])
+    except (argparse.ArgumentError, AttributeError, ImportError, SystemExit, TypeError, ValueError) as exc:
+        raise BindingError(
+            "terminal specialist create does not match Hermes CLI create syntax"
+        ) from exc
+    if getattr(parsed, "kanban_action", None) != "create":
+        raise BindingError("terminal specialist command is not a Kanban create")
+    return parsed
+
+
+def _terminal_create_conversion(parsed: argparse.Namespace) -> dict[str, Any]:
+    """Apply the same non-argparse conversions as ``hermes kanban create``."""
+    try:
+        from hermes_cli.kanban import (  # pyright: ignore[reportMissingImports]
+            _parse_branch_flag,
+            _parse_duration,
+            _parse_workspace_flag,
+        )
+
+        workspace_kind, workspace_path = _parse_workspace_flag(parsed.workspace)
+        branch_name = _parse_branch_flag(getattr(parsed, "branch", None))
+        max_runtime = _parse_duration(getattr(parsed, "max_runtime", None))
+    except (argparse.ArgumentTypeError, AttributeError, ImportError, TypeError, ValueError) as exc:
+        raise BindingError("terminal specialist create value conversion failed") from exc
+
+    max_retries = getattr(parsed, "max_retries", None)
+    if max_retries is not None and max_retries < 1:
+        raise BindingError("--max-retries must be >= 1")
+    if getattr(parsed, "provider_override", None) and not getattr(parsed, "model_override", None):
+        raise BindingError("'--provider' requires '--model' to be set as well")
+
+    raw: dict[str, Any] = {
+        "title": parsed.title,
+        "assignee": parsed.assignee,
+        "created_by": parsed.created_by,
+        "initial_status": parsed.initial_status,
+    }
+    for source, target in (
+        ("body", "body"),
+        ("project", "project"),
+        ("tenant", "tenant"),
+        ("idempotency_key", "idempotency_key"),
+        ("completion_contract", "completion_contract"),
+        ("model_override", "model"),
+        ("provider_override", "provider"),
+    ):
+        value = getattr(parsed, source, None)
+        if value is not None:
+            raw[target] = value
+    if parsed.priority:
+        raw["priority"] = parsed.priority
+    if parsed.parent:
+        raw["parents"] = list(parsed.parent)
+    if parsed.triage:
+        raw["triage"] = True
+    if workspace_kind is not None:
+        raw["workspace_kind"] = workspace_kind
+    if workspace_path is not None:
+        raw["workspace_path"] = workspace_path
+    if branch_name is not None:
+        raw["branch_name"] = branch_name
+    if max_runtime is not None:
+        raw["max_runtime_seconds"] = max_runtime
+    if parsed.skills:
+        raw["skills"] = list(parsed.skills)
+    if max_retries is not None:
+        raw["max_retries"] = max_retries
+    if parsed.goal_mode:
+        raw["goal_mode"] = True
+    if parsed.goal_max_turns is not None:
+        raw["goal_max_turns"] = parsed.goal_max_turns
+    return raw
 
 
 def _terminal_create_input(args: list[str], board: str) -> dict[str, Any] | None:
-    assignee = _first_option(args, "--assignee")
-    _reject_unresolved_shell_substitutions([assignee] if assignee is not None else [])
+    assignees = _option_values(args, "--assignee")
+    _reject_unresolved_shell_substitutions(assignees)
+    assignee = assignees[-1] if assignees else None
     specialist = _specialist(assignee)
     if specialist is None:
         return None
@@ -644,55 +757,8 @@ def _terminal_create_input(args: list[str], board: str) -> dict[str, Any] | None
     if board:
         substitution_values.append(board)
     _reject_unresolved_shell_substitutions(substitution_values)
-    if not args or args[0].startswith("-"):
-        raise BindingError("hermes kanban create requires a title before options")
-    raw: dict[str, Any] = {
-        "title": args[0],
-        "assignee": assignee,
-        "board": board or None,
-    }
-    for option, field in (
-        ("--body", "body"),
-        ("--project", "project"),
-        ("--idempotency-key", "idempotency_key"),
-        ("--completion-contract", "completion_contract"),
-        ("--tenant", "tenant"),
-        ("--priority", "priority"),
-        ("--max-runtime", "max_runtime_seconds"),
-        ("--goal-max-turns", "goal_max_turns"),
-        ("--model", "model"),
-        ("--provider", "provider"),
-    ):
-        value = _first_option(args, option)
-        if value is not None:
-            raw[field] = value
-    workspace = _first_option(args, "--workspace")
-    if workspace is not None:
-        if workspace == "worktree":
-            raw["workspace_kind"] = "worktree"
-        elif workspace.startswith("worktree:"):
-            raw["workspace_kind"] = "worktree"
-            raw["workspace_path"] = workspace.split(":", 1)[1]
-        elif workspace == "scratch":
-            raw["workspace_kind"] = "scratch"
-        elif workspace.startswith("dir:"):
-            raw["workspace_kind"] = "dir"
-            raw["workspace_path"] = workspace.split(":", 1)[1]
-        else:
-            raise BindingError("unknown --workspace value")
-    branch = _first_option(args, "--branch")
-    if branch is not None:
-        raw["branch_name"] = branch
-    parents = _option_values(args, "--parent")
-    if parents:
-        raw["parents"] = parents
-    initial_status = _first_option(args, "--initial-status")
-    if initial_status is not None:
-        raw["initial_status"] = initial_status
-    if "--triage" in args:
-        raw["triage"] = True
-    if "--goal-mode" in args:
-        raw["goal_mode"] = True
+    raw = _terminal_create_conversion(_parse_terminal_create_args(args))
+    raw["board"] = board or None
     return raw
 
 
@@ -711,7 +777,10 @@ def _specialist_invocations(command: str) -> list[tuple[str, list[str], str]]:
     if not callable(parser):
         raise BindingError("terminal specialist parser has no invocation reader")
     parser_fn = cast(Callable[[str], list[tuple[str, list[str], str]]], parser)
-    return parser_fn(command)
+    try:
+        return parser_fn(command)
+    except RuntimeError as exc:
+        raise BindingError(str(exc)) from exc
 
 
 def _prepare_structured(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], RepoBinding] | None:

@@ -224,18 +224,8 @@ def _is_control_operator(value: str) -> bool:
 
 
 def _command_segments(tokens: list[str]) -> list[list[str]]:
-    segments: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if _is_control_operator(token):
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        current.append(token)
-    if current:
-        segments.append(current)
-    return segments
+    """Return chain commands for callers that only need the segment view."""
+    return [segment for segment, _ in _command_chain(tokens)]
 
 
 def _consume_env(segment: list[str], index: int) -> int | None:
@@ -314,6 +304,119 @@ def _shell_inline_command(segment: list[str], index: int) -> str | None:
     return None
 
 
+def _command_chain(tokens: list[str]) -> list[tuple[list[str], str | None]]:
+    """Split commands while preserving the operator before the next command."""
+    chain: list[tuple[list[str], str | None]] = []
+    current: list[str] = []
+    for token in tokens:
+        if _is_control_operator(token):
+            if not current:
+                raise RuntimeError("malformed shell control-flow operator")
+            chain.append((current, token))
+            current = []
+            continue
+        current.append(token)
+    if current:
+        chain.append((current, None))
+    return chain
+
+
+def _relevant_hermes_action(tokens: list[str], start: int) -> bool:
+    try:
+        kanban_index = tokens.index("kanban", start + 1)
+    except ValueError:
+        return False
+    action_index = kanban_index + 1
+    return action_index < len(tokens) and tokens[action_index].casefold() in {"create", "assign"}
+
+
+def _contains_ambiguous_conditional(tokens: list[str]) -> bool:
+    conditional_words = {"if", "then", "elif", "else", "fi", "case", "esac", "while", "until", "do", "done"}
+    has_conditional = False
+    for index, token in enumerate(tokens):
+        if token not in conditional_words:
+            continue
+        previous_is_boundary = index == 0 or _is_control_operator(tokens[index - 1])
+        next_is_boundary = index + 1 == len(tokens) or _is_control_operator(tokens[index + 1])
+        if previous_is_boundary and (
+            token in {"if", "then", "elif", "else", "case", "while", "until", "do"}
+            or (token in {"fi", "esac", "done"} and next_is_boundary)
+        ):
+            has_conditional = True
+            break
+    if not has_conditional:
+        return False
+    return any(
+        Path(token).name == "hermes" and _relevant_hermes_action(tokens, index)
+        for index, token in enumerate(tokens)
+    )
+
+
+def _segment_has_hermes(segment: list[str], *, depth: int = 0) -> bool:
+    if depth > _MAX_SHELL_DEPTH:
+        raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
+    index = _first_executable(segment)
+    if index is None or index >= len(segment):
+        return False
+    executable = Path(segment[index]).name
+    if executable in _SHELL_BINARIES:
+        inner = _shell_inline_command(segment, index)
+        if inner is None:
+            return False
+        try:
+            nested = _tokenize(inner)
+        except ValueError as exc:
+            raise RuntimeError(f"could not parse shell wrapper: {exc}") from exc
+        return any(_segment_has_hermes(part, depth=depth + 1) for part, _ in _command_chain(nested))
+    if executable != "hermes":
+        return False
+    return _relevant_hermes_action(segment, index)
+
+
+def _literal_command_result(segment: list[str], *, depth: int = 0) -> bool | None:
+    """Return a result only for predicates whose outcome is statically known."""
+    if depth > _MAX_SHELL_DEPTH:
+        raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
+    index = _first_executable(segment)
+    if index is None or index >= len(segment):
+        return True if segment and Path(segment[0]).name == "env" else None
+    executable = Path(segment[index]).name
+    if executable in {"true", ":"}:
+        return True
+    if executable == "false":
+        return False
+    if executable == "exit":
+        if len(segment) == index + 1:
+            return True
+        try:
+            return int(segment[index + 1]) == 0
+        except ValueError:
+            return None
+    if executable == "cd":
+        values = segment[index + 1 :]
+        if len(values) != 1 or any(char in values[0] for char in "$`"):
+            return None
+        return Path(values[0]).expanduser().is_dir()
+    if executable == "export":
+        return all(_ENV_ASSIGN_RE.fullmatch(value) for value in segment[index + 1 :])
+    if executable == "unset":
+        return all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) for value in segment[index + 1 :])
+    if executable in {"echo", "printf"}:
+        return True
+    if executable in _SHELL_BINARIES:
+        inner = _shell_inline_command(segment, index)
+        if inner is None:
+            return None
+        try:
+            nested = _tokenize(inner)
+            nested_chain = _command_chain(nested)
+        except ValueError as exc:
+            raise RuntimeError(f"could not parse shell wrapper: {exc}") from exc
+        if len(nested_chain) == 1 and nested_chain[0][1] is None:
+            return _literal_command_result(nested_chain[0][0], depth=depth + 1)
+    return None
+
+
 def _hermes_kanban_invocations(
     command: str,
     *,
@@ -326,42 +429,74 @@ def _hermes_kanban_invocations(
         tokens = _tokenize(command)
     except ValueError as exc:
         raise RuntimeError(f"could not parse terminal command: {exc}") from exc
+    if _contains_ambiguous_conditional(tokens):
+        raise RuntimeError("ambiguous shell conditional reachability")
 
     invocations: list[tuple[str, list[str], str]] = []
-    for segment in _command_segments(tokens):
-        index = _first_executable(segment)
-        if index is None or index >= len(segment):
+    chain = _command_chain(tokens)
+    reachable = True
+    previous_result: bool | None = None
+    for segment_index, (segment, operator) in enumerate(chain):
+        if not reachable:
+            if operator == ";":
+                reachable = True
+                previous_result = None
+            elif operator in {"&&", "||"}:
+                reachable = previous_result if operator == "&&" else not previous_result
             continue
-        executable = Path(segment[index]).name
-        if executable in _SHELL_BINARIES:
-            inner = _shell_inline_command(segment, index)
-            if inner is not None:
-                invocations.extend(_hermes_kanban_invocations(inner, depth=depth + 1))
+        executable_index = _first_executable(segment)
+        if executable_index is None or executable_index >= len(segment):
+            previous_result = None
+        else:
+            executable = Path(segment[executable_index]).name
+            if executable in _SHELL_BINARIES:
+                inner = _shell_inline_command(segment, executable_index)
+                if inner is not None:
+                    invocations.extend(_hermes_kanban_invocations(inner, depth=depth + 1))
+            elif executable == "hermes":
+                try:
+                    kanban_index = segment.index("kanban", executable_index + 1)
+                except ValueError:
+                    kanban_index = -1
+                if kanban_index >= 0:
+                    tail = segment[kanban_index + 1 :]
+                    board = ""
+                    position = 0
+                    while position < len(tail):
+                        value = tail[position]
+                        if value == "--board":
+                            if position + 1 >= len(tail):
+                                raise RuntimeError("hermes kanban --board is missing a value")
+                            board = tail[position + 1]
+                            position += 2
+                            continue
+                        if value.startswith("--board="):
+                            board = value.split("=", 1)[1]
+                            position += 1
+                            continue
+                        break
+                    if position < len(tail):
+                        invocations.append((tail[position].casefold(), tail[position + 1 :], board))
+            previous_result = _literal_command_result(segment, depth=depth)
+
+        if operator is None:
             continue
-        if executable != "hermes":
-            continue
-        try:
-            kanban_index = segment.index("kanban", index + 1)
-        except ValueError:
-            continue
-        tail = segment[kanban_index + 1 :]
-        board = ""
-        position = 0
-        while position < len(tail):
-            value = tail[position]
-            if value == "--board":
-                if position + 1 >= len(tail):
-                    raise RuntimeError("hermes kanban --board is missing a value")
-                board = tail[position + 1]
-                position += 2
-                continue
-            if value.startswith("--board="):
-                board = value.split("=", 1)[1]
-                position += 1
-                continue
-            break
-        if position < len(tail):
-            invocations.append((tail[position].casefold(), tail[position + 1 :], board))
+        later_has_hermes = any(
+            _segment_has_hermes(later, depth=depth)
+            for later, _ in chain[segment_index + 1 :]
+        )
+        if operator == ";":
+            reachable = True
+            previous_result = None
+        elif operator in {"&&", "||"}:
+            if previous_result is None:
+                if later_has_hermes:
+                    raise RuntimeError("ambiguous shell command reachability")
+                reachable = False
+            else:
+                reachable = previous_result if operator == "&&" else not previous_result
+        elif later_has_hermes:
+            raise RuntimeError("unsupported shell operator makes command reachability ambiguous")
     return invocations
 
 

@@ -25,6 +25,8 @@ HERMES_PYTHON = HERMES_AGENT_ROOT / "venv/bin/python3"
 
 
 def _load_guard() -> Any:
+    if str(HERMES_AGENT_ROOT) not in sys.path:
+        sys.path.insert(0, str(HERMES_AGENT_ROOT))
     spec = importlib.util.spec_from_file_location("workspace_binding_guard_test", GUARD_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -42,11 +44,16 @@ class FakeAdapter:
 
     def find_idempotent(self, key: str) -> str | None:
         row = self.conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-            "ORDER BY id DESC LIMIT 1",
+            "SELECT id, created_at FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC",
             (key,),
-        ).fetchone()
-        return None if row is None else str(row["id"])
+        ).fetchall()
+        if not row:
+            return None
+        newest = int(row[0]["created_at"])
+        if sum(int(candidate["created_at"]) == newest for candidate in row) > 1:
+            raise self.guard.BindingError("same-key legacy rows have tied creation timestamps")
+        return str(row[0]["id"])
 
     def create(self, raw: dict[str, Any], binding: Any) -> str:
         existing = self.find_idempotent(str(raw["idempotency_key"]))
@@ -77,7 +84,9 @@ class FakeAdapter:
         )
         self.conn.execute(
             "INSERT INTO tasks (id, title, assignee, status, workspace_kind, workspace_path, "
-            "branch_name, project_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "branch_name, project_id, idempotency_key, created_at, created_by, "
+            "max_runtime_seconds, skills, max_retries, goal_mode, goal_max_turns) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -88,6 +97,15 @@ class FakeAdapter:
                 branch_name,
                 project_id,
                 idempotency_key,
+                1,
+                raw.get("created_by") or "worker",
+                self.guard._as_optional_int(
+                    raw.get("max_runtime_seconds"), field="max_runtime_seconds"
+                ),
+                json.dumps(raw["skills"]) if raw.get("skills") is not None else None,
+                self.guard._as_optional_int(raw.get("max_retries"), field="max_retries"),
+                1 if self.guard._as_bool(raw.get("goal_mode"), field="goal_mode") else 0,
+                self.guard._as_optional_int(raw.get("goal_max_turns"), field="goal_max_turns"),
             ),
         )
         for parent in parents:
@@ -170,8 +188,10 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     conn.execute(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT, "
         "workspace_kind TEXT, workspace_path TEXT, branch_name TEXT, project_id TEXT, "
-        "idempotency_key TEXT, claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER, "
-        "current_run_id INTEGER, block_kind TEXT)"
+        "idempotency_key TEXT, created_at INTEGER NOT NULL DEFAULT 0, created_by TEXT, "
+        "max_runtime_seconds INTEGER, skills TEXT, max_retries INTEGER, goal_mode INTEGER "
+        "NOT NULL DEFAULT 0, goal_max_turns INTEGER, claim_lock TEXT, claim_expires INTEGER, "
+        "worker_pid INTEGER, current_run_id INTEGER, block_kind TEXT)"
     )
     conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
     conn.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT)")
@@ -216,8 +236,10 @@ def _count_tasks(path: Path) -> int:
 _REAL_HANDLER_REGRESSION = r'''
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -290,20 +312,18 @@ with tempfile.TemporaryDirectory(prefix="issue138-real-regression-") as temp:
                 ).fetchall()
             ]
 
-    def handler(key: str) -> dict[str, object]:
+    def handler(key: str, **fields: object) -> dict[str, object]:
         from tools import kanban_tools as kt
 
-        return json.loads(
-            kt._handle_create(
-                {
-                    "title": "Issue #138 real handler",
-                    "assignee": "kanban-developer",
-                    "workspace_kind": "worktree",
-                    "project": "control-plane",
-                    "idempotency_key": key,
-                }
-            )
-        )
+        payload = {
+            "title": "Issue #138 real handler",
+            "assignee": "kanban-developer",
+            "workspace_kind": "worktree",
+            "project": "control-plane",
+            "idempotency_key": key,
+            **fields,
+        }
+        return json.loads(kt._handle_create(payload))
 
     if scenario == "padded":
         padded = " github:owner/repo:issue:138:real-padded "
@@ -338,6 +358,70 @@ with tempfile.TemporaryDirectory(prefix="issue138-real-regression-") as temp:
                     "first_handler": first_handler,
                     "replay_handler": replay_handler,
                     "rows": rows(),
+                }
+            )
+        )
+    elif scenario == "cli-surface":
+        command = (
+            "hermes kanban create 'Issue #138 cli surface real' --assignee kanban-developer "
+            "--workspace worktree --project control-plane "
+            "--idempotency-key github:owner/repo:issue:138:real-cli-surface "
+            "--skill translation --skill github-code-review --max-retries 3 "
+            "--created-by cli-author --goal --goal-max-turns 7 --max-runtime 30m --json"
+        )
+        shell_rc = preflight({"tool_name": "terminal", "tool_input": {"command": command}})
+        from hermes_cli.kanban_parser import build_parser
+
+        wrapper = argparse.ArgumentParser(add_help=False)
+        wrapper.exit_on_error = False
+        parser = build_parser(wrapper.add_subparsers(dest="_top"))
+        parser.exit_on_error = False
+        cli_args = parser.parse_args(shlex.split(command)[2:])
+        from hermes_cli.kanban import _cmd_create
+
+        cli_rc = _cmd_create(cli_args)
+        with sqlite3.connect(board) as conn:
+            row = conn.execute(
+                "SELECT created_by, max_runtime_seconds, skills, max_retries, goal_mode, "
+                "goal_max_turns FROM tasks WHERE idempotency_key = ?",
+                ("github:owner/repo:issue:138:real-cli-surface",),
+            ).fetchone()
+        structured_key = "github:owner/repo:issue:138:real-structured-surface"
+        structured_fields = {
+            "skills": ["translation", "github-code-review"],
+            "max_runtime_seconds": 1800,
+            "goal_mode": True,
+            "goal_max_turns": 7,
+        }
+        structured_guard_rc = preflight(
+            {
+                "tool_name": "kanban_create",
+                "tool_input": {
+                    "title": "Issue #138 real handler",
+                    "assignee": "kanban-developer",
+                    "workspace_kind": "worktree",
+                    "project": "control-plane",
+                    "idempotency_key": structured_key,
+                    **structured_fields,
+                },
+            }
+        )
+        structured_handler = handler(structured_key, **structured_fields)
+        with sqlite3.connect(board) as conn:
+            structured_row = conn.execute(
+                "SELECT max_runtime_seconds, skills, goal_mode, goal_max_turns "
+                "FROM tasks WHERE idempotency_key = ?",
+                (structured_key,),
+            ).fetchone()
+        print(
+            json.dumps(
+                {
+                    "shell_rc": shell_rc,
+                    "cli_rc": cli_rc,
+                    "row": row,
+                    "structured_guard_rc": structured_guard_rc,
+                    "structured_handler": structured_handler,
+                    "structured_row": structured_row,
                 }
             )
         )
@@ -792,6 +876,133 @@ def run_same_key() -> dict[str, object]:
         return {"scenario": "same-key", "results": results}
 
 
+def run_lifecycle() -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="issue138-lifecycle-replay-") as temp:
+        root = Path(temp)
+        _home, _shared, _repo, kb, _pdb = setup_environment(root)
+        board_path = Path(kb.kanban_db_path(board=None))
+        with sqlite3.connect(board_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+                ("t_parent", "done parent", "done", 1),
+            )
+        guard = load_guard()
+        def runtime_state() -> tuple[tuple[object, ...], list[tuple[object, ...]]]:
+            with sqlite3.connect(board_path) as conn:
+                task = conn.execute(
+                    "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id, "
+                    "max_runtime_seconds, last_heartbeat_at FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                runs = conn.execute(
+                    "SELECT id, status, claim_lock, claim_expires, worker_pid, "
+                    "last_heartbeat_at, outcome, summary, metadata, error "
+                    "FROM task_runs WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                ).fetchall()
+            return task, runs
+
+        key = "github:owner/repo:issue:138:lifecycle-replay"
+        payload = create_payload(key)
+        first_rc = guard.evaluate_payload(payload)
+        with sqlite3.connect(board_path) as conn:
+            task_id = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ?", (key,)
+            ).fetchone()[0]
+        conn = kb.connect(db_path=board_path)
+        try:
+            claimed = kb.claim_task(conn, task_id, claimer="lifecycle-replay-claimer")
+        finally:
+            conn.close()
+        before_running, before_runs = runtime_state()
+        running_rc = guard.evaluate_payload(payload)
+        after_running, after_runs = runtime_state()
+        with sqlite3.connect(board_path) as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'review', claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, current_run_id = NULL WHERE id = ?",
+                (task_id,),
+            )
+            conn.commit()
+        review_rc = guard.evaluate_payload(payload)
+        review_state, review_runs = runtime_state()
+        with sqlite3.connect(board_path) as conn:
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+            conn.commit()
+        done_rc = guard.evaluate_payload(payload)
+        done_state, done_runs = runtime_state()
+        return {
+            "scenario": "lifecycle",
+            "first_rc": first_rc,
+            "claimed": claimed is not None,
+            "before_running": before_running,
+            "running_rc": running_rc,
+            "after_running": after_running,
+            "before_runs": before_runs,
+            "after_runs": after_runs,
+            "review_rc": review_rc,
+            "review_state": review_state,
+            "review_runs": review_runs,
+            "done_rc": done_rc,
+            "done_state": done_state,
+            "done_runs": done_runs,
+        }
+
+
+def run_duplicates() -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="issue138-legacy-duplicates-") as temp:
+        root = Path(temp)
+        _home, _shared, _repo, kb, _pdb = setup_environment(root)
+        board_path = Path(kb.kanban_db_path(board=None))
+        unique_key = "github:owner/repo:issue:138:legacy-unique-real"
+        tied_key = "github:owner/repo:issue:138:legacy-tied-real"
+        with sqlite3.connect(board_path) as conn:
+            conn.executemany(
+                "INSERT INTO tasks (id, title, status, idempotency_key, created_at) "
+                "VALUES (?, ?, 'ready', ?, ?)",
+                [
+                    ("t_unique_old", "old", unique_key, 10),
+                    ("t_unique_new", "new", unique_key, 20),
+                    ("t_tied_a", "a", tied_key, 30),
+                    ("t_tied_b", "b", tied_key, 30),
+                ],
+            )
+            core_unique = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (unique_key,),
+            ).fetchone()[0]
+        guard = load_guard()
+        adapter = guard._open_adapter(None, db_path=board_path)
+        try:
+            guard_unique = adapter.find_idempotent(unique_key)
+            try:
+                adapter.find_idempotent(tied_key)
+            except guard.BindingError as exc:
+                tied_error = type(exc).__name__
+            else:
+                tied_error = None
+        finally:
+            adapter.close()
+        tied_rc = guard.evaluate_payload(create_payload(tied_key))
+        with sqlite3.connect(board_path) as conn:
+            tied_rows = conn.execute(
+                "SELECT id, status FROM tasks WHERE idempotency_key = ? ORDER BY id", (tied_key,)
+            ).fetchall()
+            quarantine_events = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE kind = 'workspace_binding_quarantined'"
+            ).fetchone()[0]
+        return {
+            "scenario": "duplicates",
+            "core_unique": core_unique,
+            "guard_unique": guard_unique,
+            "tied_error": tied_error,
+            "tied_rc": tied_rc,
+            "tied_rows": tied_rows,
+            "quarantine_events": quarantine_events,
+        }
+
+
 if scenario == "barrier":
     print(json.dumps(run_barrier(), default=list))
 elif scenario == "rollback":
@@ -800,6 +1011,10 @@ elif scenario == "paths":
     print(json.dumps(run_paths(), default=list))
 elif scenario == "same-key":
     print(json.dumps(run_same_key(), default=list))
+elif scenario == "lifecycle":
+    print(json.dumps(run_lifecycle(), default=list))
+elif scenario == "duplicates":
+    print(json.dumps(run_duplicates(), default=list))
 else:
     raise SystemExit(f"unknown scenario: {scenario}")
 """
@@ -950,6 +1165,129 @@ def test_valid_creation_reads_back_binding_status_and_parent_graph(fixture: dict
         "SELECT parent_id, child_id FROM task_links WHERE child_id = ?", (row["id"],)
     ).fetchall()
     assert [tuple(link) for link in links] == [("t_parent", row["id"])]
+    conn.close()
+
+
+@pytest.mark.parametrize("status", ["running", "review", "done"])
+def test_exact_key_replay_preserves_normal_lifecycle_and_claim_metadata(
+    fixture: dict[str, Any], status: str
+) -> None:
+    guard = fixture["guard"]
+    raw = _valid(fixture["repo"], key=f"github:owner/repo:issue:138:replay:{status}")
+    assert guard.evaluate_payload({"tool_name": "kanban_create", "tool_input": raw}) == 0
+    conn = sqlite3.connect(fixture["board"])
+    conn.execute(
+        "UPDATE tasks SET status = ?, claim_lock = ?, claim_expires = ?, worker_pid = ?, "
+        "current_run_id = ? WHERE idempotency_key = ?",
+        (
+            status,
+            "claim-replay" if status == "running" else None,
+            9999999999 if status == "running" else None,
+            4242 if status == "running" else None,
+            7 if status == "running" else None,
+            raw["idempotency_key"],
+        ),
+    )
+    conn.commit()
+    before = conn.execute(
+        "SELECT id, status, claim_lock, claim_expires, worker_pid, current_run_id "
+        "FROM tasks WHERE idempotency_key = ?",
+        (raw["idempotency_key"],),
+    ).fetchone()
+    conn.close()
+
+    assert guard.evaluate_payload({"tool_name": "kanban_create", "tool_input": raw}) == 0
+
+    conn = sqlite3.connect(fixture["board"])
+    after = conn.execute(
+        "SELECT id, status, claim_lock, claim_expires, worker_pid, current_run_id "
+        "FROM tasks WHERE idempotency_key = ?",
+        (raw["idempotency_key"],),
+    ).fetchone()
+    event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'workspace_binding_quarantined'",
+        (before[0],),
+    ).fetchone()[0]
+    conn.close()
+    assert after == before
+    assert event_count == 0
+
+
+def test_unique_legacy_duplicate_selection_matches_core_newest_timestamp(
+    fixture: dict[str, Any],
+) -> None:
+    guard = fixture["guard"]
+    raw = _valid(fixture["repo"], key="github:owner/repo:issue:138:legacy-unique")
+    binding = guard.RepoBinding("p_control", "control-plane", fixture["repo"])
+    conn = sqlite3.connect(fixture["board"])
+    conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, workspace_kind, workspace_path, "
+        "branch_name, project_id, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "t_legacy_old",
+            "wrong old row",
+            raw["assignee"],
+            "ready",
+            "scratch",
+            str(fixture["repo"]),
+            "wrong-branch",
+            "p_control",
+            raw["idempotency_key"],
+            10,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, workspace_kind, workspace_path, "
+        "branch_name, project_id, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "t_legacy_new",
+            raw["title"],
+            raw["assignee"],
+            "ready",
+            "worktree",
+            str(fixture["repo"] / ".worktrees" / "t_legacy_new"),
+            guard._branch_name(binding, "t_legacy_new", raw["title"]),
+            "p_control",
+            raw["idempotency_key"],
+            20,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert guard.evaluate_payload({"tool_name": "kanban_create", "tool_input": raw}) == 0
+    conn = sqlite3.connect(fixture["board"])
+    assert conn.execute("SELECT status FROM tasks WHERE id = 't_legacy_old'").fetchone()[0] == "ready"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'workspace_binding_quarantined'"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_tied_legacy_duplicate_selection_fails_closed_without_mutation(
+    fixture: dict[str, Any],
+) -> None:
+    guard = fixture["guard"]
+    key = "github:owner/repo:issue:138:legacy-tied"
+    conn = sqlite3.connect(fixture["board"])
+    conn.executemany(
+        "INSERT INTO tasks (id, title, status, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?)",
+        [
+            ("t_legacy_a", "legacy a", "ready", key, 30),
+            ("t_legacy_b", "legacy b", "ready", key, 30),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    raw = _valid(fixture["repo"], key=key)
+    assert guard.evaluate_payload({"tool_name": "kanban_create", "tool_input": raw}) == 2
+    conn = sqlite3.connect(fixture["board"])
+    assert conn.execute(
+        "SELECT id, status FROM tasks WHERE idempotency_key = ? ORDER BY id", (key,)
+    ).fetchall() == [("t_legacy_a", "ready"), ("t_legacy_b", "ready")]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'workspace_binding_quarantined'"
+    ).fetchone()[0] == 0
     conn.close()
 
 
@@ -1149,6 +1487,74 @@ def test_terminal_create_uses_the_same_binding_preflight(fixture: dict[str, Any]
     assert _count_tasks(fixture["board"]) == 1
 
 
+def test_terminal_create_preserves_authoritative_cli_fields(fixture: dict[str, Any]) -> None:
+    command = (
+        "hermes kanban create 'Issue #138 cli surface' --assignee kanban-developer "
+        "--workspace worktree --project control-plane "
+        "--idempotency-key github:owner/repo:issue:138:cli-surface "
+        "--skill translation --skill github-code-review --max-retries 3 "
+        "--created-by cli-author --goal --goal-max-turns 7 --max-runtime 30m"
+    )
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 0
+    conn = sqlite3.connect(fixture["board"])
+    row = conn.execute(
+        "SELECT created_by, max_runtime_seconds, skills, max_retries, goal_mode, goal_max_turns "
+        "FROM tasks WHERE idempotency_key = ?",
+        ("github:owner/repo:issue:138:cli-surface",),
+    ).fetchone()
+    conn.close()
+    assert row == ("cli-author", 1800, '["translation", "github-code-review"]', 3, 1, 7)
+
+
+@pytest.mark.parametrize("bad_option", ["--goal-mode", "--unknown-create-option"])
+def test_terminal_create_rejects_options_the_authoritative_cli_rejects(
+    fixture: dict[str, Any], bad_option: str
+) -> None:
+    command = (
+        "hermes kanban create invalid --assignee kanban-developer --workspace worktree "
+        "--project control-plane --idempotency-key github:owner/repo:issue:138:bad-option "
+        f"{bad_option}"
+    )
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("prefix", "expected_count"),
+    [("false &&", 0), ("true ||", 0), ("true &&", 1), ("false ||", 1)],
+)
+def test_terminal_literal_short_circuit_controls_materialization(
+    fixture: dict[str, Any], prefix: str, expected_count: int
+) -> None:
+    key = f"github:owner/repo:issue:138:short-circuit:{prefix.replace(' ', '-')}"
+    command = (
+        f"{prefix} hermes kanban create short-circuit --assignee kanban-developer "
+        f"--workspace worktree --project control-plane --idempotency-key {key}"
+    )
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 0
+    assert _count_tasks(fixture["board"]) == expected_count
+
+
+def test_terminal_ambiguous_conditional_fails_closed_before_materialization(
+    fixture: dict[str, Any],
+) -> None:
+    command = (
+        "test -f /tmp/maybe && hermes kanban create ambiguous --assignee kanban-developer "
+        "--workspace worktree --project control-plane --idempotency-key "
+        "github:owner/repo:issue:138:ambiguous"
+    )
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+
+
 def test_terminal_multi_create_validates_all_bindings_before_materialization(
     fixture: dict[str, Any],
 ) -> None:
@@ -1274,3 +1680,50 @@ def test_real_shell_wrapped_guard_blocks_literal_before_handler() -> None:
     assert result["rows"][0][1] == "github:owner/repo:issue:138:real-shell"
     assert "$KEY" not in {row[1] for row in result["rows"]}
     assert result["rows"][0][2] == "ready"
+
+
+def test_real_cli_and_core_preserve_the_full_terminal_create_surface() -> None:
+    result = _run_real_handler_regression("cli-surface")
+    assert result["shell_rc"] == 0
+    assert result["cli_rc"] == 0
+    assert result["row"] == [
+        "cli-author",
+        1800,
+        '["translation", "github-code-review"]',
+        3,
+        1,
+        7,
+    ]
+    assert result["structured_guard_rc"] == 0
+    assert result["structured_row"] == [
+        1800,
+        '["translation", "github-code-review"]',
+        1,
+        7,
+    ]
+
+
+def test_real_replay_accepts_running_review_and_done_without_mutation() -> None:
+    result = _run_real_atomic_regression("lifecycle")
+    assert result["first_rc"] == 0
+    assert result["claimed"] is True
+    assert result["running_rc"] == 0
+    assert result["before_running"] == result["after_running"]
+    assert result["before_runs"] == result["after_runs"]
+    assert result["review_rc"] == 0
+    assert result["review_runs"] == result["after_runs"]
+    assert result["done_rc"] == 0
+    assert result["done_runs"] == result["after_runs"]
+
+
+def test_real_lookup_matches_core_for_unique_legacy_rows_and_fails_tied_rows_closed() -> None:
+    result = _run_real_atomic_regression("duplicates")
+    assert result == {
+        "scenario": "duplicates",
+        "core_unique": "t_unique_new",
+        "guard_unique": "t_unique_new",
+        "tied_error": "BindingError",
+        "tied_rc": 2,
+        "tied_rows": [["t_tied_a", "ready"], ["t_tied_b", "ready"]],
+        "quarantine_events": 0,
+    }
