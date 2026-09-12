@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Verify the exact existing Hermes cron primitive used by n8n workflows.
+"""Preserve the historical Hermes cron trigger/pause migration fixture.
 
-This runs entirely in a temporary HERMES_HOME. It proves the dashboard route's
-underlying trigger_job -> existing scheduler.tick -> pause_job sequence executes
-a no-agent script once and leaves the legacy schedule paused for the next n8n
-wake-up.
+Current GitHub intake uses the direct actuator and does not require this cron
+primitive. This temporary-HERMES_HOME test remains only to prove the legacy
+cutover/rollback boundary can still interpret its historical one-job shape.
 """
 from __future__ import annotations
 

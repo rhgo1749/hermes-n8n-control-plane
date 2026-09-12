@@ -301,9 +301,10 @@ GitHub webhook
                  -> repository registry/task provenance -> board slug
                  -> kanban-github-sync.py --board <slug> --json
        -> other intake event -> enqueue repository scope
-            -> lease-controller -> existing Hermes job default:bf431b2a6ba6
+            -> lease-controller -> fixed intake actuator :5682
+                 -> deployed github-agent-ready-kanban-intake.py
        -> hourly safety tick -> enqueue durable full-intake scope
-            -> same lease-controller -> same Hermes intake job
+            -> same lease-controller -> same direct actuator
 ```
 
 The router's webhook inventory is reconciled from the registry with:
@@ -314,7 +315,7 @@ automation/n8n/scripts/reconcile-github-router.sh
 
 Run reconciliation when adding/removing the `hermes-agent` topic or repairing
 webhook configuration. This operation changes GitHub webhook registration only;
-it does not alter the Hermes job or Kanban state. Delivery replay
+it does not alter the direct intake actuator or Kanban state. Delivery replay
 deduplication (bounded `X-GitHub-Delivery` TTL store) is part of the router
 ingress, not the registry.
 

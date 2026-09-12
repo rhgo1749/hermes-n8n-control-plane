@@ -203,14 +203,13 @@ its current supervisor, then open the **H4V3 Overview** tab.
 
 ### Intake/edge runtime deployment (verified live path)
 
-**The live Hermes cron does not run this repository checkout.** Verified
-2026-08-13 on the host: cron job `bf431b2a6ba6` (profile `default`) stores
-`script: github-agent-ready-kanban-intake.py` with `workdir: null`, so the
-scheduler executes `$HERMES_HOME/scripts/github-agent-ready-kanban-intake.py`
-— a deployed copy whose hash matched the then-current repository `main`
-exactly. The intake resolves its edge counterpart as a sibling
-(`$HERMES_HOME/scripts/kanban-github-sync.py`), so the two files must be
-updated together.
+The live GitHub intake does not execute this repository checkout directly.
+After the direct-actuator cutover, the fixed loopback actuator executes
+`$HERMES_HOME/scripts/github-agent-ready-kanban-intake.py` — a deployed copy —
+and the intake resolves its edge counterpart as a sibling
+(`$HERMES_HOME/scripts/kanban-github-sync.py`). The legacy Hermes intake cron
+job is retired and is not required on current hosts, so deployed runtime files
+must be updated and hash-verified together.
 
 ```bash
 automation/hermes/scripts/deploy-intake-edge.sh --hermes-home "$HOME/.hermes"
@@ -224,8 +223,8 @@ The deploy script provides:
 4. **verification** — installed SHA-256 must equal the checkout;
 5. **rollback** — previous files kept as `.bak-<name>-<ts>` (matching the
    existing host convention), exact restore command printed;
-6. **no cron changes** — job id, schedule, and enabled state are never
-   touched.
+6. **no cron metadata changes** — the deployer does not read or modify Hermes
+   cron state; the current intake path is direct-actuator based.
 
 ### Update
 

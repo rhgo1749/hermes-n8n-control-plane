@@ -267,7 +267,8 @@ def test_import_command_is_fail_closed_and_canaries_production_noop() -> None:
     assert "manual UI" not in source
     assert "scheduleTrigger" not in source
     assert "/fallback" not in source
-    assert "bf431b2a6ba6" in source
+    assert "bf431b2a6ba6" not in source
+    assert "direct-actuator intake boundary" in source
 
 
 def test_runtime_helper_rejects_whitespace_in_control_value() -> None:

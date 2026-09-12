@@ -16,13 +16,12 @@ canary or a partial onboarding:
 automation/n8n/scripts/diagnose-github-onboarding.sh --hermes-home "$HOME/.hermes"
 ```
 
-The command verifies that `default:bf431b2a6ba6` exists exactly once in the
-`default` profile, matches the preserved name/script/profile/schedule/lifecycle/
-`no_agent`/delivery contract, and that the deployed intake wrapper/core expose
-all required onboarding entrypoints. It also checks the loopback router,
-lease-controller, and intake-actuator health endpoints.
-It does not create, edit, pause, or trigger a Hermes job. `--skip-network`
-checks only the local job/script boundary.
+The command verifies that the deployed intake wrapper/core expose all required
+onboarding entrypoints and that the current intake execution contract is the
+fixed loopback direct actuator (`:5682`) with `hermes_cron_required=false`. It
+also checks the loopback router, lease-controller, intake-actuator readiness,
+and the lease-controller `POST /trigger` surface without triggering intake.
+`--skip-network` checks only the deployed script/runtime boundary.
 
 Interpret bounded failures as follows: `invalid_signature` or
 `authorization_required` means the protected ingress boundary rejected the
@@ -38,27 +37,28 @@ GitHub metadata gate rejected the repository; `checkout_path_conflict`,
 overwritten and only the current attempt's temporary path is eligible for
 cleanup. A newly registered
 checkout is intentionally retained when a later registry or board step fails;
-rerun the operator recovery after fixing the reported boundary. A missing
-authoritative job is an operator stop, not permission to create a replacement.
+rerun the operator recovery after fixing the reported boundary. A missing or
+invalid deployed intake wrapper/core, unavailable direct actuator, or unhealthy
+loopback control-plane service is an operator stop. Do not recreate the retired
+legacy Hermes intake cron job as a recovery action.
 
 GitHub App installation, permissions, public HTTPS/Funnel routing, protected
 secret provisioning, host `/ws/projects` ownership, production canary, and
 post-merge edge reconciliation are host-owned validation gates. They are not
 proven by repository-local tests.
 
-## 1. Durable Hermes job ownership
+## 1. Direct intake runtime ownership
 
-The GitHub agent-ready intake continues to execute through the existing Hermes
-cron job:
+GitHub agent-ready intake executes through the deployed Hermes-side wrapper/core
+via the fixed loopback intake actuator on `127.0.0.1:5682`. The
+lease-controller owns wake serialization and lease state; it does not trigger or
+pause a Hermes cron job.
 
-| Profile | Hermes job ID | Script | Stored schedule | Runtime policy |
-|---|---|---|---|---|
-| `default` | `bf431b2a6ba6` | `github-agent-ready-kanban-intake.py` | existing `*/5 * * * *` definition | preserve definition; normally paused between external wakes |
-
-The stored schedule is historical/durable job metadata. **Do not delete,
-recreate, rename, or edit the job or its stored schedule** as part of this
-migration. Async-only operation is achieved by keeping the existing job paused
-between event-driven `trigger`/`pause` calls.
+The legacy intake cron job `default:bf431b2a6ba6` was retired after the direct
+actuator cutover and live canary. Its absence is valid current-state evidence,
+not a repair condition. Do not recreate it. Historical cron snapshots and output
+may remain for rollback archaeology, but they are not part of the active intake
+path.
 
 Other Hermes jobs remain outside this migration and must not be mutated.
 
@@ -76,9 +76,10 @@ GitHub signed webhook
                  -> kanban-github-sync.py --board <slug> --json
        -> other intake event -> durable FIFO scope queue
             -> lease-controller 127.0.0.1:5680
-                 -> existing Hermes trigger route for default:bf431b2a6ba6
+                 -> fixed intake actuator 127.0.0.1:5682
+                      -> deployed github-agent-ready-kanban-intake.py
        -> hourly safety tick -> durable full-intake scope
-            -> same lease-controller -> same Hermes intake job
+            -> same lease-controller -> same direct actuator
 ```
 
 The tracked workflow is `automation/n8n/workflows/github-pr-edge-sync.json`.
@@ -114,27 +115,20 @@ Tailnet-only Hermes dashboard.
 
 Do not mount the Docker socket into n8n/router services.
 
-## 4. Least-privilege Hermes service authorization
+## 4. Least-privilege direct intake actuator
 
-Install the user plugin:
+Install or refresh the fixed Hermes-side actuator from the Ubuntu host:
 
 ```bash
-automation/n8n/scripts/configure-hermes-service-auth.sh \
-  --hermes-home "$HOME/.hermes"
+automation/n8n/scripts/install-intake-actuator.sh
 ```
 
-The installer fails closed unless allowlisted job ID `bf431b2a6ba6` exists
-exactly once in profile `default`. It does not create or modify the job.
-
-Restart the existing Hermes dashboard through its current supervisor so the
-plugin registers the exact trigger/pause routes.
-
-The plugin token can authorize only:
-
-- `POST /api/cron/jobs/bf431b2a6ba6/trigger?profile=default`
-- `POST /api/cron/jobs/bf431b2a6ba6/pause?profile=default`
-
-It cannot list, create, edit, delete, or trigger another job.
+The actuator listens only on loopback `127.0.0.1:5682`, accepts the protected
+intake-control credential, and exposes only the fixed intake/edge operations
+implemented by the reviewed runtime. It does not accept caller-controlled shell
+commands, script paths, profiles, or arbitrary Hermes routes. The
+lease-controller calls this actuator directly; no Hermes dashboard cron-auth
+plugin or legacy intake cron job is required.
 
 ## 4a. Completion-side edge wake
 
@@ -353,11 +347,10 @@ Hermes schedule · GitHub agent-ready Issue intake
 ```
 
 keep that workflow inactive or delete the persisted n8n workflow record. Do not
-activate it. The old persisted record is separate from the new edge-sync
-workflow and from Hermes job `bf431b2a6ba6`.
-
-This persisted n8n cleanup is separate from the Hermes job. Never delete the
-Hermes `bf431b2a6ba6` job while removing the old n8n Schedule workflow.
+activate it. The old persisted schedule is separate from the current Webhook
+edge-sync workflow and from the direct-actuator intake path. The retired Hermes
+intake cron job must not be recreated while cleaning up this historical n8n
+record.
 
 The command's production canary sends a bounded `pull_request` payload with an
 unsupported `opened` action and requires the workflow's explicit
@@ -372,27 +365,21 @@ redelivery, with router HMAC/delivery/repository admission evidence and the
 expected downstream actuator result. A repository test or the unsupported
 canary does not claim that live signed-delivery gate passed.
 
-## 8. One-time transition from active polling to async-only
+## 8. Legacy cron cutover status
 
-If the live Hermes intake job is already paused and signed GitHub events are
-successfully waking it, leave it paused; no further schedule mutation is
-required.
+The production intake path has already completed the one-time migration from the
+Hermes five-minute cron primitive to the direct actuator. A current host may
+therefore have no `default:bf431b2a6ba6` entry at all. That absence is expected
+once the direct-actuator canary has passed.
 
-If a host is still running the legacy Hermes five-minute schedule, first prove
-the event path without deleting or editing the job:
+For an older host that still has the legacy job, do not delete or mutate it
+until the direct actuator, signed ingress, repository-scoped intake, and lease
+cleanup have all passed. After that migration the job may be retired; do not
+recreate it on already-migrated hosts.
 
-1. verify `github-router` and `lease-controller` are healthy;
-2. reconcile the intended `hermes-agent` repositories;
-3. deliver a signed GitHub test event;
-4. confirm the event causes one fresh successful run of `bf431b2a6ba6`;
-5. confirm the latest lease returns the same job to paused state;
-6. only then disable recurring execution by pausing that existing job.
-
-The repository's historical `cutover.sh` remains a snapshot/rollback utility
-for the one-job boundary. Its confirmation flag name predates the async-only
-router and should not be interpreted as permission to reactivate an n8n
-Schedule workflow. Do not run cutover again on a host that is already in the
-intended paused-between-events state.
+The repository's historical `cutover.sh` is a legacy snapshot/rollback utility
+for the former one-job boundary. Do not run it as a normal recovery mechanism
+on a direct-actuator host.
 
 ## 9. Runtime canary
 
@@ -403,10 +390,12 @@ A successful event canary must establish all of these facts:
   dedupe TTL the router rejects the same delivery ID as a `202` duplicate
   no-op (contract behavior, not a failure);
 - exactly one repository scope was queued;
-- lease-controller returned a lease and called the preserved Hermes job;
-- Hermes `last_run_at` advanced and `last_status=ok` for `bf431b2a6ba6`;
-- after bounded cleanup, the same job is `enabled=false` / `state=paused`;
-- no n8n Schedule Trigger fired the intake.
+- lease-controller returned a lease and called the fixed direct actuator;
+- the actuator accepted the fixed intake operation and returned to `busy=false`;
+- the claimed scope was acknowledged (or deterministically requeued/pended on a bounded failure);
+- repository/idempotency read-back proves the existing task identity was reused rather than duplicated;
+- the lease converged to `active` or the bounded cleanup state `paused`;
+- no Hermes or n8n Schedule Trigger fired the intake;
 - the active n8n workflow has one Webhook execution for the canary and one
   actuator call for a supported PR event; unsupported PR actions are no-ops.
 
@@ -418,7 +407,8 @@ primary-path canary.
 
 The router keeps `/fallback` as an authenticated operator recovery endpoint.
 It performs webhook reconciliation, enqueues a full-registry scope, and wakes
-the same preserved Hermes job. No schedule calls this endpoint automatically.
+the same lease-controller/direct-actuator intake path. No schedule calls this
+endpoint automatically.
 
 Prefer the normal signed GitHub event path. Use `/fallback` only when a full
 re-scan plus reconciliation is intentionally required. The router-local safety
@@ -426,20 +416,19 @@ wake may independently enqueue the same canonical full-intake scope after its
 configured interval, but it does not call `/fallback` or `/reconcile` and does
 not create another intake implementation.
 
-If router/lease state is unhealthy, do not recreate the Hermes job. Repair the
-control plane, verify the allowlisted job still exists uniquely, and retry the
-canary.
+If router/lease/actuator state is unhealthy, repair the control plane and retry
+the canary. Do not recreate the retired Hermes intake cron job.
 
 ## 11. Legacy rollback snapshots
 
-`automation/n8n/scripts/cutover.sh rollback` remains bounded to
-`default:bf431b2a6ba6` and rejects snapshots that contain other jobs or belong
-to another Hermes home. Existing tests enforce that boundary.
+Historical `cutover.sh` snapshots may still contain the retired
+`default:bf431b2a6ba6` definition. They are retained only for archaeology and
+migration rollback analysis. Restoring one onto a current direct-actuator host
+would reintroduce a second intake execution primitive and is not an approved
+normal recovery path.
 
-Before using a legacy rollback snapshot, ensure old n8n Schedule workflows are
-inactive so rollback cannot produce dual scheduling.
-
-Do not hand-edit snapshot targets to bypass the one-job boundary.
+Do not hand-edit or restore legacy snapshot targets to bypass the current
+single direct-actuator ownership boundary.
 
 ## 12. Validation
 
@@ -457,7 +446,7 @@ PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 \
 PYTHONDONTWRITEBYTECODE=1 /ws/hermes-agent/venv/bin/python3 \
   tests/test_completion_dispatch_safety_wake.py
 python3 tests/test_intake_lease_controller.py
-/ws/hermes-agent/venv/bin/python3 tests/test_n8n_cron_auth_plugin.py
+python3 -m pytest -q tests/test_onboarding_diagnostics.py
 /ws/hermes-agent/venv/bin/python3 tests/test_hermes_cron_trigger_pause.py
 python3 tests/test_repo_scoped_intake.py
 python3 tests/test_repository_registry.py
@@ -472,11 +461,12 @@ env -u HERMES_DELEGATED_CHILD_CONTEXT \
 Live-host evidence should additionally retain:
 
 - `docker compose ps` showing expected services healthy;
-- `curl`/health evidence for loopback router and lease-controller;
+- `curl`/health evidence for loopback router, lease-controller, and direct actuator;
 - webhook reconciliation result;
 - one signed event execution record;
-- Hermes job `last_run_at`, `last_status`, and final paused state;
-- confirmation that no n8n intake Schedule workflow is active.
+- direct-actuator source/live identity plus final `busy=false` evidence;
+- scope acknowledgment/idempotent task read-back and final lease state;
+- confirmation that no legacy Hermes/n8n intake Schedule path is active.
 
 GitHub-hosted Actions are intentionally not the required validation surface;
 follow `AGENTS.md` for local validation rules.
