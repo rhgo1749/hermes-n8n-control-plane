@@ -5,7 +5,9 @@ The stable lifecycle hook runs before Hermes' structured ``kanban_create``
 handler.  Hermes core remains the canonical task/graph owner: this policy only
 admits exact specialist creation requests, serializes same-idempotency-key
 materialization, asks the existing ``kanban_db.create_task`` owner to create
-(or return) the row, and immediately verifies the durable binding and links.
+(or return) the row, and immediately verifies the durable binding and links
+inside the same outer core transaction.  A newly created mismatch therefore
+rolls back instead of exposing a claimable row.
 
 A project-linked worktree is the only implementation/rework shape admitted:
 Hermes derives ``<project primary repo>/.worktrees/<task-id>`` and the
@@ -69,7 +71,9 @@ class _TaskAdapter(Protocol):
 
     def parent_statuses(self, parent_ids: tuple[str, ...]) -> dict[str, str]: ...
 
-    def quarantine(self, task_id: str, reason: str) -> None: ...
+    def transaction(self) -> Any: ...
+
+    def quarantine(self, task_id: str, reason: str) -> bool: ...
 
     def close(self) -> None: ...
 
@@ -402,14 +406,23 @@ def _verify_readback(
 
 
 def _board_db_path(board: str | None) -> Path:
-    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if pinned:
-        return Path(pinned).expanduser()
-    home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
-    selected = (board or os.environ.get("HERMES_KANBAN_BOARD", "") or "default").strip()
-    if not selected or selected == "default":
-        return home / "kanban.db"
-    return home / "kanban" / "boards" / selected / "kanban.db"
+    """Resolve the exact board path through Hermes' canonical resolver.
+
+    The Kanban DB is shared across profiles.  Reimplementing the resolver here
+    can silently put the creation lock beside a profile-local shadow database
+    when ``HERMES_KANBAN_HOME``, the current-board pointer, or a case variant is
+    in use.  Fail closed when the core resolver is unavailable instead of
+    falling back to a path that core will not open.
+    """
+    try:
+        from hermes_cli import kanban_db as kb  # pyright: ignore[reportMissingImports]
+
+        path = kb.kanban_db_path(board=board)
+        return Path(path).expanduser()
+    except Exception as exc:
+        raise BindingError(
+            f"Hermes Kanban board resolver is unavailable: {type(exc).__name__}"
+        ) from exc
 
 
 @contextlib.contextmanager
@@ -441,7 +454,7 @@ def _creation_lock(board: str | None, key: str):
                 raise BindingError("same-round creation lock failed") from exc
         if not acquired:
             raise BindingError("same-round creation lock was busy; retry the same idempotent request")
-        yield
+        yield db_path
     finally:
         if acquired:
             with contextlib.suppress(OSError):
@@ -452,12 +465,13 @@ def _creation_lock(board: str | None, key: str):
 class _CoreTaskAdapter:
     """Adapter to Hermes' existing Kanban DB owner; no second store is used."""
 
-    def __init__(self, board: str | None):
+    def __init__(self, board: str | None, *, db_path: Path | None = None):
         try:
             from hermes_cli import kanban_db as kb  # pyright: ignore[reportMissingImports]
             from hermes_cli import kanban_db_connect as kbc  # pyright: ignore[reportMissingImports]
             self._kb = kb
-            self._conn = kbc.connect(board=board)
+            self._kbc = kbc
+            self._conn = kbc.connect(db_path=db_path, board=board)
         except Exception as exc:
             raise BindingError(
                 f"Hermes Kanban materializer is unavailable: {type(exc).__name__}"
@@ -526,61 +540,72 @@ class _CoreTaskAdapter:
         ).fetchall()
         return {str(row["id"]): str(row["status"]) for row in rows}
 
-    def quarantine(self, task_id: str, reason: str) -> None:
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(tasks)")}
-            if "block_kind" in columns:
-                self._conn.execute(
-                    "UPDATE tasks SET status = 'blocked', block_kind = ?, claim_lock = NULL, "
-                    "claim_expires = NULL WHERE id = ?",
-                    ("capability", task_id),
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL WHERE id = ?",
-                    (task_id,),
-                )
-            self._conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
-                (
-                    task_id,
-                    "workspace_binding_quarantined",
-                    json.dumps({"reason": reason}, ensure_ascii=False),
-                    int(time.time()),
-                ),
-            )
-            self._conn.commit()
-        except Exception:
-            with contextlib.suppress(Exception):
-                self._conn.rollback()
-            raise
+    def transaction(self) -> Any:
+        """Open the outer core transaction used by creation verification."""
+        return self._kbc.write_txn(self._conn)
+
+    def quarantine(self, task_id: str, reason: str) -> bool:
+        """CAS-quarantine an existing unclaimed malformed row.
+
+        This runs inside :meth:`transaction`; it deliberately never clears
+        claim metadata or changes a running task.  A new row never takes this
+        path: its verification exception rolls the outer transaction back.
+        """
+        columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(tasks)")}
+        predicates = ["id = ?", "status IN ('todo', 'ready')"]
+        params: list[Any] = [task_id]
+        for column in ("claim_lock", "claim_expires", "worker_pid", "current_run_id"):
+            if column in columns:
+                predicates.append(f"{column} IS NULL")
+        assignments = ["status = 'blocked'"]
+        if "block_kind" in columns:
+            assignments.append("block_kind = ?")
+            params.insert(0, "capability")
+        cur = self._conn.execute(
+            f"UPDATE tasks SET {', '.join(assignments)} WHERE {' AND '.join(predicates)}",
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            return False
+        self._conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                "workspace_binding_quarantined",
+                json.dumps({"reason": reason}, ensure_ascii=False),
+                int(time.time()),
+            ),
+        )
+        return True
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
             self._conn.close()
 
 
-def _open_adapter(board: str | None) -> _TaskAdapter:
-    return _CoreTaskAdapter(board)
+def _open_adapter(board: str | None, *, db_path: Path | None = None) -> _TaskAdapter:
+    return _CoreTaskAdapter(board, db_path=db_path)
 
 
 def _materialize_and_verify(raw: Mapping[str, Any], binding: RepoBinding) -> None:
     key = _exact_idempotency_key(raw["idempotency_key"])
     board = raw.get("board") if isinstance(raw.get("board"), str) else None
-    with _creation_lock(board, key):
-        adapter = _open_adapter(board)
+    with _creation_lock(board, key) as db_path:
+        adapter = _open_adapter(board, db_path=db_path)
         try:
-            existing = adapter.find_idempotent(key)
-            task_id = existing or adapter.create(raw, binding)
-            try:
-                _verify_readback(adapter, raw, binding, task_id)
-            except BindingError as exc:
-                if existing is None:
-                    with contextlib.suppress(Exception):
-                        adapter.quarantine(task_id, str(exc))
-                raise
+            verification_error: BindingError | None = None
+            with adapter.transaction():
+                existing = adapter.find_idempotent(key)
+                task_id = existing or adapter.create(raw, binding)
+                try:
+                    _verify_readback(adapter, raw, binding, task_id)
+                except BindingError as exc:
+                    if existing is None:
+                        raise
+                    adapter.quarantine(task_id, str(exc))
+                    verification_error = exc
+            if verification_error is not None:
+                raise verification_error
         finally:
             adapter.close()
 

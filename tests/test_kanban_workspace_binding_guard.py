@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,6 @@ class FakeAdapter:
                 "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
                 (parent, task_id),
             )
-        self.conn.commit()
         return task_id
 
     def read(self, task_id: str) -> sqlite3.Row | None:
@@ -116,9 +116,32 @@ class FakeAdapter:
         ).fetchall()
         return {str(row["id"]): str(row["status"]) for row in rows}
 
-    def quarantine(self, task_id: str, reason: str) -> None:
-        self.conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
-        self.conn.commit()
+    @contextmanager
+    def transaction(self):
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except Exception:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+
+    def quarantine(self, task_id: str, reason: str) -> bool:
+        cur = self.conn.execute(
+            "UPDATE tasks SET status = 'blocked' "
+            "WHERE id = ? AND status IN ('todo', 'ready') "
+            "AND claim_lock IS NULL AND claim_expires IS NULL "
+            "AND worker_pid IS NULL AND current_run_id IS NULL",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        self.conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES (?, ?, ?)",
+            (task_id, "workspace_binding_quarantined", json.dumps({"reason": reason})),
+        )
+        return True
 
     def close(self) -> None:
         self.conn.close()
@@ -147,9 +170,11 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     conn.execute(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT, "
         "workspace_kind TEXT, workspace_path TEXT, branch_name TEXT, project_id TEXT, "
-        "idempotency_key TEXT)"
+        "idempotency_key TEXT, claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER, "
+        "current_run_id INTEGER, block_kind TEXT)"
     )
     conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
+    conn.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT)")
     conn.commit()
     conn.close()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -157,12 +182,14 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setenv("KANBAN_WORKSPACE_BINDING_GUARD_LOG", str(tmp_path / "guard.log"))
     adapters: list[FakeAdapter] = []
 
-    def open_adapter(_: str | None) -> FakeAdapter:
+    def open_adapter(_: str | None, *, db_path: Path | None = None) -> FakeAdapter:
+        del db_path
         adapter = FakeAdapter(guard, board)
         adapters.append(adapter)
         return adapter
 
     monkeypatch.setattr(guard, "_open_adapter", open_adapter)
+    monkeypatch.setattr(guard, "_board_db_path", lambda _: board)
     return {"guard": guard, "repo": repo, "board": board, "adapters": adapters}
 
 
@@ -355,6 +382,494 @@ def _run_real_handler_regression(scenario: str) -> dict[str, Any]:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+_REAL_ATOMIC_REGRESSION = r"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+scenario = sys.argv[2]
+hermes_root = Path(os.environ.get("HERMES_AGENT_SOURCE_ROOT", "/ws/hermes-agent"))
+sys.path.insert(0, str(hermes_root))
+for name in (
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_KANBAN_TASK",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_KEY",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+):
+    os.environ.pop(name, None)
+
+
+def load_guard():
+    path = repo_root / "automation/hermes/scripts/kanban-workspace-binding-guard.py"
+    spec = importlib.util.spec_from_file_location("real_atomic_guard", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def setup_environment(root: Path):
+    home = root / "profile"
+    shared = root / "shared-kanban"
+    repo = root / "repo"
+    home.mkdir()
+    repo.mkdir()
+    named = shared / "kanban" / "boards" / "ctrl-hangul"
+    named.mkdir(parents=True)
+    (named / "board.json").write_text("{}", encoding="utf-8")
+    (shared / "kanban" / "current").write_text("ctrl-hangul\n", encoding="utf-8")
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    os.environ.update(
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_KANBAN_HOME": str(shared),
+            "HERMES_PROFILE": "test-worker",
+            "KANBAN_WORKSPACE_BINDING_GUARD_LOG": str(root / "guard.log"),
+        }
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+
+    kb._INITIALIZED_PATHS.clear()
+    pdb._INITIALIZED_PATHS.clear()
+    with pdb.connect_closing() as conn:
+        pdb.create_project(
+            conn,
+            name="Control Plane",
+            slug="control-plane",
+            primary_path=str(repo),
+        )
+    kb.init_db(board="ctrl-hangul")
+    return home, shared, repo, kb, pdb
+
+
+def create_payload(key: str, board: str | None = None) -> dict[str, object]:
+    return {
+        "tool_name": "kanban_create",
+        "tool_input": {
+            "title": "Issue #138 atomic regression",
+            "assignee": "kanban-developer",
+            "workspace_kind": "worktree",
+            "project": "control-plane",
+            "idempotency_key": key,
+            "parents": ["t_parent"],
+            "board": board,
+        },
+    }
+
+
+def run_barrier() -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="issue138-atomic-barrier-") as temp:
+        root = Path(temp)
+        _home, _shared, _repo, kb, _pdb = setup_environment(root)
+        guard = load_guard()
+        board_path = Path(kb.kanban_db_path(board=None))
+        with sqlite3.connect(board_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+                ("t_parent", "done parent", "done", 1),
+            )
+        verify_started = threading.Event()
+        release = threading.Event()
+        claim_started = threading.Event()
+        claim_done = threading.Event()
+        task_ids: list[str] = []
+        outcome: dict[str, object] = {}
+        original_verify = guard._verify_readback
+
+        def paused_verify(adapter, raw, binding, task_id):
+            task_ids.append(task_id)
+            verify_started.set()
+            if not release.wait(10):
+                raise RuntimeError("barrier release timed out")
+            return original_verify(adapter, raw, binding, task_id)
+
+        guard._verify_readback = paused_verify
+
+        def run_guard() -> None:
+            outcome["guard_rc"] = guard.evaluate_payload(
+                create_payload("github:owner/repo:issue:138:atomic-barrier")
+            )
+
+        def run_claim() -> None:
+            claim_started.set()
+            conn = kb.connect(db_path=board_path)
+            try:
+                claimed = kb.claim_task(conn, task_ids[0], claimer="atomic-barrier-claimer")
+                outcome["claimed"] = claimed is not None
+            finally:
+                conn.close()
+                claim_done.set()
+
+        guard_thread = threading.Thread(target=run_guard)
+        guard_thread.start()
+        assert verify_started.wait(10), "guard did not reach in-transaction read-back"
+        task_id = task_ids[0]
+        with sqlite3.connect(board_path) as conn:
+            before_rows = conn.execute(
+                "SELECT id, status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchall()
+            before_events = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        claim_thread = threading.Thread(target=run_claim)
+        claim_thread.start()
+        assert claim_started.wait(5)
+        claim_completed_before_release = claim_done.wait(0.3)
+        release.set()
+        guard_thread.join(15)
+        claim_thread.join(15)
+        guard._verify_readback = original_verify
+        assert not guard_thread.is_alive()
+        assert not claim_thread.is_alive()
+        with sqlite3.connect(board_path) as conn:
+            after = conn.execute(
+                "SELECT status, workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            links = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT parent_id, child_id FROM task_links WHERE child_id = ?", (task_id,)
+                ).fetchall()
+            ]
+            event_kinds = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+                ).fetchall()
+            ]
+        return {
+            "scenario": "barrier",
+            "guard_rc": outcome.get("guard_rc"),
+            "claimed": outcome.get("claimed"),
+            "before_rows": before_rows,
+            "before_events": before_events,
+            "claim_completed_before_release": claim_completed_before_release,
+            "after": after,
+            "links": links,
+            "event_kinds": event_kinds,
+        }
+
+
+def run_rollback() -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="issue138-atomic-rollback-") as temp:
+        root = Path(temp)
+        _home, _shared, _repo, kb, _pdb = setup_environment(root)
+        board_path = Path(kb.kanban_db_path(board=None))
+        with sqlite3.connect(board_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+                ("t_parent", "done parent", "done", 1),
+            )
+        guard = load_guard()
+        original_verify = guard._verify_readback
+
+        def force_mismatch(*_args, **_kwargs):
+            raise guard.BindingError("forced read-back mismatch")
+
+        guard._verify_readback = force_mismatch
+        try:
+            rc = guard.evaluate_payload(
+                create_payload("github:owner/repo:issue:138:atomic-rollback")
+            )
+        finally:
+            guard._verify_readback = original_verify
+        with sqlite3.connect(board_path) as conn:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ?",
+                ("github:owner/repo:issue:138:atomic-rollback",),
+            ).fetchall()
+            links = conn.execute("SELECT * FROM task_links").fetchall()
+            events = conn.execute(
+                "SELECT * FROM task_events WHERE kind = 'created'"
+            ).fetchall()
+        return {
+            "scenario": "rollback",
+            "guard_rc": rc,
+            "rows": rows,
+            "links": links,
+            "created_events": events,
+        }
+
+
+def run_paths() -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="issue138-canonical-paths-") as temp:
+        root = Path(temp)
+        home = root / "profile"
+        shared = root / "shared-kanban"
+        home.mkdir()
+        named = shared / "kanban" / "boards" / "ctrl-hangul"
+        named.mkdir(parents=True)
+        (named / "board.json").write_text("{}", encoding="utf-8")
+        current = shared / "kanban" / "current"
+        current.write_text("Ctrl-Hangul\n", encoding="utf-8")
+        os.environ.update({"HERMES_HOME": str(home), "HERMES_KANBAN_HOME": str(shared)})
+        guard = load_guard()
+        from hermes_cli import kanban_db as kb
+
+        cases: list[dict[str, str | None]] = []
+
+        def check(label: str, board: str | None) -> None:
+            expected = Path(kb.kanban_db_path(board=board))
+            actual = guard._board_db_path(board)
+            key = "github:owner/repo:issue:138:path:" + label
+            with guard._creation_lock(board, key) as locked:
+                assert Path(locked) == actual == expected
+            cases.append({"label": label, "path": str(actual)})
+
+        check("explicit-lower", "ctrl-hangul")
+        check("explicit-case", "CTRL-HANGUL")
+        check("current-pointer", None)
+        os.environ["HERMES_KANBAN_BOARD"] = "CTRL-HANGUL"
+        check("env-case", None)
+        os.environ.pop("HERMES_KANBAN_BOARD", None)
+        check("default", "default")
+        pinned = root / "pinned.db"
+        os.environ["HERMES_KANBAN_DB"] = str(pinned)
+        check("pinned", "Ctrl-Hangul")
+        assert not (home / "kanban.db").exists()
+        assert not (home / "kanban").exists()
+        return {
+            "scenario": "paths",
+            "cases": cases,
+            "profile_shadow_exists": (home / "kanban.db").exists()
+            or (home / "kanban").exists(),
+        }
+
+
+_SAME_KEY_WORKER = r'''
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+release = Path(sys.argv[3])
+board_arg = None if sys.argv[4] == "NONE" else sys.argv[4]
+key = sys.argv[5]
+ready.write_text("ready", encoding="utf-8")
+deadline = time.monotonic() + 15
+while not release.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit("same-key worker barrier timed out")
+    time.sleep(0.01)
+payload = {
+    "tool_name": "kanban_create",
+    "tool_input": {
+        "title": "Issue #138 concurrent graph",
+        "assignee": "kanban-developer",
+        "workspace_kind": "worktree",
+        "project": "control-plane",
+        "idempotency_key": key,
+        "parents": ["t_parent"],
+        "board": board_arg,
+    },
+}
+result = subprocess.run(
+    [sys.executable, str(repo_root / "automation/hermes/scripts/kanban-block-kind-guard.py")],
+    input=json.dumps(payload),
+    capture_output=True,
+    text=True,
+    env=os.environ.copy(),
+    check=False,
+)
+print(
+    json.dumps(
+        {
+            "rc": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    )
+)
+if result.returncode != 0:
+    raise SystemExit(result.returncode)
+'''
+
+
+def run_same_key() -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="issue138-same-key-") as temp:
+        root = Path(temp)
+        _home, _shared, _repo, kb, _pdb = setup_environment(root)
+        board_path = Path(kb.kanban_db_path(board=None))
+        with sqlite3.connect(board_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+                ("t_parent", "done parent", "done", 1),
+            )
+        results: list[dict[str, object]] = []
+        for suffix, board_args in (
+            ("current", ("NONE", "Ctrl-Hangul")),
+            ("case", ("ctrl-hangul", "CTRL-HANGUL")),
+        ):
+            key = f"github:owner/repo:issue:138:same-key:{suffix}"
+            ready_paths = [root / f"{suffix}-worker-{index}.ready" for index in range(2)]
+            release = root / f"{suffix}.release"
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        _SAME_KEY_WORKER,
+                        str(repo_root),
+                        str(ready_paths[index]),
+                        str(release),
+                        board_args[index],
+                        key,
+                    ],
+                    env=os.environ.copy(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for index in range(2)
+            ]
+            try:
+                deadline = time.monotonic() + 15
+                while not all(path.exists() for path in ready_paths):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("same-key workers did not reach the start barrier")
+                    time.sleep(0.01)
+                release.write_text("release", encoding="utf-8")
+                outputs = [process.communicate(timeout=30) for process in processes]
+            finally:
+                release.touch()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+            for process, (stdout, stderr) in zip(processes, outputs):
+                assert process.returncode == 0, stderr or stdout
+            with sqlite3.connect(board_path) as conn:
+                rows = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)
+                    ).fetchall()
+                ]
+                links = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT parent_id, child_id FROM task_links "
+                        "WHERE child_id IN (SELECT id FROM tasks WHERE idempotency_key = ?)",
+                        (key,),
+                    ).fetchall()
+                ]
+                created_events = conn.execute(
+                    "SELECT COUNT(*) FROM task_events "
+                    "WHERE task_id IN (SELECT id FROM tasks WHERE idempotency_key = ?) "
+                    "AND kind = 'created'",
+                    (key,),
+                ).fetchone()[0]
+            results.append(
+                {
+                    "suffix": suffix,
+                    "rows": rows,
+                    "links": links,
+                    "created_events": created_events,
+                }
+            )
+        return {"scenario": "same-key", "results": results}
+
+
+if scenario == "barrier":
+    print(json.dumps(run_barrier(), default=list))
+elif scenario == "rollback":
+    print(json.dumps(run_rollback(), default=list))
+elif scenario == "paths":
+    print(json.dumps(run_paths(), default=list))
+elif scenario == "same-key":
+    print(json.dumps(run_same_key(), default=list))
+else:
+    raise SystemExit(f"unknown scenario: {scenario}")
+"""
+
+
+def _run_real_atomic_regression(scenario: str) -> dict[str, Any]:
+    assert HERMES_PYTHON.is_file(), f"Hermes test runtime is missing: {HERMES_PYTHON}"
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    result = subprocess.run(
+        [str(HERMES_PYTHON), "-c", _REAL_ATOMIC_REGRESSION, str(ROOT), scenario],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_real_core_create_claim_barrier_hides_uncommitted_graph(attempt: int) -> None:
+    del attempt
+    result = _run_real_atomic_regression("barrier")
+    assert result["guard_rc"] == 0, result
+    assert result["claimed"] is True, result
+    assert result["before_rows"] == [], result
+    assert result["before_events"] == [], result
+    assert result["claim_completed_before_release"] is False, result
+    assert result["after"] and result["after"][0] == "running", result
+    assert len(result["links"]) == 1, result
+    assert result["links"][0][0] == "t_parent", result
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_real_core_readback_mismatch_rolls_back_new_graph(attempt: int) -> None:
+    del attempt
+    result = _run_real_atomic_regression("rollback")
+    assert result["guard_rc"] == 2, result
+    assert result["rows"] == [], result
+    assert result["links"] == [], result
+    assert result["created_events"] == [], result
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_real_core_resolver_controls_creation_lock_without_profile_shadow(attempt: int) -> None:
+    del attempt
+    result = _run_real_atomic_regression("paths")
+    assert result["profile_shadow_exists"] is False, result
+    cases = {item["label"]: item["path"] for item in result["cases"]}
+    assert cases["explicit-lower"] == cases["explicit-case"], result
+    assert cases["explicit-lower"] == cases["current-pointer"], result
+    assert cases["current-pointer"] == cases["env-case"], result
+    assert cases["default"].endswith("/shared-kanban/kanban.db"), result
+    assert cases["pinned"].endswith("/pinned.db"), result
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_real_core_concurrent_same_key_requests_share_one_canonical_graph(attempt: int) -> None:
+    del attempt
+    result = _run_real_atomic_regression("same-key")
+    assert len(result["results"]) == 2, result
+    for item in result["results"]:
+        assert len(item["rows"]) == 1, result
+        assert item["rows"][0][1] == "ready", result
+        assert item["links"] == [["t_parent", item["rows"][0][0]]], result
+        assert item["created_events"] == 1, result
+
+
 def test_invalid_incident_payload_blocks_before_any_row(fixture: dict[str, Any]) -> None:
     guard = fixture["guard"]
     raw = _valid(fixture["repo"])
@@ -459,12 +974,13 @@ def test_open_parent_keeps_valid_child_on_todo_dependency_path(fixture: dict[str
 
 
 @pytest.mark.parametrize("corrupt_field", ["workspace_kind", "workspace_path", "branch_name"])
-def test_durable_binding_mismatch_is_quarantined_before_dispatch(
+def test_new_durable_binding_mismatch_rolls_back_without_a_dispatchable_row(
     fixture: dict[str, Any], corrupt_field: str
 ) -> None:
     guard = fixture["guard"]
 
-    def corrupt_open(_: str | None) -> FakeAdapter:
+    def corrupt_open(_: str | None, *, db_path: Path | None = None) -> FakeAdapter:
+        del db_path
         adapter = FakeAdapter(guard, fixture["board"], corrupt_field=corrupt_field)
         fixture["adapters"].append(adapter)
         return adapter
@@ -479,11 +995,115 @@ def test_durable_binding_mismatch_is_quarantined_before_dispatch(
 
     conn = sqlite3.connect(fixture["board"])
     row = conn.execute(
-        "SELECT status FROM tasks WHERE idempotency_key = ?",
+        "SELECT id, status FROM tasks WHERE idempotency_key = ?",
         (raw["idempotency_key"],),
     ).fetchone()
+    links = conn.execute("SELECT * FROM task_links").fetchall()
+    events = conn.execute(
+        "SELECT * FROM task_events WHERE kind = 'workspace_binding_quarantined'"
+    ).fetchall()
     conn.close()
-    assert row == ("blocked",)
+    assert row is None
+    assert links == []
+    assert events == []
+
+
+def test_existing_durable_binding_mismatch_uses_nonrunning_cas_quarantine(
+    fixture: dict[str, Any],
+) -> None:
+    guard = fixture["guard"]
+    raw = _valid(fixture["repo"], key="github:owner/repo:issue:138:existing-invalid")
+    conn = sqlite3.connect(fixture["board"])
+    conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, workspace_kind, workspace_path, "
+        "branch_name, project_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "t_existing_invalid",
+            raw["title"],
+            raw["assignee"],
+            "ready",
+            "scratch",
+            str(fixture["repo"] / ".worktrees" / "t_existing_invalid"),
+            guard._branch_name(
+                guard.RepoBinding("p_control", "control-plane", fixture["repo"]),
+                "t_existing_invalid",
+                raw["title"],
+            ),
+            "p_control",
+            raw["idempotency_key"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert guard.evaluate_payload({"tool_name": "kanban_create", "tool_input": raw}) == 2
+
+    conn = sqlite3.connect(fixture["board"])
+    row = conn.execute(
+        "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
+        ("t_existing_invalid",),
+    ).fetchone()
+    event = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ?", ("t_existing_invalid",)
+    ).fetchone()
+    conn.close()
+    assert row == ("blocked", None, None, None, None)
+    assert event == ("workspace_binding_quarantined",)
+
+
+def test_existing_running_binding_mismatch_is_not_overwritten(
+    fixture: dict[str, Any],
+) -> None:
+    guard = fixture["guard"]
+    raw = _valid(fixture["repo"], key="github:owner/repo:issue:138:existing-running")
+    conn = sqlite3.connect(fixture["board"])
+    conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, workspace_kind, workspace_path, "
+        "branch_name, project_id, idempotency_key, claim_lock, claim_expires, worker_pid, "
+        "current_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "t_existing_running",
+            raw["title"],
+            raw["assignee"],
+            "running",
+            "scratch",
+            str(fixture["repo"]),
+            "shared-branch",
+            "p_control",
+            raw["idempotency_key"],
+            "active-claim",
+            9999999999,
+            4242,
+            7,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert guard.evaluate_payload({"tool_name": "kanban_create", "tool_input": raw}) == 2
+
+    conn = sqlite3.connect(fixture["board"])
+    row = conn.execute(
+        "SELECT status, workspace_kind, workspace_path, branch_name, claim_lock, "
+        "claim_expires, worker_pid, current_run_id FROM tasks WHERE id = ?",
+        ("t_existing_running",),
+    ).fetchone()
+    event_count = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ?", ("t_existing_running",)
+    ).fetchone()[0]
+    conn.close()
+    assert row == (
+        "running",
+        "scratch",
+        str(fixture["repo"]),
+        "shared-branch",
+        "active-claim",
+        9999999999,
+        4242,
+        7,
+    )
+    assert event_count == 0
 
 
 def test_explicit_blocked_quarantine_is_non_dispatchable_and_exempt(fixture: dict[str, Any]) -> None:
