@@ -4,7 +4,7 @@
 - Project: `hermes-n8n-control-plane`
 - Product type: `CONTROL_PLANE_AUTOMATION` / `HERMES_PLUGIN`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `N8N_VALIDATE`, `HERMES_PLUGIN`
-- Integration target branch: `main`; required worker branch: `wt/t_2478d4a5`
+- Integration target branch: `main`; required worker branch: `wt/t_a53b154f`
 - Source-of-truth base: `origin/main` at `a0432f46d94c2baa0d39a011c9d924ff5fd76e66`
 - Remote delivery: update existing PR #149 only; merge authority is human/user only
 - Pull request title/body/final report language: Korean
@@ -16,10 +16,12 @@
 - Prior Reviewer task: `t_d9b220cb`
 - Bounded rework task: `t_0c8e19ed`
 - Follow-up Reviewer task: `t_17883aa1`
-- Current Developer task: `t_2478d4a5`
+- Prior-round Developer task: `t_2478d4a5`
+- Current Developer task: `t_a53b154f`
+- Current Reviewer task: `t_10072cbb`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:138`
 - Stable task identity: `github:rhgo1749/hermes-n8n-control-plane:issue:138:rework-round-1:developer-followup-3`
-- Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/issue-138-rework-round-6`; requested branch `wt/t_2478d4a5`
+- Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/issue-138-rework-round-7`; requested branch `wt/t_a53b154f`
 - Delivery branch: `fix/issue-138-ready-binding-preflight`
 - Delivery PR: PR #149 — `Issue #138: 구현·재작업 카드 생성 전 작업공간 바인딩 검증` — `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/149`
 - Automation stop state: `NONE` — local validation complete; no live deployment/config mutation, GitHub lifecycle mutation, merge/auto-merge, new PR, or build artifact. Human merge authority remains unchanged.
@@ -74,8 +76,9 @@ Cumulative PR allowlist additionally includes earlier-round files:
 
 ## 5. Delivery provenance and stop state
 
-- Exact final validated functional PR head for this bounded rework: `d197db38751fdc783a8725e109fc9e996b86b869` (`fix(kanban): guard reassign shell reachability`); all focused/static/edge/full-baseline validation above was run after restoring this implementation.
-- Source/provenance chain: root `t_7ec21f55`; Investigator `t_f5de81a4`; prior Developer `t_586a1100`; prior Reviewer `t_d9b220cb`; bounded Developer `t_0c8e19ed`; follow-up Reviewer `t_17883aa1`; current Developer `t_2478d4a5`.
-- PR #149 remains the existing Korean PR on `fix/issue-138-ready-binding-preflight`; its visible plain-text closing marker is `Closes #138.`. No second PR, merge, auto-merge, live deployment/config mutation, or hosted Actions change is performed. The final remote REST/GraphQL/branch read-back and current PR head are recorded in the delivery handoff.
+- Functional validation commit for this bounded rework: `d197db38751fdc783a8725e109fc9e996b86b869` (`fix(kanban): guard reassign shell reachability`); all focused/static/edge/full-baseline validation above was run after restoring this implementation.
+- Exact final validated/delivered PR head for this rework: `f7db99c984c27294d36c2df1381a91f3ecaa51ec`; it is distinct from the functional validation commit above and was independently confirmed as the PR #149 branch head by REST, GraphQL, and `git ls-remote` read-back.
+- Source/provenance chain: root `t_7ec21f55`; Investigator `t_f5de81a4`; prior Developer `t_586a1100`; prior Reviewer `t_d9b220cb`; bounded Developer `t_0c8e19ed`; follow-up Reviewer `t_17883aa1`; prior-round Developer `t_2478d4a5`; current Developer `t_a53b154f`; current Reviewer `t_10072cbb`.
+- PR #149 remains the existing Korean PR on `fix/issue-138-ready-binding-preflight`; its exact head is `f7db99c984c27294d36c2df1381a91f3ecaa51ec`, its base is `main`, and its REST/GraphQL state is OPEN/unmerged with `closingIssuesReferences=[138]`. Its visible plain-text closing marker is `Closes #138.`. No second PR, merge, auto-merge, live deployment/config mutation, or hosted Actions change is performed.
 
 Closes #138.
