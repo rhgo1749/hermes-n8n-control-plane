@@ -70,6 +70,15 @@ def test_unsupported_shell_operators_fail_closed_after_short_circuit(
             )
 
 
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_unsupported_shell_operators_fail_closed_for_reassign(operator: str) -> None:
+    guard = _load_guard()
+    create = "hermes kanban create x --assignee kanban-developer"
+    reassign = "hermes kanban reassign t_x kanban-reviewer --reclaim"
+    with pytest.raises(RuntimeError, match="unsupported shell operator"):
+        guard._hermes_kanban_invocations(f"false && {create} {operator} {reassign}")
+
+
 def test_ambiguous_conditional_reachability_fails_closed() -> None:
     guard = _load_guard()
     with pytest.raises(RuntimeError, match="reachability"):
@@ -79,4 +88,12 @@ def test_ambiguous_conditional_reachability_fails_closed() -> None:
     with pytest.raises(RuntimeError, match="conditional"):
         guard._hermes_kanban_invocations(
             "if test -f /tmp/maybe; then hermes kanban create x --assignee kanban-developer; fi"
+        )
+
+
+def test_ambiguous_conditional_reachability_fails_closed_for_reassign() -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="conditional"):
+        guard._hermes_kanban_invocations(
+            "if true; then hermes kanban reassign t_x kanban-reviewer --reclaim; fi"
         )

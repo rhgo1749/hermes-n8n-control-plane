@@ -1564,6 +1564,24 @@ def test_terminal_unsupported_shell_operators_fail_closed_without_mutation(
     assert fixture["adapters"] == []
 
 
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_terminal_unsupported_shell_operators_fail_closed_for_reassign_without_mutation(
+    fixture: dict[str, Any], operator: str
+) -> None:
+    create = (
+        "hermes kanban create unsupported-reassign-one --assignee kanban-developer "
+        "--workspace worktree --project control-plane "
+        "--idempotency-key github:owner/repo:issue:138:unsupported-reassign-one"
+    )
+    reassign = "hermes kanban reassign t_missing kanban-reviewer --reclaim"
+    command = f"false && {create} {operator} {reassign}"
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
 def test_terminal_ambiguous_conditional_fails_closed_before_materialization(
     fixture: dict[str, Any],
 ) -> None:
@@ -1576,6 +1594,17 @@ def test_terminal_ambiguous_conditional_fails_closed_before_materialization(
         {"tool_name": "terminal", "tool_input": {"command": command}}
     ) == 2
     assert _count_tasks(fixture["board"]) == 0
+
+
+def test_terminal_ambiguous_conditional_reassign_fails_closed_before_materialization(
+    fixture: dict[str, Any],
+) -> None:
+    command = "if true; then hermes kanban reassign t_missing kanban-reviewer --reclaim; fi"
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
 
 
 def test_terminal_multi_create_validates_all_bindings_before_materialization(
@@ -1652,6 +1681,63 @@ def test_stable_hook_rejects_unsupported_operator_before_materialization(operato
     assert body["action"] == "block"
     assert "unsupported shell operator" in body["message"]
     assert "No task mutation was performed" in body["message"]
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_stable_hook_rejects_unsupported_reassign_before_materialization(
+    fixture: dict[str, Any], operator: str
+) -> None:
+    raw = {
+        "tool_name": "terminal",
+        "tool_input": {
+            "command": (
+                "false && hermes kanban create unsupported-reassign-one "
+                "--assignee kanban-developer --workspace worktree "
+                "--project control-plane "
+                "--idempotency-key github:owner/repo:issue:138:stable-reassign-one "
+                f"{operator} hermes kanban reassign t_missing kanban-reviewer --reclaim"
+            )
+        },
+    }
+    result = subprocess.run(
+        [sys.executable, str(STABLE_GUARD)],
+        input=json.dumps(raw),
+        text=True,
+        capture_output=True,
+        env=os.environ.copy(),
+        check=False,
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "unsupported shell operator" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert _count_tasks(fixture["board"]) == 0
+
+
+def test_stable_hook_rejects_ambiguous_conditional_reassign_before_materialization(
+    fixture: dict[str, Any],
+) -> None:
+    raw = {
+        "tool_name": "terminal",
+        "tool_input": {
+            "command": "if true; then hermes kanban reassign t_missing kanban-reviewer --reclaim; fi"
+        },
+    }
+    result = subprocess.run(
+        [sys.executable, str(STABLE_GUARD)],
+        input=json.dumps(raw),
+        text=True,
+        capture_output=True,
+        env=os.environ.copy(),
+        check=False,
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "conditional" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert _count_tasks(fixture["board"]) == 0
 
 
 def test_padded_idempotency_key_fails_closed_before_materialization(

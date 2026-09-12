@@ -328,7 +328,11 @@ def _relevant_hermes_action(tokens: list[str], start: int) -> bool:
     except ValueError:
         return False
     action_index = kanban_index + 1
-    return action_index < len(tokens) and tokens[action_index].casefold() in {"create", "assign"}
+    return action_index < len(tokens) and tokens[action_index].casefold() in {
+        "create",
+        "assign",
+        "reassign",
+    }
 
 
 def _contains_ambiguous_conditional(tokens: list[str]) -> bool:
