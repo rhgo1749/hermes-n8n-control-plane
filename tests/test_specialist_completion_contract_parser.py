@@ -57,6 +57,19 @@ def test_literal_short_circuit_operators_skip_unreachable_invocations() -> None:
     ]
 
 
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_unsupported_shell_operators_fail_closed_after_short_circuit(
+    operator: str,
+) -> None:
+    guard = _load_guard()
+    create = "hermes kanban create x --assignee kanban-developer"
+    for predicate in ("false &&", "true ||"):
+        with pytest.raises(RuntimeError, match="unsupported shell operator"):
+            guard._hermes_kanban_invocations(
+                f"{predicate} {create} {operator} {create}"
+            )
+
+
 def test_ambiguous_conditional_reachability_fails_closed() -> None:
     guard = _load_guard()
     with pytest.raises(RuntimeError, match="reachability"):

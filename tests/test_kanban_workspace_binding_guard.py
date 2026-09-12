@@ -1541,6 +1541,29 @@ def test_terminal_literal_short_circuit_controls_materialization(
     assert _count_tasks(fixture["board"]) == expected_count
 
 
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+@pytest.mark.parametrize("prefix", ["false &&", "true ||"])
+def test_terminal_unsupported_shell_operators_fail_closed_without_mutation(
+    fixture: dict[str, Any], operator: str, prefix: str
+) -> None:
+    create = (
+        "hermes kanban create unsupported-one --assignee kanban-developer "
+        "--workspace worktree --project control-plane "
+        "--idempotency-key github:owner/repo:issue:138:unsupported-one"
+    )
+    later_create = (
+        "hermes kanban create unsupported-two --assignee kanban-developer "
+        "--workspace worktree --project control-plane "
+        "--idempotency-key github:owner/repo:issue:138:unsupported-two"
+    )
+    command = f"{prefix} {create} {operator} {later_create}"
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
 def test_terminal_ambiguous_conditional_fails_closed_before_materialization(
     fixture: dict[str, Any],
 ) -> None:
@@ -1590,6 +1613,45 @@ def test_stable_hook_blocks_incident_shape_without_touching_core() -> None:
     )
     assert result.returncode == 2
     assert json.loads(result.stdout)["action"] == "block"
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_stable_hook_rejects_unsupported_operator_before_materialization(operator: str) -> None:
+    raw = {
+        "tool_name": "terminal",
+        "tool_input": {
+            "command": (
+                "false && hermes kanban create unsupported-one "
+                "--assignee kanban-developer --workspace worktree "
+                "--project control-plane "
+                "--idempotency-key github:owner/repo:issue:138:stable-one "
+                f"{operator} hermes kanban create unsupported-two "
+                "--assignee kanban-developer --workspace worktree "
+                "--project control-plane "
+                "--idempotency-key github:owner/repo:issue:138:stable-two"
+            )
+        },
+    }
+    with tempfile.TemporaryDirectory(prefix="stable-unsupported-operator-") as directory:
+        result = subprocess.run(
+            [sys.executable, str(STABLE_GUARD)],
+            input=json.dumps(raw),
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG": str(
+                    Path(directory) / "specialist.log"
+                ),
+                "KANBAN_WORKSPACE_BINDING_GUARD_LOG": str(Path(directory) / "workspace.log"),
+            },
+            check=False,
+        )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "unsupported shell operator" in body["message"]
+    assert "No task mutation was performed" in body["message"]
 
 
 def test_padded_idempotency_key_fails_closed_before_materialization(

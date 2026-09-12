@@ -62,6 +62,7 @@ _LOG_PATH = Path(
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _SHELL_BINARIES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 _CONTROL_OPERATOR_CHARS = frozenset(";&|")
+_SUPPORTED_SHELL_OPERATORS = frozenset({";", "&&", "||"})
 _SHELL_FLAG_ONLY = frozenset(
     {
         "-l", "--login", "-i", "--interactive", "-e", "-x", "-n", "--norc",
@@ -437,6 +438,15 @@ def _hermes_kanban_invocations(
     reachable = True
     previous_result: bool | None = None
     for segment_index, (segment, operator) in enumerate(chain):
+        if (
+            operator is not None
+            and operator not in _SUPPORTED_SHELL_OPERATORS
+            and any(
+                _segment_has_hermes(later, depth=depth)
+                for later, _ in chain[segment_index + 1 :]
+            )
+        ):
+            raise RuntimeError("unsupported shell operator makes command reachability ambiguous")
         if not reachable:
             if operator == ";":
                 reachable = True
