@@ -351,10 +351,19 @@ def _contains_ambiguous_conditional(tokens: list[str]) -> bool:
             break
     if not has_conditional:
         return False
-    return any(
+    if any(
         Path(token).name == "hermes" and _relevant_hermes_action(tokens, index)
         for index, token in enumerate(tokens)
-    )
+    ):
+        return True
+    for segment, _ in _command_chain(tokens):
+        for index, token in enumerate(segment):
+            if token not in {"if", "then", "elif", "else", "case", "while", "until", "do"}:
+                continue
+            nested = segment[index + 1 :]
+            if nested and _segment_has_hermes(nested):
+                return True
+    return False
 
 
 def _segment_has_hermes(segment: list[str], *, depth: int = 0) -> bool:

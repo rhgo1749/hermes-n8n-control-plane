@@ -97,3 +97,16 @@ def test_ambiguous_conditional_reachability_fails_closed_for_reassign() -> None:
         guard._hermes_kanban_invocations(
             "if true; then hermes kanban reassign t_x kanban-reviewer --reclaim; fi"
         )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "if true; then bash -lc \"hermes kanban create x --assignee kanban-developer --completion-contract owner/repo\"; fi",
+        "if true; then env bash -lc \"hermes kanban reassign t_x kanban-reviewer --reclaim\"; fi",
+    ],
+)
+def test_reachable_conditional_shell_wrappers_fail_closed(command: str) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="conditional"):
+        guard._hermes_kanban_invocations(command)

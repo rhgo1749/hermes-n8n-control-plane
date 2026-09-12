@@ -463,3 +463,25 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
         assert "shell-hook command path unchanged; no second consent command added" in result.stdout
         assert config.read_text(encoding="utf-8") == original
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
+
+
+def test_stable_wrapper_blocks_reachable_nested_wrappers_without_mutating_db() -> None:
+    commands = (
+        "if true; then bash -lc \x27hermes kanban create x --assignee kanban-developer --completion-contract rhgo1749/ctrl-hangul\x27; fi",
+        "if true; then env bash -lc \x27hermes kanban reassign t_repoaware kanban-reviewer --reclaim\x27; fi",
+    )
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-nested-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_repoaware", "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+        for command in commands:
+            result = _run(
+                {"tool_name": "terminal", "tool_input": {"command": command}},
+                env_updates={"HERMES_KANBAN_DB": str(db)},
+            )
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            body = json.loads(result.stdout)
+            assert body["action"] == "block"
+            assert "ambiguous shell conditional reachability" in body["message"]
+            assert "No task mutation was performed" in body["message"]
+            assert db.read_bytes() == before
