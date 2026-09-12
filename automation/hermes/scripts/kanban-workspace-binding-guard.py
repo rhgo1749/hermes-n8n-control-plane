@@ -44,6 +44,7 @@ SPECIALIST_ASSIGNEES = frozenset(
 
 _TASK_ID_RE = re.compile(r"^t_[A-Za-z0-9_-]+$")
 _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
+_SHELL_SUBSTITUTION_RE = re.compile(r"[$`]|[<>]\(")
 _LOCK_TIMEOUT_SECONDS = 8.0
 
 
@@ -86,6 +87,33 @@ class _ProjectRow:
     project_slug: str
     primary_path: str
     archived: bool
+
+
+def _exact_idempotency_key(value: Any) -> str:
+    """Require the preflight and normal handler to use one byte-exact key."""
+    if not isinstance(value, str) or not value.strip():
+        raise BindingError(
+            "idempotency_key is required to bind concurrent same-Issue/rework requests"
+        )
+    if value != value.strip():
+        raise BindingError("idempotency_key must not have leading or trailing whitespace")
+    return value
+
+
+def _reject_unresolved_shell_substitutions(args: list[str]) -> None:
+    """Do not materialize parser tokens whose shell meaning is unresolved.
+
+    The specialist parser uses ``shlex`` intentionally without shell expansion,
+    so a token such as ``$KEY`` would otherwise be persisted literally before
+    the real shell expands it for the normal handler.  Reject all common
+    parameter/command/arithmetic, backtick, and process-substitution markers
+    across the complete parsed create argv and board selector, including the
+    assignee itself.
+    """
+    if any(_SHELL_SUBSTITUTION_RE.search(value) for value in args):
+        raise BindingError(
+            "terminal specialist create arguments must not contain unresolved shell substitution tokens"
+        )
 
 
 def _log_path() -> Path:
@@ -259,11 +287,7 @@ def _resolve_binding(raw: Mapping[str, Any]) -> RepoBinding:
     for field in ("branch", "branch_name"):
         if field in raw:
             raise BindingError(f"{field} cannot be supplied on the structured create path")
-    key = raw.get("idempotency_key")
-    if not isinstance(key, str) or not key.strip():
-        raise BindingError(
-            "idempotency_key is required to bind concurrent same-Issue/rework requests"
-        )
+    _exact_idempotency_key(raw.get("idempotency_key"))
     project_value = raw.get("project") if "project" in raw else raw.get("project_id")
     if not isinstance(project_value, str) or not project_value.strip():
         raise BindingError("project is required to resolve a repository anchor")
@@ -360,7 +384,9 @@ def _verify_readback(
         raise BindingError("durable branch_name is not the dedicated project branch")
     if str(_value(row, "project_id") or "") != binding.project_id:
         raise BindingError("durable project binding does not match the resolved project")
-    if str(_value(row, "idempotency_key") or "") != str(raw["idempotency_key"]).strip():
+    if str(_value(row, "idempotency_key") or "") != _exact_idempotency_key(
+        raw["idempotency_key"]
+    ):
         raise BindingError("durable idempotency key read-back does not match")
     parents = _parents(raw)
     actual_links = sorted(adapter.links(task_id))
@@ -461,7 +487,7 @@ class _CoreTaskAdapter:
                 priority=_as_optional_int(raw.get("priority"), field="priority") or 0,
                 parents=parents,
                 triage=_as_bool(raw.get("triage"), field="triage"),
-                idempotency_key=str(raw["idempotency_key"]).strip(),
+                idempotency_key=_exact_idempotency_key(raw["idempotency_key"]),
                 max_runtime_seconds=_as_optional_int(
                     raw.get("max_runtime_seconds"), field="max_runtime_seconds"
                 ),
@@ -541,7 +567,7 @@ def _open_adapter(board: str | None) -> _TaskAdapter:
 
 
 def _materialize_and_verify(raw: Mapping[str, Any], binding: RepoBinding) -> None:
-    key = str(raw["idempotency_key"]).strip()
+    key = _exact_idempotency_key(raw["idempotency_key"])
     board = raw.get("board") if isinstance(raw.get("board"), str) else None
     with _creation_lock(board, key):
         adapter = _open_adapter(board)
@@ -585,9 +611,14 @@ def _first_option(args: list[str], option: str) -> str | None:
 
 def _terminal_create_input(args: list[str], board: str) -> dict[str, Any] | None:
     assignee = _first_option(args, "--assignee")
+    _reject_unresolved_shell_substitutions([assignee] if assignee is not None else [])
     specialist = _specialist(assignee)
     if specialist is None:
         return None
+    substitution_values = [*args]
+    if board:
+        substitution_values.append(board)
+    _reject_unresolved_shell_substitutions(substitution_values)
     if not args or args[0].startswith("-"):
         raise BindingError("hermes kanban create requires a title before options")
     raw: dict[str, Any] = {

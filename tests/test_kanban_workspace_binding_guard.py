@@ -19,6 +19,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 GUARD_PATH = ROOT / "automation/hermes/scripts/kanban-workspace-binding-guard.py"
 STABLE_GUARD = ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
+HERMES_AGENT_ROOT = Path(os.environ.get("HERMES_AGENT_SOURCE_ROOT", "/ws/hermes-agent"))
+HERMES_PYTHON = HERMES_AGENT_ROOT / "venv/bin/python3"
 
 
 def _load_guard() -> Any:
@@ -46,7 +48,7 @@ class FakeAdapter:
         return None if row is None else str(row["id"])
 
     def create(self, raw: dict[str, Any], binding: Any) -> str:
-        existing = self.find_idempotent(str(raw["idempotency_key"]).strip())
+        existing = self.find_idempotent(str(raw["idempotency_key"]))
         if existing:
             return existing
         row = self.conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()
@@ -70,7 +72,7 @@ class FakeAdapter:
         idempotency_key = (
             "other-round"
             if self.corrupt_field == "idempotency_key"
-            else str(raw["idempotency_key"]).strip()
+            else str(raw["idempotency_key"])
         )
         self.conn.execute(
             "INSERT INTO tasks (id, title, assignee, status, workspace_kind, workspace_path, "
@@ -182,6 +184,175 @@ def _count_tasks(path: Path) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
     finally:
         conn.close()
+
+
+_REAL_HANDLER_REGRESSION = r'''
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+scenario = sys.argv[2]
+hermes_root = Path(os.environ.get("HERMES_AGENT_SOURCE_ROOT", "/ws/hermes-agent"))
+sys.path.insert(0, str(hermes_root))
+for name in (
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_KANBAN_TASK",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_KEY",
+):
+    os.environ.pop(name, None)
+
+with tempfile.TemporaryDirectory(prefix="issue138-real-regression-") as temp:
+    root = Path(temp)
+    home = root / "hermes"
+    repo = root / "repo"
+    board = root / "kanban.db"
+    home.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    os.environ.update(
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_KANBAN_DB": str(board),
+            "HERMES_PROFILE": "test-worker",
+            "KANBAN_WORKSPACE_BINDING_GUARD_LOG": str(root / "guard.log"),
+        }
+    )
+
+    stable_guard = repo_root / "automation/hermes/scripts/kanban-block-kind-guard.py"
+
+    def preflight(payload: dict[str, object]) -> int:
+        result = subprocess.run(
+            [sys.executable, str(stable_guard)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+        assert result.returncode in {0, 2}, result.stderr or result.stdout
+        return result.returncode
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+
+    kb._INITIALIZED_PATHS.clear()
+    pdb._INITIALIZED_PATHS.clear()
+    with pdb.connect_closing() as conn:
+        pdb.create_project(
+            conn,
+            name="Control Plane",
+            slug="control-plane",
+            primary_path=str(repo),
+        )
+    kb.init_db()
+
+    def rows() -> list[tuple[str, str, str]]:
+        with sqlite3.connect(board) as conn:
+            return [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT id, idempotency_key, status FROM tasks ORDER BY id"
+                ).fetchall()
+            ]
+
+    def handler(key: str) -> dict[str, object]:
+        from tools import kanban_tools as kt
+
+        return json.loads(
+            kt._handle_create(
+                {
+                    "title": "Issue #138 real handler",
+                    "assignee": "kanban-developer",
+                    "workspace_kind": "worktree",
+                    "project": "control-plane",
+                    "idempotency_key": key,
+                }
+            )
+        )
+
+    if scenario == "padded":
+        padded = " github:owner/repo:issue:138:real-padded "
+        exact = padded.strip()
+        padded_input = {
+            "title": "Issue #138 real handler",
+            "assignee": "kanban-developer",
+            "workspace_kind": "worktree",
+            "project": "control-plane",
+            "idempotency_key": padded,
+        }
+        exact_input = {**padded_input, "idempotency_key": exact}
+        padded_rc = preflight(
+            {"tool_name": "kanban_create", "tool_input": padded_input}
+        )
+        after_padded = rows()
+        first_guard_rc = preflight(
+            {"tool_name": "kanban_create", "tool_input": exact_input}
+        )
+        replay_guard_rc = preflight(
+            {"tool_name": "kanban_create", "tool_input": exact_input}
+        )
+        first_handler = handler(exact)
+        replay_handler = handler(exact)
+        print(
+            json.dumps(
+                {
+                    "padded_rc": padded_rc,
+                    "after_padded": after_padded,
+                    "first_guard_rc": first_guard_rc,
+                    "replay_guard_rc": replay_guard_rc,
+                    "first_handler": first_handler,
+                    "replay_handler": replay_handler,
+                    "rows": rows(),
+                }
+            )
+        )
+    else:
+        expanded = "github:owner/repo:issue:138:real-shell"
+        command = (
+            "export KEY="
+            + expanded
+            + "; sh -c 'hermes kanban create Issue #138 real handler "
+            "--assignee kanban-developer --workspace worktree "
+            "--project control-plane --idempotency-key \"$KEY\"'"
+        )
+        shell_rc = preflight(
+            {"tool_name": "terminal", "tool_input": {"command": command}}
+        )
+        handler_result = handler(expanded)
+        print(
+            json.dumps(
+                {
+                    "shell_rc": shell_rc,
+                    "handler": handler_result,
+                    "rows": rows(),
+                }
+            )
+        )
+'''
+
+
+def _run_real_handler_regression(scenario: str) -> dict[str, Any]:
+    assert HERMES_PYTHON.is_file(), f"Hermes test runtime is missing: {HERMES_PYTHON}"
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    result = subprocess.run(
+        [str(HERMES_PYTHON), "-c", _REAL_HANDLER_REGRESSION, str(ROOT), scenario],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 def test_invalid_incident_payload_blocks_before_any_row(fixture: dict[str, Any]) -> None:
@@ -393,3 +564,93 @@ def test_stable_hook_blocks_incident_shape_without_touching_core() -> None:
     )
     assert result.returncode == 2
     assert json.loads(result.stdout)["action"] == "block"
+
+
+def test_padded_idempotency_key_fails_closed_before_materialization(
+    fixture: dict[str, Any],
+) -> None:
+    raw = _valid(
+        fixture["repo"],
+        key=" github:owner/repo:issue:138:round:padded ",
+    )
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "kanban_create", "tool_input": raw}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
+@pytest.mark.parametrize(
+    "shell_token",
+    ["$KEY", "${KEY}", "$(printf expanded)", "`printf expanded`", "$((1 + 1))"],
+)
+def test_terminal_shell_substitution_fails_closed_before_materialization(
+    fixture: dict[str, Any], shell_token: str
+) -> None:
+    command = (
+        "sh -c 'hermes kanban create shell-token --assignee kanban-developer "
+        "--workspace worktree --project control-plane --idempotency-key "
+        f"{shell_token}'"
+    )
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "hermes kanban create $TITLE --assignee kanban-developer --workspace worktree "
+        "--project control-plane --idempotency-key exact-title",
+        "hermes kanban create body --assignee kanban-developer --workspace worktree "
+        "--project control-plane --body '${BODY}' --idempotency-key exact-body",
+        "hermes kanban create project --assignee kanban-developer --workspace worktree "
+        "--project '$(printf project)' --idempotency-key exact-project",
+        "hermes kanban create key --assignee kanban-developer --workspace worktree "
+        "--project control-plane --idempotency-key '`printf key`'",
+        "hermes kanban create assignee --assignee '$PROFILE' --workspace worktree "
+        "--project control-plane --idempotency-key exact-assignee",
+        "hermes kanban create process --assignee kanban-developer --workspace worktree "
+        "--project control-plane --idempotency-key '<(printf process)'",
+        "hermes kanban --board '$BOARD' create board --assignee kanban-developer "
+        "--workspace worktree --project control-plane --idempotency-key exact-board",
+    ],
+)
+def test_terminal_substitution_is_rejected_in_every_create_argument(
+    fixture: dict[str, Any], command: str
+) -> None:
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
+def test_real_guard_and_handler_converge_padded_and_exact_replays() -> None:
+    result = _run_real_handler_regression("padded")
+    assert result["padded_rc"] == 2
+    assert result["after_padded"] == []
+    assert result["first_guard_rc"] == 0
+    assert result["replay_guard_rc"] == 0
+    first = result["first_handler"]
+    replay = result["replay_handler"]
+    assert isinstance(first, dict) and isinstance(replay, dict)
+    assert first["ok"] is True
+    assert replay["ok"] is True
+    assert first["task_id"] == replay["task_id"]
+    assert result["rows"] and len(result["rows"]) == 1
+    assert result["rows"][0][1] == "github:owner/repo:issue:138:real-padded"
+    assert result["rows"][0][2] == "ready"
+
+
+def test_real_shell_wrapped_guard_blocks_literal_before_handler() -> None:
+    result = _run_real_handler_regression("shell")
+    assert result["shell_rc"] == 2
+    handler = result["handler"]
+    assert isinstance(handler, dict) and handler["ok"] is True
+    assert result["rows"] and len(result["rows"]) == 1
+    assert result["rows"][0][1] == "github:owner/repo:issue:138:real-shell"
+    assert "$KEY" not in {row[1] for row in result["rows"]}
+    assert result["rows"][0][2] == "ready"
