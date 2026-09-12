@@ -49,9 +49,12 @@ Current round:
 - `tests/test_kanban_workspace_binding_guard.py`
 - `.agent/pr-requests/REQ-138-reject-invalid-ready-implementation-cards.md`
 
-Cumulative PR allowlist additionally includes the earlier-round workspace guard:
+Cumulative PR allowlist additionally includes earlier-round files:
 
+- `automation/hermes/scripts/deploy-intake-edge.sh`
+- `automation/hermes/scripts/kanban-block-kind-guard.py`
 - `automation/hermes/scripts/kanban-workspace-binding-guard.py`
+- `tests/test_specialist_completion_contract_guard.py`
 
 ## 4. Validation evidence
 
