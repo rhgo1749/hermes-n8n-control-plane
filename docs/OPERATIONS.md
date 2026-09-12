@@ -29,9 +29,14 @@ Interpret bounded failures as follows: `invalid_signature` or
 request; `repository_not_opted_in`, `repository_archived`,
 `owner_scope_mismatch`, or `contract_visibility_invalid` means the fresh
 GitHub metadata gate rejected the repository; `checkout_path_conflict`,
-`checkout_origin_mismatch`, `checkout_dirty`, `repository_lock_busy`, or
-`clone_failed` means no existing checkout was overwritten and only the
-current attempt's temporary path is eligible for cleanup. A newly registered
+`checkout_origin_mismatch`, `checkout_dirty`,
+`checkout_default_branch_invalid`, `checkout_default_branch_mismatch`,
+`checkout_diverged`, `checkout_materialization_unsafe`,
+`checkout_ancestry_failed`, `checkout_unshallow_failed`,
+`checkout_fetch_failed`, `checkout_fast_forward_failed`,
+`repository_lock_busy`, or `clone_failed` means no existing checkout was
+overwritten and only the current attempt's temporary path is eligible for
+cleanup. A newly registered
 checkout is intentionally retained when a later registry or board step fails;
 rerun the operator recovery after fixing the reported boundary. A missing
 authoritative job is an operator stop, not permission to create a replacement.

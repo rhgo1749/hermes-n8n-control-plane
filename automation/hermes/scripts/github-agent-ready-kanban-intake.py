@@ -1700,6 +1700,108 @@ def _target_tree_has_attributes(checkout: Path, target: str) -> bool:
     return False
 
 
+def _onboarding_local_materialization_is_safe(
+    checkout: Path,
+    expected_remote: str,
+) -> None:
+    """Reject local Git execution and attribute sources before materializing.
+
+    The onboarding Git environment disables inherited hooks and global/system
+    configuration, but Git still reads the repository's local configuration
+    and ``$GIT_DIR/info/attributes``.  Those local inputs can select filters,
+    merge drivers, URL rewrites, or remote helpers.  Inspect them before any
+    cleanliness check, branch switch, fetch, or merge can execute repository
+    input.
+    """
+    code, raw_config, _ = _git_onboarding_bytes(
+        checkout,
+        "config",
+        "--local",
+        "--no-includes",
+        "--null",
+        "--get-regexp",
+        ".*",
+    )
+    if code != 0:
+        raise _onboarding_error("checkout_materialization_unsafe")
+    entries = raw_config.split(bytes((0,)))
+    if entries and not entries[-1]:
+        entries.pop()
+
+    origin_urls: list[str] = []
+    for entry in entries:
+        try:
+            raw_key, raw_value = entry.split(bytes((10,)), 1)
+            key = raw_key.decode("ascii").casefold()
+            value = raw_value.decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            raise _onboarding_error("checkout_materialization_unsafe") from None
+        if key == "remote.origin.url":
+            origin_urls.append(value)
+            continue
+        if (
+            key.startswith(
+                (
+                    "filter.",
+                    "merge.",
+                    "url.",
+                    "credential.",
+                    "include.",
+                    "protocol.",
+                    "transport.",
+                )
+            )
+            or key in {
+                "core.attributesfile",
+                "core.askpass",
+                "core.gitproxy",
+                "core.hookspath",
+                "core.sshcommand",
+                "core.worktree",
+                "core.fsmonitor",
+                "core.fsmonitorhookpath",
+                "diff.external",
+            }
+            or (
+                key.startswith("diff.")
+                and key.endswith((".command", ".textconv"))
+            )
+            or (
+                key.startswith("remote.")
+                and key not in {"remote.origin.fetch"}
+            )
+        ):
+            raise _onboarding_error("checkout_materialization_unsafe")
+
+    if (
+        len(origin_urls) != 1
+        or _normalise_remote(origin_urls[0]) != expected_remote
+    ):
+        raise _onboarding_error("checkout_origin_mismatch")
+
+    code, raw_path, _ = _git_onboarding(
+        checkout,
+        "rev-parse",
+        "--git-path",
+        "info/attributes",
+    )
+    if code != 0 or not raw_path:
+        raise _onboarding_error("checkout_materialization_unsafe")
+    attributes_path = Path(raw_path)
+    if not attributes_path.is_absolute():
+        attributes_path = checkout / attributes_path
+    if (
+        not attributes_path.is_absolute()
+        or _path_has_symlink_component(attributes_path)
+    ):
+        raise _onboarding_error("checkout_materialization_unsafe")
+    try:
+        if os.path.lexists(attributes_path):
+            raise _onboarding_error("checkout_materialization_unsafe")
+    except OSError:
+        raise _onboarding_error("checkout_materialization_unsafe") from None
+
+
 def _probe_onboarding_ancestry(
     token: str,
     metadata: OnboardingRepository,
@@ -1780,7 +1882,7 @@ def _self_heal_stale_checkout(
 
     The caller must hold ``_repository_onboarding_lock(metadata.repository)``.
     Every rejection before the first canonical Git mutation is represented by a
-    bounded semantic code.  No reset, force update, checkout, or broad cleanup
+    bounded semantic code.  No reset, force update, forced checkout, or broad cleanup
     is used.  ``noop`` means the exact clean SHA was already present; ``healed``
     means a ref and/or working tree was advanced.
     """
@@ -1804,10 +1906,11 @@ def _self_heal_stale_checkout(
     code, root, _ = _git_onboarding(checkout, "rev-parse", "--show-toplevel")
     if code != 0 or not root or Path(root).resolve() != checkout.resolve():
         raise _onboarding_error("checkout_path_conflict")
-    code, remote, _ = _git_onboarding(checkout, "remote", "get-url", "origin")
     expected_remote = _normalise_remote(
         f"https://github.com/{metadata.repository}.git"
     )
+    _onboarding_local_materialization_is_safe(checkout, expected_remote)
+    code, remote, _ = _git_onboarding(checkout, "remote", "get-url", "origin")
     if code != 0 or _normalise_remote(remote) != expected_remote:
         raise _onboarding_error("checkout_origin_mismatch")
     code, branch, _ = _git_onboarding(
@@ -1817,7 +1920,22 @@ def _self_heal_stale_checkout(
         "--short",
         "HEAD",
     )
-    if code != 0 or branch != metadata.default_branch:
+    detached = False
+    if code == 0:
+        if branch != metadata.default_branch:
+            raise _onboarding_error("checkout_default_branch_invalid")
+    elif code == 1:
+        code, symbolic_head, _ = _git_onboarding(
+            checkout,
+            "rev-parse",
+            "--symbolic-full-name",
+            "--verify",
+            "HEAD",
+        )
+        if code != 0 or symbolic_head != "HEAD":
+            raise _onboarding_error("checkout_default_branch_invalid")
+        detached = True
+    else:
         raise _onboarding_error("checkout_default_branch_invalid")
     if not _onboarding_checkout_is_clean(checkout):
         raise _onboarding_error("checkout_dirty")
@@ -1843,7 +1961,34 @@ def _self_heal_stale_checkout(
         or not _ONBOARDING_SHA.fullmatch(head_sha)
     ):
         raise _onboarding_error("checkout_default_branch_invalid")
+    local_ref: str | None = None
+    local_sha: str | None = None
+    if detached:
+        local_ref = f"refs/heads/{metadata.default_branch}"
+        code, local_sha_result, _ = _git_onboarding(
+            checkout,
+            "rev-parse",
+            "--verify",
+            f"{local_ref}^{{commit}}",
+        )
+        if code != 0 or not _ONBOARDING_SHA.fullmatch(local_sha_result):
+            raise _onboarding_error("checkout_default_branch_invalid")
+        local_sha = local_sha_result
+        code, _, _ = _git_onboarding(
+            checkout,
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            local_ref,
+        )
+        if code == 1:
+            raise _onboarding_error("checkout_default_branch_invalid")
+        if code != 0:
+            raise _onboarding_error("checkout_ancestry_failed")
+        if _target_tree_has_attributes(checkout, local_ref):
+            raise _onboarding_error("checkout_materialization_unsafe")
     if (
+        not detached and
         code == 0
         and _ONBOARDING_SHA.fullmatch(remote_sha)
         and remote_sha.casefold() == target_sha
@@ -1855,7 +2000,56 @@ def _self_heal_stale_checkout(
     askpass: Path | None = None
     try:
         askpass = _onboarding_askpass_file(checkout.parent)
-        _probe_onboarding_ancestry(token, metadata, checkout, head_sha, askpass)
+        if detached:
+            if local_ref is None or local_sha is None:
+                raise _onboarding_error("checkout_default_branch_invalid")
+            # Prove that the existing local branch can advance to the target
+            # before switching HEAD.  This keeps target divergence and target
+            # materialization failures mutation-free for detached anchors.
+            _probe_onboarding_ancestry(
+                token,
+                metadata,
+                checkout,
+                local_sha,
+                askpass,
+            )
+            # Ordinary switch is intentional: no force, reset, ref movement,
+            # worktree stealing, or branch creation is permitted here.
+            code, _, _ = _git_onboarding(
+                checkout,
+                "switch",
+                metadata.default_branch,
+            )
+            if code != 0:
+                raise _onboarding_error("checkout_default_branch_invalid")
+            code, switched_branch, _ = _git_onboarding(
+                checkout,
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            )
+            if code != 0 or switched_branch != metadata.default_branch:
+                raise _onboarding_error("checkout_default_branch_invalid")
+            code, switched_sha, _ = _git_onboarding(
+                checkout,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            )
+            if (
+                code != 0
+                or not _ONBOARDING_SHA.fullmatch(switched_sha)
+                or switched_sha.casefold() != local_sha.casefold()
+            ):
+                raise _onboarding_error("checkout_default_branch_invalid")
+            if not _onboarding_checkout_is_clean(checkout):
+                raise _onboarding_error("checkout_dirty")
+            if _target_tree_has_attributes(checkout, "HEAD"):
+                raise _onboarding_error("checkout_materialization_unsafe")
+            head_sha = switched_sha
+        else:
+            _probe_onboarding_ancestry(token, metadata, checkout, head_sha, askpass)
 
         code, shallow, _ = _git_onboarding(checkout, "rev-parse", "--is-shallow-repository")
         if code != 0:
