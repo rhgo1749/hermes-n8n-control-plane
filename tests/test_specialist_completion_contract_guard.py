@@ -16,6 +16,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
+COMPLETION_GUARD = ROOT / "automation/hermes/scripts/kanban-specialist-completion-guard.py"
 CONFIG_HELPER = ROOT / "automation/hermes/scripts/kanban-block-kind-hook-config.py"
 DEPLOYER = ROOT / "automation/hermes/scripts/deploy-intake-edge.sh"
 
@@ -33,13 +34,14 @@ def _run(
     payload: dict[str, Any],
     *,
     env_updates: dict[str, str] | None = None,
+    guard_path: Path = GUARD,
 ) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory(prefix="specialist-contract-guard-") as directory:
         env = os.environ.copy()
         env["KANBAN_SPECIALIST_COMPLETION_GUARD_LOG"] = str(Path(directory) / "guard.log")
         env.update(env_updates or {})
         return subprocess.run(
-            [sys.executable, str(GUARD)],
+            [sys.executable, str(guard_path)],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
@@ -122,7 +124,8 @@ def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_dis
                 "assignee": "kanban-reviewer",
                 "parents": ["t_dev"],
             },
-        }
+        },
+        guard_path=COMPLETION_GUARD,
     )
     assert normal_wait.returncode == 0, (normal_wait.stdout, normal_wait.stderr)
 
@@ -134,7 +137,8 @@ def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_dis
                 "assignee": "kanban-reviewer",
                 "initial_status": "blocked",
             },
-        }
+        },
+        guard_path=COMPLETION_GUARD,
     )
     assert explicit_ops_hold.returncode == 0, (
         explicit_ops_hold.stdout,
@@ -179,7 +183,10 @@ def test_structured_specialist_allows_omitted_and_local_only_contract() -> None:
         }
         if value is not None:
             tool_input["completion_contract"] = value
-        result = _run({"tool_name": "kanban_create", "tool_input": tool_input})
+        result = _run(
+            {"tool_name": "kanban_create", "tool_input": tool_input},
+            guard_path=COMPLETION_GUARD,
+        )
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert result.stdout == ""
 
@@ -232,7 +239,10 @@ def test_terminal_specialist_local_only_or_omitted_contract_is_allowed() -> None
         "hermes kanban create x --assignee kanban-designer",
     )
     for command in commands:
-        result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            guard_path=COMPLETION_GUARD,
+        )
         assert result.returncode == 0, (command, result.stdout, result.stderr)
 
 
@@ -252,7 +262,10 @@ def test_terminal_dependency_wait_without_preblock_and_explicit_ops_hold_are_all
         "hermes kanban create ops --assignee kanban-reviewer --initial-status blocked",
     )
     for command in commands:
-        result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            guard_path=COMPLETION_GUARD,
+        )
         assert result.returncode == 0, (command, result.stdout, result.stderr)
 
 
@@ -423,6 +436,7 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert "kanban-block-kind-guard-core.py" in result.stdout
         assert "kanban-specialist-completion-guard.py" in result.stdout
+        assert "kanban-workspace-binding-guard.py" in result.stdout
         assert "lifecycle-guard matcher=kanban_create (fail_closed=true)" in result.stdout
         assert "shell-hook command path unchanged; no second consent command added" in result.stdout
         assert config.read_text(encoding="utf-8") == original

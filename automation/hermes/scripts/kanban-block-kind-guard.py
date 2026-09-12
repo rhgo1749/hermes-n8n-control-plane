@@ -6,13 +6,13 @@ shell-hook allowlist. Keep that exact command path stable and route both
 lifecycle policies behind it:
 
 * ``kanban_block`` -> the preserved block-kind core guard;
-* ``kanban_create`` -> the specialist completion-contract policy in-process;
-* ``terminal`` -> block-kind core first, then specialist completion policy.
+* ``kanban_create`` -> specialist completion and workspace-binding policies;
+* ``terminal`` -> block-kind core first, then both specialist policies.
 
 Keeping one approved ``pre_tool_call`` command avoids introducing a second
-shell-hook consent boundary during a hotfix. The specialist policy is imported
-in-process so terminal calls spawn at most the one preserved block-kind core
-subprocess.
+shell-hook consent boundary during a hotfix. Both specialist policies are
+imported in-process so terminal calls spawn at most the one preserved
+block-kind core subprocess.
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 BLOCK_KIND_CORE = HERE / "kanban-block-kind-guard-core.py"
 SPECIALIST_COMPLETION_GUARD = HERE / "kanban-specialist-completion-guard.py"
+WORKSPACE_BINDING_GUARD = HERE / "kanban-workspace-binding-guard.py"
 
 
 def _hard_block(message: str) -> int:
@@ -108,6 +109,43 @@ def _run_specialist_policy(payload: dict[str, Any]) -> int:
         )
 
 
+def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
+    try:
+        if not WORKSPACE_BINDING_GUARD.is_file():
+            raise RuntimeError(f"guard dependency missing: {WORKSPACE_BINDING_GUARD.name}")
+        spec = importlib.util.spec_from_file_location(
+            "h4v3_workspace_binding_guard",
+            WORKSPACE_BINDING_GUARD,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"cannot load guard dependency: {WORKSPACE_BINDING_GUARD.name}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        evaluate = getattr(module, "evaluate_payload", None)
+        if not callable(evaluate):
+            raise RuntimeError(
+                f"guard dependency has no evaluate_payload: {WORKSPACE_BINDING_GUARD.name}"
+            )
+        decision = evaluate(payload)
+        if not isinstance(decision, int):
+            raise RuntimeError("workspace-binding guard returned a non-integer decision")
+        return decision
+    except Exception as exc:
+        return _hard_block(
+            f"{WORKSPACE_BINDING_GUARD.name}: {type(exc).__name__}: {exc}"
+        )
+
+
+def _run_specialist_policies(payload: dict[str, Any]) -> int:
+    decision = _run_specialist_policy(payload)
+    if decision != 0:
+        return decision
+    return _run_workspace_binding_policy(payload)
+
+
 def main() -> int:
     raw = sys.stdin.read()
     try:
@@ -123,7 +161,7 @@ def main() -> int:
     if tool_name == "kanban_block":
         return _delegate_block_kind(raw)
     if tool_name == "kanban_create":
-        return _run_specialist_policy(payload)
+        return _run_specialist_policies(payload)
     if tool_name != "terminal":
         return 0
 
@@ -146,7 +184,7 @@ def main() -> int:
         if isinstance(directive, dict) and directive.get("action") == "block":
             sys.stdout.write(stdout)
             return 2
-    return _run_specialist_policy(payload)
+    return _run_specialist_policies(payload)
 
 
 if __name__ == "__main__":
