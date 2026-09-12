@@ -61,11 +61,18 @@ per-repository lock used by onboarding. Refresh is bounded and Git-owned:
 shallow repositories are unshallowed, the GitHub default-branch SHA is fetched
 into the canonical remote-tracking ref, Git itself proves `HEAD` is an ancestor,
 and `git merge --ff-only origin/<default-branch>` advances the checkout. No
-reset, force update, broad cleanup, or overwrite is allowed. Dirty, detached,
+reset, force update, broad cleanup, or overwrite is allowed. Dirty,
 wrong-branch, wrong-origin, diverged/non-fast-forward, and unsafe
 attribute-driven materialization states fail closed without changing the
-canonical checkout. Fetch, unshallow, and fast-forward failures use bounded
-semantic reasons, and the final head/ref/contract/cleanliness gate is rerun.
+canonical checkout. A clean detached HEAD is recoverable only when the local
+`refs/heads/<default-branch>` exists, the detached commit is an ancestor of
+that ref, and an ordinary `git switch <default-branch>` succeeds without
+stealing a branch held by another worktree. Local repository configuration
+that can select filters, merge drivers, URL rewrites, remote helpers, or alternate
+attribute files, and any `$GIT_DIR/info/attributes` file, is rejected before the
+cleanliness check, switch, fetch, or merge. Fetch, unshallow, and fast-forward
+failures use bounded semantic reasons, and the final head/ref/contract/cleanliness
+gate is rerun.
 A later registry or board failure leaves a newly registered checkout in place
 and reports the partial onboarding state for the next idempotent intake.
 
