@@ -78,6 +78,7 @@ Blocked-state read contract:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -4071,7 +4072,7 @@ def _latest_rework_event(
     if row is None:
         return None
     try:
-        payload = json.loads(row["payload"] or "{}")
+        payload = json.loads(_attention_row_value(row, "payload", 0) or "{}")
     except (TypeError, ValueError):
         payload = {}
     if not isinstance(payload, dict):
@@ -4079,8 +4080,8 @@ def _latest_rework_event(
     payload = cast(dict[str, object], payload)
     return (
         payload,
-        int(row["created_at"] or 0),
-        str(row["kind"]),
+        int(_attention_row_value(row, "created_at", 1) or 0),
+        str(_attention_row_value(row, "kind", 2)),
     )
 
 
@@ -5726,6 +5727,8 @@ def _rework_provenance_attention(
 
 _OPERATOR_ATTENTION_REASONS = frozenset({
     "rework_retry_blocked",
+    "rework_attention_label_projection_failed",
+    "rework_retry_label_projection_failed",
     "rework_dispatch_failed",
     "claim_projection_reclaim_failed",
     "workspace_resolve_failed",
@@ -5747,22 +5750,54 @@ _OPERATOR_ATTENTION_MARKERS = (
     "human_validation_required",
     "human review",
 )
+_REWORK_OPERATOR_ATTENTION_REASONS = frozenset({
+    "rework_human_attention",
+    "rework_threshold_exceeded",
+    "rework_retry_blocked",
+    "rework_attention_label_projection_failed",
+    "rework_retry_label_projection_failed",
+    "rework_dispatch_failed",
+    "claim_projection_reclaim_failed",
+    "workspace_resolve_failed",
+    "spawn_failed",
+    "rework_context_failed",
+    "delivery_query_failed",
+    "review_ready_label_projection_failed",
+    "merged_lifecycle_cleanup_failed",
+    "stale_review_ready_normalize_failed",
+    "lifecycle_label_conflict",
+})
+_BOARD_OPERATOR_ATTENTION_REASONS = frozenset({
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
+})
+_ATTENTION_COMPONENT_LIMIT = 96
+_ATTENTION_REF_LIMIT = 384
 
 
 def _operator_attention_reason(entry: Mapping[str, Any]) -> Optional[str]:
     reason = str(entry.get("reason") or "")
-    if reason == "rework_human_attention":
-        return reason
+    if reason in {"rework_human_attention", "rework_human_attention_predicted"}:
+        return "rework_human_attention"
     if reason in _OPERATOR_ATTENTION_REASONS:
         return reason
     block_kind = str(entry.get("block_kind") or "")
-    if block_kind in {"needs_input", "capability"} and str(entry.get("status") or "") == "blocked":
+    if (
+        block_kind in {"needs_input", "capability"}
+        and str(entry.get("status") or "") == "blocked"
+    ):
         return block_kind
     evidence = entry.get("evidence")
     evidence_reason = evidence.get("reason") if isinstance(evidence, Mapping) else ""
     text = " ".join(
         str(value or "")
-        for value in (reason, entry.get("diagnostic"), entry.get("retry_reason"), entry.get("error"), evidence_reason)
+        for value in (
+            reason,
+            entry.get("diagnostic"),
+            entry.get("retry_reason"),
+            entry.get("error"),
+            evidence_reason,
+        )
     ).casefold()
     if any(marker in text for marker in _OPERATOR_ATTENTION_MARKERS):
         return reason or "human_attention_required"
@@ -5778,43 +5813,353 @@ def _operator_attention_reason(entry: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _positive_attention_int(value: object) -> Optional[int]:
+    """Return a positive integer identity component, without coercion drift."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return None
+    parsed = int(value.strip())
+    return parsed if parsed > 0 else None
+
+
+def _attention_component(value: object, *, missing: str = "unknown") -> str:
+    """Encode one bounded identity component for a delimiter-based ref."""
+    if value is None:
+        text = missing
+    elif isinstance(value, int) and not isinstance(value, bool):
+        text = str(value)
+    else:
+        text = str(value).strip() or missing
+    # ``:`` belongs to the attention-key separator and ``|`` to the
+    # incident-ref field separator. Percent-encoding keeps the ref
+    # unambiguous while preserving short, human-readable values.
+    text = (
+        text.replace("%", "%25")
+        .replace(":", "%3A")
+        .replace("|", "%7C")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+    if len(text) <= _ATTENTION_COMPONENT_LIMIT:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{text[:_ATTENTION_COMPONENT_LIMIT - 17]}~{digest}"
+
+
+def _attention_ref(parts: Iterable[object]) -> str:
+    ref = "|".join(_attention_component(part) for part in parts)
+    if len(ref) <= _ATTENTION_REF_LIMIT:
+        return ref
+    digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:16]
+    return f"{ref[:_ATTENTION_REF_LIMIT - 17]}~{digest}"
+
+
+def _entry_pr_number(entry: Mapping[str, Any]) -> Optional[int]:
+    """Find the one canonical PR identity carried by an observer entry."""
+    containers: list[Mapping[str, Any]] = [entry]
+    for key in ("rework", "evidence"):
+        value = entry.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    for container in containers:
+        for key in ("pr_number", "round_pr_number"):
+            value = _positive_attention_int(container.get(key))
+            if value is not None:
+                return value
+        decision_pr_numbers = container.get("decision_pr_numbers")
+        if (
+            isinstance(decision_pr_numbers, (list, tuple))
+            and len(decision_pr_numbers) == 1
+        ):
+            value = _positive_attention_int(decision_pr_numbers[0])
+            if value is not None:
+                return value
+    return None
+
+
+def _entry_rework_round(entry: Mapping[str, Any]) -> Optional[int]:
+    for key in ("rework", "evidence", ""):
+        value = entry if not key else entry.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        round_value = _positive_attention_int(value.get("rework_round"))
+        if round_value is not None:
+            return round_value
+    return None
+
+
+def _entry_request_comment_id(entry: Mapping[str, Any]) -> object:
+    for key in ("rework", "evidence"):
+        value = entry.get(key)
+        if isinstance(value, Mapping) and value.get("request_comment_id") is not None:
+            return value.get("request_comment_id")
+    return None
+
+
+def _attention_row_value(row: Any, name: str, index: int) -> Any:
+    """Read sqlite.Row and tuple rows alike in focused edge tests."""
+    try:
+        return row[name]
+    except (IndexError, KeyError, TypeError):
+        return row[index]
+
+
+def _latest_blocked_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[dict[str, Any], int, int]]:
+    """Return the latest blocked payload, timestamp, and durable row id."""
+    row = conn.execute(
+        "SELECT payload, created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(_attention_row_value(row, "payload", 0) or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return (
+        cast(dict[str, Any], payload),
+        int(_attention_row_value(row, "created_at", 1) or 0),
+        int(_attention_row_value(row, "id", 2)),
+    )
+
+
+def _rework_attention_identity(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+    reason: str,
+) -> Optional[tuple[str, dict[str, Any]]]:
+    latest = _latest_rework_event(conn, str(entry.get("task_id") or ""))
+    event_payload = latest[0] if latest is not None else {}
+    event_created_at = latest[1] if latest is not None else None
+    event_kind = latest[2] if latest is not None else None
+    repository = str(
+        event_payload.get("repository") or entry.get("repository") or ""
+    ).strip()
+    issue_number = _positive_attention_int(
+        event_payload.get("issue_number") or entry.get("issue_number")
+    )
+    pr_number = _positive_attention_int(event_payload.get("pr_number"))
+    if pr_number is None:
+        pr_number = _entry_pr_number(entry)
+    rework_round = _positive_attention_int(event_payload.get("rework_round"))
+    if rework_round is None:
+        rework_round = _entry_rework_round(entry)
+    if (
+        not repository
+        or issue_number is None
+        or pr_number is None
+        or rework_round is None
+    ):
+        return None
+    request_comment_id = event_payload.get("request_comment_id")
+    if request_comment_id is None:
+        request_comment_id = _entry_request_comment_id(entry)
+    incident_ref = _attention_ref(
+        (
+            repository,
+            issue_number,
+            pr_number,
+            rework_round,
+            request_comment_id if request_comment_id is not None else "none",
+        )
+    )
+    provenance: dict[str, Any] = {
+        "source": "rework_round",
+        "repository": repository,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "rework_round": rework_round,
+        "request_comment_id": request_comment_id,
+        "reason": reason,
+        "incident_ref": incident_ref,
+    }
+    if event_kind is not None:
+        provenance["rework_event_kind"] = event_kind
+    if event_created_at is not None:
+        provenance["rework_event_created_at"] = event_created_at
+    return incident_ref, provenance
+
+
+def _blocked_attention_identity(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+    reason: str,
+) -> Optional[tuple[str, dict[str, Any]]]:
+    latest = _latest_blocked_event(conn, str(entry.get("task_id") or ""))
+    if latest is None:
+        return None
+    event_payload, created_at, blocked_event_id = latest
+    payload_kind = event_payload.get("kind")
+    payload_reason = event_payload.get("reason")
+    block_kind = str(entry.get("block_kind") or "untyped")
+    incident_ref = _attention_ref(
+        (
+            block_kind,
+            payload_kind if payload_kind is not None else "untyped",
+            payload_reason if payload_reason is not None else "unknown",
+            created_at,
+            blocked_event_id,
+        )
+    )
+    provenance = {
+        "source": "blocked_event",
+        "blocked_event_id": blocked_event_id,
+        "blocked_event_kind": payload_kind,
+        "blocked_event_reason": payload_reason,
+        "blocked_event_created_at": created_at,
+        "block_kind": block_kind,
+        "reason": reason,
+        "incident_ref": incident_ref,
+    }
+    return incident_ref, provenance
+
+
+def _operator_attention_payload(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    reason = _operator_attention_reason(entry)
+    task_id = str(entry.get("task_id") or "")
+    repository = str(entry.get("repository") or "")
+    issue_number = _positive_attention_int(entry.get("issue_number"))
+    board = str(entry.get("board") or "").strip()
+    if reason is None:
+        return None
+
+    def _payload(
+        incident_ref: Optional[str],
+        provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        attention_key = (
+            f"{reason}:{incident_ref}" if incident_ref is not None else reason
+        )
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "attention_key": attention_key,
+            "repository": repository or None,
+            "issue_number": issue_number,
+            "previous_status": entry.get("from_state"),
+            "new_status": entry.get("to_state") or entry.get("status"),
+            "source": "github_edge_operator_attention",
+            "incident_provenance": provenance,
+        }
+        if incident_ref is None:
+            # Do not invent identity from a PR number or task-event cursor.
+            # Board-global lock failures remain visible but unresolved.
+            payload["incident_unresolved"] = True
+        return payload
+
+    if reason in _BOARD_OPERATOR_ATTENTION_REASONS:
+        if not board:
+            return None
+        # Dispatch-lock failures describe the board admission boundary, not
+        # the task/PR that happened to be in the pending batch.  Keep that
+        # scope explicit even when a caller decorates the result with task
+        # context; a PR number is not a governing lock generation.
+        payload = _payload(None, {
+            "source": "board_context",
+            "board": board,
+            "reason": reason,
+            "incident_ref": None,
+        })
+        payload["repository"] = None
+        payload["issue_number"] = None
+        return payload
+
+    if not task_id:
+        return None
+    if not repository or issue_number is None:
+        return None
+
+    identity: Optional[tuple[str, dict[str, Any]]] = None
+    if reason in _REWORK_OPERATOR_ATTENTION_REASONS:
+        identity = _rework_attention_identity(conn, entry, reason)
+    if identity is None and reason in {"needs_input", "capability"}:
+        identity = _blocked_attention_identity(conn, entry, reason)
+    if identity is None:
+        # PR context alone is not a resolved identity for rework-family
+        # reasons; retain it as provenance while remaining fail-open.
+        pr_number = _entry_pr_number(entry)
+        if reason in _REWORK_OPERATOR_ATTENTION_REASONS:
+            incident_ref = None
+        elif pr_number is not None:
+            incident_ref = _attention_ref((pr_number,))
+        else:
+            incident_ref = None
+        provenance: dict[str, Any] = {
+            "source": "entry_context",
+            "pr_number": pr_number,
+            "reason": reason,
+            "incident_ref": incident_ref,
+        }
+    else:
+        incident_ref, provenance = identity
+    return _payload(incident_ref, provenance)
+
+
+def _attach_operator_attention(
+    entry: dict[str, Any],
+    payload: Mapping[str, Any],
+) -> None:
+    entry["operator_attention"] = {
+        "reason": payload["reason"],
+        "attention_key": payload["attention_key"],
+        "incident_provenance": payload["incident_provenance"],
+    }
+    if payload.get("incident_unresolved"):
+        entry["operator_attention"]["incident_unresolved"] = True
+
+
 def _record_operator_attention(
     conn: sqlite3.Connection,
     entry: dict[str, Any],
 ) -> bool:
     """Record one deduped operator-attention event in existing task_events."""
-    reason = _operator_attention_reason(entry)
     task_id = str(entry.get("task_id") or "")
-    repository = str(entry.get("repository") or "")
-    issue_number = entry.get("issue_number")
-    if reason is None or not task_id or not repository or not issue_number:
+    payload = _operator_attention_payload(conn, entry)
+    if payload is None:
         return False
-    # Exclude prior operator-attention rows from the cursor. A new ordinary
-    # lifecycle event therefore permits a later recurrence, while an unchanged
-    # incident remains quiet on every five-minute tick.
-    cursor_row = conn.execute(
-        "SELECT COALESCE(MAX(id), 0) FROM task_events "
-        "WHERE task_id = ? AND kind != 'github_operator_attention'",
-        (task_id,),
-    ).fetchone()
-    cursor = int(cursor_row[0] or 0)
-    key = f"{reason}:{cursor}"
-    existing = conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'github_operator_attention' "
-        "AND payload LIKE ? LIMIT 1",
+    _attach_operator_attention(entry, payload)
+    if (
+        not task_id
+        or payload["incident_provenance"].get("source") == "board_context"
+    ):
+        # Board-global attention has no task row to own a durable event. Keep
+        # the explicit unresolved observer identity for Telegram delivery.
+        return False
+    key = str(payload["attention_key"])
+    # Keep the task-scoped LIKE lookup for compatibility with existing SQLite
+    # deployments, then require an exact decoded JSON key. The post-filter
+    # prevents a legacy ``reason:<cursor>`` row from suppressing a semantic
+    # key that merely contains the same reason prefix.
+    existing_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'github_operator_attention' AND payload LIKE ?",
         (task_id, f"%attention_key%{key}%"),
-    ).fetchone()
-    if existing is not None:
-        return False
-    payload = {
-        "reason": reason,
-        "attention_key": key,
-        "repository": repository,
-        "issue_number": int(issue_number),
-        "previous_status": entry.get("from_state"),
-        "new_status": entry.get("to_state") or entry.get("status"),
-        "source": "github_edge_operator_attention",
-    }
+    ).fetchall()
+    for existing_row in existing_rows:
+        try:
+            existing_payload = json.loads(
+                _attention_row_value(existing_row, "payload", 0) or "{}"
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(existing_payload, dict)
+            and existing_payload.get("attention_key") == key
+            and isinstance(existing_payload.get("incident_provenance"), Mapping)
+        ):
+            return False
     with conn:
         _append_sync_event(conn, task_id, payload, kind="github_operator_attention")
     return True
@@ -8367,11 +8712,21 @@ def sync_board(
         attention_reason = _operator_attention_reason(entry)
         if attention_reason is not None:
             if dry_run:
-                entry["operator_attention_predicted"] = {
-                    "reason": attention_reason,
-                }
-            elif _record_operator_attention(conn, entry):
-                entry["operator_attention"] = {"reason": attention_reason}
+                attention_payload = _operator_attention_payload(conn, entry)
+                if attention_payload is not None:
+                    entry["operator_attention_predicted"] = {
+                        "reason": attention_payload["reason"],
+                        "attention_key": attention_payload["attention_key"],
+                        "incident_provenance": attention_payload["incident_provenance"],
+                    }
+                    if attention_payload.get(
+                        "incident_unresolved"
+                    ):
+                        entry["operator_attention_predicted"][
+                            "incident_unresolved"
+                        ] = True
+            else:
+                _record_operator_attention(conn, entry)
         return entry
 
     with kanban_db_connect.connect_closing(board=board) as conn:
@@ -8896,6 +9251,7 @@ def sync_board(
                     "task_id": None, "status": None, "changed": False,
                     "reason": "rework_dispatch_failed",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "board": board,
                 }]
             # Structured-result extension (intake Telegram observer): a
             # spawned rework worker is a READY -> RUNNING transition; every
@@ -8903,7 +9259,11 @@ def sync_board(
             # number attached via the task body ref.
             for entry in dispatch_entries:
                 entry = cast(dict[str, Any], entry)
+                entry.setdefault("board", board)
                 if not entry.get("task_id"):
+                    attention_payload = _operator_attention_payload(conn, entry)
+                    if attention_payload is not None:
+                        _attach_operator_attention(entry, attention_payload)
                     continue
                 if entry.get("changed") and entry.get("status") == "running":
                     entry["from_state"] = "ready"
@@ -8918,6 +9278,7 @@ def sync_board(
                             entry["repository"] = dref.repository
                             entry["issue_number"] = dref.issue_number
                             entry["issue_title"] = dref.issue_title
+                _record_operator_attention(conn, entry)
             results.extend(dispatch_entries)
         # Surface the self-healing pass first so operators see what was
         # repaired (real runs) or predicted (dry-run) ahead of any

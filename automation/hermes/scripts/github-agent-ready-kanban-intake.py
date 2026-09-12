@@ -3327,6 +3327,10 @@ _HUMAN_ATTENTION_REASONS = frozenset({
     "dispatch_lock_failed",
     "dispatch_lock_unavailable",
 })
+_BOARD_GLOBAL_ATTENTION_REASONS = frozenset({
+    "dispatch_lock_failed",
+    "dispatch_lock_unavailable",
+})
 _HUMAN_ATTENTION_TEXT_MARKERS = (
     "needs_input",
     "needs maintainer",
@@ -3336,6 +3340,16 @@ _HUMAN_ATTENTION_TEXT_MARKERS = (
     "human_validation_required",
 )
 _REWORK_ATTENTION_THRESHOLD = 3
+
+
+@dataclass(frozen=True)
+class _TelegramNotification:
+    """Rendered observer line plus structured identity/scope metadata."""
+
+    line: str
+    attention_key: str | None
+    unresolved: bool
+    scope: str | None = None
 
 
 def _telegram_config() -> tuple[str, str] | None:
@@ -3393,22 +3407,90 @@ def _truncate_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
-def _attention_notification_line(
+def _entry_attention_key(entry: dict[str, Any]) -> str | None:
+    """Return the edge's semantic identity for notification dedupe."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if isinstance(value, dict) and value.get("attention_key"):
+            return str(value["attention_key"])
+    return None
+
+
+def _entry_attention_unresolved(entry: dict[str, Any]) -> bool:
+    """Return whether the producer marked this attention identity unresolved."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if isinstance(value, dict) and value.get("incident_unresolved") is True:
+            return True
+    return False
+
+
+def _board_global_attention_board(entry: dict[str, Any]) -> str | None:
+    """Return a verified board scope for an unresolved board-level alert."""
+    for field in ("operator_attention", "operator_attention_predicted"):
+        value = entry.get(field)
+        if not isinstance(value, dict):
+            continue
+        reason = str(value.get("reason") or "")
+        provenance = value.get("incident_provenance")
+        if (
+            reason in _BOARD_GLOBAL_ATTENTION_REASONS
+            and value.get("incident_unresolved") is True
+            and isinstance(provenance, dict)
+            and provenance.get("source") == "board_context"
+        ):
+            board = str(provenance.get("board") or entry.get("board") or "").strip()
+            if board:
+                return board
+    return None
+
+
+def _attention_notification(
     board: str,
     short_name: str,
-    issue_number: int,
+    issue_number: int | None,
     entry: dict[str, Any],
-) -> str:
+) -> _TelegramNotification:
     reason = _entry_attention_reason(entry) or "human_attention_required"
-    line = f"⚠️ [{board}] {short_name} #{issue_number} · 확인 필요"
+    reason = _escape_telegram_marker_decoys(reason)
+    subject = f"#{issue_number}" if issue_number is not None else "board"
+    line = f"⚠️ [{board}] {short_name} {subject} · 확인 필요"
     pr_number = _entry_pr_number(entry)
     if pr_number is not None:
         line += f" (PR #{pr_number})"
     line += f" — {reason}"
     title = str(entry.get("issue_title") or "").strip()
     if title:
-        line += f" — {_truncate_title(title)}"
-    return line
+        line += f" — {_escape_telegram_marker_decoys(_truncate_title(title))}"
+    attention_key = _entry_attention_key(entry)
+    unresolved = _entry_attention_unresolved(entry)
+    if attention_key is not None:
+        # Keep the exact edge identity at the end of the delivered body so
+        # title/reason punctuation cannot make extraction ambiguous.
+        if unresolved:
+            line += " · incident_unresolved=true"
+        line += f" · incident={attention_key}"
+    return _TelegramNotification(
+        line=line,
+        attention_key=attention_key,
+        unresolved=unresolved,
+        scope=_board_global_attention_board(entry),
+    )
+
+
+def _attention_notification_line(
+    board: str,
+    short_name: str,
+    issue_number: int | None,
+    entry: dict[str, Any],
+) -> str:
+    """Render one notification line, preserving the legacy string helper."""
+    return _attention_notification(board, short_name, issue_number, entry).line
+
+
+def _escape_telegram_marker_decoys(text: str) -> str:
+    """Keep display text from imitating the canonical unresolved suffix."""
+    return text.replace(_TELEGRAM_INCIDENT_UNRESOLVED_MARKER, " [incident_unresolved=true]")
 
 
 def _entry_pr_number(entry: dict[str, Any]) -> int | None:
@@ -3470,10 +3552,13 @@ def _entry_attention_reason(entry: dict[str, Any]) -> str | None:
 
 def _should_notify_entry(entry: dict[str, Any]) -> bool:
     """Apply the suppress/send policy to one sync result."""
+    attention_reason = _entry_attention_reason(entry)
+    if attention_reason is not None:
+        if attention_reason in _BOARD_GLOBAL_ATTENTION_REASONS:
+            return _board_global_attention_board(entry) is not None
+        return bool(entry.get("repository") and entry.get("issue_number"))
     if not entry.get("repository") or not entry.get("issue_number"):
         return False
-    if _entry_attention_reason(entry) is not None:
-        return True
     if not entry.get("changed"):
         return False
     transition = (str(entry.get("from_state") or ""), str(entry.get("to_state") or ""))
@@ -3482,18 +3567,287 @@ def _should_notify_entry(entry: dict[str, Any]) -> bool:
     return transition not in _SUPPRESSED_TRANSITIONS and False
 
 
+def _notification_context(
+    entry: dict[str, Any],
+    configs: tuple[RepositoryConfig, ...],
+) -> tuple[str, str, int | None]:
+    """Resolve display identity for repository and board-global alerts."""
+    board_context = _board_global_attention_board(entry)
+    if board_context is not None:
+        short_name = board_context.rsplit("/", 1)[-1].replace("-", " ").title()
+        return board_context, short_name, None
+    repository = str(entry.get("repository") or "").strip()
+    board = str(entry.get("board") or "").strip()
+    if repository:
+        board = board or _board_for_repository(repository, configs)
+        short_name = _board_display_name(board, repository, configs)
+    else:
+        board = board or "unknown-board"
+        short_name = board.rsplit("/", 1)[-1].replace("-", " ").title()
+    raw_issue = entry.get("issue_number")
+    if isinstance(raw_issue, bool):
+        issue_number = None
+    elif isinstance(raw_issue, int):
+        issue_number = raw_issue if raw_issue > 0 else None
+    elif isinstance(raw_issue, str) and raw_issue.strip().isdigit():
+        parsed = int(raw_issue.strip())
+        issue_number = parsed if parsed > 0 else None
+    else:
+        issue_number = None
+    return board, short_name, issue_number
+
+
 def _telegram_dedup_state_path() -> Path:
-    """State file for full-body delivery dedup (observer layer only).
+    """State file for semantic delivery dedup (observer layer only).
 
     This is NOT a reconciliation correctness cache: GitHub issue identity
     and the Kanban idempotency key remain the only correctness boundary.
-    The file records the last delivered notification body so an unchanged
-    attention set stops re-alerting on every five-minute cron tick.
+    The file records delivered ``attention_key`` generations so an active
+    attention set can grow or change its display text without re-delivering
+    already-seen incidents.
     """
     return _hermes_home() / "state" / "kanban-intake-last-sent.txt"
 
 
-def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
+_TELEGRAM_DEDUP_STATE_VERSION = 4
+_TELEGRAM_PREVIOUS_DEDUP_STATE_VERSION = 3
+_TELEGRAM_LEGACY_DEDUP_STATE_VERSION = 2
+_TELEGRAM_UNSCOPED_SCOPE = ""
+_TELEGRAM_INCIDENT_MARKER = " · incident="
+_TELEGRAM_INCIDENT_UNRESOLVED_MARKER = " · incident_unresolved=true"
+
+
+def _telegram_attention_key(line: str) -> str | None:
+    """Extract the edge-provided semantic key from one notification line."""
+    # Display/reason text is not escaped and may contain the same marker. The
+    # canonical marker is appended last by _attention_notification_line().
+    marker_at = line.rfind(_TELEGRAM_INCIDENT_MARKER)
+    if marker_at < 0:
+        return None
+    key = line[marker_at + len(_TELEGRAM_INCIDENT_MARKER):].strip()
+    return key or None
+
+
+def _telegram_attention_is_unresolved(line: str) -> bool:
+    """Read the canonical unresolved flag immediately before the key suffix."""
+    marker_at = line.rfind(_TELEGRAM_INCIDENT_MARKER)
+    if marker_at < 0:
+        return False
+    return line[:marker_at].endswith(_TELEGRAM_INCIDENT_UNRESOLVED_MARKER)
+
+
+def _parse_telegram_dedup_key_list(
+    raw_keys: Any,
+    field_name: str,
+) -> set[str] | None:
+    """Validate one persisted semantic-key list without partial recovery."""
+    if not isinstance(raw_keys, list):
+        print(
+            f"kanban-intake: invalid dedup state {field_name} (warning only)",
+            file=sys.stderr,
+        )
+        return None
+    parsed: set[str] = set()
+    for value in raw_keys:
+        if not isinstance(value, str) or not value.strip():
+            print(
+                f"kanban-intake: invalid dedup state {field_name} "
+                "entry (warning only)",
+                file=sys.stderr,
+            )
+            return None
+        parsed.add(value.strip())
+    return parsed
+
+
+def _parse_telegram_dedup_scope_map(
+    raw_scopes: Any,
+) -> dict[str, set[str]] | None:
+    """Validate scoped unresolved state without partial recovery."""
+    if not isinstance(raw_scopes, dict):
+        print(
+            "kanban-intake: invalid dedup state active_unresolved_by_scope "
+            "(warning only)",
+            file=sys.stderr,
+        )
+        return None
+    parsed: dict[str, set[str]] = {}
+    for scope, raw_keys in raw_scopes.items():
+        if not isinstance(scope, str):
+            print(
+                "kanban-intake: invalid dedup state scope (warning only)",
+                file=sys.stderr,
+            )
+            return None
+        keys = _parse_telegram_dedup_key_list(
+            raw_keys,
+            f"active_unresolved_by_scope[{scope!r}]",
+        )
+        if keys is None:
+            return None
+        if keys:
+            parsed[scope] = keys
+    return parsed
+
+
+def _read_telegram_dedup_state(
+    state_path: Path,
+) -> tuple[set[str], dict[str, set[str]]]:
+    """Read resolved history and scoped unresolved snapshots.
+
+    Version 4 stores unresolved keys by canonical observer scope. Version 3
+    stored one unscoped list, which is deliberately discarded during migration
+    so it cannot suppress a newly scoped board incident. Legacy, malformed, and
+    unreadable state fails open so an observer problem cannot suppress a
+    notification.
+    """
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set(), {}
+    except (OSError, UnicodeError) as exc:
+        print(
+            "kanban-intake: dedup state unreadable "
+            f"(warning only): {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return set(), {}
+    try:
+        state = json.loads(raw)
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        # The pre-semantic state file contained a full body. It cannot safely
+        # identify generations, so migrate by sending and overwriting it after
+        # a successful keyed delivery.
+        print(
+            "kanban-intake: legacy or invalid dedup state "
+            f"(warning only): {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return set(), {}
+    if not isinstance(state, dict):
+        print(
+            "kanban-intake: unsupported dedup state version (warning only)",
+            file=sys.stderr,
+        )
+        return set(), {}
+    version = state.get("version")
+    if version == _TELEGRAM_LEGACY_DEDUP_STATE_VERSION:
+        active_unresolved_by_scope: dict[str, set[str]] = {}
+    elif version == _TELEGRAM_PREVIOUS_DEDUP_STATE_VERSION:
+        # Validate the old shape, but do not reuse its global active snapshot:
+        # a reason-only key has no authority to suppress a scoped incident.
+        legacy_active_keys = _parse_telegram_dedup_key_list(
+            state.get("active_unresolved_keys"),
+            "active_unresolved_keys",
+        )
+        if legacy_active_keys is None:
+            return set(), {}
+        active_unresolved_by_scope = {}
+    elif version == _TELEGRAM_DEDUP_STATE_VERSION:
+        parsed_scopes = _parse_telegram_dedup_scope_map(
+            state.get("active_unresolved_by_scope")
+        )
+        if parsed_scopes is None:
+            return set(), {}
+        active_unresolved_by_scope = parsed_scopes
+    else:
+        print(
+            "kanban-intake: unsupported dedup state version (warning only)",
+            file=sys.stderr,
+        )
+        return set(), {}
+    delivered_keys = _parse_telegram_dedup_key_list(
+        state.get("attention_keys"),
+        "attention_keys",
+    )
+    if delivered_keys is None:
+        return set(), {}
+    return delivered_keys, active_unresolved_by_scope
+
+
+def _read_telegram_dedup_keys(state_path: Path) -> set[str]:
+    """Read only the persistent resolved-generation history."""
+    delivered_keys, _ = _read_telegram_dedup_state(state_path)
+    return delivered_keys
+
+
+def _write_telegram_dedup_state(
+    state_path: Path,
+    attention_keys: set[str],
+    active_unresolved_by_scope: dict[str, set[str]],
+) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_path.with_name(state_path.name + ".tmp")
+    payload = {
+        "active_unresolved_by_scope": {
+            scope: sorted(keys)
+            for scope, keys in sorted(active_unresolved_by_scope.items())
+            if keys
+        },
+        "attention_keys": sorted(attention_keys),
+        "version": _TELEGRAM_DEDUP_STATE_VERSION,
+    }
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, state_path)
+
+
+def _write_telegram_dedup_keys(state_path: Path, keys: set[str]) -> None:
+    _, active_unresolved_by_scope = _read_telegram_dedup_state(state_path)
+    _write_telegram_dedup_state(state_path, keys, active_unresolved_by_scope)
+
+
+def _coerce_telegram_notification(
+    value: str | _TelegramNotification,
+) -> _TelegramNotification:
+    if isinstance(value, _TelegramNotification):
+        return value
+    return _TelegramNotification(
+        line=value,
+        attention_key=_telegram_attention_key(value),
+        unresolved=_telegram_attention_is_unresolved(value),
+    )
+
+
+def _telegram_observed_scopes(
+    notifications: list[_TelegramNotification],
+    observed_scopes: Iterable[str] | None,
+) -> set[str]:
+    """Return scopes whose successful observation may replace active state."""
+    if observed_scopes is None:
+        scopes = {
+            notification.scope
+            for notification in notifications
+            if notification.unresolved and notification.scope is not None
+        }
+        replacement_scopes = {scope for scope in scopes if scope}
+        if not replacement_scopes:
+            replacement_scopes = {_TELEGRAM_UNSCOPED_SCOPE}
+    else:
+        replacement_scopes = {
+            str(scope).strip()
+            for scope in observed_scopes
+            if str(scope).strip()
+        }
+    # An unresolved entry without canonical board provenance remains fail-open
+    # and owns only the explicit unscoped bucket; it is never treated as a
+    # board key by display-name inference.
+    if any(
+        notification.unresolved and not notification.scope
+        for notification in notifications
+    ):
+        replacement_scopes.add(_TELEGRAM_UNSCOPED_SCOPE)
+    return replacement_scopes
+
+
+def _send_telegram_batch(
+    lines: Iterable[str | _TelegramNotification],
+    cfg: tuple[str, str],
+    *,
+    observed_scopes: Iterable[str] | None = None,
+) -> str | bool:
     """Send one batch through the existing Hermes messaging path.
 
     The intake does not implement Telegram HTTP, credentials, retries, or
@@ -3501,30 +3855,105 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
     installed Hermes platform/Gateway configuration.  Delivery is an observer
     side effect: a failure warns but never rolls back reconciliation.
 
-    Full-body dedup: when the assembled notification text exactly matches
-    the previously delivered body, the batch is skipped so an unchanged
-    attention set does not re-alert every tick.  State read failures fail
-    open (send); state write failures warn but never fail the send.
+    Resolved generations use persistent ``attention_keys``. Unresolved
+    generations use replace-on-observed-scope ``active_unresolved_by_scope``
+    snapshots so a recurring board-level diagnostic can alert again after it
+    disappears without clearing another board's active incident.
+    ``observed_scopes`` is supplied by the repository/event reconciliation
+    owner; omitted scopes are intentionally preserved.
+    Lines without a key fail open and are sent without being persisted. State
+    read failures fail open (send); state write failures warn but never fail
+    the send.
 
     Returns ``"sent"`` when the batch was delivered, ``"skipped"`` when
     the dedup suppressed a duplicate, and ``False`` on any delivery failure.
     """
     chat_id, thread_id = cfg
-    text = "🤖 Hermes Kanban\n\n" + "\n".join(lines)
     state_path = _telegram_dedup_state_path()
-    try:
-        if state_path.is_file() and state_path.read_text(encoding="utf-8") == text:
+    notifications = [_coerce_telegram_notification(line) for line in lines]
+    replacement_scopes = _telegram_observed_scopes(
+        notifications,
+        observed_scopes,
+    )
+    delivered_keys, active_unresolved_by_scope = _read_telegram_dedup_state(
+        state_path
+    )
+    selected_lines: list[str] = []
+    selected_tokens: set[tuple[str, str, str]] = set()
+    selected_resolved_keys: set[str] = set()
+    current_unresolved_by_scope: dict[str, set[str]] = {}
+    for notification in notifications:
+        key = notification.attention_key
+        if key is None:
+            # A missing semantic identity is an upstream evidence problem;
+            # observer delivery remains fail-open rather than guessing a key.
+            selected_lines.append(notification.line)
+            continue
+        unresolved = notification.unresolved
+        if unresolved:
+            scope = notification.scope or _TELEGRAM_UNSCOPED_SCOPE
+            current_unresolved_by_scope.setdefault(scope, set()).add(key)
+            selection_token = ("unresolved", scope, key)
+        else:
+            scope = ""
+            selection_token = ("resolved", scope, key)
+        if selection_token in selected_tokens:
+            continue
+        if unresolved:
+            if key in active_unresolved_by_scope.get(scope, set()):
+                continue
+        elif key in delivered_keys:
+            continue
+        selected_lines.append(notification.line)
+        selected_tokens.add(selection_token)
+        if not unresolved:
+            selected_resolved_keys.add(key)
+
+    def persist_observer_state() -> None:
+        # An unresolved identity must never become a permanent delivered key,
+        # including when it came from a legacy v2 state file.
+        current_unresolved_keys = {
+            key
+            for keys in current_unresolved_by_scope.values()
+            for key in keys
+        }
+        next_delivered_keys = (
+            delivered_keys | selected_resolved_keys
+        ) - current_unresolved_keys
+        next_active_by_scope = {
+            scope: set(keys)
+            for scope, keys in active_unresolved_by_scope.items()
+        }
+        for scope in replacement_scopes:
+            current_keys = current_unresolved_by_scope.get(scope, set())
+            if current_keys:
+                next_active_by_scope[scope] = set(current_keys)
+            else:
+                next_active_by_scope.pop(scope, None)
+        try:
+            _write_telegram_dedup_state(
+                state_path,
+                next_delivered_keys,
+                next_active_by_scope,
+            )
+        except OSError as exc:
             print(
-                "kanban-intake: identical notification body already sent; skipping",
+                "kanban-intake: dedup state write failed "
+                f"(warning only): {type(exc).__name__}",
                 file=sys.stderr,
             )
-            return "skipped"
-    except OSError as exc:
+
+    if not selected_lines:
+        # This includes an empty configured tick and a fully deduped batch.
+        # Both update only the unresolved activity snapshot and never invoke
+        # the Hermes sender.
+        persist_observer_state()
         print(
-            "kanban-intake: dedup state unreadable "
-            f"(warning only): {type(exc).__name__}",
+            "kanban-intake: semantic notification generations already sent; skipping",
             file=sys.stderr,
         )
+        return "skipped"
+    text = "🤖 Hermes Kanban\n\n" + "\n".join(selected_lines)
     target = f"telegram:{chat_id}"
     if thread_id:
         target += f":{thread_id}"
@@ -3541,17 +3970,7 @@ def _send_telegram_batch(lines: list[str], cfg: tuple[str, str]) -> str | bool:
             check=False,
         )
         if proc.returncode == 0:
-            try:
-                state_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = state_path.with_name(state_path.name + ".tmp")
-                tmp_path.write_text(text, encoding="utf-8")
-                os.replace(tmp_path, state_path)
-            except OSError as exc:
-                print(
-                    "kanban-intake: dedup state write failed "
-                    f"(warning only): {type(exc).__name__}",
-                    file=sys.stderr,
-                )
+            persist_observer_state()
             return "sent"
         print(
             f"kanban-intake: Hermes send skipped (warning only): exit={proc.returncode}",
@@ -4160,6 +4579,8 @@ def _run_once(args: argparse.Namespace) -> int:
     imported_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     results: list[dict[str, Any]] = []
     notification_lines: list[str] = []
+    notification_records: list[_TelegramNotification] = []
+    observed_notification_scopes: set[str] = set()
     def process_candidate(config: RepositoryConfig, issue: dict[str, Any]) -> None:
         snapshot = snapshots[config.name]
         key = _idempotency_key(config.name, issue["number"])
@@ -4234,6 +4655,7 @@ def _run_once(args: argparse.Namespace) -> int:
                 sync_results.extend(
                     _sync_board(config, token, dry_run=bool(args.dry_run))
                 )
+                observed_notification_scopes.add(config.board)
             except IntakeError as exc:
                 if not repository_isolation:
                     raise
@@ -4265,41 +4687,43 @@ def _run_once(args: argparse.Namespace) -> int:
         for entry in sync_results:
             if not _should_notify_entry(entry):
                 continue
-            board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_display_name(
-                board, str(entry["repository"]), selected_configs
+            board, short_name, issue_number = _notification_context(
+                entry, selected_configs
             )
             predicted.append(
-                _attention_notification_line(
+                _attention_notification(
                     board,
                     short_name,
-                    int(entry["issue_number"]),
+                    issue_number,
                     entry,
-                )
+                ).line
             )
     else:
         for entry in sync_results:
             if not _should_notify_entry(entry):
                 continue
-            board = _board_for_repository(str(entry["repository"]), selected_configs)
-            short_name = _board_display_name(
-                board, str(entry["repository"]), selected_configs
+            board, short_name, issue_number = _notification_context(
+                entry, selected_configs
             )
-            notification_lines.append(
-                _attention_notification_line(
-                    board,
-                    short_name,
-                    int(entry["issue_number"]),
-                    entry,
-                )
+            notification = _attention_notification(
+                board,
+                short_name,
+                issue_number,
+                entry,
             )
+            notification_records.append(notification)
+            notification_lines.append(notification.line)
         # Telegram is a side-effect observer: a send failure is a warning
         # only and never fails or rolls back the reconciliation.  Without
         # a configured bot/chat nothing is sent.  ``telegram_sent`` is true
         # ONLY for an actual delivery; a dedup-skipped duplicate reports
         # ``telegram_skipped=true`` instead of masquerading as a send.
-        if notification_lines and telegram_cfg:
-            result = _send_telegram_batch(notification_lines, telegram_cfg)
+        if telegram_cfg:
+            result = _send_telegram_batch(
+                notification_records,
+                telegram_cfg,
+                observed_scopes=observed_notification_scopes,
+            )
             if result == "sent":
                 telegram_sent = True
             elif result == "skipped":
