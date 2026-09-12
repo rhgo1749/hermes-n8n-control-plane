@@ -363,4 +363,4 @@ fi
 echo "Published managed GitHub PR edge-sync workflow with runtime credential binding."
 echo "n8n is healthy and the safe unsupported-action production canary passed."
 echo "Live signed GitHub delivery/redelivery remains the host-runtime evidence gate."
-echo "The preserved Hermes job default:bf431b2a6ba6 was not modified."
+echo "The direct-actuator intake boundary was not modified by this workflow import."

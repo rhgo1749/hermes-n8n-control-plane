@@ -34,7 +34,8 @@ GitHub repository event
           |
           +-- Issue/intake event
           |       -> lease-controller
-          |       -> existing Hermes intake job
+          |       -> fixed intake actuator :5682
+          |       -> deployed Hermes intake script
           |
           +-- PR merge / trusted rework
                   -> private n8n Webhook
@@ -96,11 +97,12 @@ signed GitHub event
   -> github-router
   -> repository-scoped durable wake
   -> lease-controller
-  -> existing Hermes intake job
+  -> fixed intake actuator :5682
+  -> deployed Hermes intake script
   -> repository / board / idempotency revalidation
 ```
 
-The existing Hermes job remains the durable execution primitive. This repository does not recreate or replace it as part of the n8n/event integration.
+The lease-controller serializes intake wakes and invokes the fixed loopback actuator. The legacy Hermes cron intake job is not required in the current runtime topology.
 
 ### PR merge / rework
 
@@ -147,7 +149,7 @@ See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for the actual host deployment an
 | Path | Purpose |
 | --- | --- |
 | `automation/n8n/github-router/` | Signed GitHub event ingress and bounded routing |
-| `automation/n8n/lease-controller/` | Existing Hermes intake-job wake/lease guard |
+| `automation/n8n/lease-controller/` | Direct-actuator intake wake/lease guard |
 | `automation/n8n/workflows/github-pr-edge-sync.json` | Private PR lifecycle Webhook → fixed actuator workflow |
 | `automation/n8n/scripts/` | Registry, deployment, workflow import and validation helpers |
 | `automation/hermes/scripts/` | Hermes-side intake/edge deployment and integration helpers |

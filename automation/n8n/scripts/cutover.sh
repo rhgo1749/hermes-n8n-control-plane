@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Historical one-job cutover/rollback utility. It pauses the preserved Hermes
-# intake job only after the event-driven router path has been independently
-# verified. It never creates or activates an n8n Schedule Trigger workflow.
+# Historical one-job cutover/rollback utility retained for legacy migration
+# snapshots only. Current direct-actuator hosts do not require the retired
+# Hermes intake job and must not use this as a normal recovery path. It never
+# creates or activates an n8n Schedule Trigger workflow.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,11 +36,10 @@ Usage:
   cutover.sh --confirm-n8n-verified [--hermes-home PATH] [--hermes-bin PATH] [--n8n-port PORT]
   cutover.sh rollback --confirm-n8n-workflows-deactivated [--hermes-home PATH] [--hermes-bin PATH] [--n8n-port PORT]
 
-`--confirm-n8n-verified` is a legacy compatibility flag. In the current
-async-only topology it means the signed GitHub event path has already been
-verified end-to-end: github-router -> lease-controller -> existing Hermes job
-`default:bf431b2a6ba6`, the intake reached last_status=ok, and the latest lease
-returned that same job to paused state.
+`--confirm-n8n-verified` is a legacy compatibility flag for a pre-direct-actuator
+snapshot. It means that historical signed GitHub path was verified end-to-end
+through `default:bf431b2a6ba6` before that job was retired. Do not use this
+utility to recreate the job on a current direct-actuator host.
 
 This script never creates or activates an n8n Schedule Trigger. If an old
 persisted n8n intake Schedule workflow exists, keep it inactive (or delete that

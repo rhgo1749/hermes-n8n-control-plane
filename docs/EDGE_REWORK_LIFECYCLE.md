@@ -610,10 +610,11 @@ original positive convergence path.
 
 ## Deployment (host)
 
-The authoritative intake job remains Hermes job `default:bf431b2a6ba6`, but
-after PR #35 it is kept paused between **event-driven / async-only** wakes;
-n8n no longer owns a five-minute polling schedule for GitHub intake. The
-canonical reconciliation source remains `edge/kanban-github-sync.py`.
+Issue intake now executes through the lease-controller and fixed loopback
+direct actuator (`:5682`); the legacy Hermes intake cron job was retired after
+the direct-actuator cutover and live canary. n8n still does not own a polling
+schedule for GitHub intake. The canonical reconciliation source remains
+`edge/kanban-github-sync.py`.
 
 Deploy through `automation/hermes/scripts/deploy-intake-edge.sh`. The deploy
 script installs the canonical reconciliation source as
@@ -622,9 +623,9 @@ script installs the canonical reconciliation source as
 installs both `kanban_resource_admission.py` and
 `kanban_head_binding_feedback.py` onto the loaded canonical core. All overlay
 dependencies and the core are candidate-compiled and installed before the
-entrypoint switch, then byte-for-byte hash-verified. Deployment never edits
-the preserved Hermes job definition, schedule, or enabled state. This PR does
-**not** auto-deploy.
+entrypoint switch, then byte-for-byte hash-verified. Deployment does not read or
+modify Hermes cron metadata; the current intake path does not require the
+retired legacy job. This PR does **not** auto-deploy.
 
 ## Verification
 
