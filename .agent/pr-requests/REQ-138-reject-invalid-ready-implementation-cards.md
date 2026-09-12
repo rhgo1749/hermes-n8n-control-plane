@@ -22,7 +22,9 @@
 - Prior rework Reviewer task: `t_000bf302`
 - Prior Developer task: `t_b7258023`
 - Prior follow-up Reviewer task: `t_5f4c60b5`
-- Current provenance-correction Developer task: `t_34bee817`
+- Prior provenance-correction Developer task: `t_34bee817`
+- Prior current-head Reviewer task: `t_9cc04b9c`
+- Current provenance-correction Developer task: `t_8e8df685`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:138`
 - Prior stable task identity: `github:rhgo1749/hermes-n8n-control-plane:issue:138:rework-round-8:developer`
 - Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/issue-138-rework-round-8`; requested branch `wt/t_b7258023`
@@ -81,12 +83,13 @@ Cumulative PR allowlist additionally includes earlier-round files:
 ## 5. Delivery provenance and stop state
 
 - Functional validation commit for this bounded rework: `d197db38751fdc783a8725e109fc9e996b86b869` (`fix(kanban): guard reassign shell reachability`); all focused/static/edge/full-baseline validation above was run after restoring this implementation.
-- Prior validated implementation head for this rework: `f7db99c984c27294d36c2df1381a91f3ecaa51ec`; it is distinct from the functional validation commit above and is retained as historical implementation provenance.
+- Prior validated implementation head for this rework: `f7db99c984c27294d36c2df1381a91f3ecaa51ec`; it is distinct from the functional validation commit above and remains explicitly prior validated implementation provenance, not the current or final PR head.
 - Published provenance correction checkpoint: `d598a36f2d118044021c2109c2c35bf522427a13`, whose parent is the prior validated implementation head `f7db99c984c27294d36c2df1381a91f3ecaa51ec`; this correction changes only the tracked REQ file.
 - Historical/intermediate round-8 publication checkpoint: `fb8d59568a1bf0531023b8f04f34b81c41e11d1b`; this is a provenance-only descendant and is not the current PR head.
-- Exact current final validated/delivered PR #149 head: `824e65471c7fd912b3ac6d3c0542935e715c5b0c`; this is the current full branch/PR head and the only current delivery identity after the round-8 publication.
-- Fresh Reviewer `t_000bf302` returned REWORK solely because the previous provenance correction was local; prior Developer `t_b7258023` published the preceding correction, and Reviewer `t_5f4c60b5` identified the stale current-head identity. Current provenance-correction Developer `t_34bee817` publishes this bounded REQ-only update.
-- Source/provenance chain: root `t_7ec21f55`; Investigator `t_f5de81a4`; prior Developer `t_586a1100`; prior Reviewer `t_d9b220cb`; bounded Developer `t_0c8e19ed`; earlier follow-up Reviewer `t_17883aa1`; prior-round Developer `t_2478d4a5`; prior provenance Developer `t_a53b154f`; prior provenance Reviewer `t_10072cbb`; prior rework Reviewer `t_000bf302`; prior Developer `t_b7258023`; prior follow-up Reviewer `t_5f4c60b5`; current provenance-correction Developer `t_34bee817`.
-- PR #149 remains the existing Korean PR on `fix/issue-138-ready-binding-preflight`; its current exact head is `824e65471c7fd912b3ac6d3c0542935e715c5b0c`, its base is `main`, and its REST/GraphQL state is OPEN/unmerged with `closingIssuesReferences=[138]`. Its visible plain-text closing marker is `Closes #138.`. No second PR, merge, auto-merge, live deployment/config mutation, or hosted Actions change is performed.
+- Last validated/delivered implementation head before the current provenance-only publication: `824e65471c7fd912b3ac6d3c0542935e715c5b0c`; this remains the exact last validated/delivered implementation identity, but is not the current remote branch/PR head after the current publication.
+- Current published branch/PR head: `8b3162d3a2b6c5b5a5f354e809254d93ae2185d9`; this is the actual current full head of PR #149 and the delivery branch after the current provenance-only publication.
+- Fresh Reviewer `t_000bf302` returned REWORK solely because the previous provenance correction was local; prior Developer `t_b7258023` published the preceding correction, Reviewer `t_5f4c60b5` identified the earlier stale current-head identity, prior provenance-correction Developer `t_34bee817` published the last bounded REQ-only update, and Reviewer `t_9cc04b9c` identified that the actual current head was still omitted. Current provenance-correction Developer `t_8e8df685` publishes this bounded REQ-only update.
+- Source/provenance chain: root `t_7ec21f55`; Investigator `t_f5de81a4`; prior Developer `t_586a1100`; prior Reviewer `t_d9b220cb`; bounded Developer `t_0c8e19ed`; earlier follow-up Reviewer `t_17883aa1`; prior-round Developer `t_2478d4a5`; prior provenance Developer `t_a53b154f`; prior provenance Reviewer `t_10072cbb`; prior rework Reviewer `t_000bf302`; prior Developer `t_b7258023`; prior follow-up Reviewer `t_5f4c60b5`; prior provenance-correction Developer `t_34bee817`; prior current-head Reviewer `t_9cc04b9c`; current provenance-correction Developer `t_8e8df685`.
+- PR #149 remains the existing Korean PR on `fix/issue-138-ready-binding-preflight`; its current published branch/PR head is `8b3162d3a2b6c5b5a5f354e809254d93ae2185d9`, while `824e65471c7fd912b3ac6d3c0542935e715c5b0c` remains the last validated/delivered implementation head. Its base is `main`, and its REST/GraphQL state is OPEN/unmerged with `closingIssuesReferences=[138]`. Its visible plain-text closing marker is `Closes #138.`. No second PR, merge, auto-merge, live deployment/config mutation, or hosted Actions change is performed.
 
 Closes #138.
