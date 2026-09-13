@@ -12,12 +12,21 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
+COMPLETION_GUARD = ROOT / "automation/hermes/scripts/kanban-specialist-completion-guard.py"
 CONFIG_HELPER = ROOT / "automation/hermes/scripts/kanban-block-kind-hook-config.py"
 DEPLOYER = ROOT / "automation/hermes/scripts/deploy-intake-edge.sh"
+H4V3_PROFILE_NAMES = (
+    "kanban-main",
+    "kanban-investigator",
+    "kanban-developer",
+    "kanban-reviewer",
+    "kanban-designer",
+)
 
 
 def _load(name: str, path: Path) -> Any:
@@ -33,13 +42,14 @@ def _run(
     payload: dict[str, Any],
     *,
     env_updates: dict[str, str] | None = None,
+    guard_path: Path = GUARD,
 ) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory(prefix="specialist-contract-guard-") as directory:
         env = os.environ.copy()
         env["KANBAN_SPECIALIST_COMPLETION_GUARD_LOG"] = str(Path(directory) / "guard.log")
         env.update(env_updates or {})
         return subprocess.run(
-            [sys.executable, str(GUARD)],
+            [sys.executable, str(guard_path)],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
@@ -59,6 +69,66 @@ def _task_db(path: Path, task_id: str, contract: str | None) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _run_stable_hook_then_shell(
+    command: str,
+) -> tuple[
+    subprocess.CompletedProcess[str],
+    subprocess.CompletedProcess[str] | None,
+    str,
+    bytes,
+    bytes,
+]:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-substitution-") as directory:
+        root = Path(directory)
+        db = root / "kanban.db"
+        _task_db(db, "t_substitution", "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        calls = root / "hermes-calls.log"
+        fake_hermes = fake_bin / "hermes"
+        fake_hermes.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_HERMES_CALLS\"\n",
+            encoding="utf-8",
+        )
+        fake_hermes.chmod(0o755)
+        (fake_bin / "python3").symlink_to(sys.executable)
+
+        env = os.environ.copy()
+        env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+        env.update(
+            {
+                "FAKE_HERMES_CALLS": str(calls),
+                "HERMES_KANBAN_DB": str(db),
+                "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG": str(root / "specialist.log"),
+                "KANBAN_WORKSPACE_BINDING_GUARD_LOG": str(root / "workspace.log"),
+                "PATH": f"{fake_bin}:{env.get('PATH', '')}",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        payload = {"tool_name": "terminal", "tool_input": {"command": command}}
+        prehook = subprocess.run(
+            [sys.executable, str(GUARD)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        shell_result = None
+        if prehook.returncode == 0:
+            shell_result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+        calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        return prehook, shell_result, calls_text, before, db.read_bytes()
 
 
 def _assert_blocked(result: subprocess.CompletedProcess[str], assignee: str) -> None:
@@ -122,7 +192,8 @@ def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_dis
                 "assignee": "kanban-reviewer",
                 "parents": ["t_dev"],
             },
-        }
+        },
+        guard_path=COMPLETION_GUARD,
     )
     assert normal_wait.returncode == 0, (normal_wait.stdout, normal_wait.stderr)
 
@@ -134,7 +205,8 @@ def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_dis
                 "assignee": "kanban-reviewer",
                 "initial_status": "blocked",
             },
-        }
+        },
+        guard_path=COMPLETION_GUARD,
     )
     assert explicit_ops_hold.returncode == 0, (
         explicit_ops_hold.stdout,
@@ -179,7 +251,10 @@ def test_structured_specialist_allows_omitted_and_local_only_contract() -> None:
         }
         if value is not None:
             tool_input["completion_contract"] = value
-        result = _run({"tool_name": "kanban_create", "tool_input": tool_input})
+        result = _run(
+            {"tool_name": "kanban_create", "tool_input": tool_input},
+            guard_path=COMPLETION_GUARD,
+        )
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert result.stdout == ""
 
@@ -232,7 +307,10 @@ def test_terminal_specialist_local_only_or_omitted_contract_is_allowed() -> None
         "hermes kanban create x --assignee kanban-designer",
     )
     for command in commands:
-        result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            guard_path=COMPLETION_GUARD,
+        )
         assert result.returncode == 0, (command, result.stdout, result.stderr)
 
 
@@ -252,7 +330,10 @@ def test_terminal_dependency_wait_without_preblock_and_explicit_ops_hold_are_all
         "hermes kanban create ops --assignee kanban-reviewer --initial-status blocked",
     )
     for command in commands:
-        result = _run({"tool_name": "terminal", "tool_input": {"command": command}})
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            guard_path=COMPLETION_GUARD,
+        )
         assert result.returncode == 0, (command, result.stdout, result.stderr)
 
 
@@ -375,6 +456,14 @@ def test_hook_config_reuses_one_approved_command_idempotently_without_losing_sib
         "    - matcher: other\n"
         "      command: python3 /tmp/other.py\n"
         "      timeout: 5\n"
+        "    - matcher: kanban_create\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: true\n"
+        "    - matcher: terminal\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: false\n"
         "  post_tool_call:\n"
         "    - matcher: post\n"
         "      command: python3 /tmp/post.py\n"
@@ -402,18 +491,48 @@ def test_hook_config_reuses_one_approved_command_idempotently_without_losing_sib
         "kanban-specialist-completion-guard.py" in str(entry.get("command", ""))
         for entry in entries
     )
+    assert not any(
+        "kanban-workspace-guard.py" in str(entry.get("command", ""))
+        for entry in entries
+    )
     assert parsed["hooks"]["post_tool_call"][0]["matcher"] == "post"
     assert parsed["logging"]["level"] == "INFO"
 
 
-def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -> None:
+def _legacy_workspace_hook_config() -> str:
+    return (
+        "hooks:\n"
+        "  pre_tool_call:\n"
+        "    - matcher: other\n"
+        "      command: python3 /tmp/other.py\n"
+        "    - matcher: kanban_create\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: true\n"
+        "    - matcher: terminal\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: false\n"
+    )
+
+
+def _write_runtime_configs(home: Path, original: str) -> list[Path]:
+    configs = [home / "config.yaml"]
+    for profile in H4V3_PROFILE_NAMES:
+        configs.append(home / "profiles" / profile / "config.yaml")
+    for config in configs:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(original, encoding="utf-8")
+    return configs
+
+
+def test_deployer_dry_run_validates_all_profile_guards_without_mutating_configs() -> None:
     with tempfile.TemporaryDirectory(prefix="specialist-contract-deploy-") as directory:
         home = Path(directory)
         scripts = home / "scripts"
         scripts.mkdir()
-        config = home / "config.yaml"
-        original = "hooks:\n  pre_tool_call:\n    - matcher: other\n      command: python3 /tmp/other.py\n"
-        config.write_text(original, encoding="utf-8")
+        original = _legacy_workspace_hook_config()
+        configs = _write_runtime_configs(home, original)
         result = subprocess.run(
             ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
             text=True,
@@ -423,7 +542,230 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert "kanban-block-kind-guard-core.py" in result.stdout
         assert "kanban-specialist-completion-guard.py" in result.stdout
+        assert "kanban-workspace-binding-guard.py" in result.stdout
         assert "lifecycle-guard matcher=kanban_create (fail_closed=true)" in result.stdout
+        assert (
+            "superseded kanban-workspace-guard.py hooks would be retired "
+            "from global and H4V3 profile configs"
+        ) in result.stdout
         assert "shell-hook command path unchanged; no second consent command added" in result.stdout
-        assert config.read_text(encoding="utf-8") == original
+        for profile in H4V3_PROFILE_NAMES:
+            assert str(home / "profiles" / profile / "config.yaml") in result.stdout
+        assert all(config.read_text(encoding="utf-8") == original for config in configs)
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
+
+
+def test_deployer_replaces_legacy_workspace_hooks_in_global_and_profile_configs() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-deploy-apply-") as directory:
+        home = Path(directory)
+        scripts = home / "scripts"
+        scripts.mkdir()
+        original = _legacy_workspace_hook_config()
+        configs = _write_runtime_configs(home, original)
+        result = subprocess.run(
+            ["bash", str(DEPLOYER), "--hermes-home", str(home)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "Profile config hooks installed for:" in result.stdout
+        expected_matchers = {"kanban_block", "kanban_create", "terminal"}
+        for config in configs:
+            parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
+            entries = parsed["hooks"]["pre_tool_call"]
+            stable = [
+                entry
+                for entry in entries
+                if "kanban-block-kind-guard.py" in str(entry.get("command", ""))
+            ]
+            assert {entry["matcher"] for entry in stable} == expected_matchers
+            assert all(entry.get("fail_closed") is True for entry in stable)
+            assert not any(
+                "kanban-workspace-guard.py" in str(entry.get("command", ""))
+                for entry in entries
+            )
+        assert any(home.glob(".bak-config.yaml-*"))
+        for profile in H4V3_PROFILE_NAMES:
+            assert any((home / "profiles" / profile).glob(".bak-config.yaml-*"))
+        assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
+
+
+def test_stable_wrapper_blocks_reachable_nested_wrappers_without_mutating_db() -> None:
+    commands = (
+        "if true; then bash -lc \x27hermes kanban create x --assignee kanban-developer --completion-contract rhgo1749/ctrl-hangul\x27; fi",
+        "if true; then env bash -lc \x27hermes kanban reassign t_repoaware kanban-reviewer --reclaim\x27; fi",
+    )
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-nested-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_repoaware", "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+        for command in commands:
+            result = _run(
+                {"tool_name": "terminal", "tool_input": {"command": command}},
+                env_updates={"HERMES_KANBAN_DB": str(db)},
+            )
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            body = json.loads(result.stdout)
+            assert body["action"] == "block"
+            assert "ambiguous shell conditional reachability" in body["message"]
+            assert "No task mutation was performed" in body["message"]
+            assert db.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("command", "task_id"),
+    [
+        (
+            "( hermes kanban create x --assignee kanban-developer "
+            "--completion-contract local-only )",
+            "t_grouped",
+        ),
+        (
+            "{ hermes kanban assign t_grouped kanban-reviewer; }",
+            "t_grouped",
+        ),
+        (
+            "{ hermes kanban reassign t_grouped kanban-reviewer --reclaim; }",
+            "t_grouped",
+        ),
+    ],
+)
+def test_stable_wrapper_rejects_grouped_specialist_mutations_without_mutating_db(
+    command: str,
+    task_id: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-grouped-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, task_id, "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        body = json.loads(result.stdout)
+        assert body["action"] == "block"
+        assert "unsupported shell grouping" in body["message"]
+        assert "No task mutation was performed" in body["message"]
+        assert db.read_bytes() == before
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"$(hermes kanban create x --assignee kanban-developer)\"",
+        "echo \"$(hermes kanban assign t_substitution kanban-reviewer)\"",
+        "echo \"$(hermes kanban reassign t_substitution kanban-reviewer --reclaim)\"",
+        "echo `hermes kanban create x --assignee kanban-developer`",
+        "echo `hermes kanban assign t_substitution kanban-reviewer`",
+        "echo `hermes kanban reassign t_substitution kanban-reviewer --reclaim`",
+        "bash -lc 'echo \"$(hermes kanban create x --assignee kanban-developer)\"'",
+        "env FOO=bar bash -lc 'echo `hermes kanban reassign t_substitution kanban-reviewer --reclaim`'",
+    ],
+)
+def test_stable_hook_blocks_command_substitution_before_shell_execution(
+    command: str,
+) -> None:
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "command substitution" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+@pytest.mark.parametrize("action", ["create", "assign", "reassign"])
+def test_stable_wrapper_rejects_unsupported_specialist_mutations_without_mutating_db(
+    operator: str,
+    action: str,
+) -> None:
+    commands = {
+        "create": (
+            "hermes kanban create x --assignee kanban-developer "
+            "--completion-contract local-only"
+        ),
+        "assign": "hermes kanban assign t_operator kanban-reviewer",
+        "reassign": "hermes kanban reassign t_operator kanban-reviewer --reclaim",
+    }
+    command = f"printf '%s' safe {operator} {commands[action]}"
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-operator-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_operator", "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        body = json.loads(result.stdout)
+        assert body["action"] == "block"
+        assert "unsupported shell operator" in body["message"]
+        assert "No task mutation was performed" in body["message"]
+        assert db.read_bytes() == before
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?", ("t_operator",)
+            ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+@pytest.mark.parametrize("operator", ["&&", "||"])
+@pytest.mark.parametrize("board_option", ["--board ctrl-hangul", "--board=ctrl-hangul"])
+@pytest.mark.parametrize("action", ["create", "assign", "reassign"])
+def test_stable_hook_rejects_unknown_board_lookahead_before_shell_execution(
+    operator: str, board_option: str, action: str
+) -> None:
+    args = {
+        "create": "x --assignee kanban-developer",
+        "assign": "t_substitution kanban-reviewer",
+        "reassign": "t_substitution kanban-reviewer --reclaim",
+    }[action]
+    command = (
+        f"test -f /tmp/maybe {operator} hermes kanban {board_option} "
+        f"{action} {args}"
+    )
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "b" + "lock"
+    assert "reachability" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(( $(hermes kanban create x --assignee kanban-developer) + 1 ))",
+        "echo \"$(( $(hermes kanban --board ctrl-hangul assign t_substitution kanban-reviewer) + 1 ))\"",
+        "echo $(( `hermes kanban reassign t_substitution kanban-reviewer --reclaim` + 1 ))",
+        "echo \"$(( `hermes kanban --board=ctrl-hangul create x --assignee kanban-developer` + 1 ))\"",
+    ],
+)
+def test_stable_hook_rejects_arithmetic_substitutions_before_shell_execution(
+    command: str,
+) -> None:
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "b" + "lock"
+    assert "command substitution" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before

@@ -50,6 +50,10 @@ Designer phases are conditional; Investigator, Developer, and Reviewer are the n
 
 Main reads the source Issue/root task to establish identity and authorization, but it should not make every Developer reconstruct the entire Issue/PR discussion. The Investigator handoff is the default implementation context, with exact source references retained for bounded verification.
 
+For dispatchable H4V3 specialist creation, Main uses structured `kanban_create` with a canonical project binding: `workspace_kind="worktree"`, the repository's Hermes `project` id/slug, and a stable `idempotency_key`. `workspace_path`, `branch`, and `branch_name` are not supplied on that structured path; Hermes core derives the task-id worktree and deterministic project branch, and the creation preflight verifies the durable binding/read-back before dispatch. A rejected structured create is not permission to shell out to `hermes kanban create` or run `git worktree add` manually; Main must repair the structured provenance/binding or surface the controller/operator blocker.
+
+Publication provenance must also be acyclic. A tracked REQ/request file may record a time-bounded observed/prior PR head, but it must never require the SHA of the commit that publishes that same file to already appear inside the file. Current publication/head identity is proved after publication by fresh GitHub/remote read-back and recorded in the worker/Kanban/PR handoff evidence. Requiring the immutable file tree to embed its own publishing commit SHA is a self-referential fixed-point condition and must be rejected rather than retried through endless provenance-only rework rounds.
+
 ### Specialist completion-contract boundary
 
 Hermes core supports PR-aware `completion_contract` values for standalone Kanban tasks whose **own terminal condition** is exact-head GitHub acceptance. That is a different lifecycle from an H4V3 specialist phase.

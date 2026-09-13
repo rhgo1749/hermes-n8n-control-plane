@@ -24,8 +24,11 @@ The structured ``kanban_create`` tool is the canonical creation path. The
 ``terminal`` policy recognizes executable ``hermes kanban`` command segments
 (including supported shell wrappers) and closes literal create/assign/reassign
 bypasses without treating quoted documentation or echo/printf data as commands.
-Reassignment reads only the canonical task row; unreadable/ambiguous state
-fails closed and is never rewritten by this guard.
+Unsupported shell grouping is not flattened into the supported command-chain
+grammar: a relevant mutation inside ``(...)`` or ``{...;}`` fails closed before
+the terminal command can execute. Reassignment reads only the canonical task
+row; unreadable/ambiguous state fails closed and is never rewritten by this
+guard.
 
 ``evaluate_payload`` is importable by the already-approved lifecycle hook
 wrapper so this policy does not need a second shell-hook command or a second
@@ -62,6 +65,8 @@ _LOG_PATH = Path(
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _SHELL_BINARIES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 _CONTROL_OPERATOR_CHARS = frozenset(";&|")
+_SUPPORTED_SHELL_OPERATORS = frozenset({";", "&&", "||"})
+_GROUPING_OPEN_TO_CLOSE = {"(": ")", "{": "}"}
 _SHELL_FLAG_ONLY = frozenset(
     {
         "-l", "--login", "-i", "--interactive", "-e", "-x", "-n", "--norc",
@@ -224,18 +229,8 @@ def _is_control_operator(value: str) -> bool:
 
 
 def _command_segments(tokens: list[str]) -> list[list[str]]:
-    segments: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if _is_control_operator(token):
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        current.append(token)
-    if current:
-        segments.append(current)
-    return segments
+    """Return chain commands for callers that only need the segment view."""
+    return [segment for segment, _ in _command_chain(tokens)]
 
 
 def _consume_env(segment: list[str], index: int) -> int | None:
@@ -314,6 +309,447 @@ def _shell_inline_command(segment: list[str], index: int) -> str | None:
     return None
 
 
+def _command_chain(tokens: list[str]) -> list[tuple[list[str], str | None]]:
+    """Split commands while preserving the operator before the next command."""
+    chain: list[tuple[list[str], str | None]] = []
+    current: list[str] = []
+    for token in tokens:
+        if _is_control_operator(token):
+            if not current:
+                raise RuntimeError("malformed shell control-flow operator")
+            chain.append((current, token))
+            current = []
+            continue
+        current.append(token)
+    if current:
+        chain.append((current, None))
+    return chain
+
+
+def _extract_hermes_action(
+    tokens: list[str], start: int
+) -> tuple[str, list[str], str] | None:
+    try:
+        kanban_index = tokens.index("kanban", start + 1)
+    except ValueError:
+        return None
+    tail = tokens[kanban_index + 1 :]
+    board = ""
+    position = 0
+    while position < len(tail):
+        value = tail[position]
+        if value == "--board":
+            if position + 1 >= len(tail):
+                raise RuntimeError("hermes kanban --board is missing a value")
+            board = tail[position + 1]
+            position += 2
+            continue
+        if value.startswith("--board="):
+            board = value.split("=", 1)[1]
+            position += 1
+            continue
+        break
+    if position >= len(tail):
+        return None
+    return tail[position].casefold(), tail[position + 1 :], board
+
+
+def _relevant_hermes_action(tokens: list[str], start: int) -> bool:
+    invocation = _extract_hermes_action(tokens, start)
+    return invocation is not None and invocation[0] in {
+        "create",
+        "assign",
+        "reassign",
+    }
+
+
+def _contains_ambiguous_conditional(tokens: list[str]) -> bool:
+    conditional_words = {"if", "then", "elif", "else", "fi", "case", "esac", "while", "until", "do", "done"}
+    has_conditional = False
+    for index, token in enumerate(tokens):
+        if token not in conditional_words:
+            continue
+        previous_is_boundary = index == 0 or _is_control_operator(tokens[index - 1])
+        next_is_boundary = index + 1 == len(tokens) or _is_control_operator(tokens[index + 1])
+        if previous_is_boundary and (
+            token in {"if", "then", "elif", "else", "case", "while", "until", "do"}
+            or (token in {"fi", "esac", "done"} and next_is_boundary)
+        ):
+            has_conditional = True
+            break
+    if not has_conditional:
+        return False
+    if any(
+        Path(token).name == "hermes" and _relevant_hermes_action(tokens, index)
+        for index, token in enumerate(tokens)
+    ):
+        return True
+    for segment, _ in _command_chain(tokens):
+        for index, token in enumerate(segment):
+            if token not in {"if", "then", "elif", "else", "case", "while", "until", "do"}:
+                continue
+            nested = segment[index + 1 :]
+            if nested and _segment_has_hermes(nested):
+                return True
+    return False
+
+
+def _segment_has_hermes(segment: list[str], *, depth: int = 0) -> bool:
+    if depth > _MAX_SHELL_DEPTH:
+        raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
+    index = _first_executable(segment)
+    if index is None or index >= len(segment):
+        return False
+    executable = Path(segment[index]).name
+    if executable in _SHELL_BINARIES:
+        inner = _shell_inline_command(segment, index)
+        if inner is None:
+            return False
+        return _command_contains_relevant_hermes(inner, depth=depth + 1)
+    if executable != "hermes":
+        return False
+    return _relevant_hermes_action(segment, index)
+
+
+def _scan_shell_groupings(
+    command: str,
+) -> tuple[list[str], list[tuple[str, bool, int]], bool]:
+    """Return grouping bodies, command substitutions, and malformed status.
+
+    The scanner is deliberately lexical rather than a shell interpreter.  A
+    substitution body is returned with a per-body malformed flag so callers
+    can reject a relevant incomplete expansion without rejecting harmless
+    expansion syntax.  Single-quoted and escaped data stays inert; the body
+    of a command substitution is scanned in its own quote context because
+    double quotes do not make ``$()`` or backticks inert.
+    """
+    groups: list[str] = []
+    substitutions: list[tuple[str, bool, int]] = []
+
+    def consume_arithmetic(
+        start: int,
+        *,
+        depth: int,
+        record_substitutions: bool,
+        segment_index: int,
+    ) -> tuple[int, bool]:
+        """Return the end of a ``$((...))`` expansion without interpreting it."""
+        arithmetic_depth = 0
+        index = start
+        malformed = False
+        while index < len(command):
+            value = command[index]
+            if value == "\\":
+                index += 2
+                continue
+            if value == "$" and command[index + 1 : index + 3] == "((":
+                nested_end, nested_malformed = consume_arithmetic(
+                    index + 1,
+                    depth=depth,
+                    record_substitutions=record_substitutions,
+                    segment_index=segment_index,
+                )
+                malformed |= nested_malformed
+                if nested_malformed:
+                    return len(command), True
+                index = nested_end + 1
+                continue
+            delimiter: str | None = None
+            if value == "$" and command[index : index + 2] == "$(":
+                delimiter = "$("
+            elif value == "`":
+                delimiter = "`"
+            if delimiter is not None:
+                end, body, substitution_malformed = consume_substitution(
+                    index, delimiter, depth=depth + 1
+                )
+                if record_substitutions:
+                    substitutions.append(
+                        (body, substitution_malformed, segment_index)
+                    )
+                malformed |= substitution_malformed
+                if substitution_malformed:
+                    return len(command), True
+                index = end + 1
+                continue
+            if value == "(":
+                arithmetic_depth += 1
+            elif value == ")":
+                arithmetic_depth -= 1
+                if arithmetic_depth == 0:
+                    return index, malformed
+            index += 1
+        return len(command), True
+
+    def consume_substitution(
+        start: int, delimiter: str, *, depth: int
+    ) -> tuple[int, str, bool]:
+        if depth > _MAX_SHELL_DEPTH:
+            raise RuntimeError("shell command substitution nesting exceeds the specialist guard limit")
+        body_start = start + (2 if delimiter == "$(" else 1)
+        end, malformed, closed = scan_fragment(
+            body_start,
+            ")" if delimiter == "$(" else "`",
+            depth=depth,
+        )
+        return end, command[body_start:end], malformed or not closed
+
+    def scan_fragment(
+        start: int,
+        closing: str | None,
+        *,
+        depth: int = 0,
+        record_substitutions: bool = False,
+    ) -> tuple[int, bool, bool]:
+        fragment_malformed = False
+        stack: list[tuple[str, int]] = []
+        quote: str | None = None
+        segment_index = 0
+        index = start
+        while index < len(command):
+            value = command[index]
+            if quote == "'":
+                if value == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if value == "\\":
+                    index += 2
+                    continue
+                if value == '"':
+                    quote = None
+                    index += 1
+                    continue
+                if value == "$" and command[index + 1 : index + 3] == "((":
+                    arithmetic_end, arithmetic_malformed = consume_arithmetic(
+                        index + 1,
+                        depth=depth,
+                        record_substitutions=record_substitutions,
+                        segment_index=segment_index,
+                    )
+                    fragment_malformed |= arithmetic_malformed
+                    if arithmetic_malformed:
+                        index = len(command)
+                    else:
+                        index = arithmetic_end + 1
+                    continue
+                if value == "$" and command[index : index + 2] == "$(":
+                    end, body, substitution_malformed = consume_substitution(
+                        index, "$(", depth=depth + 1
+                    )
+                    if record_substitutions and not stack:
+                        substitutions.append(
+                            (body, substitution_malformed, segment_index)
+                        )
+                    fragment_malformed |= substitution_malformed
+                    index = len(command) if substitution_malformed else end + 1
+                    continue
+                if value == "`":
+                    end, body, substitution_malformed = consume_substitution(
+                        index, "`", depth=depth + 1
+                    )
+                    if record_substitutions and not stack:
+                        substitutions.append(
+                            (body, substitution_malformed, segment_index)
+                        )
+                    fragment_malformed |= substitution_malformed
+                    index = len(command) if substitution_malformed else end + 1
+                    continue
+                index += 1
+                continue
+            if value == "'":
+                quote = "'"
+                index += 1
+                continue
+            if value == '"':
+                quote = '"'
+                index += 1
+                continue
+            if value == "\\":
+                escaped = command[index + 1 : index + 2]
+                if escaped == "$" and command[index + 1 : index + 3] == "$(":
+                    end, _, _ = consume_substitution(
+                        index + 1, "$(", depth=depth + 1
+                    )
+                    index = end + 1
+                elif escaped == "`":
+                    end, _, _ = consume_substitution(
+                        index + 1, "`", depth=depth + 1
+                    )
+                    index = end + 1
+                else:
+                    index += 2
+                continue
+            if closing == "`" and value == "`":
+                return index, fragment_malformed, True
+            if value == "$" and command[index + 1 : index + 3] == "((":
+                arithmetic_end, arithmetic_malformed = consume_arithmetic(
+                    index + 1,
+                    depth=depth,
+                    record_substitutions=record_substitutions,
+                    segment_index=segment_index,
+                )
+                fragment_malformed |= arithmetic_malformed
+                if arithmetic_malformed:
+                    index = len(command)
+                else:
+                    index = arithmetic_end + 1
+                continue
+            if value == "$" and command[index : index + 2] == "$(":
+                end, body, substitution_malformed = consume_substitution(
+                    index, "$(", depth=depth + 1
+                )
+                if record_substitutions and not stack:
+                    substitutions.append((body, substitution_malformed, segment_index))
+                fragment_malformed |= substitution_malformed
+                index = len(command) if substitution_malformed else end + 1
+                continue
+            if value == "`":
+                end, body, substitution_malformed = consume_substitution(
+                    index, "`", depth=depth + 1
+                )
+                if record_substitutions and not stack:
+                    substitutions.append((body, substitution_malformed, segment_index))
+                fragment_malformed |= substitution_malformed
+                index = len(command) if substitution_malformed else end + 1
+                continue
+            if value in _GROUPING_OPEN_TO_CLOSE:
+                stack.append((value, index + 1))
+            elif value in {")", "}"}:
+                if stack:
+                    if _GROUPING_OPEN_TO_CLOSE[stack[-1][0]] != value:
+                        fragment_malformed = True
+                    else:
+                        _, body_start = stack.pop()
+                        groups.append(command[body_start:index])
+                elif closing == value:
+                    return index, fragment_malformed, True
+                else:
+                    fragment_malformed = True
+            elif value in _CONTROL_OPERATOR_CHARS:
+                operator_start = index
+                while (
+                    index < len(command)
+                    and command[index] in _CONTROL_OPERATOR_CHARS
+                ):
+                    index += 1
+                if index > operator_start:
+                    segment_index += 1
+                    continue
+            index += 1
+        if quote is not None:
+            fragment_malformed = True
+        if stack:
+            fragment_malformed = True
+            groups.extend(command[group_start:] for _, group_start in stack)
+        if closing is not None:
+            fragment_malformed = True
+        return len(command), fragment_malformed, False
+
+    _, malformed, _ = scan_fragment(0, None, record_substitutions=True)
+    return groups, substitutions, malformed
+
+
+def _command_contains_relevant_hermes(command: str, *, depth: int = 0) -> bool:
+    """Return whether a bounded command body can invoke a relevant action.
+
+    The invocation walker remains the single owner of shell reachability.  This
+    predicate is only used by grouping/operator lookahead, so an ambiguous or
+    malformed body is conservatively treated as relevant rather than parsed by
+    a second command-chain implementation.
+    """
+    if depth > _MAX_SHELL_DEPTH:
+        raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
+    try:
+        invocations = _hermes_kanban_invocations(command, depth=depth)
+    except RuntimeError:
+        return True
+    return any(action in {"create", "assign", "reassign"} for action, _, _ in invocations)
+
+
+def _substitution_records_contain_relevant(
+    substitutions: list[tuple[str, bool, int]],
+    *,
+    depth: int,
+    segment_index: int | None = None,
+    after_segment: int | None = None,
+) -> bool:
+    for body, malformed, body_segment in substitutions:
+        if segment_index is not None and body_segment != segment_index:
+            continue
+        if after_segment is not None and body_segment <= after_segment:
+            continue
+        if not _command_contains_relevant_hermes(body, depth=depth + 1):
+            continue
+        if malformed:
+            raise RuntimeError(
+                "malformed shell command substitution contains a relevant "
+                "specialist Kanban mutation"
+            )
+        return True
+    return False
+
+
+def _substitutions_contain_relevant_hermes(
+    command: str, *, depth: int = 0
+) -> bool:
+    _, substitutions, _ = _scan_shell_groupings(command)
+    return _substitution_records_contain_relevant(substitutions, depth=depth)
+
+
+def _groups_contain_relevant_hermes(command: str, *, depth: int = 0) -> bool:
+    groups, _, _ = _scan_shell_groupings(command)
+    return any(
+        _command_contains_relevant_hermes(group, depth=depth + 1)
+        for group in groups
+    )
+
+
+def _literal_command_result(segment: list[str], *, depth: int = 0) -> bool | None:
+    """Return a result only for predicates whose outcome is statically known."""
+    if depth > _MAX_SHELL_DEPTH:
+        raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
+    index = _first_executable(segment)
+    if index is None or index >= len(segment):
+        return True if segment and Path(segment[0]).name == "env" else None
+    executable = Path(segment[index]).name
+    if executable in {"true", ":"}:
+        return True
+    if executable == "false":
+        return False
+    if executable == "exit":
+        if len(segment) == index + 1:
+            return True
+        try:
+            return int(segment[index + 1]) == 0
+        except ValueError:
+            return None
+    if executable == "cd":
+        values = segment[index + 1 :]
+        if len(values) != 1 or any(char in values[0] for char in "$`"):
+            return None
+        return Path(values[0]).expanduser().is_dir()
+    if executable == "export":
+        return all(_ENV_ASSIGN_RE.fullmatch(value) for value in segment[index + 1 :])
+    if executable == "unset":
+        return all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) for value in segment[index + 1 :])
+    if executable in {"echo", "printf"}:
+        return True
+    if executable in _SHELL_BINARIES:
+        inner = _shell_inline_command(segment, index)
+        if inner is None:
+            return None
+        try:
+            nested = _tokenize(inner)
+            nested_chain = _command_chain(nested)
+        except ValueError as exc:
+            raise RuntimeError(f"could not parse shell wrapper: {exc}") from exc
+        if len(nested_chain) == 1 and nested_chain[0][1] is None:
+            return _literal_command_result(nested_chain[0][0], depth=depth + 1)
+    return None
+
+
 def _hermes_kanban_invocations(
     command: str,
     *,
@@ -326,42 +762,91 @@ def _hermes_kanban_invocations(
         tokens = _tokenize(command)
     except ValueError as exc:
         raise RuntimeError(f"could not parse terminal command: {exc}") from exc
+    groups, substitutions, _ = _scan_shell_groupings(command)
+    if any(
+        _command_contains_relevant_hermes(group, depth=depth + 1)
+        for group in groups
+    ):
+        raise RuntimeError(
+            "unsupported shell grouping contains a relevant specialist Kanban mutation"
+        )
+    if _contains_ambiguous_conditional(tokens):
+        raise RuntimeError("ambiguous shell conditional reachability")
 
     invocations: list[tuple[str, list[str], str]] = []
-    for segment in _command_segments(tokens):
-        index = _first_executable(segment)
-        if index is None or index >= len(segment):
+    chain = _command_chain(tokens)
+    reachable = True
+    previous_result: bool | None = None
+    for segment_index, (segment, operator) in enumerate(chain):
+        if (
+            (
+                operator is not None
+                and operator not in _SUPPORTED_SHELL_OPERATORS
+                and any(
+                    _segment_has_hermes(later, depth=depth)
+                    for later, _ in chain[segment_index + 1 :]
+                )
+            )
+            or (
+                operator is not None
+                and operator not in _SUPPORTED_SHELL_OPERATORS
+                and _substitution_records_contain_relevant(
+                    substitutions, depth=depth, after_segment=segment_index
+                )
+            )
+        ):
+            raise RuntimeError(
+                "unsupported shell operator makes command reachability ambiguous"
+            )
+        if not reachable:
+            if operator == ";":
+                reachable = True
+                previous_result = None
+            elif operator in {"&&", "||"}:
+                reachable = previous_result if operator == "&&" else not previous_result
             continue
-        executable = Path(segment[index]).name
-        if executable in _SHELL_BINARIES:
-            inner = _shell_inline_command(segment, index)
-            if inner is not None:
-                invocations.extend(_hermes_kanban_invocations(inner, depth=depth + 1))
+        if _substitution_records_contain_relevant(
+            substitutions, depth=depth, segment_index=segment_index
+        ):
+            raise RuntimeError(
+                "unsupported shell command substitution contains a relevant "
+                "specialist Kanban mutation"
+            )
+        executable_index = _first_executable(segment)
+        if executable_index is None or executable_index >= len(segment):
+            previous_result = None
+        else:
+            executable = Path(segment[executable_index]).name
+            if executable in _SHELL_BINARIES:
+                inner = _shell_inline_command(segment, executable_index)
+                if inner is not None:
+                    invocations.extend(_hermes_kanban_invocations(inner, depth=depth + 1))
+            elif executable == "hermes":
+                invocation = _extract_hermes_action(segment, executable_index)
+                if invocation is not None:
+                    invocations.append(invocation)
+            previous_result = _literal_command_result(segment, depth=depth)
+
+        if operator is None:
             continue
-        if executable != "hermes":
-            continue
-        try:
-            kanban_index = segment.index("kanban", index + 1)
-        except ValueError:
-            continue
-        tail = segment[kanban_index + 1 :]
-        board = ""
-        position = 0
-        while position < len(tail):
-            value = tail[position]
-            if value == "--board":
-                if position + 1 >= len(tail):
-                    raise RuntimeError("hermes kanban --board is missing a value")
-                board = tail[position + 1]
-                position += 2
-                continue
-            if value.startswith("--board="):
-                board = value.split("=", 1)[1]
-                position += 1
-                continue
-            break
-        if position < len(tail):
-            invocations.append((tail[position].casefold(), tail[position + 1 :], board))
+        later_has_hermes = any(
+            _segment_has_hermes(later, depth=depth)
+            for later, _ in chain[segment_index + 1 :]
+        ) or _substitution_records_contain_relevant(
+            substitutions, depth=depth, after_segment=segment_index
+        )
+        if operator == ";":
+            reachable = True
+            previous_result = None
+        elif operator in {"&&", "||"}:
+            if previous_result is None:
+                if later_has_hermes:
+                    raise RuntimeError("ambiguous shell command reachability")
+                reachable = False
+            else:
+                reachable = previous_result if operator == "&&" else not previous_result
+        elif later_has_hermes:
+            raise RuntimeError("unsupported shell operator makes command reachability ambiguous")
     return invocations
 
 
