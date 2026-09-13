@@ -230,6 +230,7 @@ def build_graph(root_status: str = "todo",
                 reviewer_status: str = "todo",
                 impl_status: str = "done",
                 blocked_claim: str | None = None,
+                reviewer_claim: str | None = None,
                 extra_ancestor: tuple[str, str] | None = None,
                 rework_evidence: bool = True) -> dict:
     """Create the #88-shaped chain and return the node ids used.
@@ -286,6 +287,11 @@ def build_graph(root_status: str = "todo",
             conn.execute(
                 "UPDATE tasks SET claim_lock = ? WHERE id = ?",
                 (blocked_claim, blocked),
+            )
+        if reviewer_claim is not None:
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = 4242 WHERE id = ?",
+                (reviewer_claim, reviewer),
             )
         if extra_ancestor is not None:
             ancestor_status, ancestor_key = extra_ancestor
@@ -491,6 +497,61 @@ def test_4_active_ownership():
               and root_entry["changed"] is False, str(root_entry))
         check("blocked node still blocked", after[ids["blocked"]]["status"] == "blocked")
         assert_no_workers({k: v for k, v in ids.items() if k != "blocked"})
+
+
+def test_4b_review_root_with_active_reviewer_restores_dependency_wait():
+    print("4b. parked review root + active reviewer -> root todo, reviewer preserved")
+    with isolated_test_environment():
+        _prepare_isolated_environment()
+        init_db()
+        fake = FakeGitHub(
+            issue_state="closed",
+            pr=pr_payload(PR_N, state="closed", merged=True),
+        )
+        ids = build_graph(
+            root_status="review",
+            reviewer_status="running",
+            reviewer_claim="reviewer-live-claim",
+        )
+        before = statuses(ids)
+        results = run_sync(fake)
+        after = statuses(ids)
+        root_entry = next(r for r in results if r["task_id"] == ids["root"])
+
+        check(
+            "parked review root repaired to todo",
+            root_entry["status"] == "todo"
+            and root_entry["changed"] is True
+            and root_entry.get("reason") == "internal_dependency_pending",
+            str(root_entry),
+        )
+        check(
+            "active reviewer status preserved",
+            after[ids["reviewer"]]["status"] == "running",
+            str(after[ids["reviewer"]]),
+        )
+        check(
+            "active reviewer ownership preserved",
+            after[ids["reviewer"]]["claim_lock"] == "reviewer-live-claim"
+            and after[ids["reviewer"]]["worker_pid"] == 4242,
+            str(after[ids["reviewer"]]),
+        )
+        check(
+            "root was review before repair",
+            before[ids["root"]]["status"] == "review",
+            str(before[ids["root"]]),
+        )
+        dep_events = [
+            e for e in events_for(ids["root"])
+            if e["kind"] == "github_dependency_gate"
+        ]
+        check(
+            "root records dependency-gate repair",
+            len(dep_events) == 1
+            and dep_events[0]["payload"].get("previous_status") == "review"
+            and dep_events[0]["payload"].get("new_status") == "todo",
+            str(dep_events),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1122,7 @@ def main() -> int:
         test_2_idempotent_repeat,
         test_3_fail_closed,
         test_4_active_ownership,
+        test_4b_review_root_with_active_reviewer_restores_dependency_wait,
         test_5_ambiguous_ancestor,
         test_5b_unrelated_allowed_status_ancestors,
         test_5c_missing_rework_provenance,
