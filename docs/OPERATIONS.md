@@ -185,6 +185,106 @@ named primary plugin, and prints rollback commands. The safety-wake installer
 installs/enables only its bounded companion plugin; it requires the primary
 completion plugin and deployed edge runtime to be present.
 
+### 4b. Intake/edge lifecycle-guard deployment and recovery
+
+The `deploy-intake-edge.sh` step above also owns the fail-closed lifecycle
+guard used by `kanban_block`, structured `kanban_create`, and `terminal`. Run it
+against the namespace that owns the active Hermes runtime. In the current
+containerized deployment, the host-side form is:
+
+```bash
+docker exec hermes-cloudcli-agent bash -lc '
+  cd /ws/projects/<checkout> &&
+  automation/hermes/scripts/deploy-intake-edge.sh \
+    --hermes-home /home/hermes/.hermes \
+    --dry-run
+'
+```
+
+Run the same command without `--dry-run` only after the candidate passes. When
+already inside `hermes-cloudcli-agent`, invoke the repository-owned script
+directly instead:
+
+```bash
+bash /ws/projects/<checkout>/automation/hermes/scripts/deploy-intake-edge.sh \
+  --hermes-home /home/hermes/.hermes \
+  --dry-run
+```
+
+Repeat the direct invocation without `--dry-run` to apply the candidate. Do
+not substitute the Ubuntu user's `$HOME/.hermes` unless that directory is the
+active Hermes runtime; a host-side profile directory is not the live target in
+the current deployment.
+
+Before creating a candidate, the deployer requires the global config plus the
+five required H4V3 profile-local config targets:
+
+- `$HERMES_HOME/config.yaml` (the global config);
+- `$HERMES_HOME/profiles/kanban-main/config.yaml`;
+- `$HERMES_HOME/profiles/kanban-investigator/config.yaml`;
+- `$HERMES_HOME/profiles/kanban-developer/config.yaml`;
+- `$HERMES_HOME/profiles/kanban-reviewer/config.yaml`; and
+- `$HERMES_HOME/profiles/kanban-designer/config.yaml`.
+
+Missing targets are a fail-closed preflight failure and must be repaired or
+escalated before any live mutation. The deployer copies the tracked intake,
+edge, registry, and lifecycle-guard sources into
+`$HERMES_HOME/scripts/.deploy-candidate-<timestamp>/`, compiles the candidate,
+and runs its bounded `--help` smoke checks before applying it. A dry-run must
+leave every live source/config byte unchanged and must remove its candidate;
+after either mode, inspect for any remaining `.deploy-candidate-*` residue.
+
+The approved shell-hook identity remains one shared command:
+
+```text
+python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py
+```
+
+The command is rendered for exactly these three fail-closed matchers in the
+global and each of the five profile-local configs: `kanban_block`,
+`kanban_create`, and `terminal`; each entry has `timeout: 10` and
+`fail_closed: true`. Rendering retires any `kanban-workspace-guard.py` hook
+references from those configs. The old script may remain as rollback
+archaeology, but it is not an active policy or a reason to restore a competing
+hook.
+
+Apply ordering is dependency-first. Each source and config target is replaced
+with a same-filesystem `mv` only after its candidate is validated. This is
+atomic per-target, not a multi-file transaction: a failure can leave an
+already-replaced target in place, so stop and use the deployer's recovery
+output rather than assuming an all-or-nothing deployment. A successful apply
+removes its candidate and does not read or modify Hermes cron metadata.
+
+After applying, independently read back every source/target pair covered by
+the deployer's source mapping and compare source/target SHA-256 values with
+`sha256sum`. Then inspect only
+the hook metadata in the global plus five profile configs: all six must contain
+the same three matcher entries and command, all must be fail-closed with the
+ten-second timeout, and none may reference `kanban-workspace-guard.py`. Do not
+dump secrets or whole config files as evidence.
+
+An apply creates timestamped same-run backups beside existing script targets,
+the global config, and each profile config. Retain the deployer's printed
+backup paths and use only its exact printed `mv` rollback commands if a
+post-install verification fails. A target that was absent before deployment
+has no same-run backup or printed restore command; record that pre-state and do
+not claim that rollback can recreate absence automatically. Do not restore
+older snapshots, hand-copy files, or use a legacy deployment path. After any
+rollback, repeat the source/target hash, six-config semantic, and candidate
+residue checks before retrying.
+
+Once source/config read-back passes, run one safe native structured-create
+canary through the canonical board operation. It must use
+`workspace_kind: worktree`, the canonical project binding, a unique
+idempotency key bound to the
+deployed source, `completion_contract: local-only`, and a real unresolved
+parent; omit `initial_status`. The expected result is `todo` behind that
+parent, with a controller-derived isolated task-id workspace/branch and no
+claim, spawn, run, or physical worktree. Archive only this canary through the
+canonical board operation and read back its archived state and event history.
+Do not substitute a CLI create, an ad-hoc `git worktree`, a parentless card, or
+a preblocked placeholder.
+
 Restart the existing Hermes worker process after primary-observer activation,
 and restart the long-lived Hermes gateway/dispatcher after safety-wake
 activation so the dispatcher hook is registered. A plugin installed on disk
