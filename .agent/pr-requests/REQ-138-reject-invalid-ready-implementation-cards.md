@@ -82,7 +82,7 @@ No Hermes core, product repository, n8n workflow ownership, cron, or live runtim
 
 ## Delivery and rollback boundary
 
-- Implementation checkpoint: `af31e91` (`fix(kanban): close board-aware arithmetic parser paths`). This commit contains the bounded parser, regression tests, and current REQ provenance; the final publication SHA is authoritative only after remote read-back.
+- Implementation checkpoint: `f78594d` (`fix(kanban): close board-aware arithmetic parser paths`). The subsequent REQ-only provenance commit is the final publication commit for this round; its SHA is authoritative only after remote read-back.
 - Stable live entrypoint identity remains the repository-approved `automation/hermes/scripts/kanban-block-kind-guard.py`; it delegates terminal classification to the shared specialist parser and then to the existing workspace-binding guard for native creation. This round did not deploy or mutate that live hook/config.
 - Rollback boundary is the existing PR #149 branch: revert the substitution-parser commit and this REQ-only provenance commit as ordinary branch commits; no Hermes core rollback or live host operation is required for this round.
 - PR #149 will be fresh-read after both publication commits as OPEN/unmerged, base `main`, branch `fix/issue-138-ready-binding-preflight`, with exactly one Issue #138-linked PR and visible plain-text `Closes #138.`. The exact final head is authoritative only from the post-push GitHub/remote read-back and Kanban handoff, not from a self-referential SHA embedded in this file.
