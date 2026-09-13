@@ -5,14 +5,11 @@
 # --hermes-home /home/hermes/.hermes; a host-side $HOME/.hermes is not the live
 # runtime unless it is explicitly the mounted backing path.
 #
-# Live deployment path (verified 2026-08-13): the Hermes cron job
-# bf431b2a6ba6 ("GitHub agent-ready Issue intake") in the `default` profile
-# stores `script: github-agent-ready-kanban-intake.py` with `workdir: null`,
-# so the scheduler resolves and executes the file under
+# Live deployment path: the fixed loopback direct actuator executes
 # $HERMES_HOME/scripts/github-agent-ready-kanban-intake.py — a deployed copy,
 # NOT this repository checkout. The intake resolves its edge counterpart and
 # repository registry from the same runtime directory, so all deployed files
-# must be updated together.
+# must be updated together. The retired legacy intake cron job is not required.
 #
 # The canonical intake source remains
 # automation/hermes/scripts/github-agent-ready-kanban-intake.py. Deployment
@@ -36,7 +33,7 @@
 #   * wrapper dependencies are installed before either live wrapper switch
 #   * timestamped backup of the previous files (existing .bak-* convention)
 #   * rollback = restore the backup (exact command printed)
-#   * NEVER touches cron jobs.json / job id / schedule / enabled state
+#   * NEVER touches cron jobs.json; any historical legacy intake job is left as-is
 #   * lifecycle guard dependencies are installed before the approved wrapper
 #   * workspace-binding preflight is installed before the approved wrapper
 #   * the existing approved shell-hook command path stays unchanged
@@ -84,14 +81,16 @@ plus kanban_resource_admission.py, kanban_head_binding_feedback.py,
 kanban_retry_signal_guard.py, and the dynamic resource core/wrapper pair. If no
 kanban.worker_resources are configured, scheduling behavior is unchanged. All
 wrapper dependencies are replaced before the corresponding live entrypoint, so
-a cron invocation during deploy sees either the old standalone script or a
-fully backed new wrapper — never a wrapper whose imports have not been installed.
+a concurrent actuator invocation during deploy sees either the old standalone
+script or a fully backed new wrapper — never a wrapper whose imports have not
+been installed.
 
 Run this where the supplied --hermes-home path is the active Hermes runtime.
 For the current containerized deployment:
   docker exec hermes-cloudcli-agent bash /ws/projects/<checkout>/automation/hermes/scripts/deploy-intake-edge.sh --hermes-home /home/hermes/.hermes
 
-The Hermes cron job definition (id/schedule/enabled) is never modified.
+The deployer never reads or modifies Hermes cron metadata. The current
+intake topology is direct-actuator based (`hermes_cron_required=false`).
 
 The deployment keeps the already-approved
 $HERMES_HOME/scripts/kanban-block-kind-guard.py shell-hook command stable. That
@@ -391,7 +390,7 @@ echo "Deployed intake/edge/registry and lifecycle guards to $TARGET_DIR (backup:
 echo "Config hooks installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
 echo "Shell-hook command remains $TARGET_DIR/kanban-block-kind-guard.py (existing consent identity preserved)."
 echo "Superseded kanban-workspace-guard.py hook entries are retired from live config; the old file is left untouched for rollback archaeology."
-echo "Cron job bf431b2a6ba6 is untouched (id/schedule/enabled unchanged)."
+echo "Hermes cron metadata is untouched; the current intake path does not require the retired legacy intake job."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Rollback:"
   for backup in "${BACKUPS[@]}"; do
