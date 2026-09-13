@@ -49,6 +49,133 @@ def test_direct_shell_and_compound_invocations_are_detected() -> None:
 @pytest.mark.parametrize(
     "command",
     [
+        "echo \"$(hermes kanban create x --assignee kanban-developer)\"",
+        "echo \"$(hermes kanban assign t_x kanban-reviewer)\"",
+        "echo \"$(hermes kanban reassign t_x kanban-reviewer --reclaim)\"",
+        "echo `hermes kanban create x --assignee kanban-developer`",
+        "echo `hermes kanban assign t_x kanban-reviewer`",
+        "echo `hermes kanban reassign t_x kanban-reviewer --reclaim`",
+        "echo $(hermes kanban create x --assignee kanban-developer)",
+        "echo $(hermes kanban assign t_x kanban-reviewer)",
+        "echo $(hermes kanban reassign t_x kanban-reviewer --reclaim)",
+    ],
+)
+def test_executable_command_substitutions_fail_closed_for_all_mutations(
+    command: str,
+) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="command substitution"):
+        guard._hermes_kanban_invocations(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -lc 'echo \"$(hermes kanban create x --assignee kanban-developer)\"'",
+        "env FOO=bar bash -lc 'echo `hermes kanban assign t_x kanban-reviewer`'",
+        "env -- bash -lc 'echo $(hermes kanban reassign t_x kanban-reviewer --reclaim)'",
+    ],
+)
+def test_nested_shell_wrappers_cannot_hide_command_substitutions(command: str) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="command substitution"):
+        guard._hermes_kanban_invocations(command)
+
+
+@pytest.mark.parametrize(
+    "substitution",
+    [
+        "$(hermes kanban create x --assignee kanban-developer)",
+        "`hermes kanban assign t_x kanban-reviewer`",
+    ],
+)
+def test_command_substitutions_preserve_literal_short_circuit_reachability(
+    substitution: str,
+) -> None:
+    guard = _load_guard()
+    mutation = f'echo "{substitution}"'
+    assert guard._hermes_kanban_invocations(f"false && {mutation}") == []
+    assert guard._hermes_kanban_invocations(f"true || {mutation}") == []
+    for prefix in ("true &&", "false ||"):
+        with pytest.raises(RuntimeError, match="command substitution"):
+            guard._hermes_kanban_invocations(f"{prefix} {mutation}")
+
+
+def test_unknown_predicate_cannot_hide_a_command_substitution() -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="reachability"):
+        guard._hermes_kanban_invocations(
+            "test -f /tmp/maybe && echo "
+            '"$(hermes kanban create x --assignee kanban-developer)"'
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"$(bash -lc 'hermes kanban create x --assignee kanban-developer')\"",
+        "echo \"$(env FOO=bar bash -lc 'hermes kanban assign t_x kanban-reviewer')\"",
+        "echo `env -- bash -lc 'hermes kanban reassign t_x kanban-reviewer --reclaim'`",
+    ],
+)
+def test_shell_wrappers_nested_inside_substitutions_cannot_hide_mutations(
+    command: str,
+) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="command substitution"):
+        guard._hermes_kanban_invocations(command)
+
+
+def test_unsupported_operator_after_a_reachable_substitution_fails_closed() -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="unsupported shell operator"):
+        guard._hermes_kanban_invocations(
+            'true && printf safe | echo "$(hermes kanban create x --assignee kanban-developer)"'
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo '$(hermes kanban create x --assignee kanban-developer)'",
+        'echo "\\$(hermes kanban assign t_x kanban-reviewer)"',
+        'echo "\\`hermes kanban reassign t_x kanban-reviewer --reclaim\\`"',
+        'echo "$(printf safe)"',
+        "echo `printf safe`",
+        'printf "%s" "hermes kanban create x --assignee kanban-developer"',
+    ],
+)
+def test_literal_escaped_and_harmless_substitutions_remain_data(command: str) -> None:
+    guard = _load_guard()
+    assert guard._hermes_kanban_invocations(command) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "$(hermes kanban create x --assignee kanban-developer"',
+        "echo `hermes kanban assign t_x kanban-reviewer",
+    ],
+)
+def test_malformed_relevant_command_substitutions_fail_closed(command: str) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="shell (?:command )?substitution|shell grouping"):
+        guard._hermes_kanban_invocations(command)
+
+
+def test_relevant_command_substitution_nesting_is_bounded() -> None:
+    guard = _load_guard()
+    command = "hermes kanban create x --assignee kanban-developer"
+    for _ in range(guard._MAX_SHELL_DEPTH + 1):
+        command = f'echo "$({command})"'
+
+    with pytest.raises(RuntimeError, match="nesting exceeds"):
+        guard._hermes_kanban_invocations(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "( hermes kanban create x --assignee kanban-developer )",
         "true && ( hermes kanban assign t_x kanban-reviewer )",
         "{ hermes kanban reassign t_x kanban-reviewer --reclaim; }",

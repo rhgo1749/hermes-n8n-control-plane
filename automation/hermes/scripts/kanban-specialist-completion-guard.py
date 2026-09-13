@@ -381,92 +381,254 @@ def _segment_has_hermes(segment: list[str], *, depth: int = 0) -> bool:
         inner = _shell_inline_command(segment, index)
         if inner is None:
             return False
-        try:
-            nested = _tokenize(inner)
-        except ValueError as exc:
-            raise RuntimeError(f"could not parse shell wrapper: {exc}") from exc
-        return any(_segment_has_hermes(part, depth=depth + 1) for part, _ in _command_chain(nested))
+        return _command_contains_relevant_hermes(inner, depth=depth + 1)
     if executable != "hermes":
         return False
     return _relevant_hermes_action(segment, index)
 
 
-def _scan_shell_groupings(command: str) -> tuple[list[str], bool]:
-    """Return unquoted compound-command bodies and a malformed flag.
+def _scan_shell_groupings(
+    command: str,
+) -> tuple[list[str], list[tuple[str, bool, int]], bool]:
+    """Return grouping bodies, command substitutions, and malformed status.
 
-    This is deliberately a lexical check, not a shell interpreter.  In
-    particular, quoted or escaped grouping characters are ignored so a
-    documentation string passed to ``echo``/``printf`` remains data.
+    The scanner is deliberately lexical rather than a shell interpreter.  A
+    substitution body is returned with a per-body malformed flag so callers
+    can reject a relevant incomplete expansion without rejecting harmless
+    expansion syntax.  Single-quoted and escaped data stays inert; the body
+    of a command substitution is scanned in its own quote context because
+    double quotes do not make ``$()`` or backticks inert.
     """
     groups: list[str] = []
-    stack: list[tuple[str, int]] = []
-    quote: str | None = None
-    malformed = False
-    index = 0
-    while index < len(command):
-        value = command[index]
-        if quote is not None:
-            if quote == '"' and value == "\\":
+    substitutions: list[tuple[str, bool, int]] = []
+
+    def consume_arithmetic(start: int) -> tuple[int, bool]:
+        """Return the end of a ``$((...))`` expansion without interpreting it."""
+        depth = 0
+        index = start
+        while index < len(command):
+            value = command[index]
+            if value == "\\":
                 index += 2
                 continue
-            if value == quote:
-                quote = None
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth -= 1
+                if depth == 0:
+                    return index, False
             index += 1
-            continue
-        if value in {"'", '"'}:
-            quote = value
+        return len(command), True
+
+    def consume_substitution(
+        start: int, delimiter: str, *, depth: int
+    ) -> tuple[int, str, bool]:
+        if depth > _MAX_SHELL_DEPTH:
+            raise RuntimeError("shell command substitution nesting exceeds the specialist guard limit")
+        body_start = start + (2 if delimiter == "$(" else 1)
+        end, malformed, closed = scan_fragment(
+            body_start,
+            ")" if delimiter == "$(" else "`",
+            depth=depth,
+        )
+        return end, command[body_start:end], malformed or not closed
+
+    def scan_fragment(
+        start: int,
+        closing: str | None,
+        *,
+        depth: int = 0,
+        record_substitutions: bool = False,
+    ) -> tuple[int, bool, bool]:
+        fragment_malformed = False
+        stack: list[tuple[str, int]] = []
+        quote: str | None = None
+        segment_index = 0
+        index = start
+        while index < len(command):
+            value = command[index]
+            if quote == "'":
+                if value == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if value == "\\":
+                    index += 2
+                    continue
+                if value == '"':
+                    quote = None
+                    index += 1
+                    continue
+                if value == "$" and command[index + 1 : index + 3] == "((":
+                    arithmetic_end, arithmetic_malformed = consume_arithmetic(index + 1)
+                    fragment_malformed |= arithmetic_malformed
+                    if arithmetic_malformed:
+                        index = len(command)
+                    else:
+                        index = arithmetic_end + 1
+                    continue
+                if value == "$" and command[index : index + 2] == "$(":
+                    end, body, substitution_malformed = consume_substitution(
+                        index, "$(", depth=depth + 1
+                    )
+                    if record_substitutions and not stack:
+                        substitutions.append(
+                            (body, substitution_malformed, segment_index)
+                        )
+                    fragment_malformed |= substitution_malformed
+                    index = len(command) if substitution_malformed else end + 1
+                    continue
+                if value == "`":
+                    end, body, substitution_malformed = consume_substitution(
+                        index, "`", depth=depth + 1
+                    )
+                    if record_substitutions and not stack:
+                        substitutions.append(
+                            (body, substitution_malformed, segment_index)
+                        )
+                    fragment_malformed |= substitution_malformed
+                    index = len(command) if substitution_malformed else end + 1
+                    continue
+                index += 1
+                continue
+            if value == "'":
+                quote = "'"
+                index += 1
+                continue
+            if value == '"':
+                quote = '"'
+                index += 1
+                continue
+            if value == "\\":
+                escaped = command[index + 1 : index + 2]
+                if escaped == "$" and command[index + 1 : index + 3] == "$(":
+                    end, _, _ = consume_substitution(
+                        index + 1, "$(", depth=depth + 1
+                    )
+                    index = end + 1
+                elif escaped == "`":
+                    end, _, _ = consume_substitution(
+                        index + 1, "`", depth=depth + 1
+                    )
+                    index = end + 1
+                else:
+                    index += 2
+                continue
+            if closing == "`" and value == "`":
+                return index, fragment_malformed, True
+            if value == "$" and command[index + 1 : index + 3] == "((":
+                arithmetic_end, arithmetic_malformed = consume_arithmetic(index + 1)
+                fragment_malformed |= arithmetic_malformed
+                if arithmetic_malformed:
+                    index = len(command)
+                else:
+                    index = arithmetic_end + 1
+                continue
+            if value == "$" and command[index : index + 2] == "$(":
+                end, body, substitution_malformed = consume_substitution(
+                    index, "$(", depth=depth + 1
+                )
+                if record_substitutions and not stack:
+                    substitutions.append((body, substitution_malformed, segment_index))
+                fragment_malformed |= substitution_malformed
+                index = len(command) if substitution_malformed else end + 1
+                continue
+            if value == "`":
+                end, body, substitution_malformed = consume_substitution(
+                    index, "`", depth=depth + 1
+                )
+                if record_substitutions and not stack:
+                    substitutions.append((body, substitution_malformed, segment_index))
+                fragment_malformed |= substitution_malformed
+                index = len(command) if substitution_malformed else end + 1
+                continue
+            if value in _GROUPING_OPEN_TO_CLOSE:
+                stack.append((value, index + 1))
+            elif value in {")", "}"}:
+                if stack:
+                    if _GROUPING_OPEN_TO_CLOSE[stack[-1][0]] != value:
+                        fragment_malformed = True
+                    else:
+                        _, body_start = stack.pop()
+                        groups.append(command[body_start:index])
+                elif closing == value:
+                    return index, fragment_malformed, True
+                else:
+                    fragment_malformed = True
+            elif value in _CONTROL_OPERATOR_CHARS:
+                operator_start = index
+                while (
+                    index < len(command)
+                    and command[index] in _CONTROL_OPERATOR_CHARS
+                ):
+                    index += 1
+                if index > operator_start:
+                    segment_index += 1
+                    continue
             index += 1
-            continue
-        if value == "\\":
-            index += 2
-            continue
-        if value in _GROUPING_OPEN_TO_CLOSE:
-            stack.append((value, index + 1))
-        elif value in {")", "}"}:
-            if not stack or _GROUPING_OPEN_TO_CLOSE[stack[-1][0]] != value:
-                malformed = True
-            else:
-                _, start = stack.pop()
-                groups.append(command[start:index])
-        index += 1
-    if quote is not None:
-        malformed = True
-    if stack:
-        malformed = True
-        groups.extend(command[start:] for _, start in stack)
-    return groups, malformed
+        if quote is not None:
+            fragment_malformed = True
+        if stack:
+            fragment_malformed = True
+            groups.extend(command[group_start:] for _, group_start in stack)
+        if closing is not None:
+            fragment_malformed = True
+        return len(command), fragment_malformed, False
+
+    _, malformed, _ = scan_fragment(0, None, record_substitutions=True)
+    return groups, substitutions, malformed
 
 
 def _command_contains_relevant_hermes(command: str, *, depth: int = 0) -> bool:
-    """Return whether a bounded command body can invoke a relevant action."""
+    """Return whether a bounded command body can invoke a relevant action.
+
+    The invocation walker remains the single owner of shell reachability.  This
+    predicate is only used by grouping/operator lookahead, so an ambiguous or
+    malformed body is conservatively treated as relevant rather than parsed by
+    a second command-chain implementation.
+    """
     if depth > _MAX_SHELL_DEPTH:
         raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
-    if _groups_contain_relevant_hermes(command, depth=depth):
-        return True
     try:
-        tokens = _tokenize(command)
-    except ValueError as exc:
-        raise RuntimeError(f"could not parse shell grouping: {exc}") from exc
-    if _contains_ambiguous_conditional(tokens):
+        invocations = _hermes_kanban_invocations(command, depth=depth)
+    except RuntimeError:
         return True
-    for segment, _ in _command_chain(tokens):
-        index = _first_executable(segment)
-        if index is None or index >= len(segment):
+    return any(action in {"create", "assign", "reassign"} for action, _, _ in invocations)
+
+
+def _substitution_records_contain_relevant(
+    substitutions: list[tuple[str, bool, int]],
+    *,
+    depth: int,
+    segment_index: int | None = None,
+    after_segment: int | None = None,
+) -> bool:
+    for body, malformed, body_segment in substitutions:
+        if segment_index is not None and body_segment != segment_index:
             continue
-        executable = Path(segment[index]).name
-        if executable in _SHELL_BINARIES:
-            inner = _shell_inline_command(segment, index)
-            if inner is not None and _command_contains_relevant_hermes(
-                inner, depth=depth + 1
-            ):
-                return True
-        elif executable == "hermes" and _relevant_hermes_action(segment, index):
-            return True
+        if after_segment is not None and body_segment <= after_segment:
+            continue
+        if not _command_contains_relevant_hermes(body, depth=depth + 1):
+            continue
+        if malformed:
+            raise RuntimeError(
+                "malformed shell command substitution contains a relevant "
+                "specialist Kanban mutation"
+            )
+        return True
     return False
 
 
+def _substitutions_contain_relevant_hermes(
+    command: str, *, depth: int = 0
+) -> bool:
+    _, substitutions, _ = _scan_shell_groupings(command)
+    return _substitution_records_contain_relevant(substitutions, depth=depth)
+
+
 def _groups_contain_relevant_hermes(command: str, *, depth: int = 0) -> bool:
-    groups, _ = _scan_shell_groupings(command)
+    groups, _, _ = _scan_shell_groupings(command)
     return any(
         _command_contains_relevant_hermes(group, depth=depth + 1)
         for group in groups
@@ -529,7 +691,11 @@ def _hermes_kanban_invocations(
         tokens = _tokenize(command)
     except ValueError as exc:
         raise RuntimeError(f"could not parse terminal command: {exc}") from exc
-    if _groups_contain_relevant_hermes(command, depth=depth):
+    groups, substitutions, _ = _scan_shell_groupings(command)
+    if any(
+        _command_contains_relevant_hermes(group, depth=depth + 1)
+        for group in groups
+    ):
         raise RuntimeError(
             "unsupported shell grouping contains a relevant specialist Kanban mutation"
         )
@@ -542,14 +708,25 @@ def _hermes_kanban_invocations(
     previous_result: bool | None = None
     for segment_index, (segment, operator) in enumerate(chain):
         if (
-            operator is not None
-            and operator not in _SUPPORTED_SHELL_OPERATORS
-            and any(
-                _segment_has_hermes(later, depth=depth)
-                for later, _ in chain[segment_index + 1 :]
+            (
+                operator is not None
+                and operator not in _SUPPORTED_SHELL_OPERATORS
+                and any(
+                    _segment_has_hermes(later, depth=depth)
+                    for later, _ in chain[segment_index + 1 :]
+                )
+            )
+            or (
+                operator is not None
+                and operator not in _SUPPORTED_SHELL_OPERATORS
+                and _substitution_records_contain_relevant(
+                    substitutions, depth=depth, after_segment=segment_index
+                )
             )
         ):
-            raise RuntimeError("unsupported shell operator makes command reachability ambiguous")
+            raise RuntimeError(
+                "unsupported shell operator makes command reachability ambiguous"
+            )
         if not reachable:
             if operator == ";":
                 reachable = True
@@ -557,6 +734,13 @@ def _hermes_kanban_invocations(
             elif operator in {"&&", "||"}:
                 reachable = previous_result if operator == "&&" else not previous_result
             continue
+        if _substitution_records_contain_relevant(
+            substitutions, depth=depth, segment_index=segment_index
+        ):
+            raise RuntimeError(
+                "unsupported shell command substitution contains a relevant "
+                "specialist Kanban mutation"
+            )
         executable_index = _first_executable(segment)
         if executable_index is None or executable_index >= len(segment):
             previous_result = None
@@ -597,6 +781,8 @@ def _hermes_kanban_invocations(
         later_has_hermes = any(
             _segment_has_hermes(later, depth=depth)
             for later, _ in chain[segment_index + 1 :]
+        ) or _substitution_records_contain_relevant(
+            substitutions, depth=depth, after_segment=segment_index
         )
         if operator == ";":
             reachable = True

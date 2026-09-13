@@ -71,6 +71,66 @@ def _task_db(path: Path, task_id: str, contract: str | None) -> None:
         conn.close()
 
 
+def _run_stable_hook_then_shell(
+    command: str,
+) -> tuple[
+    subprocess.CompletedProcess[str],
+    subprocess.CompletedProcess[str] | None,
+    str,
+    bytes,
+    bytes,
+]:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-substitution-") as directory:
+        root = Path(directory)
+        db = root / "kanban.db"
+        _task_db(db, "t_substitution", "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        calls = root / "hermes-calls.log"
+        fake_hermes = fake_bin / "hermes"
+        fake_hermes.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_HERMES_CALLS\"\n",
+            encoding="utf-8",
+        )
+        fake_hermes.chmod(0o755)
+        (fake_bin / "python3").symlink_to(sys.executable)
+
+        env = os.environ.copy()
+        env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+        env.update(
+            {
+                "FAKE_HERMES_CALLS": str(calls),
+                "HERMES_KANBAN_DB": str(db),
+                "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG": str(root / "specialist.log"),
+                "KANBAN_WORKSPACE_BINDING_GUARD_LOG": str(root / "workspace.log"),
+                "PATH": f"{fake_bin}:{env.get('PATH', '')}",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        payload = {"tool_name": "terminal", "tool_input": {"command": command}}
+        prehook = subprocess.run(
+            [sys.executable, str(GUARD)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        shell_result = None
+        if prehook.returncode == 0:
+            shell_result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+        calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        return prehook, shell_result, calls_text, before, db.read_bytes()
+
+
 def _assert_blocked(result: subprocess.CompletedProcess[str], assignee: str) -> None:
     assert result.returncode == 2, (result.stdout, result.stderr)
     body = json.loads(result.stdout)
@@ -594,6 +654,34 @@ def test_stable_wrapper_rejects_grouped_specialist_mutations_without_mutating_db
             assert conn.execute(
                 "SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)
             ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"$(hermes kanban create x --assignee kanban-developer)\"",
+        "echo \"$(hermes kanban assign t_substitution kanban-reviewer)\"",
+        "echo \"$(hermes kanban reassign t_substitution kanban-reviewer --reclaim)\"",
+        "echo `hermes kanban create x --assignee kanban-developer`",
+        "echo `hermes kanban assign t_substitution kanban-reviewer`",
+        "echo `hermes kanban reassign t_substitution kanban-reviewer --reclaim`",
+        "bash -lc 'echo \"$(hermes kanban create x --assignee kanban-developer)\"'",
+        "env FOO=bar bash -lc 'echo `hermes kanban reassign t_substitution kanban-reviewer --reclaim`'",
+    ],
+)
+def test_stable_hook_blocks_command_substitution_before_shell_execution(
+    command: str,
+) -> None:
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "command substitution" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before
 
 
 @pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])

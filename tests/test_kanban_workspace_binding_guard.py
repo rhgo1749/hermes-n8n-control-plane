@@ -1748,6 +1748,35 @@ def test_terminal_grouped_specialist_mutations_fail_closed_before_materializatio
     assert fixture["adapters"] == []
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"$(hermes kanban create x --assignee kanban-developer)\"",
+        "echo \"$(hermes kanban assign t_missing kanban-reviewer)\"",
+        "echo \"$(hermes kanban reassign t_missing kanban-reviewer --reclaim)\"",
+        "echo `hermes kanban create x --assignee kanban-developer`",
+        "echo `hermes kanban assign t_missing kanban-reviewer`",
+        "echo `hermes kanban reassign t_missing kanban-reviewer --reclaim`",
+        "echo $(hermes kanban create x --assignee kanban-developer)",
+        "bash -lc 'echo \"$(hermes kanban reassign t_missing kanban-reviewer --reclaim)\"'",
+    ],
+)
+def test_terminal_command_substitutions_fail_closed_without_workspace_mutation(
+    fixture: dict[str, Any], command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = fixture["board"].read_bytes()
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    diagnostic = json.loads(capsys.readouterr().out)
+    assert diagnostic["action"] == "block"
+    assert "command substitution" in diagnostic["message"]
+    assert "No dispatchable task mutation" in diagnostic["message"]
+    assert fixture["board"].read_bytes() == before
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
 @pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
 def test_terminal_unsupported_shell_operators_fail_closed_for_assign_without_mutation(
     fixture: dict[str, Any], operator: str, capsys: pytest.CaptureFixture[str]
