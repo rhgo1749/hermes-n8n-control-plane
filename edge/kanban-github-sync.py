@@ -2852,6 +2852,14 @@ def _attempt_terminal_merge_convergence(
     root_body = str(row["body"] or "")
     for node_id, node in sorted(nodes.items()):
         if _node_has_active_ownership(node):
+            # A parked GitHub-backed review root must never stay externally
+            # projected while live internal work is still owned.  Terminal
+            # convergence is not eligible in this shape, so fall through to
+            # the classic dependency lane, which repairs review -> todo and
+            # leaves the active parent untouched.  Keep the existing
+            # diagnostic for already-todo roots where no repair is needed.
+            if root_status == "review":
+                return None
             return {
                 "task_id": task_id,
                 "status": root_status,
