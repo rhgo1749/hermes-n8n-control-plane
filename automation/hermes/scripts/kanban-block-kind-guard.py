@@ -133,6 +133,25 @@ def _hermes_python() -> Path:
     raise RuntimeError(f"Hermes Python interpreter is missing beside {bin_dir / 'hermes'}")
 
 
+def _workspace_binding_subprocess_env(payload: dict[str, Any]) -> dict[str, str]:
+    env = os.environ.copy()
+    if str(payload.get("tool_name") or "") == "kanban_create":
+        # Shell hooks are ordinary worker descendants. Hermes therefore stamps the
+        # hook subprocess with HERMES_DELEGATED_CHILD_CONTEXT even when the caller
+        # is the dispatcher-owned root worker. The workspace guard intentionally
+        # calls canonical create_task() to atomically materialize+verify a valid
+        # structured create, so carrying that descendant fence into the nested
+        # guard makes every legitimate root create fail before mutation.
+        #
+        # Remove the subprocess-only fence for the *native structured tool* path.
+        # Hermes hides/refuses kanban_* tools for real delegate_task children before
+        # pre_tool_call hooks run, so this does not grant a delegated child a board
+        # mutation route. Keep the fence for terminal: a delegated child can invoke
+        # terminal, and H4V3 explicitly forbids CLI/ad-hoc create as a fallback.
+        env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    return env
+
+
 def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
     if not WORKSPACE_BINDING_GUARD.is_file():
         return _hard_block(f"guard dependency missing: {WORKSPACE_BINDING_GUARD.name}")
@@ -144,6 +163,7 @@ def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
             capture_output=True,
             timeout=10,
             check=False,
+            env=_workspace_binding_subprocess_env(payload),
         )
     except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         return _hard_block(

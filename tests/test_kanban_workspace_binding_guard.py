@@ -44,6 +44,43 @@ def _load_stable_guard() -> Any:
     return module
 
 
+def test_stable_guard_clears_descendant_fence_only_for_native_kanban_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = _load_stable_guard()
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/board.db")
+
+    structured = guard._workspace_binding_subprocess_env({"tool_name": "kanban_create"})
+    terminal = guard._workspace_binding_subprocess_env({"tool_name": "terminal"})
+
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" not in structured
+    assert structured["HERMES_KANBAN_DB"] == "/tmp/board.db"
+    assert terminal["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+
+
+def test_stable_guard_passes_scoped_env_to_workspace_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = _load_stable_guard()
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    monkeypatch.setattr(guard, "_hermes_python", lambda: Path(sys.executable))
+    captured: dict[str, Any] = {}
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(*args: Any, **kwargs: Any) -> Result:
+        captured.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    assert guard._run_workspace_binding_policy({"tool_name": "kanban_create"}) == 0
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" not in captured["env"]
+
+
 def test_stable_guard_uses_python_beside_resolved_hermes_launcher(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
