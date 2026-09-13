@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, "/ws/hermes-agent")
-from hermes_cli import kanban_db, kanban_db_connect  # type: ignore[import-not-found]
+from hermes_cli import kanban_db, kanban_db_connect  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD = REPO_ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
