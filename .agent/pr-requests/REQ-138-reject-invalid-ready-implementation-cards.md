@@ -1,18 +1,18 @@
 # REQ-138: invalid ready implementation/REWORK card preflight
 
-- Status: Implementation complete / review pending
+- Status: Implementation published / review pending
 - Project: `hermes-n8n-control-plane`
 - Product type: `CONTROL_PLANE_AUTOMATION` / `HERMES_PLUGIN`
 - Validation profiles: `STATIC_UNIT`, `EDGE_REWORK`, `N8N_VALIDATE`, `HERMES_PLUGIN`
 - Source Issue: `rhgo1749/hermes-n8n-control-plane#138`
 - Source issue URL: `https://github.com/rhgo1749/hermes-n8n-control-plane/issues/138`
-- Source-of-truth base: `origin/main` at `e8ee13718f8eb5b067f0d8743b1a73ecd43517f8`
+- Source-of-truth base: `origin/main` at `ed88d3255bbb8a40e5b7d00d01e5b10c73461660`
 - Root Kanban task: `t_7ec21f55`
-- Investigator handoff: `t_41c9596f` (durable handoff comment `#460`)
-- Current bounded Developer task: `t_065a9ef1`
-- Downstream Reviewer task: `t_d6f73614`
+- Investigator handoff: `t_f65c1857` (durable handoff comment `#468`)
+- Current bounded Developer task: `t_917e9e15`
+- Downstream Reviewer task: `t_f92869f9`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:138`
-- Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/t_065a9ef1`
+- Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/t_917e9e15`
 - Delivery branch: `fix/issue-138-ready-binding-preflight`
 - Delivery PR: PR #149 — `Issue #138: 구현·재작업 카드 생성 전 작업공간 바인딩 검증` — `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/149`
 - Merge/auto-merge authority: human/user only
@@ -20,18 +20,18 @@
 
 ## Objective and confirmed cause
 
-At the pre-round PR #149 head `52ab579b064a1d1320d95f5de267eb8bed88312e`, the shared parser in `automation/hermes/scripts/kanban-specialist-completion-guard.py` handled board options only in the main invocation walker, so unknown-predicate lookahead could miss `hermes kanban --board ... create|assign|reassign`. Its arithmetic-expansion scanner also skipped nested executable `$()` and backtick substitutions.
+At the exact pre-round PR #149 head `ede92845011ca09f8e42517fdc216b4cdb7e44e3` (post-sync pre-fix checkpoint `d30300f392d276d44f3398c5f7c7160e3b155a68`), the shared parser passed escaped legacy-backtick delimiters inside an active outer substitution to `consume_substitution` without recording or recursively inspecting the nested body. Real Bash executes the nested `create`, `assign`, and `reassign` forms, while the parser and stable guard returned allow/rc=0.
 
-The bounded fix keeps one parser owner: board-aware action extraction is shared by lookahead and the main invocation walker, while arithmetic expansion lexically records nested `$()`/backtick bodies with malformed status and command-chain segment ownership. Reachable bodies are recursively inspected through the existing invocation walker for specialist `create`, `assign`, or `reassign`; single-quoted/escaped data and harmless substitutions remain inert, malformed or over-deep relevant bodies fail closed, and no predicate is executed. Earlier grouping/operator rejection and literal deterministic `false &&` / `true ||` / `true &&` / `false ||` behavior remain unchanged.
+The bounded fix keeps one parser owner: an escaped legacy-backtick delimiter is recorded and recursively inspected only when the scanner is already inside an executable substitution or arithmetic body. The existing quote/escape, malformed, and depth handling remains in force; top-level escaped data, single-quoted data, and harmless substitutions remain inert; and no shell predicate or broad interpreter is evaluated.
 
 ## Scope and non-goals
 
 In scope for this round:
 
-1. `automation/hermes/scripts/kanban-specialist-completion-guard.py`: shared board-aware action extraction for reachable lookahead plus fail-closed lexical inspection of executable arithmetic substitutions.
-2. Parser regressions for `--board` and `--board=` under unknown `&&`/`||` predicates, arithmetic `$()`/backticks across `create`, `assign`, and `reassign`, and preserved nested-wrapper, short-circuit, malformed/depth, grouping/operator, literal, escaped, and harmless controls.
-3. Stable `kanban-block-kind-guard.py` wrapper and workspace-binding no-mutation regressions proving rc=2, diagnostics, byte-identical board state, zero rows/adapter activity, fake-shell zero invocation, and no assignment/reassignment.
-4. This tracked REQ provenance refresh.
+1. `automation/hermes/scripts/kanban-specialist-completion-guard.py`: recursively record escaped legacy-backtick bodies only from an already-active executable substitution/arithmetic scanner.
+2. Parser regressions for nested legacy-backtick `create`, `assign`, and `reassign`, including arithmetic-wrapped forms, while preserving top-level escaped-data and harmless/documentation controls.
+3. Stable `kanban-block-kind-guard.py` and workspace-binding no-mutation regressions proving rc=2, bounded diagnostics, byte-identical board state, zero fake-shell invocation, and no task/assignment/reassignment mutation.
+4. This tracked REQ provenance refresh after implementation publication.
 
 Explicit non-goals: Hermes core or product changes; a second parser, dispatcher, or state store; arbitrary shell interpretation/predicate execution; GitHub lifecycle changes; cron/polling; live deployment/config mutation; active-worker rebinding; new PR creation; merge/auto-merge; hosted Actions; unrelated stale-test cleanup.
 
@@ -66,26 +66,25 @@ No Hermes core, product repository, n8n workflow ownership, cron, or live runtim
 
 ## Validation evidence
 
-- Expected RED against the exact pre-round PR #149 head `52ab579b064a1d1320d95f5de267eb8bed88312e` script with current regression files: `51 failed, 216 passed`; the failures include every new board-qualified lookahead and arithmetic-substitution case, proving the current regressions bite before the fix.
-- Focused current-round suite after the fix: `env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_specialist_completion_contract_parser.py tests/test_specialist_completion_contract_guard.py tests/test_kanban_workspace_binding_guard.py` → `267 passed`.
-- Focused stable-hook/workspace cases assert rc=2, no shell invocation, unchanged DB bytes, and no task/assignment activity for board-qualified reachability and arithmetic substitutions; the full three-file suite above is the authoritative count.
-- Real-core parser/handler probes: atomic `barrier`, `rollback`, `paths`, `same-key`, `lifecycle`, and `duplicates` scenarios PASS; handler `padded`, `cli-surface`, and `shell` scenarios PASS.
-- Direct edge scripts: workspace admission `45 passed`; workspace self-heal `38 passed`; race gate `5/5` in each of two iterations; completion and dependency gates PASS; terminal convergence `95 passed`.
-- Rework/projection suites: delivery provenance `9 passed`; attention delivery recovery `8 passed`; edge projection/label history `4 passed`; parking-comment `20 passed`; GitHub-sync rework `925 passed`.
-- Block-kind suite on candidate: `60 passed, 2 failed`; both failures are legacy deployer dry-run fixtures that omit required H4V3 profile configs (fresh `origin/main` baseline is `62 passed`). No block-kind production file changed in this round.
-- Auxiliary attention self-heal-label script remains a pre-existing fixture mismatch (`agent_review_ready_predicted` assertion) and does not import or modify the changed parser path.
-- Full repository candidate vs fresh `origin/main`: candidate `638 passed, 4 failed, 23 errors`; baseline `394 passed, 4 failed, 23 errors`. The same four completion-wake failures and 23 board-identity fixture setup errors occurred on both trees; no candidate-only failure/error identity was observed.
+- Required causal RED: on the post-sync pre-fix checkpoint `d30300f392d276d44f3398c5f7c7160e3b155a68` with the current regression files, the nested parser/stable-hook/workspace matrix was `18 failed, 267 deselected`; the parser cases did not raise and the stable hook returned `0`. A separate Bash probe returned `0` for all nested `create`, `assign`, and `reassign` forms and recorded all three fake-Hermes calls.
+- Focused current-round matrix after the fix: `env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_specialist_completion_contract_parser.py tests/test_specialist_completion_contract_guard.py tests/test_kanban_workspace_binding_guard.py` → `285 passed`; the nested regression filter alone → `18 passed, 267 deselected`.
+- Focused stable-hook/workspace cases assert rc=2, bounded diagnostics, no shell invocation, unchanged DB bytes, and no task/assignment activity for all three action families and arithmetic-wrapped forms.
+- Real-core parser/handler probes from the preserved Issue #138 contract: atomic `barrier`, `rollback`, `paths`, `same-key`, `lifecycle`, and `duplicates` scenarios PASS; handler `padded`, `cli-surface`, and `shell` scenarios PASS.
+- Direct edge scripts after the latest main sync: workspace admission `27 passed, 0 failed` (one optional actual-core/entrypoint regression skipped because `hermes_cli` is not installed); workspace self-heal `38 passed`; race gate `5/5` in each of two iterations; completion, dependency, and head-binding gates PASS; terminal convergence `100 passed`.
+- Rework/projection suites: delivery provenance `9 passed`; attention delivery recovery `8 passed`; edge projection/label history `4 passed`; parking-comment `20 passed`; GitHub-sync rework and related sync scripts exited `0`.
+- Block-kind suite on candidate: `63 passed, 2 failed`; the two failures are legacy deployer dry-run fixtures that require the newer H4V3 profile-config layout. Fresh `origin/main` baseline is `65 passed`, so these are retained pre-existing PR #149 fixture failures; no block-kind production file changed in this round.
+- Auxiliary attention self-heal-label script is `FAIL` for the pre-existing `agent_review_ready_predicted` fixture mismatch; the same assertion fails on fresh `origin/main`, and the script does not import or modify the changed parser path.
+- Full repository candidate vs fresh `origin/main`: candidate `656 passed, 4 failed, 23 errors`; baseline `394 passed, 4 failed, 23 errors`. The same four completion-wake failures and 23 board-identity fixture setup errors occurred on both trees; no candidate-only failure/error identity was observed.
 - N8N validator: `python3 automation/n8n/scripts/validate.py` → `{"ok": true, "schedule_workflows": 0, "edge_sync_workflows": 1, "github_workflows": 1, "github_event_router": 1, "edge_sync_execution": "n8n-webhook->direct-actuator:5682", "hermes_cron_required": false, "hermes_schedule_owned_by_n8n": false}`.
-- Static checks: changed-file `python3 -m py_compile` PASS; Ruff `E4,E7,E9,F` PASS (`All checks passed!`); basedpyright `--level error` PASS (`0 errors, 0 warnings, 0 notes`); profile `lsp/bin/pyright` severity-1 diagnostics PASS (`0` diagnostics); no shell file changed in this round (`bash -n`/ShellCheck were not applicable); `git diff --check` PASS.
-- Auxiliary canonical tests: `test_n8n_import_contract.py`, `test_github_router.py`, `test_github_intake_actuator.py`, `test_intake_completion_contract_entrypoint.py`, completion edge wake, intake lease, repository-scope, registry, and registry-workdir suites PASS. `test_github_event_concurrency_contract.py` remains a pre-existing compose-contract assertion failure (`origin/main` uses `${GITHUB_ROUTER_INSTALLATION_ID:-}` while the test expects `:?`); `test_cutover_snapshot_boundary.py` remains a pre-existing temporary-fixture failure because `state-root.sh` is absent. Neither path changed.
+- Static checks: changed-file `python3 -m py_compile` PASS; Ruff `E4,E7,E9,F` PASS (`All checks passed!`); basedpyright `--level error` PASS (`0 errors, 0 warnings, 0 notes`); profile `/home/hermes/.hermes/profiles/kanban-main/lsp/node_modules/.bin/pyright --level error` PASS (`0 errors, 0 warnings, 0 informations`); cumulative changed shell `bash -n` and ShellCheck PASS; `git diff --check` PASS.
 - GitHub Actions are disabled by repository policy and were not used as a substitute for local validation.
 
 ## Delivery and rollback boundary
 
-- Implementation checkpoint: `f78594d` (`fix(kanban): close board-aware arithmetic parser paths`). The subsequent REQ-only provenance commit is the final publication commit for this round; its SHA is authoritative only after remote read-back.
+- Implementation checkpoint: `27f9024` (`fix(kanban): close nested legacy-backtick mutation paths`); the main-sync publication head before this REQ refresh was `4454e6fa734c1568c1c37baec9d75730e43db14d`. The subsequent REQ-only provenance commit is authoritative only after remote read-back.
 - Stable live entrypoint identity remains the repository-approved `automation/hermes/scripts/kanban-block-kind-guard.py`; it delegates terminal classification to the shared specialist parser and then to the existing workspace-binding guard for native creation. This round did not deploy or mutate that live hook/config.
 - Rollback boundary is the existing PR #149 branch: revert the substitution-parser commit and this REQ-only provenance commit as ordinary branch commits; no Hermes core rollback or live host operation is required for this round.
-- PR #149 will be fresh-read after both publication commits as OPEN/unmerged, base `main`, branch `fix/issue-138-ready-binding-preflight`, with exactly one Issue #138-linked PR and visible plain-text `Closes #138.`. The exact final head is authoritative only from the post-push GitHub/remote read-back and Kanban handoff, not from a self-referential SHA embedded in this file.
+- PR #149 was fresh-read after implementation publication as OPEN/unmerged, base `main`, branch `fix/issue-138-ready-binding-preflight`, with exactly one Issue #138-linked PR and visible plain-text `Closes #138.`; the REST/GraphQL head was `4454e6fa734c1568c1c37baec9d75730e43db14d`. The exact final head after this REQ refresh is authoritative only from post-push GitHub/remote read-back and Kanban handoff, not from a self-referential SHA embedded in this file.
 - Merge/auto-merge was not performed. Internal Developer completion remains provisional until the independent Reviewer and canonical edge reconciliation complete.
 
 Closes #138.
