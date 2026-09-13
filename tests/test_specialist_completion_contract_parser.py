@@ -83,6 +83,23 @@ def test_nested_shell_wrappers_cannot_hide_command_substitutions(command: str) -
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        r"echo `echo \`hermes kanban create x --assignee kanban-developer\``",
+        r"echo `echo \`hermes kanban assign t_x kanban-reviewer\``",
+        r"echo `echo \`hermes kanban reassign t_x kanban-reviewer --reclaim\``",
+        r"echo `echo $(( 1 + \`hermes kanban create x --assignee kanban-developer\` ))`",
+        r"echo `echo $(( 1 + \`hermes kanban assign t_x kanban-reviewer\` ))`",
+        r"echo `echo $(( 1 + \`hermes kanban reassign t_x kanban-reviewer --reclaim\` ))`",
+    ],
+)
+def test_nested_escaped_legacy_backticks_cannot_hide_mutations(command: str) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="command substitution"):
+        guard._hermes_kanban_invocations(command)
+
+
+@pytest.mark.parametrize(
     "substitution",
     [
         "$(hermes kanban create x --assignee kanban-developer)",

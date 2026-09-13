@@ -684,6 +684,32 @@ def test_stable_hook_blocks_command_substitution_before_shell_execution(
     assert after == before
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"echo `echo \`hermes kanban create x --assignee kanban-developer\``",
+        r"echo `echo \`hermes kanban assign t_substitution kanban-reviewer\``",
+        r"echo `echo \`hermes kanban reassign t_substitution kanban-reviewer --reclaim\``",
+        r"echo `echo $(( 1 + \`hermes kanban create x --assignee kanban-developer\` ))`",
+        r"echo `echo $(( 1 + \`hermes kanban assign t_substitution kanban-reviewer\` ))`",
+        r"echo `echo $(( 1 + \`hermes kanban reassign t_substitution kanban-reviewer --reclaim\` ))`",
+    ],
+)
+def test_stable_hook_blocks_nested_escaped_legacy_backticks_before_shell_execution(
+    command: str,
+) -> None:
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "block"
+    assert "command substitution" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before
+
+
 @pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
 @pytest.mark.parametrize("action", ["create", "assign", "reassign"])
 def test_stable_wrapper_rejects_unsupported_specialist_mutations_without_mutating_db(

@@ -371,6 +371,81 @@ def test_stable_guard_rejects_shell_mutations_without_workspace_db_mutation(
             ).fetchone() == ("rhgo1749/ctrl-hangul",)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"echo `echo \`hermes kanban create x --assignee kanban-developer\``",
+        r"echo `echo \`hermes kanban assign t_target kanban-reviewer\``",
+        r"echo `echo \`hermes kanban reassign t_target kanban-reviewer --reclaim\``",
+        r"echo `echo $(( 1 + \`hermes kanban create x --assignee kanban-developer\` ))`",
+        r"echo `echo $(( 1 + \`hermes kanban assign t_target kanban-reviewer\` ))`",
+        r"echo `echo $(( 1 + \`hermes kanban reassign t_target kanban-reviewer --reclaim\` ))`",
+    ],
+)
+def test_stable_guard_rejects_nested_escaped_legacy_backticks_before_shell_execution(
+    command: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="workspace-nested-backtick-") as directory:
+        root = Path(directory)
+        db = root / "kanban.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, completion_contract TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, completion_contract) VALUES (?, ?)",
+                ("t_target", "rhgo1749/ctrl-hangul"),
+            )
+            conn.commit()
+
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        calls = root / "hermes-calls.log"
+        fake_hermes = fake_bin / "hermes"
+        fake_hermes.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_HERMES_CALLS\"\n",
+            encoding="utf-8",
+        )
+        fake_hermes.chmod(0o755)
+        (fake_bin / "python3").symlink_to(sys.executable)
+
+        before = db.read_bytes()
+        env = os.environ.copy()
+        env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+        env.update(
+            {
+                "FAKE_HERMES_CALLS": str(calls),
+                "HERMES_KANBAN_DB": str(db),
+                "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG": str(root / "guard.log"),
+                "PATH": f"{fake_bin}:{env.get('PATH', '')}",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        result = subprocess.run(
+            [sys.executable, str(STABLE_GUARD)],
+            input=json.dumps(
+                {"tool_name": "terminal", "tool_input": {"command": command}}
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        body = json.loads(result.stdout)
+        assert body["action"] == "block"
+        assert "command substitution" in body["message"]
+        assert "No task mutation was performed" in body["message"]
+        assert not calls.exists() or calls.read_text(encoding="utf-8") == ""
+        assert db.read_bytes() == before
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone() == (1,)
+            assert conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?", ("t_target",)
+            ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+
 _REAL_HANDLER_REGRESSION = r'''
 from __future__ import annotations
 

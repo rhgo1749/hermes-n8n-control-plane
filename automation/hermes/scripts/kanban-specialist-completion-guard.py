@@ -440,7 +440,21 @@ def _scan_shell_groupings(
         while index < len(command):
             value = command[index]
             if value == "\\":
-                index += 2
+                escaped = command[index + 1 : index + 2]
+                if escaped == "`":
+                    end, body, substitution_malformed = consume_substitution(
+                        index + 1,
+                        "`",
+                        depth=depth + 1,
+                        record_substitutions=True,
+                    )
+                    substitutions.append(
+                        (body, substitution_malformed, segment_index)
+                    )
+                    malformed |= substitution_malformed
+                    index = len(command) if substitution_malformed else end + 1
+                else:
+                    index += 2
                 continue
             if value == "$" and command[index + 1 : index + 3] == "((":
                 nested_end, nested_malformed = consume_arithmetic(
@@ -482,7 +496,11 @@ def _scan_shell_groupings(
         return len(command), True
 
     def consume_substitution(
-        start: int, delimiter: str, *, depth: int
+        start: int,
+        delimiter: str,
+        *,
+        depth: int,
+        record_substitutions: bool = False,
     ) -> tuple[int, str, bool]:
         if depth > _MAX_SHELL_DEPTH:
             raise RuntimeError("shell command substitution nesting exceeds the specialist guard limit")
@@ -491,6 +509,7 @@ def _scan_shell_groupings(
             body_start,
             ")" if delimiter == "$(" else "`",
             depth=depth,
+            record_substitutions=record_substitutions,
         )
         return end, command[body_start:end], malformed or not closed
 
@@ -574,10 +593,27 @@ def _scan_shell_groupings(
                     )
                     index = end + 1
                 elif escaped == "`":
-                    end, _, _ = consume_substitution(
-                        index + 1, "`", depth=depth + 1
-                    )
-                    index = end + 1
+                    if closing is not None:
+                        end, body, substitution_malformed = consume_substitution(
+                            index + 1,
+                            "`",
+                            depth=depth + 1,
+                            record_substitutions=True,
+                        )
+                        substitutions.append(
+                            (body, substitution_malformed, segment_index)
+                        )
+                        fragment_malformed |= substitution_malformed
+                        index = (
+                            len(command)
+                            if substitution_malformed
+                            else end + 1
+                        )
+                    else:
+                        end, _, _ = consume_substitution(
+                            index + 1, "`", depth=depth + 1
+                        )
+                        index = end + 1
                 else:
                     index += 2
                 continue
