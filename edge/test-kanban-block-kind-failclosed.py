@@ -151,6 +151,80 @@ def test_explicit_canonical_kind_passes_after_read_only_validation(board_db, kin
     assert result.stdout == ""
 
 
+def test_explicit_dependency_without_pending_parent_fails_closed_without_mutation(board_db):
+    path, _, child = board_db
+    with kanban_db_connect.connect_closing(path) as conn:
+        conn.execute("DELETE FROM task_links WHERE child_id = ?", (child,))
+        conn.commit()
+        before = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (child,),
+        ).fetchone()
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (child,)
+        ).fetchone()[0]
+    result = _run_guard(
+        path,
+        {"tool_name": "kanban_block", "tool_input": {"task_id": child, "kind": "dependency"}},
+    )
+    _assert_blocked(result, "requires at least one unresolved parent")
+    with kanban_db_connect.connect_closing(path) as conn:
+        after = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (child,),
+        ).fetchone()
+        after_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (child,)
+        ).fetchone()[0]
+    assert tuple(after) == tuple(before)
+    assert after_events == before_events
+
+
+def test_explicit_dependency_with_only_terminal_parents_fails_closed(board_db):
+    path, parent, child = board_db
+    with kanban_db_connect.connect_closing(path) as conn:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        conn.commit()
+        before = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+        ).fetchone()
+    result = _run_guard(
+        path,
+        {"tool_name": "kanban_block", "tool_input": {"task_id": child, "kind": "dependency"}},
+    )
+    _assert_blocked(result, "requires at least one unresolved parent")
+    with kanban_db_connect.connect_closing(path) as conn:
+        after = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+        ).fetchone()
+    assert tuple(after) == tuple(before)
+
+
+def test_terminal_dependency_without_pending_parent_fails_closed(board_db):
+    path, _, child = board_db
+    with kanban_db_connect.connect_closing(path) as conn:
+        conn.execute("DELETE FROM task_links WHERE child_id = ?", (child,))
+        conn.commit()
+        before = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+        ).fetchone()
+    result = _run_guard(
+        path,
+        {
+            "tool_name": "terminal",
+            "tool_input": {
+                "command": f"hermes kanban block {child} waiting --kind=dependency"
+            },
+        },
+    )
+    _assert_blocked(result, "requires at least one unresolved parent")
+    with kanban_db_connect.connect_closing(path) as conn:
+        after = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (child,)
+        ).fetchone()
+    assert tuple(after) == tuple(before)
+
+
 def test_explicit_dependency_preserves_core_todo_then_ready_route(board_db):
     path, parent, child = board_db
     result = _run_guard(

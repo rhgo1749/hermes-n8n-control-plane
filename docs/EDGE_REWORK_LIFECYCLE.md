@@ -195,8 +195,12 @@ store is introduced. Each historical entry carries `block_kind`,
 Two invariants make the read surface safe and useful:
 
 * **Status-agnostic reachability.** A canonical `kanban_block(kind=
-  "dependency")` routes the task to `todo` (auto-promotable) and later `ready`
-  when its parents resolve — it does NOT remain `blocked`. The history is
+  "dependency")` is valid only when canonical `task_links` already contains
+  at least one non-terminal parent. The fail-closed pre-tool guard rejects a
+  dependency wait with zero unresolved parents, so callers must link the real
+  dependency first instead of creating an immediate `todo -> ready` respawn
+  loop. A valid dependency block routes the task to `todo` (auto-promotable)
+  and later `ready` when its parents resolve — it does NOT remain `blocked`. The history is
   therefore exposed on a general read surface reachable while the task is in
   the dependency `todo`/`ready` path AND after auto-promotion, not only while
   it sits in a human `blocked` state. The H4V3 Overview carries it as
