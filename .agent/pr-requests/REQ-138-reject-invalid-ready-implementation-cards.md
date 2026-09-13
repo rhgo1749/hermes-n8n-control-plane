@@ -9,10 +9,10 @@
 - Source-of-truth base: `origin/main` at `ed88d3255bbb8a40e5b7d00d01e5b10c73461660`
 - Root Kanban task: `t_7ec21f55`
 - Investigator handoff: `t_f65c1857` (durable handoff comment `#468`)
-- Current bounded Developer task: `t_917e9e15`
-- Downstream Reviewer task: `t_f92869f9`
+- Current bounded Developer task: `t_cd3da97a`
+- Downstream Reviewer task: `t_61006dba`
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:138`
-- Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/t_917e9e15`
+- Controller workspace binding: `/ws/projects/hermes-n8n-control-plane/.worktrees/t_cd3da97a`
 - Delivery branch: `fix/issue-138-ready-binding-preflight`
 - Delivery PR: PR #149 — `Issue #138: 구현·재작업 카드 생성 전 작업공간 바인딩 검증` — `https://github.com/rhgo1749/hermes-n8n-control-plane/pull/149`
 - Merge/auto-merge authority: human/user only
@@ -28,9 +28,9 @@ The bounded fix keeps one parser owner: an escaped legacy-backtick delimiter is 
 
 In scope for this round:
 
-1. `automation/hermes/scripts/kanban-specialist-completion-guard.py`: recursively record escaped legacy-backtick bodies only from an already-active executable substitution/arithmetic scanner.
-2. Parser regressions for nested legacy-backtick `create`, `assign`, and `reassign`, including arithmetic-wrapped forms, while preserving top-level escaped-data and harmless/documentation controls.
-3. Stable `kanban-block-kind-guard.py` and workspace-binding no-mutation regressions proving rc=2, bounded diagnostics, byte-identical board state, zero fake-shell invocation, and no task/assignment/reassignment mutation.
+1. `edge/test-kanban-block-kind-failclosed.py`: provide a small fixture helper that creates the global config and all five required H4V3 profile-local `config.yaml` files.
+2. Update both valid deployer dry-run fixtures to use the five-profile fixture layout without changing the deployer or weakening its preflight.
+3. Preserve explicit fail-closed coverage for a deliberately missing profile config.
 4. This tracked REQ provenance refresh after implementation publication.
 
 Explicit non-goals: Hermes core or product changes; a second parser, dispatcher, or state store; arbitrary shell interpretation/predicate execution; GitHub lifecycle changes; cron/polling; live deployment/config mutation; active-worker rebinding; new PR creation; merge/auto-merge; hosted Actions; unrelated stale-test cleanup.
@@ -39,10 +39,7 @@ Explicit non-goals: Hermes core or product changes; a second parser, dispatcher,
 
 Current round edits (plus this REQ document):
 
-- `automation/hermes/scripts/kanban-specialist-completion-guard.py`
-- `tests/test_specialist_completion_contract_parser.py`
-- `tests/test_specialist_completion_contract_guard.py`
-- `tests/test_kanban_workspace_binding_guard.py`
+- `edge/test-kanban-block-kind-failclosed.py`
 - `.agent/pr-requests/REQ-138-reject-invalid-ready-implementation-cards.md`
 
 Cumulative PR #149 allowlist relative to `origin/main`:
@@ -61,6 +58,7 @@ Cumulative PR #149 allowlist relative to `origin/main`:
 - `tests/test_kanban_workspace_binding_guard.py`
 - `tests/test_specialist_completion_contract_guard.py`
 - `tests/test_specialist_completion_contract_parser.py`
+- `edge/test-kanban-block-kind-failclosed.py`
 
 No Hermes core, product repository, n8n workflow ownership, cron, or live runtime file was changed in this round.
 
@@ -72,9 +70,9 @@ No Hermes core, product repository, n8n workflow ownership, cron, or live runtim
 - Real-core parser/handler probes from the preserved Issue #138 contract: atomic `barrier`, `rollback`, `paths`, `same-key`, `lifecycle`, and `duplicates` scenarios PASS; handler `padded`, `cli-surface`, and `shell` scenarios PASS.
 - Direct edge scripts after the latest main sync: workspace admission `27 passed, 0 failed` (one optional actual-core/entrypoint regression skipped because `hermes_cli` is not installed); workspace self-heal `38 passed`; race gate `5/5` in each of two iterations; completion, dependency, and head-binding gates PASS; terminal convergence `100 passed`.
 - Rework/projection suites: delivery provenance `9 passed`; attention delivery recovery `8 passed`; edge projection/label history `4 passed`; parking-comment `20 passed`; GitHub-sync rework and related sync scripts exited `0`.
-- Block-kind suite on candidate: `63 passed, 2 failed`; the two failures are legacy deployer dry-run fixtures that require the newer H4V3 profile-config layout. Fresh `origin/main` baseline is `65 passed`, so these are retained pre-existing PR #149 fixture failures; no block-kind production file changed in this round.
+- Block-kind suite after this fixture correction: candidate `env -u HERMES_DELEGATED_CHILD_CONTEXT PYTHONDONTWRITEBYTECODE=1 python3 edge/test-kanban-block-kind-failclosed.py -q` -> `66 passed` (the prior 65 cases plus one explicit missing-profile fail-closed regression); fresh detached `origin/main` -> `65 passed`. Both valid dry-run fixtures now create `kanban-main`, `kanban-investigator`, `kanban-developer`, `kanban-reviewer`, and `kanban-designer` profile configs, while the production five-profile preflight remains unchanged.
 - Auxiliary attention self-heal-label script is `FAIL` for the pre-existing `agent_review_ready_predicted` fixture mismatch; the same assertion fails on fresh `origin/main`, and the script does not import or modify the changed parser path.
-- Full repository candidate vs fresh `origin/main`: candidate `656 passed, 4 failed, 23 errors`; baseline `394 passed, 4 failed, 23 errors`. The same four completion-wake failures and 23 board-identity fixture setup errors occurred on both trees; no candidate-only failure/error identity was observed.
+- Full repository candidate vs fresh detached `origin/main`: candidate `656 passed, 4 failed, 23 errors`; baseline `394 passed, 4 failed, 23 errors`. The same four completion-wake failures and 23 board-identity fixture setup errors occurred on both trees; no candidate-only failure/error identity was observed.
 - N8N validator: `python3 automation/n8n/scripts/validate.py` → `{"ok": true, "schedule_workflows": 0, "edge_sync_workflows": 1, "github_workflows": 1, "github_event_router": 1, "edge_sync_execution": "n8n-webhook->direct-actuator:5682", "hermes_cron_required": false, "hermes_schedule_owned_by_n8n": false}`.
 - Static checks: changed-file `python3 -m py_compile` PASS; Ruff `E4,E7,E9,F` PASS (`All checks passed!`); basedpyright `--level error` PASS (`0 errors, 0 warnings, 0 notes`); profile `/home/hermes/.hermes/profiles/kanban-main/lsp/node_modules/.bin/pyright --level error` PASS (`0 errors, 0 warnings, 0 informations`); cumulative changed shell `bash -n` and ShellCheck PASS; `git diff --check` PASS.
 - GitHub Actions are disabled by repository policy and were not used as a substitute for local validation.
