@@ -585,6 +585,14 @@ def evaluate(kind: str | None, task_id: str, board: str, source: str) -> int:
     projection = _read_projection(db_path, task_id)
     if kind not in VALID_BLOCK_KINDS:
         return _block(_diagnostic(task_id, projection), task_id=task_id, board=board)
+    if kind == "dependency" and not projection.get("pending"):
+        return _block(
+            f"kanban_block for {task_id} with kind=dependency requires at least one "
+            "unresolved parent in canonical task_links; link the parent before "
+            "declaring dependency wait. No task mutation was performed.",
+            task_id=task_id,
+            board=board,
+        )
     return 0
 
 
