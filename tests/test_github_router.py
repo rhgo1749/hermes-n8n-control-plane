@@ -267,7 +267,7 @@ def test_merged_pull_request_routes_to_n8n_edge_sync_once() -> None:
                 {"status": 200, "body": {"ok": True}},
             )[1]
             router.__dict__["_wake"] = lambda: (_ for _ in ()).throw(
-                AssertionError("PR edge sync must not wake legacy intake")
+                AssertionError("PR edge sync must not wake issue intake")
             )
             body = _pull_request_body(action="closed", merged=True)
             with RunningServer() as server:

@@ -13,9 +13,9 @@ entrypoint leaves those boundaries unchanged and adds two bounded wake hints:
 
 Neither hint is lifecycle authority. The completion-comment path only asks the
 existing edge owner to fresh-read GitHub. The periodic path only enqueues a
-canonical ``full`` intake scope and wakes the preserved Hermes intake job; it
-never reads or writes Issue/Kanban lifecycle state directly and it never runs
-webhook reconciliation.
+canonical ``full`` intake scope and wakes the lease-controller/direct-actuator
+intake path; it never reads or writes Issue/Kanban lifecycle state directly and
+it never runs webhook reconciliation.
 """
 from __future__ import annotations
 

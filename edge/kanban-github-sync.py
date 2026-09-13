@@ -7243,8 +7243,8 @@ def _reconcile_rework_lifecycle(
             # The ``labels`` snapshot captured at the top of this function is
             # now stale on GitHub.  Refetch the live label set so the rest of
             # this SAME reconciliation pass evaluates against fresh state
-            # instead of deferring to the next cron tick (the observed
-            # 5-10 minute normalization latency).  Task state (``status``),
+            # instead of deferring to a later reconciliation pass. Task state
+            # (``status``),
             # the PR decision, and the governing rework event are all
             # untouched by a label-only removal, so only ``labels`` is stale.
             #

@@ -61,11 +61,18 @@ per-repository lock used by onboarding. Refresh is bounded and Git-owned:
 shallow repositories are unshallowed, the GitHub default-branch SHA is fetched
 into the canonical remote-tracking ref, Git itself proves `HEAD` is an ancestor,
 and `git merge --ff-only origin/<default-branch>` advances the checkout. No
-reset, force update, broad cleanup, or overwrite is allowed. Dirty, detached,
+reset, force update, broad cleanup, or overwrite is allowed. Dirty,
 wrong-branch, wrong-origin, diverged/non-fast-forward, and unsafe
 attribute-driven materialization states fail closed without changing the
-canonical checkout. Fetch, unshallow, and fast-forward failures use bounded
-semantic reasons, and the final head/ref/contract/cleanliness gate is rerun.
+canonical checkout. A clean detached HEAD is recoverable only when the local
+`refs/heads/<default-branch>` exists, the detached commit is an ancestor of
+that ref, and an ordinary `git switch <default-branch>` succeeds without
+stealing a branch held by another worktree. Local repository configuration
+that can select filters, merge drivers, URL rewrites, remote helpers, or alternate
+attribute files, and any `$GIT_DIR/info/attributes` file, is rejected before the
+cleanliness check, switch, fetch, or merge. Fetch, unshallow, and fast-forward
+failures use bounded semantic reasons, and the final head/ref/contract/cleanliness
+gate is rerun.
 A later registry or board failure leaves a newly registered checkout in place
 and reports the partial onboarding state for the next idempotent intake.
 
@@ -294,9 +301,10 @@ GitHub webhook
                  -> repository registry/task provenance -> board slug
                  -> kanban-github-sync.py --board <slug> --json
        -> other intake event -> enqueue repository scope
-            -> lease-controller -> existing Hermes job default:bf431b2a6ba6
+            -> lease-controller -> fixed intake actuator :5682
+                 -> deployed github-agent-ready-kanban-intake.py
        -> hourly safety tick -> enqueue durable full-intake scope
-            -> same lease-controller -> same Hermes intake job
+            -> same lease-controller -> same direct actuator
 ```
 
 The router's webhook inventory is reconciled from the registry with:
@@ -307,7 +315,7 @@ automation/n8n/scripts/reconcile-github-router.sh
 
 Run reconciliation when adding/removing the `hermes-agent` topic or repairing
 webhook configuration. This operation changes GitHub webhook registration only;
-it does not alter the Hermes job or Kanban state. Delivery replay
+it does not alter the direct intake actuator or Kanban state. Delivery replay
 deduplication (bounded `X-GitHub-Delivery` TTL store) is part of the router
 ingress, not the registry.
 

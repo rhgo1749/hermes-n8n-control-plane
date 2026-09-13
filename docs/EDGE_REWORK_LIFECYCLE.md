@@ -234,7 +234,7 @@ valid completed round projects `agent-review-ready`.
 | `agent-review-ready` maintained on a running claim | delivered round + running card (core review lane claim) | keep `running`; labels stay `agent-review-ready` (never `agent-working`) |
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, clear consumed execution/output labels, and never synthesize `agent-rework` or project `agent-review-ready` |
-| `agent-working` → READY (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | clear consumed lifecycle labels; task requeued `→ ready` from durable `github_pr_rework_retry` evidence, failure counted against `kanban.failure_limit` (circuit breaker preserved); the edge never re-creates `agent-rework` |
+| `agent-working` → READY (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | clear consumed lifecycle labels; task requeued `→ ready` from durable `github_pr_rework_retry` evidence, failure counted against `kanban.failure_limit` (circuit breaker preserved); the edge never re-creates `agent-rework`. A canonical `github_pr_rework`/`github_pr_rework_retry` event newer than the latest completed run is also an explicit dispatcher re-run authorization: the control-plane respawn overlay may waive core `recent_success`/`active_pr` only after strict round/PR/head provenance validation. Stale or malformed evidence leaves both core guards intact. |
 | BLOCKED or operator-recovered REVIEW attention hold → new round | preferred: a fresh trusted `agent-rework` label addition after the current round's attention; compatibility fallback: an exact trusted `AGENT_REWORK_RETRY` whole-comment; source Issue open + `agent-ready` | the fresh label returns to the classic `apply_rework` intake and opens an ordinary label-requested round; the fallback comment opens `trigger: maintainer_retry` with `retry_comment_id`; stale/untrusted/edge-owned label projections do not qualify, and dispatch projects `agent-working` only after claim |
 | `agent-working` → attention hold | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | clear consumed lifecycle labels; emit idempotent `HERMES_KANBAN_REWORK_ATTENTION` PR feedback + Kanban `github_pr_rework_attention`; only a later trusted maintainer command may open another round |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same pass |
@@ -610,10 +610,11 @@ original positive convergence path.
 
 ## Deployment (host)
 
-The authoritative intake job remains Hermes job `default:bf431b2a6ba6`, but
-after PR #35 it is kept paused between **event-driven / async-only** wakes;
-n8n no longer owns a five-minute polling schedule for GitHub intake. The
-canonical reconciliation source remains `edge/kanban-github-sync.py`.
+Issue intake now executes through the lease-controller and fixed loopback
+direct actuator (`:5682`); the legacy Hermes intake cron job was retired after
+the direct-actuator cutover and live canary. n8n still does not own a polling
+schedule for GitHub intake. The canonical reconciliation source remains
+`edge/kanban-github-sync.py`.
 
 Deploy through `automation/hermes/scripts/deploy-intake-edge.sh`. The deploy
 script installs the canonical reconciliation source as
@@ -622,9 +623,9 @@ script installs the canonical reconciliation source as
 installs both `kanban_resource_admission.py` and
 `kanban_head_binding_feedback.py` onto the loaded canonical core. All overlay
 dependencies and the core are candidate-compiled and installed before the
-entrypoint switch, then byte-for-byte hash-verified. Deployment never edits
-the preserved Hermes job definition, schedule, or enabled state. This PR does
-**not** auto-deploy.
+entrypoint switch, then byte-for-byte hash-verified. Deployment does not read or
+modify Hermes cron metadata; the current intake path does not require the
+retired legacy job. This PR does **not** auto-deploy.
 
 ## Verification
 

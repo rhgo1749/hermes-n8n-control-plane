@@ -21,7 +21,8 @@ GitHub event
 GitHub router
 (HMAC verification / delivery dedupe / repository admission)
     |
-    +-- Issue intake ------> lease controller ------> existing Hermes intake job
+    +-- Issue intake ------> lease controller ------> fixed intake actuator
+                                                  -> deployed Hermes intake script
     |
     +-- PR merge/rework --> private n8n Webhook --> fixed edge actuator
                                                     |
@@ -56,7 +57,7 @@ GitHub-backed task가 내부 Kanban에서 완료되었더라도 그것만으로 
 
 - **Event-driven integration** — signed GitHub webhook intake와 repository-scoped wake
 - **Idempotency / replay safety** — `X-GitHub-Delivery` dedupe와 bounded retry
-- **Explicit ownership boundaries** — router, n8n, Hermes job, edge reconciler의 역할 분리
+- **Explicit ownership boundaries** — router, n8n, lease/direct-actuator intake, edge reconciler의 역할 분리
 - **Defensive state reconciliation** — 현재 외부 상태 재조회 후 projection
 - **Least-privilege automation** — 고정된 actuator/credential 경계와 loopback-only internal services
 - **Failure isolation** — ambiguous failure를 merge/completion evidence로 승격하지 않음

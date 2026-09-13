@@ -172,7 +172,7 @@ def test_trigger_options_contract_is_read_only() -> None:
     try:
         with RunningServer() as server:
             request = Request(
-                f"{server.base_url}/trigger?profile=default",
+                f"{server.base_url}/trigger",
                 method="OPTIONS",
             )
             with urlopen(request, timeout=5) as response:

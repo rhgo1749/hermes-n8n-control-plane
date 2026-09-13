@@ -19,6 +19,13 @@ GUARD = ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
 COMPLETION_GUARD = ROOT / "automation/hermes/scripts/kanban-specialist-completion-guard.py"
 CONFIG_HELPER = ROOT / "automation/hermes/scripts/kanban-block-kind-hook-config.py"
 DEPLOYER = ROOT / "automation/hermes/scripts/deploy-intake-edge.sh"
+H4V3_PROFILE_NAMES = (
+    "kanban-main",
+    "kanban-investigator",
+    "kanban-developer",
+    "kanban-reviewer",
+    "kanban-designer",
+)
 
 
 def _load(name: str, path: Path) -> Any:
@@ -431,23 +438,40 @@ def test_hook_config_reuses_one_approved_command_idempotently_without_losing_sib
     assert parsed["logging"]["level"] == "INFO"
 
 
-def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -> None:
+def _legacy_workspace_hook_config() -> str:
+    return (
+        "hooks:\n"
+        "  pre_tool_call:\n"
+        "    - matcher: other\n"
+        "      command: python3 /tmp/other.py\n"
+        "    - matcher: kanban_create\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: true\n"
+        "    - matcher: terminal\n"
+        "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
+        "      timeout: 10\n"
+        "      fail_closed: false\n"
+    )
+
+
+def _write_runtime_configs(home: Path, original: str) -> list[Path]:
+    configs = [home / "config.yaml"]
+    for profile in H4V3_PROFILE_NAMES:
+        configs.append(home / "profiles" / profile / "config.yaml")
+    for config in configs:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(original, encoding="utf-8")
+    return configs
+
+
+def test_deployer_dry_run_validates_all_profile_guards_without_mutating_configs() -> None:
     with tempfile.TemporaryDirectory(prefix="specialist-contract-deploy-") as directory:
         home = Path(directory)
         scripts = home / "scripts"
         scripts.mkdir()
-        config = home / "config.yaml"
-        original = (
-            "hooks:\n"
-            "  pre_tool_call:\n"
-            "    - matcher: other\n"
-            "      command: python3 /tmp/other.py\n"
-            "    - matcher: kanban_create\n"
-            "      command: python3 /home/hermes/.hermes/scripts/kanban-workspace-guard.py\n"
-            "      timeout: 10\n"
-            "      fail_closed: true\n"
-        )
-        config.write_text(original, encoding="utf-8")
+        original = _legacy_workspace_hook_config()
+        configs = _write_runtime_configs(home, original)
         result = subprocess.run(
             ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
             text=True,
@@ -459,9 +483,50 @@ def test_deployer_dry_run_validates_specialist_guard_without_mutating_config() -
         assert "kanban-specialist-completion-guard.py" in result.stdout
         assert "kanban-workspace-binding-guard.py" in result.stdout
         assert "lifecycle-guard matcher=kanban_create (fail_closed=true)" in result.stdout
-        assert "superseded kanban-workspace-guard.py hooks would be retired from config" in result.stdout
+        assert (
+            "superseded kanban-workspace-guard.py hooks would be retired "
+            "from global and H4V3 profile configs"
+        ) in result.stdout
         assert "shell-hook command path unchanged; no second consent command added" in result.stdout
-        assert config.read_text(encoding="utf-8") == original
+        for profile in H4V3_PROFILE_NAMES:
+            assert str(home / "profiles" / profile / "config.yaml") in result.stdout
+        assert all(config.read_text(encoding="utf-8") == original for config in configs)
+        assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
+
+
+def test_deployer_replaces_legacy_workspace_hooks_in_global_and_profile_configs() -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-deploy-apply-") as directory:
+        home = Path(directory)
+        scripts = home / "scripts"
+        scripts.mkdir()
+        original = _legacy_workspace_hook_config()
+        configs = _write_runtime_configs(home, original)
+        result = subprocess.run(
+            ["bash", str(DEPLOYER), "--hermes-home", str(home)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "Profile config hooks installed for:" in result.stdout
+        expected_matchers = {"kanban_block", "kanban_create", "terminal"}
+        for config in configs:
+            parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
+            entries = parsed["hooks"]["pre_tool_call"]
+            stable = [
+                entry
+                for entry in entries
+                if "kanban-block-kind-guard.py" in str(entry.get("command", ""))
+            ]
+            assert {entry["matcher"] for entry in stable} == expected_matchers
+            assert all(entry.get("fail_closed") is True for entry in stable)
+            assert not any(
+                "kanban-workspace-guard.py" in str(entry.get("command", ""))
+                for entry in entries
+            )
+        assert any(home.glob(".bak-config.yaml-*"))
+        for profile in H4V3_PROFILE_NAMES:
+            assert any((home / "profiles" / profile).glob(".bak-config.yaml-*"))
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
 
 

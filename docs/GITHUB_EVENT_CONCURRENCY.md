@@ -4,11 +4,11 @@
 
 Repository-specific n8n GitHub Trigger workflows and the n8n Schedule fallback
 are retired. Production intake is event-driven through one loopback GitHub
-router. Issue/intake events continue to use the existing Hermes cron primitive;
-PR completion/rework events use one private n8n Webhook hop and the existing
-edge reconciliation script. A router-local low-frequency safety tick also
-reuses the same durable full-intake scope path so a single missed webhook cannot
-strand an `agent-ready` Issue indefinitely.
+router. Issue/intake events use the lease-controller plus fixed direct intake
+actuator; PR completion/rework events use one private n8n Webhook hop and the
+existing edge reconciliation script. A router-local low-frequency safety tick
+also reuses the same durable full-intake scope path so a single missed webhook
+cannot strand an `agent-ready` Issue indefinitely.
 
 ```text
 GitHub App webhook (or reconciled repository webhook)
@@ -23,9 +23,10 @@ GitHub App webhook (or reconciled repository webhook)
                  -> kanban-github-sync.py --board <slug> --json
        -> new/unknown or other intake event: durable FIFO wake-scope queue
             -> lease-controller :5680
-                 -> existing Hermes job default:bf431b2a6ba6 trigger
+                 -> fixed intake actuator :5682
+                      -> deployed github-agent-ready-kanban-intake.py
        -> hourly safety tick: durable full-intake scope
-            -> same lease-controller and same Hermes intake job
+            -> same lease-controller and same direct actuator
 ```
 
 The App webhook is the discovery boundary for repositories that are not yet in
@@ -51,10 +52,11 @@ value matching the installed App's `installation.id`. Every payload containing
 `installation.account` is checked for owner/type strengthening when present,
 but is not required for repository-bearing events.
 
-The Hermes job itself is preserved. Its stored job ID, name, script, schedule,
-and ownership are not migrated into n8n. Between event-driven invocations the
-job normally remains paused; an accepted lease temporarily triggers that same
-job and the latest lease alone may pause it again.
+The direct actuator is the single intake execution primitive. The legacy Hermes
+intake cron job was retired after the direct-actuator cutover and successful
+live canary; its absence is valid on current hosts. An accepted lease invokes
+the fixed actuator, and delayed cleanup closes only the lease locally rather
+than pausing a persistent schedule.
 
 The router entrypoint runs a bounded full-intake safety wake with a default
 interval of 3600 seconds and rejects configured intervals below 300 seconds.
@@ -69,7 +71,7 @@ lifecycle owner. Normal signed webhook delivery remains the primary intake
 path.
 
 Each non-PR intake event, including a first App delivery for an unknown
-repository, enqueues its repository scope before triggering Hermes.
+repository, enqueues its repository scope before waking the direct actuator.
 Each intake invocation claims exactly one queued scope. Expired unclaimed scopes are
 recovered with a bounded attempt/backoff or retained in the durable pending list
 when the retry limit is reached; they are never silently dropped. Claimed scopes
@@ -80,9 +82,9 @@ API/clone/lock/registry/board failures are requeued, while permanent repository
 validation skips are acknowledged with structured skip evidence. A PR event is
 sent only as bounded normalized data to the private n8n Webhook; n8n never
 receives the external signature boundary or a caller-controlled command. The
-persisted lease-controller remains the stale delayed-pause correctness guard
-for the Hermes path; n8n's `N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a
-load limiter.
+persisted lease-controller remains the stale delayed-cleanup correctness guard
+for the direct-actuator path; n8n's `N8N_CONCURRENCY_PRODUCTION_LIMIT=1`
+remains only a load limiter.
 
 The router exposes the worker control contract only through authenticated POST
 requests: `/scope/claim` returns one scope plus `claim_token`, `/scope/ack`
