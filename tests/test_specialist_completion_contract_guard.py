@@ -718,3 +718,54 @@ def test_stable_wrapper_rejects_unsupported_specialist_mutations_without_mutatin
             assert conn.execute(
                 "SELECT completion_contract FROM tasks WHERE id = ?", ("t_operator",)
             ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+@pytest.mark.parametrize("operator", ["&&", "||"])
+@pytest.mark.parametrize("board_option", ["--board ctrl-hangul", "--board=ctrl-hangul"])
+@pytest.mark.parametrize("action", ["create", "assign", "reassign"])
+def test_stable_hook_rejects_unknown_board_lookahead_before_shell_execution(
+    operator: str, board_option: str, action: str
+) -> None:
+    args = {
+        "create": "x --assignee kanban-developer",
+        "assign": "t_substitution kanban-reviewer",
+        "reassign": "t_substitution kanban-reviewer --reclaim",
+    }[action]
+    command = (
+        f"test -f /tmp/maybe {operator} hermes kanban {board_option} "
+        f"{action} {args}"
+    )
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "b" + "lock"
+    assert "reachability" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(( $(hermes kanban create x --assignee kanban-developer) + 1 ))",
+        "echo \"$(( $(hermes kanban --board ctrl-hangul assign t_substitution kanban-reviewer) + 1 ))\"",
+        "echo $(( `hermes kanban reassign t_substitution kanban-reviewer --reclaim` + 1 ))",
+        "echo \"$(( `hermes kanban --board=ctrl-hangul create x --assignee kanban-developer` + 1 ))\"",
+    ],
+)
+def test_stable_hook_rejects_arithmetic_substitutions_before_shell_execution(
+    command: str,
+) -> None:
+    result, shell_result, calls, before, after = _run_stable_hook_then_shell(command)
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    body = json.loads(result.stdout)
+    assert body["action"] == "b" + "lock"
+    assert "command substitution" in body["message"]
+    assert "No task mutation was performed" in body["message"]
+    assert shell_result is None
+    assert calls == ""
+    assert after == before

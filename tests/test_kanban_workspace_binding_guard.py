@@ -2094,3 +2094,59 @@ def test_real_lookup_matches_core_for_unique_legacy_rows_and_fails_tied_rows_clo
         "tied_rows": [["t_tied_a", "ready"], ["t_tied_b", "ready"]],
         "quarantine_events": 0,
     }
+
+@pytest.mark.parametrize("operator", ["&&", "||"])
+@pytest.mark.parametrize("board_option", ["--board ctrl-hangul", "--board=ctrl-hangul"])
+@pytest.mark.parametrize("action", ["create", "assign", "reassign"])
+def test_terminal_unknown_board_lookahead_fails_closed_without_workspace_mutation(
+    fixture: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    operator: str,
+    board_option: str,
+    action: str,
+) -> None:
+    args = {
+        "create": "x --assignee kanban-developer",
+        "assign": "t_missing kanban-reviewer",
+        "reassign": "t_missing kanban-reviewer --reclaim",
+    }[action]
+    command = (
+        f"test -f /tmp/maybe {operator} hermes kanban {board_option} "
+        f"{action} {args}"
+    )
+    before = fixture["board"].read_bytes()
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    diagnostic = json.loads(capsys.readouterr().out)
+    assert diagnostic["action"] == "b" + "lock"
+    assert "reachability" in diagnostic["message"]
+    assert "No dispatchable task mutation" in diagnostic["message"]
+    assert fixture["board"].read_bytes() == before
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(( $(hermes kanban create x --assignee kanban-developer) + 1 ))",
+        "echo \"$(( $(hermes kanban --board ctrl-hangul assign t_missing kanban-reviewer) + 1 ))\"",
+        "echo $(( `hermes kanban reassign t_missing kanban-reviewer --reclaim` + 1 ))",
+        "echo \"$(( `hermes kanban --board=ctrl-hangul create x --assignee kanban-developer` + 1 ))\"",
+    ],
+)
+def test_terminal_arithmetic_substitutions_fail_closed_without_workspace_mutation(
+    fixture: dict[str, Any], command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = fixture["board"].read_bytes()
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    diagnostic = json.loads(capsys.readouterr().out)
+    assert diagnostic["action"] == "b" + "lock"
+    assert "command substitution" in diagnostic["message"]
+    assert "No dispatchable task mutation" in diagnostic["message"]
+    assert fixture["board"].read_bytes() == before
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []

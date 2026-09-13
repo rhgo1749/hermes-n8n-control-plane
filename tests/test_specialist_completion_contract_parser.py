@@ -110,6 +110,55 @@ def test_unknown_predicate_cannot_hide_a_command_substitution() -> None:
         )
 
 
+@pytest.mark.parametrize("operator", ["&&", "||"])
+@pytest.mark.parametrize("board_option", ["--board ctrl-hangul", "--board=ctrl-hangul"])
+@pytest.mark.parametrize(
+    ("action", "args"),
+    [
+        ("create", "x --assignee kanban-developer"),
+        ("assign", "t_x kanban-reviewer"),
+        ("reassign", "t_x kanban-reviewer --reclaim"),
+    ],
+)
+def test_unknown_predicate_lookahead_recognizes_board_qualified_mutations(
+    operator: str, board_option: str, action: str, args: str
+) -> None:
+    guard = _load_guard()
+    command = (
+        f"test -f /tmp/maybe {operator} hermes kanban {board_option} "
+        f"{action} {args}"
+    )
+    with pytest.raises(RuntimeError, match="reachability"):
+        guard._hermes_kanban_invocations(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(( $(hermes kanban create x --assignee kanban-developer) + 1 ))",
+        'echo "$(( $(hermes kanban --board ctrl-hangul assign t_x kanban-reviewer) + 1 ))"',
+        "echo $(( `hermes kanban reassign t_x kanban-reviewer --reclaim` + 1 ))",
+        'echo "$(( `hermes kanban --board=ctrl-hangul create x --assignee kanban-developer` + 1 ))"',
+    ],
+)
+def test_arithmetic_expansions_cannot_hide_nested_command_substitutions(
+    command: str,
+) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="command substitution"):
+        guard._hermes_kanban_invocations(command)
+
+
+def test_arithmetic_nested_command_substitution_depth_is_bounded() -> None:
+    guard = _load_guard()
+    command = "hermes kanban create x --assignee kanban-developer"
+    for _ in range(guard._MAX_SHELL_DEPTH + 1):
+        command = f'echo "$(( $({command}) + 1 ))"'
+
+    with pytest.raises(RuntimeError, match="nesting exceeds"):
+        guard._hermes_kanban_invocations(command)
+
+
 @pytest.mark.parametrize(
     "command",
     [

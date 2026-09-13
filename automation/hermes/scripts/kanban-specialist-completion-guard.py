@@ -326,13 +326,37 @@ def _command_chain(tokens: list[str]) -> list[tuple[list[str], str | None]]:
     return chain
 
 
-def _relevant_hermes_action(tokens: list[str], start: int) -> bool:
+def _extract_hermes_action(
+    tokens: list[str], start: int
+) -> tuple[str, list[str], str] | None:
     try:
         kanban_index = tokens.index("kanban", start + 1)
     except ValueError:
-        return False
-    action_index = kanban_index + 1
-    return action_index < len(tokens) and tokens[action_index].casefold() in {
+        return None
+    tail = tokens[kanban_index + 1 :]
+    board = ""
+    position = 0
+    while position < len(tail):
+        value = tail[position]
+        if value == "--board":
+            if position + 1 >= len(tail):
+                raise RuntimeError("hermes kanban --board is missing a value")
+            board = tail[position + 1]
+            position += 2
+            continue
+        if value.startswith("--board="):
+            board = value.split("=", 1)[1]
+            position += 1
+            continue
+        break
+    if position >= len(tail):
+        return None
+    return tail[position].casefold(), tail[position + 1 :], board
+
+
+def _relevant_hermes_action(tokens: list[str], start: int) -> bool:
+    invocation = _extract_hermes_action(tokens, start)
+    return invocation is not None and invocation[0] in {
         "create",
         "assign",
         "reassign",
@@ -402,21 +426,58 @@ def _scan_shell_groupings(
     groups: list[str] = []
     substitutions: list[tuple[str, bool, int]] = []
 
-    def consume_arithmetic(start: int) -> tuple[int, bool]:
+    def consume_arithmetic(
+        start: int,
+        *,
+        depth: int,
+        record_substitutions: bool,
+        segment_index: int,
+    ) -> tuple[int, bool]:
         """Return the end of a ``$((...))`` expansion without interpreting it."""
-        depth = 0
+        arithmetic_depth = 0
         index = start
+        malformed = False
         while index < len(command):
             value = command[index]
             if value == "\\":
                 index += 2
                 continue
+            if value == "$" and command[index + 1 : index + 3] == "((":
+                nested_end, nested_malformed = consume_arithmetic(
+                    index + 1,
+                    depth=depth,
+                    record_substitutions=record_substitutions,
+                    segment_index=segment_index,
+                )
+                malformed |= nested_malformed
+                if nested_malformed:
+                    return len(command), True
+                index = nested_end + 1
+                continue
+            delimiter: str | None = None
+            if value == "$" and command[index : index + 2] == "$(":
+                delimiter = "$("
+            elif value == "`":
+                delimiter = "`"
+            if delimiter is not None:
+                end, body, substitution_malformed = consume_substitution(
+                    index, delimiter, depth=depth + 1
+                )
+                if record_substitutions:
+                    substitutions.append(
+                        (body, substitution_malformed, segment_index)
+                    )
+                malformed |= substitution_malformed
+                if substitution_malformed:
+                    return len(command), True
+                index = end + 1
+                continue
             if value == "(":
-                depth += 1
+                arithmetic_depth += 1
             elif value == ")":
-                depth -= 1
-                if depth == 0:
-                    return index, False
+                arithmetic_depth -= 1
+                if arithmetic_depth == 0:
+                    return index, malformed
             index += 1
         return len(command), True
 
@@ -461,7 +522,12 @@ def _scan_shell_groupings(
                     index += 1
                     continue
                 if value == "$" and command[index + 1 : index + 3] == "((":
-                    arithmetic_end, arithmetic_malformed = consume_arithmetic(index + 1)
+                    arithmetic_end, arithmetic_malformed = consume_arithmetic(
+                        index + 1,
+                        depth=depth,
+                        record_substitutions=record_substitutions,
+                        segment_index=segment_index,
+                    )
                     fragment_malformed |= arithmetic_malformed
                     if arithmetic_malformed:
                         index = len(command)
@@ -518,7 +584,12 @@ def _scan_shell_groupings(
             if closing == "`" and value == "`":
                 return index, fragment_malformed, True
             if value == "$" and command[index + 1 : index + 3] == "((":
-                arithmetic_end, arithmetic_malformed = consume_arithmetic(index + 1)
+                arithmetic_end, arithmetic_malformed = consume_arithmetic(
+                    index + 1,
+                    depth=depth,
+                    record_substitutions=record_substitutions,
+                    segment_index=segment_index,
+                )
                 fragment_malformed |= arithmetic_malformed
                 if arithmetic_malformed:
                     index = len(command)
@@ -751,29 +822,9 @@ def _hermes_kanban_invocations(
                 if inner is not None:
                     invocations.extend(_hermes_kanban_invocations(inner, depth=depth + 1))
             elif executable == "hermes":
-                try:
-                    kanban_index = segment.index("kanban", executable_index + 1)
-                except ValueError:
-                    kanban_index = -1
-                if kanban_index >= 0:
-                    tail = segment[kanban_index + 1 :]
-                    board = ""
-                    position = 0
-                    while position < len(tail):
-                        value = tail[position]
-                        if value == "--board":
-                            if position + 1 >= len(tail):
-                                raise RuntimeError("hermes kanban --board is missing a value")
-                            board = tail[position + 1]
-                            position += 2
-                            continue
-                        if value.startswith("--board="):
-                            board = value.split("=", 1)[1]
-                            position += 1
-                            continue
-                        break
-                    if position < len(tail):
-                        invocations.append((tail[position].casefold(), tail[position + 1 :], board))
+                invocation = _extract_hermes_action(segment, executable_index)
+                if invocation is not None:
+                    invocations.append(invocation)
             previous_result = _literal_command_result(segment, depth=depth)
 
         if operator is None:
