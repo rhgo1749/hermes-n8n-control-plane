@@ -24,8 +24,11 @@ The structured ``kanban_create`` tool is the canonical creation path. The
 ``terminal`` policy recognizes executable ``hermes kanban`` command segments
 (including supported shell wrappers) and closes literal create/assign/reassign
 bypasses without treating quoted documentation or echo/printf data as commands.
-Reassignment reads only the canonical task row; unreadable/ambiguous state
-fails closed and is never rewritten by this guard.
+Unsupported shell grouping is not flattened into the supported command-chain
+grammar: a relevant mutation inside ``(...)`` or ``{...;}`` fails closed before
+the terminal command can execute. Reassignment reads only the canonical task
+row; unreadable/ambiguous state fails closed and is never rewritten by this
+guard.
 
 ``evaluate_payload`` is importable by the already-approved lifecycle hook
 wrapper so this policy does not need a second shell-hook command or a second
@@ -63,6 +66,7 @@ _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _SHELL_BINARIES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 _CONTROL_OPERATOR_CHARS = frozenset(";&|")
 _SUPPORTED_SHELL_OPERATORS = frozenset({";", "&&", "||"})
+_GROUPING_OPEN_TO_CLOSE = {"(": ")", "{": "}"}
 _SHELL_FLAG_ONLY = frozenset(
     {
         "-l", "--login", "-i", "--interactive", "-e", "-x", "-n", "--norc",
@@ -387,6 +391,88 @@ def _segment_has_hermes(segment: list[str], *, depth: int = 0) -> bool:
     return _relevant_hermes_action(segment, index)
 
 
+def _scan_shell_groupings(command: str) -> tuple[list[str], bool]:
+    """Return unquoted compound-command bodies and a malformed flag.
+
+    This is deliberately a lexical check, not a shell interpreter.  In
+    particular, quoted or escaped grouping characters are ignored so a
+    documentation string passed to ``echo``/``printf`` remains data.
+    """
+    groups: list[str] = []
+    stack: list[tuple[str, int]] = []
+    quote: str | None = None
+    malformed = False
+    index = 0
+    while index < len(command):
+        value = command[index]
+        if quote is not None:
+            if quote == '"' and value == "\\":
+                index += 2
+                continue
+            if value == quote:
+                quote = None
+            index += 1
+            continue
+        if value in {"'", '"'}:
+            quote = value
+            index += 1
+            continue
+        if value == "\\":
+            index += 2
+            continue
+        if value in _GROUPING_OPEN_TO_CLOSE:
+            stack.append((value, index + 1))
+        elif value in {")", "}"}:
+            if not stack or _GROUPING_OPEN_TO_CLOSE[stack[-1][0]] != value:
+                malformed = True
+            else:
+                _, start = stack.pop()
+                groups.append(command[start:index])
+        index += 1
+    if quote is not None:
+        malformed = True
+    if stack:
+        malformed = True
+        groups.extend(command[start:] for _, start in stack)
+    return groups, malformed
+
+
+def _command_contains_relevant_hermes(command: str, *, depth: int = 0) -> bool:
+    """Return whether a bounded command body can invoke a relevant action."""
+    if depth > _MAX_SHELL_DEPTH:
+        raise RuntimeError("shell wrapper nesting exceeds the specialist guard limit")
+    if _groups_contain_relevant_hermes(command, depth=depth):
+        return True
+    try:
+        tokens = _tokenize(command)
+    except ValueError as exc:
+        raise RuntimeError(f"could not parse shell grouping: {exc}") from exc
+    if _contains_ambiguous_conditional(tokens):
+        return True
+    for segment, _ in _command_chain(tokens):
+        index = _first_executable(segment)
+        if index is None or index >= len(segment):
+            continue
+        executable = Path(segment[index]).name
+        if executable in _SHELL_BINARIES:
+            inner = _shell_inline_command(segment, index)
+            if inner is not None and _command_contains_relevant_hermes(
+                inner, depth=depth + 1
+            ):
+                return True
+        elif executable == "hermes" and _relevant_hermes_action(segment, index):
+            return True
+    return False
+
+
+def _groups_contain_relevant_hermes(command: str, *, depth: int = 0) -> bool:
+    groups, _ = _scan_shell_groupings(command)
+    return any(
+        _command_contains_relevant_hermes(group, depth=depth + 1)
+        for group in groups
+    )
+
+
 def _literal_command_result(segment: list[str], *, depth: int = 0) -> bool | None:
     """Return a result only for predicates whose outcome is statically known."""
     if depth > _MAX_SHELL_DEPTH:
@@ -443,6 +529,10 @@ def _hermes_kanban_invocations(
         tokens = _tokenize(command)
     except ValueError as exc:
         raise RuntimeError(f"could not parse terminal command: {exc}") from exc
+    if _groups_contain_relevant_hermes(command, depth=depth):
+        raise RuntimeError(
+            "unsupported shell grouping contains a relevant specialist Kanban mutation"
+        )
     if _contains_ambiguous_conditional(tokens):
         raise RuntimeError("ambiguous shell conditional reachability")
 

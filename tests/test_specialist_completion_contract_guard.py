@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -550,3 +551,82 @@ def test_stable_wrapper_blocks_reachable_nested_wrappers_without_mutating_db() -
             assert "ambiguous shell conditional reachability" in body["message"]
             assert "No task mutation was performed" in body["message"]
             assert db.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("command", "task_id"),
+    [
+        (
+            "( hermes kanban create x --assignee kanban-developer "
+            "--completion-contract local-only )",
+            "t_grouped",
+        ),
+        (
+            "{ hermes kanban assign t_grouped kanban-reviewer; }",
+            "t_grouped",
+        ),
+        (
+            "{ hermes kanban reassign t_grouped kanban-reviewer --reclaim; }",
+            "t_grouped",
+        ),
+    ],
+)
+def test_stable_wrapper_rejects_grouped_specialist_mutations_without_mutating_db(
+    command: str,
+    task_id: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-grouped-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, task_id, "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        body = json.loads(result.stdout)
+        assert body["action"] == "block"
+        assert "unsupported shell grouping" in body["message"]
+        assert "No task mutation was performed" in body["message"]
+        assert db.read_bytes() == before
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+@pytest.mark.parametrize("action", ["create", "assign", "reassign"])
+def test_stable_wrapper_rejects_unsupported_specialist_mutations_without_mutating_db(
+    operator: str,
+    action: str,
+) -> None:
+    commands = {
+        "create": (
+            "hermes kanban create x --assignee kanban-developer "
+            "--completion-contract local-only"
+        ),
+        "assign": "hermes kanban assign t_operator kanban-reviewer",
+        "reassign": "hermes kanban reassign t_operator kanban-reviewer --reclaim",
+    }
+    command = f"printf '%s' safe {operator} {commands[action]}"
+    with tempfile.TemporaryDirectory(prefix="specialist-contract-operator-") as directory:
+        db = Path(directory) / "kanban.db"
+        _task_db(db, "t_operator", "rhgo1749/ctrl-hangul")
+        before = db.read_bytes()
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            env_updates={"HERMES_KANBAN_DB": str(db)},
+        )
+
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        body = json.loads(result.stdout)
+        assert body["action"] == "block"
+        assert "unsupported shell operator" in body["message"]
+        assert "No task mutation was performed" in body["message"]
+        assert db.read_bytes() == before
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?", ("t_operator",)
+            ).fetchone() == ("rhgo1749/ctrl-hangul",)

@@ -26,6 +26,8 @@ def test_quoted_documentation_is_not_an_executable_hermes_invocation() -> None:
     commands = (
         "echo 'hermes kanban assign t_x kanban-developer'",
         "printf '%s' 'hermes kanban create x --assignee kanban-developer --completion-contract owner/repo'",
+        "printf '%s' '( hermes kanban create x --assignee kanban-developer )'",
+        "echo '{ hermes kanban assign t_x kanban-reviewer; }'",
     )
     for command in commands:
         assert guard._hermes_kanban_invocations(command) == []
@@ -42,6 +44,23 @@ def test_direct_shell_and_compound_invocations_are_detected() -> None:
     assert guard._hermes_kanban_invocations(
         "cd /tmp && hermes kanban --board ctrl-hangul assign t_c kanban-designer"
     ) == [("assign", ["t_c", "kanban-designer"], "ctrl-hangul")]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "( hermes kanban create x --assignee kanban-developer )",
+        "true && ( hermes kanban assign t_x kanban-reviewer )",
+        "{ hermes kanban reassign t_x kanban-reviewer --reclaim; }",
+        "false || { hermes kanban create x --assignee kanban-developer; }",
+    ],
+)
+def test_reachable_shell_grouping_fails_closed_for_all_mutation_families(
+    command: str,
+) -> None:
+    guard = _load_guard()
+    with pytest.raises(RuntimeError, match="unsupported shell grouping"):
+        guard._hermes_kanban_invocations(command)
 
 
 def test_literal_short_circuit_operators_skip_unreachable_invocations() -> None:
@@ -77,6 +96,15 @@ def test_unsupported_shell_operators_fail_closed_for_reassign(operator: str) -> 
     reassign = "hermes kanban reassign t_x kanban-reviewer --reclaim"
     with pytest.raises(RuntimeError, match="unsupported shell operator"):
         guard._hermes_kanban_invocations(f"false && {create} {operator} {reassign}")
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_unsupported_shell_operators_fail_closed_for_assign(operator: str) -> None:
+    guard = _load_guard()
+    create = "hermes kanban create x --assignee kanban-developer"
+    assign = "hermes kanban assign t_x kanban-reviewer"
+    with pytest.raises(RuntimeError, match="unsupported shell operator"):
+        guard._hermes_kanban_invocations(f"false && {create} {operator} {assign}")
 
 
 def test_ambiguous_conditional_reachability_fails_closed() -> None:

@@ -300,6 +300,77 @@ def _count_tasks(path: Path) -> int:
         conn.close()
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        (
+            "( hermes kanban create x --assignee kanban-developer "
+            "--completion-contract local-only )"
+        ),
+        "{ hermes kanban assign t_target kanban-reviewer; }",
+        "{ hermes kanban reassign t_target kanban-reviewer --reclaim; }",
+        "printf '%s' safe & hermes kanban assign t_target kanban-reviewer",
+        "printf '%s' safe | hermes kanban reassign t_target kanban-reviewer --reclaim",
+        "printf '%s' safe ;& hermes kanban create x --assignee kanban-developer",
+        "printf '%s' safe ;;& hermes kanban assign t_target kanban-reviewer",
+        "printf '%s' safe ||| hermes kanban reassign t_target kanban-reviewer --reclaim",
+    ],
+)
+def test_stable_guard_rejects_shell_mutations_without_workspace_db_mutation(
+    command: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="workspace-shell-mutation-") as directory:
+        root = Path(directory)
+        db = root / "kanban.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, completion_contract TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, completion_contract) VALUES (?, ?)",
+                ("t_target", "rhgo1749/ctrl-hangul"),
+            )
+            conn.commit()
+
+        before = db.read_bytes()
+        env = os.environ.copy()
+        env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+        env.update(
+            {
+                "HERMES_KANBAN_DB": str(db),
+                "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG": str(root / "guard.log"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        result = subprocess.run(
+            [sys.executable, str(STABLE_GUARD)],
+            input=json.dumps(
+                {"tool_name": "terminal", "tool_input": {"command": command}}
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        body = json.loads(result.stdout)
+        assert body["action"] == "block"
+        assert any(
+            marker in body["message"]
+            for marker in ("unsupported shell grouping", "unsupported shell operator")
+        )
+        assert "No task mutation was performed" in body["message"]
+        assert db.read_bytes() == before
+        with sqlite3.connect(db) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM tasks"
+            ).fetchone() == (1,)
+            assert conn.execute(
+                "SELECT completion_contract FROM tasks WHERE id = ?", ("t_target",)
+            ).fetchone() == ("rhgo1749/ctrl-hangul",)
+
+
 _REAL_HANDLER_REGRESSION = r'''
 from __future__ import annotations
 
@@ -1645,6 +1716,58 @@ def test_terminal_unsupported_shell_operators_fail_closed_for_reassign_without_m
     assert fixture["guard"].evaluate_payload(
         {"tool_name": "terminal", "tool_input": {"command": command}}
     ) == 2
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        (
+            "( hermes kanban create grouped --assignee kanban-developer "
+            "--workspace worktree --project control-plane "
+            "--idempotency-key github:owner/repo:issue:138:grouped )"
+        ),
+        "{ hermes kanban assign t_missing kanban-reviewer; }",
+        "{ hermes kanban reassign t_missing kanban-reviewer --reclaim; }",
+    ],
+)
+def test_terminal_grouped_specialist_mutations_fail_closed_before_materialization(
+    fixture: dict[str, Any], command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = fixture["board"].read_bytes()
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    diagnostic = capsys.readouterr().out
+    assert '"action": "block"' in diagnostic
+    assert "unsupported shell grouping" in diagnostic
+    assert "No dispatchable task mutation" in diagnostic
+    assert fixture["board"].read_bytes() == before
+    assert _count_tasks(fixture["board"]) == 0
+    assert fixture["adapters"] == []
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ";&", ";;&", "|||"])
+def test_terminal_unsupported_shell_operators_fail_closed_for_assign_without_mutation(
+    fixture: dict[str, Any], operator: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = (
+        "false && hermes kanban create unsupported-assign-one "
+        "--assignee kanban-developer --workspace worktree "
+        "--project control-plane "
+        "--idempotency-key github:owner/repo:issue:138:unsupported-assign-one "
+        f"{operator} hermes kanban assign t_missing kanban-reviewer"
+    )
+    before = fixture["board"].read_bytes()
+    assert fixture["guard"].evaluate_payload(
+        {"tool_name": "terminal", "tool_input": {"command": command}}
+    ) == 2
+    diagnostic = capsys.readouterr().out
+    assert '"action": "block"' in diagnostic
+    assert "unsupported shell operator" in diagnostic
+    assert "No dispatchable task mutation" in diagnostic
+    assert fixture["board"].read_bytes() == before
     assert _count_tasks(fixture["board"]) == 0
     assert fixture["adapters"] == []
 
