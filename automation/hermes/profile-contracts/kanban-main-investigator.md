@@ -30,6 +30,8 @@ Developer task context should reference the completed Investigator task/handoff 
 
 Use structured `kanban_create` as the canonical specialist creation surface. For every dispatchable H4V3 specialist card, pass `workspace_kind="worktree"`, the canonical Hermes `project` id/slug for the repository, and a stable `idempotency_key`. Omit `workspace_path`, `branch`, and `branch_name`: Hermes core derives the task-id worktree under `<repo>/.worktrees/<task-id>` and its deterministic project branch, and the control-plane creation preflight verifies the durable read-back before the card becomes dispatchable.
 
+Hermes project IDs are profile-local because each profile owns its own `projects.db`. Cross-profile orchestration must not assume that the same repository has the same `p_*` project ID in different profiles. Resolve the project in the creator profile's active `HERMES_HOME`; when project identity must remain portable across profile boundaries, use the canonical project slug together with the verified primary repository anchor rather than treating a raw project ID as a global repository identity. A child specialist may therefore persist a different `project_id` from its root task while still being correctly bound to the same repository slug and anchor.
+
 Do not fall back to `hermes kanban create`, `git worktree add`, or ad-hoc branch creation merely because a structured create is rejected. A rejection means the structured binding/provenance is incomplete or unsafe; fix the structured payload or surface the controller/operator blocker instead of bypassing the creation boundary.
 
 ### Dependency waiting state
