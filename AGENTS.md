@@ -14,6 +14,17 @@ Issue-driven implementation must use the repository-owned request contract at `.
 - Treat GitHub, Hermes Kanban, edge reconciliation, n8n, H4V3 Overview, and Telegram according to the ownership boundaries defined by the request template and repository docs.
 - PRs may be created or updated by agents, but merge/auto-merge remains human/user authority unless the user explicitly authorizes a merge.
 
+## Runtime namespace resolution before deployment
+
+Before declaring a host/runtime deployment gate unavailable, establish where the worker is already running and whether the canonical target runtime is directly accessible from that namespace.
+
+- Read the owning operations/deploy contract first; do not infer the target namespace merely from the word "Docker".
+- If the current process already runs inside the target runtime namespace and the canonical runtime home is directly accessible, invoke the repository-owned install/deploy script **directly** against that runtime home. Do not try to enter the same container again with `docker exec`.
+- Absence of a `docker` CLI or host Docker socket proves only that nested/host Docker control is unavailable. It does **not** prove that the worker lacks access to the runtime it is already executing inside.
+- Use host-level Docker commands only when the current namespace does not already provide the required target access and the canonical operations contract explicitly requires the host as the bridge.
+- A capability blocker is valid only after direct target-runtime access and any authorized canonical bridge are both unavailable. Record the concrete preflight evidence rather than guessing from one missing binary.
+- When a repository-owned deployer emits an `H4V3_RUNTIME_CONTEXT ...` marker, treat that marker plus the owning operations contract as the first deployment-context evidence before choosing host/container commands.
+
 ## Existing test contract governance
 
 - 기존 테스트가 현재 구현과 충돌한다는 이유만으로 테스트를 수정·삭제·skip·assertion 완화하지 않는다.
