@@ -40,11 +40,30 @@ explicitly `unknown`/`unavailable`/`partial` rather than zero.
 - Code: `hermes-plugin/h4v3-overview/dashboard/trajectory_report.py` and
   `dashboard/plugin_api.py`.
 - Deploy contract: `automation/hermes/scripts/install-h4v3-overview.sh`.
-- Canonical docs: `docs/H4V3_OVERVIEW.md`.
+- Canonical docs: `docs/H4V3_OVERVIEW.md` plus the runtime-namespace rules in
+  `AGENTS.md` / `docs/OPERATIONS.md`.
 - Validation profiles: `pytest -q tests/test_trajectory_report.py tests/test_h4v3_overview.py`; `python3 -m py_compile` for both backend modules; `git diff --check`; live read-only #138 fixture smoke with fresh GitHub evidence supplied separately.
 - Golden anchors: observed PR head
   `f23000b9771772b6210593d5e611b782e88ba351`; merge commit
   `4043ec1bb8db4383dce822ec77d377da44bfee9b`.
+
+## Runtime namespace gate
+
+Before classifying live deployment as blocked, run the repository-owned installer
+preflight/dry-run in the worker's current namespace and record its
+`H4V3_RUNTIME_CONTEXT ...` line.
+
+- The current production Hermes runtime is `hermes-cloudcli-agent` with
+  `/home/hermes/.hermes`.
+- If the worker is already inside that runtime namespace and the runtime home is
+  directly accessible, run the installer directly against
+  `/home/hermes/.hermes`; do not attempt nested `docker exec`.
+- A missing `docker` executable or host Docker socket is not by itself a
+  capability blocker when the target runtime is already directly accessible.
+- Host-level Docker is only the bridge used from the Ubuntu host when the caller
+  is outside the target runtime namespace.
+- Report a capability blocker only if direct runtime access and the authorized
+  canonical bridge are both unavailable, with the exact preflight evidence.
 
 ## Automation stop state
 
@@ -55,7 +74,10 @@ Issue relationship must be verified before handoff.
 
 ## Operator acceptance
 
-The host operator must run the installer in the active Hermes runtime namespace,
-restart the existing dashboard supervisor, and verify the read-only Overview
-and trajectory routes. A runtime failure is an explicit gate; it is not hidden
-behind a passing repository test.
+Run the installer in the active Hermes runtime namespace, restart the existing
+dashboard supervisor, verify the read-only Overview and trajectory routes, then
+repeat the same install/read-back path to prove idempotent convergence. When the
+worker is already inside `hermes-cloudcli-agent`, this is a direct runtime
+operation rather than a nested Docker operation. A runtime failure after that
+namespace preflight is an explicit gate; it is not hidden behind a passing
+repository test.
