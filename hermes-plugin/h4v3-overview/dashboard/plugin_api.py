@@ -9,13 +9,38 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
+import os
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
+
+try:
+    from .trajectory_report import (
+        TrajectoryInputError,
+        aggregate_trajectory_reports,
+        build_trajectory_report,
+        discover_root_task_ids,
+    )
+except ImportError:  # The dashboard loader imports plugin_api.py by path.
+    _trajectory_spec = importlib.util.spec_from_file_location(
+        "h4v3_overview_trajectory_report",
+        Path(__file__).with_name("trajectory_report.py"),
+    )
+    if _trajectory_spec is None or _trajectory_spec.loader is None:
+        raise RuntimeError("H4V3 trajectory report module is unavailable")
+    _trajectory_module = importlib.util.module_from_spec(_trajectory_spec)
+    sys.modules[_trajectory_spec.name] = _trajectory_module
+    _trajectory_spec.loader.exec_module(_trajectory_module)
+    TrajectoryInputError = _trajectory_module.TrajectoryInputError
+    aggregate_trajectory_reports = _trajectory_module.aggregate_trajectory_reports
+    build_trajectory_report = _trajectory_module.build_trajectory_report
+    discover_root_task_ids = _trajectory_module.discover_root_task_ids
 
 try:
     from fastapi import APIRouter as _FastAPIRouter  # type: ignore[assignment]
@@ -869,3 +894,107 @@ def overview() -> dict[str, Any]:
 @router.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "read_only": True}
+
+
+def _trajectory_board(slug: str) -> Mapping[str, Any]:
+    if kanban_db is None:
+        raise RuntimeError("Hermes kanban_db is unavailable")
+    wanted = str(slug or "default").strip()
+    for item in kanban_db.list_boards(include_archived=False):
+        metadata = dict(item)
+        if str(metadata.get("slug") or "") == wanted:
+            return metadata
+    raise TrajectoryInputError(f"board not found: {wanted}")
+
+
+def _trajectory_profiles_root() -> Path:
+    configured = str(os.environ.get("HERMES_PROFILES_ROOT") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".hermes" / "profiles"
+
+
+def _trajectory_request(
+    *,
+    board: str,
+    repository: Optional[str],
+    issue: Optional[int],
+    root_task_id: Optional[str],
+) -> dict[str, Any]:
+    if not repository:
+        raise TrajectoryInputError("repository is required")
+    if issue is None or int(issue) <= 0:
+        raise TrajectoryInputError("issue must be a positive integer")
+    metadata = _trajectory_board(board)
+    return build_trajectory_report(
+        Path(str(metadata.get("db_path") or "")),
+        board_slug=str(metadata.get("slug") or board),
+        repository=repository,
+        issue=int(issue),
+        root_task_id=root_task_id,
+        profile_root=_trajectory_profiles_root(),
+    )
+
+
+@router.get("/trajectory-report")
+def trajectory_report(
+    board: str = "default",
+    repository: Optional[str] = None,
+    issue: Optional[int] = None,
+    root_task_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return one root-task trajectory without mutating any source."""
+    try:
+        return _trajectory_request(
+            board=board, repository=repository, issue=issue,
+            root_task_id=root_task_id,
+        )
+    except TrajectoryInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Trajectory unavailable: {_safe_text(exc)}") from exc
+
+
+@router.get("/trajectory-report/period")
+def trajectory_period(
+    board: str = "default",
+    repository: Optional[str] = None,
+    issue: Optional[int] = None,
+    from_epoch: Optional[int] = None,
+    to_epoch: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return a known-only aggregate over exact GitHub intake roots."""
+    if not repository:
+        raise HTTPException(status_code=400, detail="repository is required")
+    try:
+        metadata = _trajectory_board(board)
+        roots = discover_root_task_ids(
+            Path(str(metadata.get("db_path") or "")), repository=repository,
+            from_epoch=from_epoch, to_epoch=to_epoch,
+        )
+        if issue is not None:
+            roots = [root for root in roots if root[1] == int(issue)]
+        reports = [
+            build_trajectory_report(
+                Path(str(metadata.get("db_path") or "")),
+                board_slug=str(metadata.get("slug") or board), repository=repository,
+                issue=issue_number, root_task_id=root_id,
+                profile_root=_trajectory_profiles_root(),
+            )
+            for root_id, issue_number, _created_at in roots
+        ]
+        aggregate = aggregate_trajectory_reports(reports, from_epoch=from_epoch, to_epoch=to_epoch)
+        aggregate["source"] = {
+            "board_slug": str(metadata.get("slug") or board),
+            "repository": repository,
+            "root_candidates": [
+                {"root_task_id": root_id, "issue_number": issue_number, "created_at": created_at}
+                for root_id, issue_number, created_at in roots
+            ],
+            "read_only": True,
+        }
+        return aggregate
+    except TrajectoryInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Trajectory period unavailable: {_safe_text(exc)}") from exc

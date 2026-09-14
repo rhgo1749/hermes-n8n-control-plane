@@ -46,7 +46,7 @@ done
 
 # Candidate validation: the backend must compile with the host python3 before
 # anything is written (the dashboard imports it as a module on restart).
-python3 -m py_compile "$SOURCE/dashboard/plugin_api.py" "$SOURCE/__init__.py" || {
+python3 -m py_compile "$SOURCE/dashboard/plugin_api.py" "$SOURCE/dashboard/trajectory_report.py" "$SOURCE/__init__.py" || {
   echo "candidate validation failed (py_compile)" >&2; exit 1;
 }
 
@@ -57,6 +57,7 @@ FILES=(
   "__init__.py"
   "dashboard/manifest.json"
   "dashboard/plugin_api.py"
+  "dashboard/trajectory_report.py"
   "dashboard/dist/index.js"
   "dashboard/dist/style.css"
 )

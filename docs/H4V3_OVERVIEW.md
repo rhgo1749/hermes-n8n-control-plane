@@ -36,7 +36,8 @@ Installed as a user dashboard plugin (`hermes-plugin/h4v3-overview/`):
 |---|---|
 | `plugin.yaml` / `__init__.py` | Hermes plugin manifest + no-op `register` so `hermes plugins enable` works |
 | `dashboard/manifest.json` | Dashboard plugin manifest — tab `/h4v3-overview` after Kanban |
-| `dashboard/plugin_api.py` | Backend: mounts `/api/plugins/h4v3-overview/overview` |
+| `dashboard/plugin_api.py` | Backend: mounts `/api/plugins/h4v3-overview/overview` and read-only trajectory report routes |
+| `dashboard/trajectory_report.py` | Versioned read-only trajectory/evaluation schema over existing Kanban, profile state, and fresh GitHub evidence |
 | `dashboard/dist/index.js` | Mobile-first read-only overview UI (IIFE, no build step) |
 | `dashboard/dist/style.css` | Overview styles (responsive) |
 
@@ -124,6 +125,45 @@ visible (fail-open) until stronger evidence is available. Legacy rows without
 
 The Overview does not use the notification event stream as its source, and
 the notification path never reads the Overview.
+
+## Trajectory / evaluation report contract (Issue #154)
+
+The same dashboard plugin exposes two observer-only JSON routes:
+
+* `GET /api/plugins/h4v3-overview/trajectory-report?board=<slug>&repository=<owner/repo>&issue=<number>` returns one root task and its linked specialist rounds.
+* `GET /api/plugins/h4v3-overview/trajectory-report/period?board=<slug>&repository=<owner/repo>&from_epoch=<unix>&to_epoch=<unix>` returns a known-only aggregate over exact GitHub intake roots. Add `issue=<number>` to restrict the period query to one Issue.
+
+The response is schema `h4v3-trajectory-v1` (`schema_version: 1`). Root
+selection is strict: an exact `github:<owner/repo>:issue:<number>`
+`idempotency_key` is preferred, and linked graph closure is used to recover
+specialist rounds when the root row has been retained/archived. Titles, bodies,
+prompt text, and transcript length are never selectors or telemetry inputs.
+An explicit root ID is accepted only when its idempotency key matches the
+repository/Issue anchor. A missing or ambiguous root remains
+`unavailable`/`unknown`; it is not guessed.
+
+The report preserves board slug, task IDs, task-link edges, run IDs, event IDs,
+profile names, worker session IDs when present, and profile-local `project_id`
+only with profile/creator scope. It reads existing Kanban databases and profile
+`state.db` files through SQLite `mode=ro` with `query_only`; it creates no
+schema, event, task, cache, or analytics database. Provider/model token totals
+come only from canonical `sessions` / `session_model_usage` rows. Missing
+session IDs, state rows, model rows, tool-failure events, and cost data are
+reported as `unknown`, `unavailable`, or `partial`, not as numeric zero.
+
+Reviewer verdict/rework, investigation model-refresh markers, terminal
+infrastructure failures, explicit operator block/unblock pairs, first-pass
+review, implementation/review rounds, dependency waits, and worker run
+duration are separate fields. Worker duration is never substituted for wall
+clock elapsed time. Fresh GitHub issue and PR reads are separate from internal
+Kanban closure and expose Issue closure, PR merge time, observed PR head SHA,
+and merge commit SHA as distinct fields. GitHub failures produce a partial
+report and never mutate lifecycle state.
+
+The real Issue #138 / merged PR #149 evidence is the compatibility fixture:
+the observed PR head is `f23000b9771772b6210593d5e611b782e88ba351` and the merge
+commit is `4043ec1bb8db4383dce822ec77d377da44bfee9b`. These values are verified
+by tests as separate fields; historical Kanban rows are never rewritten.
 
 ## Telegram notification policy
 
@@ -275,6 +315,7 @@ touched by either rollback.
 
 ```bash
 python3 tests/test_h4v3_overview.py          # projection: counts, terminal-aware Need You, recent event, rework, read-only
+python3 -m pytest -q tests/test_trajectory_report.py  # schema, golden-compatible fixture, provenance, coverage, redaction
 python3 tests/test_h4v3_notification_policy.py  # suppress/send matrix + dedupe
 python3 tests/test_repo_scoped_intake.py     # intake regression
 /ws/hermes-agent/venv/bin/python3 edge/test-kanban-github-sync-rework.py  # edge regression
