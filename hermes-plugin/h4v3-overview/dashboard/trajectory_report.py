@@ -285,7 +285,8 @@ def _select_scope(
     if root_task_id:
         method = "explicit_root_task_id"
         root_task_id = _safe_id(root_task_id)
-        root = all_tasks.get(root_task_id or "")
+        root_row = all_tasks.get(root_task_id or "")
+        root = dict(root_row) if root_row is not None else None
         if root is None:
             root_status = "unavailable"
         elif root.get("idempotency_key") != exact_key:
@@ -296,7 +297,7 @@ def _select_scope(
             root_status = "unknown"
             method = "explicit_root_task_id_mismatch"
     elif len(exact_roots) == 1:
-        root = exact_roots[0]
+        root = dict(exact_roots[0])
         root_task_id = str(root["id"])
     elif len(exact_roots) > 1:
         root_status = "unknown"
