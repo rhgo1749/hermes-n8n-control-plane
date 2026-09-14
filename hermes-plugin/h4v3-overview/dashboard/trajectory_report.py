@@ -881,12 +881,21 @@ def _ordered_evidence(
     return evidence
 
 
-def _human_summary(repository: str, issue: int, counts: Mapping[str, Any], github: Mapping[str, Any]) -> str:
+def _human_summary(
+    repository: str, issue: int, counts: Mapping[str, Any], github: Mapping[str, Any],
+    usage: Optional[Mapping[str, Any]] = None, timing: Optional[Mapping[str, Any]] = None,
+) -> str:
     roles = counts.get("task_roles") or {}
+    usage_totals = (usage or {}).get("totals") or {}
+    total_tokens = usage_totals.get("total_tokens")
+    worker_seconds = (timing or {}).get("summed_worker_seconds")
     return (
         f"Issue #{issue} in {repository}: {counts.get('specialist_tasks', 0)} specialist tasks, "
         f"{roles.get('developer_work_rounds', 0)} implementation rounds and "
-        f"{roles.get('reviewer_rounds', 0)} review rounds; "
+        f"{roles.get('reviewer_rounds', 0)} review rounds, "
+        f"rework={counts.get('reviewer_rework_count', 0)}, "
+        f"tokens={total_tokens if total_tokens is not None else 'unavailable'}, "
+        f"worker_seconds={worker_seconds if worker_seconds is not None else 'unavailable'}; "
         f"fresh GitHub outcome={github.get('outcome') or 'unavailable'}."
     )
 
@@ -1052,7 +1061,7 @@ def build_trajectory_report(
                 if availability != "known"
             ],
         },
-        "summary": _human_summary(repository, issue, counts, github),
+        "summary": _human_summary(repository, issue, counts, github, usage, timing),
     }
 
 

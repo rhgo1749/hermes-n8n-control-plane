@@ -978,6 +978,18 @@ def _validate_period_bounds(from_epoch: Optional[int], to_epoch: Optional[int]) 
         raise TrajectoryInputError("from must not be greater than to")
 
 
+def _query_epoch(value: Any) -> Optional[int]:
+    """Normalize FastAPI Query defaults for direct Python callers/tests."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    default = getattr(value, "default", None)
+    return int(default) if isinstance(default, int) and not isinstance(default, bool) else None
+
+
 @router.get("/trajectory-report/aggregate")
 @router.get("/trajectory-report/period")
 def trajectory_period(
@@ -989,7 +1001,8 @@ def trajectory_period(
 ) -> dict[str, Any]:
     """Return known-only aggregates over exact GitHub intake roots."""
     try:
-        _validate_period_bounds(from_epoch, to_epoch)
+        from_value, to_value = _query_epoch(from_epoch), _query_epoch(to_epoch)
+        _validate_period_bounds(from_value, to_value)
         if issue is not None and int(issue) <= 0:
             raise TrajectoryInputError("issue must be a positive integer")
         reports: list[Mapping[str, Any]] = []
@@ -1001,7 +1014,7 @@ def trajectory_period(
             db_path = Path(str(metadata.get("db_path") or ""))
             candidates = discover_root_candidates(
                 db_path, repository=repository, issue=issue,
-                from_epoch=from_epoch, to_epoch=to_epoch,
+                from_epoch=from_value, to_epoch=to_value,
             )
             for candidate in candidates:
                 candidate = dict(candidate)
@@ -1017,12 +1030,14 @@ def trajectory_period(
                     )
                 )
         aggregate = aggregate_trajectory_reports(
-            reports, from_epoch=from_epoch, to_epoch=to_epoch,
+            reports, from_epoch=from_value, to_epoch=to_value,
         )
         aggregate["source"] = {
             "board_slugs": sorted(set(board_slugs)),
             "repository": repository,
             "issue": issue,
+            "from": from_value,
+            "to": to_value,
             "root_candidates": root_candidates,
             "read_only": True,
         }
