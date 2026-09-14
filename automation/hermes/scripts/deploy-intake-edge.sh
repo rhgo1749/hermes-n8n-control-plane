@@ -35,6 +35,7 @@
 #   * rollback = restore the backup (exact command printed)
 #   * NEVER touches cron jobs.json; any historical legacy intake job is left as-is
 #   * lifecycle guard dependencies are installed before the approved wrapper
+#   * workspace-binding preflight is installed before the approved wrapper
 #   * the existing approved shell-hook command path stays unchanged
 set -Eeuo pipefail
 
@@ -52,6 +53,7 @@ EDGE_DYNAMIC_SOURCE="$ROOT/edge/kanban_dynamic_resource.py"
 BLOCK_KIND_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
 BLOCK_KIND_GUARD_CORE_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-guard-core.py"
 SPECIALIST_COMPLETION_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-specialist-completion-guard.py"
+WORKSPACE_BINDING_GUARD_SOURCE="$ROOT/automation/hermes/scripts/kanban-workspace-binding-guard.py"
 BLOCK_KIND_CONFIG_SOURCE="$ROOT/automation/hermes/scripts/kanban-block-kind-hook-config.py"
 REGISTRY_SOURCE="$ROOT/automation/n8n/scripts/repository_registry.py"
 MIGRATION_SOURCE="$ROOT/automation/n8n/scripts/board_identity_migration.py"
@@ -94,7 +96,7 @@ The deployment keeps the already-approved
 $HERMES_HOME/scripts/kanban-block-kind-guard.py shell-hook command stable. That
 wrapper now covers three fail-closed pre_tool_call matchers:
   * kanban_block -> explicit block-kind policy
-  * kanban_create -> H4V3 specialist local-only completion-contract policy
+  * kanban_create -> H4V3 specialist completion and workspace-binding policies
   * terminal -> both policies
 Its block-kind and specialist policy implementations are deployed beside the
 wrapper before it is switched. This avoids a new shell-hook consent boundary.
@@ -126,6 +128,7 @@ for source in \
   "$BLOCK_KIND_GUARD_SOURCE" \
   "$BLOCK_KIND_GUARD_CORE_SOURCE" \
   "$SPECIALIST_COMPLETION_GUARD_SOURCE" \
+  "$WORKSPACE_BINDING_GUARD_SOURCE" \
   "$BLOCK_KIND_CONFIG_SOURCE" \
   "$REGISTRY_SOURCE" \
   "$MIGRATION_SOURCE"
@@ -140,6 +143,22 @@ TARGET_DIR="$HERMES_HOME/scripts"
 [[ -d "$TARGET_DIR" ]] || { echo "Hermes scripts dir not found: $TARGET_DIR" >&2; exit 2; }
 CONFIG_TARGET="$HERMES_HOME/config.yaml"
 [[ -f "$CONFIG_TARGET" ]] || { echo "Hermes config not found: $CONFIG_TARGET" >&2; exit 2; }
+H4V3_PROFILE_NAMES=(
+  kanban-main
+  kanban-investigator
+  kanban-developer
+  kanban-reviewer
+  kanban-designer
+)
+PROFILE_CONFIG_TARGETS=()
+for profile in "${H4V3_PROFILE_NAMES[@]}"; do
+  profile_config="$HERMES_HOME/profiles/$profile/config.yaml"
+  [[ -f "$profile_config" ]] || {
+    echo "Hermes profile config not found: $profile_config" >&2
+    exit 2
+  }
+  PROFILE_CONFIG_TARGETS+=("$profile_config")
+done
 
 # 1) candidate copy into a temp dir on the same filesystem
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -158,18 +177,25 @@ cp -p "$EDGE_DYNAMIC_CORE_SOURCE" "$CANDIDATE/kanban_dynamic_resource_core.py"
 cp -p "$EDGE_DYNAMIC_SOURCE" "$CANDIDATE/kanban_dynamic_resource.py"
 cp -p "$BLOCK_KIND_GUARD_CORE_SOURCE" "$CANDIDATE/kanban-block-kind-guard-core.py"
 cp -p "$SPECIALIST_COMPLETION_GUARD_SOURCE" "$CANDIDATE/kanban-specialist-completion-guard.py"
+cp -p "$WORKSPACE_BINDING_GUARD_SOURCE" "$CANDIDATE/kanban-workspace-binding-guard.py"
 cp -p "$BLOCK_KIND_GUARD_SOURCE" "$CANDIDATE/kanban-block-kind-guard.py"
 cp -p "$REGISTRY_SOURCE" "$CANDIDATE/repository_registry.py"
 cp -p "$MIGRATION_SOURCE" "$CANDIDATE/board_identity_migration.py"
-python3 "$BLOCK_KIND_CONFIG_SOURCE" "$CONFIG_TARGET" "$CANDIDATE/config.yaml" \
-  --guard "$TARGET_DIR/kanban-block-kind-guard.py"
-python3 - "$CANDIDATE/config.yaml" <<'PY'
+render_lifecycle_config() {
+  local source_config="$1"
+  local candidate_config="$2"
+  local label="$3"
+  python3 "$BLOCK_KIND_CONFIG_SOURCE" "$source_config" "$candidate_config" \
+    --guard "$TARGET_DIR/kanban-block-kind-guard.py"
+  python3 - "$candidate_config" "$label" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 
-config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+config_path = Path(sys.argv[1])
+label = sys.argv[2]
+config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 entries = config.get("hooks", {}).get("pre_tool_call", [])
 guard_entries = [
     entry for entry in entries
@@ -182,11 +208,32 @@ if {
 } != {"kanban_block", "kanban_create", "terminal"} or any(
     entry.get("fail_closed") is not True for entry in guard_entries
 ):
-    raise SystemExit("candidate config is missing fail-closed H4V3 lifecycle guard entries")
+    raise SystemExit(
+        f"candidate config {label} is missing fail-closed H4V3 lifecycle guard entries"
+    )
 commands = {str(entry.get("command", "")) for entry in guard_entries}
 if len(commands) != 1:
-    raise SystemExit("candidate config must reuse one approved lifecycle guard command")
+    raise SystemExit(
+        f"candidate config {label} must reuse one approved lifecycle guard command"
+    )
+if any(
+    "kanban-workspace-guard.py" in str(entry.get("command", ""))
+    for entry in entries
+    if isinstance(entry, dict)
+):
+    raise SystemExit(
+        f"candidate config {label} still references superseded kanban-workspace-guard.py"
+    )
 PY
+}
+
+render_lifecycle_config "$CONFIG_TARGET" "$CANDIDATE/config.yaml" "global"
+for profile in "${H4V3_PROFILE_NAMES[@]}"; do
+  render_lifecycle_config \
+    "$HERMES_HOME/profiles/$profile/config.yaml" \
+    "$CANDIDATE/profile-$profile-config.yaml" \
+    "profile:$profile"
+done
 
 # 2) validation: compile + argparse smoke (--help exits 0)
 python3 -m py_compile \
@@ -202,6 +249,7 @@ python3 -m py_compile \
   "$CANDIDATE/kanban_dynamic_resource.py" \
   "$CANDIDATE/kanban-block-kind-guard-core.py" \
   "$CANDIDATE/kanban-specialist-completion-guard.py" \
+  "$CANDIDATE/kanban-workspace-binding-guard.py" \
   "$CANDIDATE/kanban-block-kind-guard.py" \
   "$CANDIDATE/repository_registry.py" \
   "$CANDIDATE/board_identity_migration.py" || {
@@ -238,6 +286,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/kanban_dynamic_resource.py"
   echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard-core.py"
   echo "dry-run:   $TARGET_DIR/kanban-specialist-completion-guard.py"
+  echo "dry-run:   $TARGET_DIR/kanban-workspace-binding-guard.py"
   echo "dry-run:   $TARGET_DIR/kanban-block-kind-guard.py"
   echo "dry-run:   $TARGET_DIR/repository_registry.py"
   echo "dry-run:   $TARGET_DIR/board_identity_migration.py"
@@ -245,9 +294,13 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry-run:   $TARGET_DIR/github-agent-ready-kanban-intake.py"
   echo "dry-run:   $TARGET_DIR/kanban-github-sync.py"
   echo "dry-run: would atomically replace $CONFIG_TARGET with lifecycle hook entries"
+  for profile in "${H4V3_PROFILE_NAMES[@]}"; do
+    echo "dry-run: would atomically replace $HERMES_HOME/profiles/$profile/config.yaml with lifecycle hook entries"
+  done
   echo "dry-run:   lifecycle-guard matcher=kanban_block (fail_closed=true)"
   echo "dry-run:   lifecycle-guard matcher=kanban_create (fail_closed=true)"
   echo "dry-run:   lifecycle-guard matcher=terminal (fail_closed=true)"
+  echo "dry-run: superseded kanban-workspace-guard.py hooks would be retired from global and H4V3 profile configs"
   echo "dry-run: shell-hook command path unchanged; no second consent command added"
   rm -rf "$CANDIDATE"
   exit 0
@@ -268,6 +321,7 @@ for name in \
   kanban_dynamic_resource.py \
   kanban-block-kind-guard-core.py \
   kanban-specialist-completion-guard.py \
+  kanban-workspace-binding-guard.py \
   kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py \
@@ -284,7 +338,19 @@ do
 done
 CONFIG_BACKUP="$HERMES_HOME/.bak-config.yaml-$TS"
 cp -p "$CONFIG_TARGET" "$CONFIG_BACKUP"
+PROFILE_CONFIG_BACKUPS=()
+for index in "${!H4V3_PROFILE_NAMES[@]}"; do
+  profile_target="${PROFILE_CONFIG_TARGETS[$index]}"
+  profile_backup="${profile_target%/config.yaml}/.bak-config.yaml-$TS"
+  cp -p "$profile_target" "$profile_backup"
+  PROFILE_CONFIG_BACKUPS+=("$profile_backup")
+done
 mv -f "$CANDIDATE/config.yaml" "$CONFIG_TARGET"
+for index in "${!H4V3_PROFILE_NAMES[@]}"; do
+  profile="${H4V3_PROFILE_NAMES[$index]}"
+  profile_target="${PROFILE_CONFIG_TARGETS[$index]}"
+  mv -f "$CANDIDATE/profile-$profile-config.yaml" "$profile_target"
+done
 rm -rf "$CANDIDATE"
 
 source_path_for() {
@@ -325,6 +391,9 @@ source_path_for() {
     kanban-specialist-completion-guard.py)
       printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-specialist-completion-guard.py"
       ;;
+    kanban-workspace-binding-guard.py)
+      printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-workspace-binding-guard.py"
+      ;;
     kanban-block-kind-guard.py)
       printf '%s\n' "$ROOT/automation/hermes/scripts/kanban-block-kind-guard.py"
       ;;
@@ -354,6 +423,7 @@ for name in \
   kanban_dynamic_resource.py \
   kanban-block-kind-guard-core.py \
   kanban-specialist-completion-guard.py \
+  kanban-workspace-binding-guard.py \
   kanban-block-kind-guard.py \
   repository_registry.py \
   board_identity_migration.py
@@ -368,7 +438,9 @@ done
 
 echo "Deployed intake/edge/registry and lifecycle guards to $TARGET_DIR (backup: ${BACKUPS[*]:-none})"
 echo "Config hooks installed at $CONFIG_TARGET (backup: $CONFIG_BACKUP)"
+echo "Profile config hooks installed for: ${H4V3_PROFILE_NAMES[*]}"
 echo "Shell-hook command remains $TARGET_DIR/kanban-block-kind-guard.py (existing consent identity preserved)."
+echo "Superseded kanban-workspace-guard.py hook entries are retired from global/profile live config; the old file is left untouched for rollback archaeology."
 echo "Hermes cron metadata is untouched; the current intake path does not require the retired legacy intake job."
 if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   echo "Rollback:"
@@ -379,3 +451,6 @@ if [[ ${#BACKUPS[@]} -gt 0 ]]; then
   done
 fi
 echo "  mv \"$CONFIG_BACKUP\" \"$CONFIG_TARGET\""
+for index in "${!PROFILE_CONFIG_BACKUPS[@]}"; do
+  echo "  mv \"${PROFILE_CONFIG_BACKUPS[$index]}\" \"${PROFILE_CONFIG_TARGETS[$index]}\""
+done

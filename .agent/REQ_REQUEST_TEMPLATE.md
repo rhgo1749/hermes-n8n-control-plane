@@ -233,6 +233,7 @@ PR/final report에 반드시 남긴다.
 
 - authoritative base SHA
 - PR head SHA / exact candidate identity
+  - 단, tracked REQ 파일 자체에 **그 파일을 publish한 동일 커밋의 SHA를 내용으로 포함하라고 요구하지 않는다**. 이는 자기참조 fixed-point가 되어 수렴할 수 없다. publish 후 current/head identity는 fresh GitHub/remote read-back과 worker/Kanban/PR handoff evidence가 권위이며, REQ 내부 SHA는 명시적으로 시점이 고정된 observed/prior checkpoint로만 기록한다.
 - 아직 검증하지 못한 항목
 - copy-paste 가능한 최소 acceptance command
 - expected PASS conditions

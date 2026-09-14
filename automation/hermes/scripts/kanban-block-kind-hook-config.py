@@ -4,13 +4,15 @@
 This helper preserves the existing YAML text and comments instead of loading
 and dumping the whole Hermes configuration. It writes a candidate path only;
 the deployer decides whether to atomically install it. Re-running it replaces
-only entries for the same approved guard command, so deployment is idempotent.
+entries for the same approved guard command and retires the superseded
+``kanban-workspace-guard.py`` hook, so deployment is idempotent and cannot
+leave two competing workspace creation policies active.
 
 The historical ``kanban-block-kind-guard.py`` command path remains stable for
 shell-hook consent. The command is now a small lifecycle wrapper and is
-registered for ``kanban_block``, ``kanban_create``, and ``terminal``; this adds
-the specialist completion-contract boundary without introducing a second
-allowlist approval.
+registered for ``kanban_block``, ``kanban_create``, and ``terminal``; it owns
+the specialist completion-contract and workspace-binding creation boundaries
+without introducing a second allowlist approval.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import tempfile
 from pathlib import Path
 
 GUARD_FILENAME = "kanban-block-kind-guard.py"
+LEGACY_WORKSPACE_GUARD_FILENAME = "kanban-workspace-guard.py"
 _MATCHERS = ("kanban_block", "kanban_create", "terminal")
 
 
@@ -82,9 +85,12 @@ def _entry_ranges(lines: list[str], start: int, end: int) -> list[tuple[int, int
     ]
 
 
-def _is_guard_entry(lines: list[str], start: int, end: int) -> bool:
+def _is_replaced_guard_entry(lines: list[str], start: int, end: int) -> bool:
     block = "".join(lines[start:end])
-    return GUARD_FILENAME in block
+    return any(
+        filename in block
+        for filename in (GUARD_FILENAME, LEGACY_WORKSPACE_GUARD_FILENAME)
+    )
 
 
 def render(text: str, command: str) -> str:
@@ -97,7 +103,7 @@ def render(text: str, command: str) -> str:
         cursor = start + 1
         for position, (entry_start, entry_end) in enumerate(ranges):
             kept.extend(lines[cursor:entry_start])
-            if not _is_guard_entry(lines, entry_start, entry_end):
+            if not _is_replaced_guard_entry(lines, entry_start, entry_end):
                 kept.extend(lines[entry_start:entry_end])
             elif position == len(ranges) - 1:
                 # The final entry range includes the blank separator before

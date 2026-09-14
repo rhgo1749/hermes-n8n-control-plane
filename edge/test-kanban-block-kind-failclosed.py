@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, "/ws/hermes-agent")
-from hermes_cli import kanban_db, kanban_db_connect  # type: ignore[import-not-found]
+from hermes_cli import kanban_db, kanban_db_connect  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD = REPO_ROOT / "automation/hermes/scripts/kanban-block-kind-guard.py"
@@ -25,6 +25,24 @@ CONFIG_HELPER = REPO_ROOT / "automation/hermes/scripts/kanban-block-kind-hook-co
 DEPLOYER = REPO_ROOT / "automation/hermes/scripts/deploy-intake-edge.sh"
 SYNC_PATH = REPO_ROOT / "edge/kanban-github-sync.py"
 OVERVIEW_PATH = REPO_ROOT / "hermes-plugin/h4v3-overview/dashboard/plugin_api.py"
+H4V3_PROFILE_NAMES = (
+    "kanban-main",
+    "kanban-investigator",
+    "kanban-developer",
+    "kanban-reviewer",
+    "kanban-designer",
+)
+
+
+def _write_runtime_configs(home: Path, original: str) -> list[Path]:
+    """Create the global and five profile configs required by the deployer."""
+    configs = [home / "config.yaml"]
+    for profile in H4V3_PROFILE_NAMES:
+        configs.append(home / "profiles" / profile / "config.yaml")
+    for config in configs:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(original, encoding="utf-8")
+    return configs
 
 
 def _load(name: str, path: Path) -> Any:
@@ -620,9 +638,9 @@ def test_deployer_dry_run_validates_without_changing_live_config():
         home = Path(directory)
         scripts = home / "scripts"
         scripts.mkdir()
-        config = home / "config.yaml"
         original = "hooks:\n  pre_tool_call:\n    - matcher: other\n      command: python3 /tmp/other.py\n"
-        config.write_text(original, encoding="utf-8")
+        configs = _write_runtime_configs(home, original)
+        config = configs[0]
         result = subprocess.run(
             ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
             text=True,
@@ -633,6 +651,27 @@ def test_deployer_dry_run_validates_without_changing_live_config():
         assert "matcher=kanban_block (fail_closed=true)" in result.stdout
         assert "matcher=terminal (fail_closed=true)" in result.stdout
         assert config.read_text(encoding="utf-8") == original
+        assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
+
+
+def test_deployer_dry_run_rejects_missing_profile_config():
+    with tempfile.TemporaryDirectory(prefix="issue92-hermes-home-missing-profile-") as directory:
+        home = Path(directory)
+        scripts = home / "scripts"
+        scripts.mkdir()
+        original = "hooks:\n  pre_tool_call:\n    - matcher: other\n      command: python3 /tmp/other.py\n"
+        configs = _write_runtime_configs(home, original)
+        missing = home / "profiles" / "kanban-designer" / "config.yaml"
+        missing.unlink()
+        result = subprocess.run(
+            ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        assert f"Hermes profile config not found: {missing}" in result.stderr
+        assert configs[0].read_text(encoding="utf-8") == original
         assert not any(path.name.startswith(".deploy-candidate-") for path in scripts.iterdir())
 
 
@@ -849,8 +888,7 @@ def test_deployer_dry_run_with_following_sibling_hook():
         home = Path(directory)
         scripts = home / "scripts"
         scripts.mkdir()
-        config = home / "config.yaml"
-        config.write_text(
+        original = (
             "hooks:\n"
             "  pre_tool_call:\n"
             "    - matcher: other\n"
@@ -860,9 +898,10 @@ def test_deployer_dry_run_with_following_sibling_hook():
             "      command: python3 /tmp/audit.py\n"
             "\n"
             "logging:\n"
-            "  level: INFO\n",
-            encoding="utf-8",
+            "  level: INFO\n"
         )
+        configs = _write_runtime_configs(home, original)
+        config = configs[0]
         result = subprocess.run(
             ["bash", str(DEPLOYER), "--hermes-home", str(home), "--dry-run"],
             text=True,

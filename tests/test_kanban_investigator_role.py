@@ -95,6 +95,11 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
         assert "do not block solely because `AGENT_REWORK_RETRY` is absent" in main_soul
         assert "fresh trusted PR-side `agent-rework` command intentionally opens a label-origin round" in main_soul
         assert "`AGENT_REWORK_RETRY` is a different one-shot recovery signal" in main_soul
+        assert "### Specialist workspace creation" in main_soul
+        assert 'workspace_kind="worktree"' in main_soul
+        assert "stable `idempotency_key`" in main_soul
+        assert "Omit `workspace_path`, `branch`, and `branch_name`" in main_soul
+        assert "Do not fall back to `hermes kanban create`, `git worktree add`" in main_soul
         assert "### Dependency waiting state" in main_soul
         assert "Do not use `initial_status=blocked` merely because a parent is still open" in main_soul
         assert "Reviewer todo (parent=Developer)" in main_soul
@@ -130,6 +135,9 @@ def test_profile_deployer_updates_managed_block_idempotently() -> None:
         assert "When operating as `kanban-main`" in refreshed
         assert "edge has already decided rework admission for that round" in refreshed
         assert "do not block solely because `AGENT_REWORK_RETRY` is absent" in refreshed
+        assert "### Specialist workspace creation" in refreshed
+        assert 'workspace_kind="worktree"' in refreshed
+        assert "Do not fall back to `hermes kanban create`, `git worktree add`" in refreshed
         assert "### Dependency waiting state" in refreshed
         assert "Do not use `initial_status=blocked` merely because a parent is still open" in refreshed
         assert refreshed.count(deployer.MARKER_BEGIN) == 1

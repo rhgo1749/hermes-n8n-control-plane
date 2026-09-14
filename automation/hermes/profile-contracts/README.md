@@ -38,7 +38,7 @@ docker exec hermes-cloudcli-agent \
   --hermes-home /home/hermes/.hermes
 ```
 
-The specialist completion guard is deployed through the existing intake/edge deployer, not by copying the guard manually:
+The specialist lifecycle guard is deployed through the existing intake/edge deployer, not by copying the guard manually. The deployer renders the same approved `kanban-block-kind-guard.py` hook into both the global Hermes config and all five H4V3 profile-local `config.yaml` files (`kanban-main`, `kanban-investigator`, `kanban-developer`, `kanban-reviewer`, `kanban-designer`). This is required because profile-local hook configuration can override the otherwise-correct global hook set:
 
 ```bash
 docker exec hermes-cloudcli-agent \
