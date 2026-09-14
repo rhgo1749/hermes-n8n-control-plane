@@ -150,6 +150,11 @@ schema, event, task, cache, or analytics database. Provider/model token totals
 come only from canonical `sessions` / `session_model_usage` rows. Missing
 session IDs, state rows, model rows, tool-failure events, and cost data are
 reported as `unknown`, `unavailable`, or `partial`, not as numeric zero.
+The report-level `status` is `complete` only when identity, Kanban tables,
+fresh GitHub evidence, and usage evidence are all complete; a partial or
+unavailable usage source makes the report `partial`. Human summaries label a
+numeric partial token total as `known-only` rather than presenting it as the
+complete trajectory total.
 
 Reviewer verdict/rework, investigation model-refresh markers, terminal
 infrastructure failures, explicit operator block/unblock pairs, first-pass
@@ -159,6 +164,11 @@ clock elapsed time. Fresh GitHub issue and PR reads are separate from internal
 Kanban closure and expose Issue closure, PR merge time, observed PR head SHA,
 and merge commit SHA as distinct fields. GitHub failures produce a partial
 report and never mutate lifecycle state.
+Infrastructure retry counts include terminal crash/timeout/spawn/reclaim runs
+and generic `failed` runs only when structured runtime/provider/dispatcher/tool
+cause evidence is present. A generic `failed` run without that evidence is not
+counted as an infrastructure retry and keeps the infrastructure metric
+unknown.
 
 The real Issue #138 / merged PR #149 evidence is the compatibility fixture:
 the observed PR head is `f23000b9771772b6210593d5e611b782e88ba351` and the merge

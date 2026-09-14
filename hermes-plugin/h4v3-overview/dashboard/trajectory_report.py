@@ -25,6 +25,15 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
 _VERDICT_RE = re.compile(r"^(PASS|REWORK)$", re.IGNORECASE)
 _TOOL_FAILURE_KINDS = frozenset({"tool_failed", "tool_failure", "tool_error"})
 _TOOL_RETRY_KINDS = frozenset({"tool_retry", "tool_retried"})
+_INFRA_FAILURE_DOMAINS = frozenset({"runtime", "provider", "dispatcher", "tool"})
+_INFRA_FAILURE_EVENT_KINDS = frozenset({
+    "runtime_failure", "provider_failure", "dispatcher_failure", "tool_failure",
+    "tool_failed", "tool_error",
+})
+_INFRA_FAILURE_METADATA_KEYS = (
+    "failure_domain", "failure_class", "failure_kind", "failure_type",
+    "failure_code", "error_class", "error_kind", "cause",
+)
 
 
 class TrajectoryInputError(ValueError):
@@ -1091,6 +1100,55 @@ def _sha_or_none(value: Any) -> Optional[str]:
     return value if _SHA_RE.fullmatch(value) else None
 
 
+def _infra_failure_domain(value: Any) -> Optional[str]:
+    """Return a bounded infrastructure domain from structured evidence."""
+    text = str(value or "").strip().casefold()
+    if text in _INFRA_FAILURE_DOMAINS:
+        return text
+    for domain in _INFRA_FAILURE_DOMAINS:
+        if text.startswith(domain + "_") or text.endswith("_" + domain):
+            return domain
+    return None
+
+
+def _structured_infra_failure_domain(value: Any) -> Optional[str]:
+    if not isinstance(value, Mapping):
+        return _infra_failure_domain(value)
+    for key in _INFRA_FAILURE_METADATA_KEYS + ("domain", "component", "category"):
+        domain = _infra_failure_domain(value.get(key))
+        if domain:
+            return domain
+    return None
+
+
+def _run_has_infrastructure_failure_cause(
+    run: Mapping[str, Any], events: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Require explicit runtime/provider/dispatcher/tool evidence for ``failed``."""
+    metadata = _run_metadata(run)
+    if _structured_infra_failure_domain(metadata):
+        return True
+    nested_failure = metadata.get("failure")
+    if _structured_infra_failure_domain(nested_failure):
+        return True
+
+    run_id = _as_int(run.get("id"))
+    task_id = str(run.get("task_id") or "")
+    for event in events:
+        if str(event.get("task_id") or "") != task_id:
+            continue
+        event_run_id = _as_int(event.get("run_id"))
+        if run_id is None or event_run_id != run_id:
+            continue
+        kind = str(event.get("kind") or "").strip().casefold()
+        if kind in _INFRA_FAILURE_EVENT_KINDS:
+            return True
+        payload = _json_dict(event.get("payload"))
+        if _structured_infra_failure_domain(payload):
+            return True
+    return False
+
+
 def _counts_report(
     tasks: Mapping[str, Mapping[str, Any]],
     runs: Sequence[Mapping[str, Any]],
@@ -1154,10 +1212,17 @@ def _counts_report(
         and str(task.get("status") or "") == "archived"
         and not runs_by_task.get(task_id)
     ]
-    infra_retry_count = sum(
-        str(run.get("outcome") or "").casefold() in {"crashed", "timed_out", "failed", "spawn_failed", "reclaimed"}
-        for run in runs
-    )
+    infra_retry_count = 0
+    unknown_infra_failures = 0
+    for run in runs:
+        outcome = str(run.get("outcome") or "").casefold()
+        if outcome in {"crashed", "timed_out", "spawn_failed", "reclaimed"}:
+            infra_retry_count += 1
+        elif outcome == "failed":
+            if _run_has_infrastructure_failure_cause(run, events):
+                infra_retry_count += 1
+            else:
+                unknown_infra_failures += 1
     return {
         "specialist_tasks": len(tasks),
         "task_roles": {
@@ -1186,8 +1251,9 @@ def _counts_report(
         "infrastructure_retries": {
             "value": infra_retry_count,
             "count": infra_retry_count,
-            "availability": "known",
-            "definition": "terminal crash/timeout/spawn/runtime failure runs only",
+            "availability": "unknown" if unknown_infra_failures else "known",
+            "unknown": unknown_infra_failures,
+            "definition": "terminal crash/timeout/spawn/reclaim or failed runs with explicit runtime/provider/dispatcher/tool cause evidence only",
         },
         "operator_intervention": {
             "block_unblock_pairs": operator_pairs,
@@ -1278,13 +1344,24 @@ def _human_summary(
     roles = counts.get("task_roles") or {}
     usage_totals = (usage or {}).get("totals") or {}
     total_tokens = usage_totals.get("total_tokens")
+    usage_availability = str((usage or {}).get("availability") or "unavailable")
+    token_availability = str(
+        ((usage or {}).get("field_availability") or {}).get("total_tokens")
+        or "unavailable"
+    )
     worker_seconds = (timing or {}).get("summed_worker_seconds")
+    if total_tokens is None:
+        token_summary = "tokens=unavailable"
+    elif token_availability == "known":
+        token_summary = f"tokens={total_tokens}"
+    else:
+        token_summary = f"known-only total_tokens={total_tokens}"
     return (
         f"Issue #{issue} in {repository}: {counts.get('specialist_tasks', 0)} specialist tasks, "
         f"{roles.get('developer_work_rounds', 0)} implementation rounds and "
         f"{roles.get('reviewer_rounds', 0)} review rounds, "
         f"rework={counts.get('reviewer_rework_count', 0)}, "
-        f"tokens={total_tokens if total_tokens is not None else 'unavailable'}, "
+        f"usage={usage_availability} ({token_summary}; total_tokens availability={token_availability}), "
         f"worker_seconds={worker_seconds if worker_seconds is not None else 'unavailable'}; "
         f"fresh GitHub outcome={github.get('outcome') or 'unavailable'}."
     )
@@ -1404,6 +1481,7 @@ def build_trajectory_report(
         "complete"
         if root_status == "known"
         and github.get("availability") == "known"
+        and usage.get("availability") == "known"
         and all(availability == "known" for availability in table_availability.values())
         else "partial"
     )

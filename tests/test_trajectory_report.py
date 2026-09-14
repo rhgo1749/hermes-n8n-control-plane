@@ -177,6 +177,7 @@ def test_fixture_reconstructs_linked_rounds_and_separates_github_outcome(tmp_pat
         "github_fetched_at": 200,
     }
     assert report["status"] == "complete"
+    assert "usage=known" in report["summary"]
     assert hashlib.sha256(board.read_bytes()).hexdigest() == before
     encoded = json.dumps(report)
     assert "prompt" not in encoded.casefold()
@@ -199,6 +200,9 @@ def test_missing_usage_is_not_numeric_zero_and_period_is_known_only(tmp_path: Pa
     assert report["usage"]["totals"]["total_tokens"] == 60
     assert report["usage"]["field_availability"]["total_tokens"] == "partial"
     assert report["usage"]["cost"]["availability"] == "unavailable"
+    assert report["status"] == "partial"
+    assert "usage=partial" in report["summary"]
+    assert "known-only total_tokens=60" in report["summary"]
 
     aggregate = trajectory.aggregate_trajectory_reports([report])
     assert aggregate["eligible_denominators"]["token_efficiency"] == 0
@@ -274,6 +278,91 @@ def test_aggregate_token_efficiency_accepts_one_complete_source_report_pair() ->
         "tokens_per_worker_second": 10.0,
         "availability": "known",
     }
+
+
+def test_generic_failed_without_cause_is_not_an_infrastructure_retry() -> None:
+    counts = trajectory._counts_report(
+        {"task": {"status": "done"}},
+        [{"id": 1, "task_id": "task", "status": "failed", "outcome": "failed"}],
+        [],
+        {"task": "developer"},
+    )
+
+    assert counts["infrastructure_retries"]["value"] == 0
+    assert counts["infrastructure_retries"]["count"] == 0
+    assert counts["infrastructure_retries"]["availability"] == "unknown"
+    assert counts["infrastructure_retries"]["unknown"] == 1
+
+
+def test_failed_with_explicit_runtime_cause_is_an_infrastructure_retry() -> None:
+    counts = trajectory._counts_report(
+        {"task": {"status": "done"}},
+        [{
+            "id": 1,
+            "task_id": "task",
+            "status": "failed",
+            "outcome": "failed",
+            "metadata": json.dumps({"failure_class": "runtime"}),
+        }],
+        [],
+        {"task": "developer"},
+    )
+
+    assert counts["infrastructure_retries"]["value"] == 1
+    assert counts["infrastructure_retries"]["count"] == 1
+    assert counts["infrastructure_retries"]["availability"] == "known"
+    assert counts["infrastructure_retries"]["unknown"] == 0
+
+
+def test_terminal_worker_outcomes_remain_infrastructure_retries() -> None:
+    outcomes = ("crashed", "timed_out", "spawn_failed", "reclaimed")
+    tasks = {f"task-{index}": {"status": "ready"} for index in range(len(outcomes))}
+    runs = [
+        {
+            "id": index,
+            "task_id": f"task-{index}",
+            "status": outcome,
+            "outcome": outcome,
+        }
+        for index, outcome in enumerate(outcomes, start=1)
+    ]
+
+    counts = trajectory._counts_report(
+        tasks,
+        runs,
+        [],
+        {task_id: "developer" for task_id in tasks},
+    )
+
+    assert counts["infrastructure_retries"] == {
+        "value": 4,
+        "count": 4,
+        "availability": "known",
+        "unknown": 0,
+        "definition": "terminal crash/timeout/spawn/reclaim or failed runs with explicit runtime/provider/dispatcher/tool cause evidence only",
+    }
+
+
+def test_failed_with_run_scoped_runtime_event_is_an_infrastructure_retry() -> None:
+    counts = trajectory._counts_report(
+        {"task": {"status": "done"}},
+        [{"id": 1, "task_id": "task", "status": "failed", "outcome": "failed"}],
+        [{"task_id": "task", "run_id": 1, "kind": "runtime_failure", "payload": "{}"}],
+        {"task": "developer"},
+    )
+
+    assert counts["infrastructure_retries"]["value"] == 1
+    assert counts["infrastructure_retries"]["availability"] == "known"
+
+    unrelated_counts = trajectory._counts_report(
+        {"task": {"status": "done"}},
+        [{"id": 1, "task_id": "task", "status": "failed", "outcome": "failed"}],
+        [{"task_id": "task", "run_id": 2, "kind": "runtime_failure", "payload": "{}"}],
+        {"task": "developer"},
+    )
+
+    assert unrelated_counts["infrastructure_retries"]["value"] == 0
+    assert unrelated_counts["infrastructure_retries"]["availability"] == "unknown"
 
 
 def test_default_fetcher_discovers_timeline_pr_and_validates_closing_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
