@@ -1555,8 +1555,10 @@ def aggregate_trajectory_reports(
     first_pass: list[bool] = []
     unknown_first = 0
     reworks: list[int] = []
-    tokens: list[int] = []
-    seconds: list[int] = []
+    token_efficiency_pairs: list[tuple[int, int]] = []
+    known_token_total_reports = 0
+    known_worker_duration_reports = 0
+    token_efficiency_component_observed = False
     model_totals: dict[str, dict[str, Any]] = {}
     model_eligible = 0
     for report in selected:
@@ -1569,12 +1571,27 @@ def aggregate_trajectory_reports(
         rework = _as_int(counts.get("reviewer_rework_count"))
         if rework is not None:
             reworks.append(rework)
-        total = _as_int(((report.get("usage") or {}).get("totals") or {}).get("total_tokens"))
-        if total is not None:
-            tokens.append(total)
-        worker = _as_int((report.get("timing") or {}).get("summed_worker_seconds"))
-        if worker is not None:
-            seconds.append(worker)
+        usage = report.get("usage") or {}
+        total = _as_int((usage.get("totals") or {}).get("total_tokens"))
+        token_availability = (usage.get("field_availability") or {}).get("total_tokens")
+        if total is not None or token_availability not in {None, "unavailable"}:
+            token_efficiency_component_observed = True
+        if total is not None and token_availability == "known":
+            known_token_total_reports += 1
+        timing = report.get("timing") or {}
+        worker = _as_int(timing.get("summed_worker_seconds"))
+        worker_availability = timing.get("worker_run_duration_availability")
+        if worker is not None or worker_availability not in {None, "unavailable"}:
+            token_efficiency_component_observed = True
+        if worker is not None and worker_availability == "known":
+            known_worker_duration_reports += 1
+        if (
+            total is not None
+            and token_availability == "known"
+            and worker is not None
+            and worker_availability == "known"
+        ):
+            token_efficiency_pairs.append((total, worker))
         model_rows = (report.get("usage") or {}).get("by_effective_model") or {}
         if any(
             _as_int(value.get("total_tokens")) is not None
@@ -1613,6 +1630,13 @@ def aggregate_trajectory_reports(
                 "known" if known_reports == reports and reports else
                 "partial" if known_reports else "unavailable"
             )
+    token_efficiency_availability = (
+        "known" if selected and len(token_efficiency_pairs) == len(selected) else
+        "partial" if token_efficiency_pairs or token_efficiency_component_observed else
+        "unavailable"
+    )
+    paired_tokens = sum(total for total, _worker in token_efficiency_pairs) if token_efficiency_pairs else None
+    paired_worker_seconds = sum(worker for _total, worker in token_efficiency_pairs) if token_efficiency_pairs else None
     generated = int(time.time())
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1623,12 +1647,12 @@ def aggregate_trajectory_reports(
         "from": from_epoch,
         "to": to_epoch,
         "report_count": len(selected),
-        "eligible_denominators": {"first_pass_success": len(first_pass), "average_rework": len(reworks), "token_efficiency": min(len(tokens), len(seconds)), "model_provider_comparison": model_eligible},
+        "eligible_denominators": {"first_pass_success": len(first_pass), "average_rework": len(reworks), "token_efficiency": len(token_efficiency_pairs), "model_provider_comparison": model_eligible},
         "first_pass_success": {"successes": sum(first_pass), "eligible": len(first_pass), "rate": sum(first_pass) / len(first_pass) if first_pass else None, "unknown": unknown_first},
         "average_rework": {"value": sum(reworks) / len(reworks) if reworks else None, "eligible": len(reworks), "unknown": len(selected) - len(reworks)},
-        "token_efficiency": {"total_tokens": sum(tokens) if tokens else None, "worker_seconds": sum(seconds) if seconds else None, "tokens_per_worker_second": sum(tokens) / sum(seconds) if tokens and seconds and sum(seconds) else None, "availability": "known" if tokens and seconds else "partial"},
+        "token_efficiency": {"total_tokens": paired_tokens, "worker_seconds": paired_worker_seconds, "tokens_per_worker_second": paired_tokens / paired_worker_seconds if paired_tokens is not None and paired_worker_seconds else None, "availability": token_efficiency_availability},
         "by_effective_model": dict(sorted(model_totals.items())),
         "model_provider_comparison": dict(sorted(model_totals.items())),
-        "unknown_counts": {"first_pass_success": unknown_first, "reports_without_token_total": len(selected) - len(tokens), "reports_without_worker_seconds": len(selected) - len(seconds), "model_provider_comparison": len(selected) - model_eligible},
+        "unknown_counts": {"first_pass_success": unknown_first, "reports_without_token_total": len(selected) - known_token_total_reports, "reports_without_worker_seconds": len(selected) - known_worker_duration_reports, "token_efficiency_pair": len(selected) - len(token_efficiency_pairs), "model_provider_comparison": len(selected) - model_eligible},
         "reports": [{"repository": (report.get("identity") or {}).get("repository"), "issue_number": (report.get("identity") or {}).get("issue_number"), "status": report.get("status"), "summary": report.get("summary")} for report in selected],
     }

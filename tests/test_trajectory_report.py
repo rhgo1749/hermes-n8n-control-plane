@@ -201,8 +201,79 @@ def test_missing_usage_is_not_numeric_zero_and_period_is_known_only(tmp_path: Pa
     assert report["usage"]["cost"]["availability"] == "unavailable"
 
     aggregate = trajectory.aggregate_trajectory_reports([report])
+    assert aggregate["eligible_denominators"]["token_efficiency"] == 0
+    assert aggregate["token_efficiency"] == {
+        "total_tokens": None,
+        "worker_seconds": None,
+        "tokens_per_worker_second": None,
+        "availability": "partial",
+    }
+
+
+def _aggregate_report(
+    *,
+    total_tokens: int | None,
+    token_availability: str,
+    worker_seconds: int | None,
+    worker_availability: str,
+) -> dict[str, object]:
+    return {
+        "identity": {"root_task_row": {"created_at": 1}},
+        "counts": {},
+        "usage": {
+            "totals": {"total_tokens": total_tokens},
+            "field_availability": {"total_tokens": token_availability},
+            "by_effective_model": {},
+        },
+        "timing": {
+            "summed_worker_seconds": worker_seconds,
+            "worker_run_duration_availability": worker_availability,
+        },
+    }
+
+
+def test_aggregate_token_efficiency_requires_a_complete_source_report_pair() -> None:
+    aggregate = trajectory.aggregate_trajectory_reports([
+        _aggregate_report(
+            total_tokens=100,
+            token_availability="known",
+            worker_seconds=None,
+            worker_availability="unavailable",
+        ),
+        _aggregate_report(
+            total_tokens=None,
+            token_availability="unavailable",
+            worker_seconds=10,
+            worker_availability="known",
+        ),
+    ])
+
+    assert aggregate["eligible_denominators"]["token_efficiency"] == 0
+    assert aggregate["token_efficiency"] == {
+        "total_tokens": None,
+        "worker_seconds": None,
+        "tokens_per_worker_second": None,
+        "availability": "partial",
+    }
+
+
+def test_aggregate_token_efficiency_accepts_one_complete_source_report_pair() -> None:
+    aggregate = trajectory.aggregate_trajectory_reports([
+        _aggregate_report(
+            total_tokens=100,
+            token_availability="known",
+            worker_seconds=10,
+            worker_availability="known",
+        ),
+    ])
+
     assert aggregate["eligible_denominators"]["token_efficiency"] == 1
-    assert aggregate["token_efficiency"]["availability"] == "known"
+    assert aggregate["token_efficiency"] == {
+        "total_tokens": 100,
+        "worker_seconds": 10,
+        "tokens_per_worker_second": 10.0,
+        "availability": "known",
+    }
 
 
 def test_default_fetcher_discovers_timeline_pr_and_validates_closing_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
