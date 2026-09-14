@@ -586,6 +586,7 @@ def _github_outcome(
             "observed_pr_head_sha": None,
             "merge_commit_sha": None,
             "outcome": None,
+            "issue_closure_authoritative": False,
             "error": "github_issue_unavailable" if issue_failed else "github_issue_missing",
         }
     issue_repo = None
@@ -621,6 +622,7 @@ def _github_outcome(
             "observed_pr_head_sha": None,
             "merge_commit_sha": None,
             "outcome": None,
+            "issue_closure_authoritative": repository_anchor and issue_state == "closed" if issue_state else False,
             "error": "github_pr_unavailable",
         }
     base = pr_data.get("base")

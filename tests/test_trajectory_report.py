@@ -27,7 +27,7 @@ def _make_fixture(tmp_path: Path) -> tuple[Path, Path]:
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY, status TEXT, assignee TEXT, created_by TEXT,
             created_at INTEGER, started_at INTEGER, completed_at INTEGER,
-            project_id TEXT, idempotency_key TEXT
+            project_id TEXT, idempotency_key TEXT, title TEXT, body TEXT
         );
         CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
         CREATE TABLE task_runs (
@@ -42,15 +42,15 @@ def _make_fixture(tmp_path: Path) -> tuple[Path, Path]:
         """
     )
     tasks = [
-        ("root", "done", "kanban-main", "kanban-main", 100, 101, 190, "project-root", ISSUE_KEY),
-        ("dev", "done", "kanban-developer", "kanban-main", 110, 111, 130, "project-dev", ISSUE_KEY + ":developer:1"),
-        ("review", "done", "kanban-reviewer", "kanban-main", 140, 141, 160, "project-review", ISSUE_KEY + ":reviewer:1"),
-        ("investigate", "done", "kanban-investigator", "kanban-main", 115, 116, 135, "project-investigate", ISSUE_KEY + ":investigator:1"),
-        # This card mentions the issue only in its source-side identity. It is
-        # not linked and must never enter the report by body/title matching.
-        ("poison", "done", "kanban-developer", "kanban-main", 120, 121, 125, "other", f"github:{REPOSITORY}:issue:999"),
+        ("root", "done", "kanban-main", "kanban-main", 100, 101, 190, "project-root", ISSUE_KEY, "root", "root"),
+        ("dev", "done", "kanban-developer", "kanban-main", 110, 111, 130, None, ISSUE_KEY + ":developer:1", "dev", "dev"),
+        ("review", "done", "kanban-reviewer", "kanban-main", 140, 141, 160, "p_7f39082d", ISSUE_KEY + ":reviewer:1", "review", "review"),
+        ("investigate", "done", "kanban-investigator", "kanban-main", 115, 116, 135, "p_7f39082d", ISSUE_KEY + ":investigator:1", "investigate", "investigate"),
+        # The canonical identity belongs to Issue #154, but its prose mentions
+        # #138. It must never enter the report by body/title matching.
+        ("poison", "done", "kanban-developer", "kanban-main", 120, 121, 125, "other", f"github:{REPOSITORY}:issue:154", "Issue #138", "Issue #138"),
     ]
-    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tasks)
+    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tasks)
     conn.executemany(
         "INSERT INTO task_links VALUES (?, ?)",
         [("root", "dev"), ("root", "review"), ("root", "investigate")],
@@ -69,6 +69,7 @@ def _make_fixture(tmp_path: Path) -> tuple[Path, Path]:
         (5, "dev", 1, "unblocked", "{}", 120),
         (6, "dev", 1, "tool_failed", "{}", 122),
         (7, "dev", 1, "tool_retry", "{}", 123),
+        (8, "dev", 1, "future_event", "[malformed", 124),
     ]
     conn.executemany("INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?)", events)
     conn.commit()
@@ -144,6 +145,10 @@ def test_fixture_reconstructs_linked_rounds_and_separates_github_outcome(tmp_pat
 
     assert report["read_only"] is True
     assert report["identity"]["selection"]["body_or_title_matching"] is False
+    assert all(item.get("task_id") != "poison" for item in report["evidence"])
+    scoped_projects = report["identity"]["project_identity"]["scoped_project_ids"]
+    assert {item["profile"] for item in scoped_projects if item["project_id"] == "p_7f39082d"} == {"kanban-investigator", "kanban-reviewer"}
+    assert report["identity"]["project_identity"]["null_project_id_task_count"] == 1
     assert report["counts"]["specialist_tasks"] == 4
     assert report["counts"]["task_links"] == 3
     assert report["counts"]["task_runs"] == 3
@@ -193,8 +198,44 @@ def test_missing_usage_is_not_numeric_zero_and_period_is_known_only(tmp_path: Pa
 
 def test_root_discovery_uses_exact_source_key_and_not_issue_text(tmp_path: Path) -> None:
     board, _profiles = _make_fixture(tmp_path)
-    assert trajectory.discover_root_task_ids(board, repository=REPOSITORY) == [("root", 138, 100), ("poison", 999, 120)]
+    assert trajectory.discover_root_task_ids(board, repository=REPOSITORY) == [("root", 138, 100), ("poison", 154, 120)]
     assert trajectory.discover_root_task_ids(board, repository="other/repository") == []
+
+
+def test_archived_unrun_canary_is_visible_but_not_a_work_round(tmp_path: Path) -> None:
+    board, profiles = _make_fixture(tmp_path)
+    conn = sqlite3.connect(board)
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("canary", "archived", "kanban-developer", "kanban-main", 121, None, None, None, "issue138-canary-probe", "canary", "canary"),
+    )
+    conn.commit()
+    conn.close()
+    report = trajectory.build_trajectory_report(
+        board, board_slug="hermes-n8n-control-plane", repository=REPOSITORY,
+        issue=138, profile_root=profiles, github_evidence=_github_fixture(), generated_at=200,
+    )
+    assert report["counts"]["archived_unrun_canary"] == {"task_id": "canary", "count": 1}
+    assert report["counts"]["task_roles"]["developer_total"] == 2
+    assert report["counts"]["task_roles"]["developer_work_rounds"] == 1
+
+
+def test_github_failure_is_partial_and_observer_only(tmp_path: Path) -> None:
+    board, profiles = _make_fixture(tmp_path)
+    before = hashlib.sha256(board.read_bytes()).hexdigest()
+
+    def unavailable(_path: str) -> dict[str, object]:
+        raise OSError("fixture outage")
+
+    report = trajectory.build_trajectory_report(
+        board, board_slug="hermes-n8n-control-plane", repository=REPOSITORY,
+        issue=138, profile_root=profiles, github_fetcher=unavailable, generated_at=200,
+    )
+    assert report["status"] == "partial"
+    assert report["github"]["availability"] == "unavailable"
+    assert report["github"]["issue_closure_authoritative"] is False
+    assert report["counts"]["specialist_tasks"] == 4
+    assert hashlib.sha256(board.read_bytes()).hexdigest() == before
 
 
 def test_bad_repository_is_rejected() -> None:
