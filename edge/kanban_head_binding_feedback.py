@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Reason-aware PR feedback for rework head-binding delivery rejection.
+"""Reason-aware PR feedback and narrow rework-policy hotfixes.
 
 This is a narrow edge overlay.  It deliberately leaves the canonical rework
-state machine in ``kanban-github-sync.py`` unchanged and only augments:
+state machine in ``kanban-github-sync.py`` unchanged and augments:
 
 * evidence for ``run_head_mismatch`` with the round-requested head;
 * the existing idempotent PR attention comment with reason-specific recovery
-  guidance; and
+  guidance;
 * retryable head-binding failures with the same PR feedback before/after the
-  existing retry routing completes.
+  existing retry routing completes; and
+* operator-attention classification so historical ``rework_round`` count can
+  never cap an explicit trusted-maintainer rework command.
+
+The round-count hotfix removes only the synthetic ``rework_threshold_exceeded``
+attention reason.  Automatic worker retry protection remains owned by the
+existing ``kanban.failure_limit`` / failure circuit-breaker path; trust,
+one-shot, freshness, provenance, and delivery gates are unchanged.
 
 PR #36's trusted-maintainer verification-only same-head acceptance remains
 owned exclusively by the canonical ``_rework_delivery_evidence`` function.
 The overlay never pre-classifies same-head as an error and never changes task,
-retry, label, failure-limit, or delivery transitions.
+retry, label, failure-limit, or delivery transitions apart from removing the
+historical-round-count operator-attention cap described above.
 """
 from __future__ import annotations
 
@@ -27,12 +35,26 @@ HEAD_BINDING_REJECT_REASONS = frozenset({
 
 
 def install_head_binding_feedback(core: Any) -> Any:
-    """Install the feedback-only overlay onto a loaded edge-sync module."""
+    """Install feedback plus the trusted-maintainer round-cap hotfix."""
     if getattr(core, "_head_binding_feedback_installed", False):
         return core
 
     original_delivery_evidence = core._rework_delivery_evidence
     original_reconcile = core._reconcile_rework_lifecycle
+    original_operator_attention_reason = core._operator_attention_reason
+
+    def operator_attention_reason(entry: Mapping[str, Any]) -> Optional[str]:
+        """Never turn historical rework count into a human command cap.
+
+        ``rework_round`` is provenance, not retry authorization.  A trusted
+        maintainer may explicitly request round 4, 5, ... through the existing
+        one-shot/freshness guards.  Automatic crash/retry limiting remains in
+        the separate failure-limit path.
+        """
+        reason = original_operator_attention_reason(entry)
+        if reason == "rework_threshold_exceeded":
+            return None
+        return reason
 
     def delivery_evidence(
         conn: Any,
@@ -224,6 +246,7 @@ def install_head_binding_feedback(core: Any) -> Any:
         return result
 
     core.HEAD_BINDING_REJECT_REASONS = HEAD_BINDING_REJECT_REASONS
+    core._operator_attention_reason = operator_attention_reason
     core._rework_delivery_evidence = delivery_evidence
     core._post_rework_attention_pr_comment = post_attention_pr_comment
     core._reconcile_rework_lifecycle = reconcile_rework_lifecycle
