@@ -131,7 +131,7 @@ the notification path never reads the Overview.
 The same dashboard plugin exposes two observer-only JSON routes:
 
 * `GET /api/plugins/h4v3-overview/trajectory-report?board=<slug>&repository=<owner/repo>&issue=<number>` returns one root task and its linked specialist rounds.
-* `GET /api/plugins/h4v3-overview/trajectory-report/period?board=<slug>&repository=<owner/repo>&from_epoch=<unix>&to_epoch=<unix>` returns a known-only aggregate over exact GitHub intake roots. Add `issue=<number>` to restrict the period query to one Issue.
+* `GET /api/plugins/h4v3-overview/trajectory-report/aggregate?board=<optional>&repository=<optional>&issue=<optional>&from=<unix>&to=<unix>` returns a known-only period aggregate over exact GitHub intake roots. The `period` path remains an internal compatibility alias.
 
 The response is schema `h4v3-trajectory-v1` (`schema_version: 1`). Root
 selection is strict: an exact `github:<owner/repo>:issue:<number>`

@@ -441,6 +441,8 @@ def _usage_report(
     else:
         totals["total_tokens"] = None
         field_availability["total_tokens"] = "unavailable"
+    totals["total_tokens_input_plus_output"] = totals["total_tokens"]
+    field_availability["total_tokens_input_plus_output"] = field_availability["total_tokens"]
 
     by_profile: dict[str, dict[str, Any]] = {}
     by_model: dict[str, dict[str, Any]] = {}
@@ -454,6 +456,7 @@ def _usage_report(
         for field in ("input_tokens", "output_tokens"):
             profile_bucket[field] += _as_int(session.get(field)) or 0
         profile_bucket["total_tokens"] = profile_bucket["input_tokens"] + profile_bucket["output_tokens"]
+        profile_bucket["total_tokens_input_plus_output"] = profile_bucket["total_tokens"]
         model_rows = list(record.get("model_rows") or [])
         if not model_rows and session.get("model"):
             # The session row is still canonical model/provider evidence even
@@ -474,16 +477,26 @@ def _usage_report(
             for field in ("input_tokens", "output_tokens"):
                 bucket[field] += _as_int(row.get(field)) or 0
             bucket["total_tokens"] = bucket["input_tokens"] + bucket["output_tokens"]
+            bucket["total_tokens_input_plus_output"] = bucket["total_tokens"]
     statuses = list(field_availability.values())
     overall = "known" if statuses and all(status == "known" for status in statuses) else (
         "partial" if any(status in {"known", "partial"} for status in statuses) else "unavailable"
     )
+    completed_run_ids = {
+        _as_int(run.get("id")) for run in runs
+        if str(run.get("outcome") or "").casefold() == "completed"
+    }
+    known_run_ids = {
+        _as_int(record.get("run_id")) for record in known
+    }
+    completed_known = len(completed_run_ids & known_run_ids)
     failure_events = [event for event in events if str(event.get("kind") or "").casefold() in _TOOL_FAILURE_KINDS]
     retry_events = [event for event in events if str(event.get("kind") or "").casefold() in _TOOL_RETRY_KINDS]
     report = {
         "availability": overall,
         "coverage": {
             "all_runs": {"known": len(known), "total": len(runs), "fraction": len(known) / len(runs) if runs else None},
+            "completed_runs": {"known": completed_known, "total": len(completed_run_ids), "fraction": completed_known / len(completed_run_ids) if completed_run_ids else None},
             "model_split_runs": {
                 "known": sum(
                     bool(record.get("model_rows"))
@@ -499,6 +512,7 @@ def _usage_report(
         "by_profile": dict(sorted(by_profile.items())),
         "by_effective_model": dict(sorted(by_model.items())),
         "cost": {"value": None, "availability": "unavailable", "reason": "no_authoritative_per_task_charge"},
+        "monetary_cost": {"value": None, "availability": "unavailable", "reason": "subscription_included_or_no_authoritative_per_task_charge"},
         "tool_failures": {
             "value": len(failure_events) if failure_events else None,
             "availability": "known" if failure_events else "unavailable",
@@ -671,6 +685,7 @@ def _timing_report(tasks: Mapping[str, Mapping[str, Any]], runs: Sequence[Mappin
         "trajectory_elapsed_availability": "known" if elapsed is not None else "unavailable",
         "worker_run_seconds_by_profile": dict(sorted(worker_by_profile.items())),
         "summed_worker_seconds": sum(worker_by_profile.values()) if worker_known else None,
+        "summed_worker_hours": sum(worker_by_profile.values()) / 3600 if worker_known else None,
         "worker_run_duration_availability": "known" if worker_known == len(runs) and runs else ("partial" if worker_known else "unavailable"),
         "dependency_wait_seconds": dependency_wait,
         "dependency_wait_availability": "known" if dependency_wait is not None else "unknown",
@@ -741,12 +756,12 @@ def _counts_report(
         role == "developer" and any(_as_int(run.get("started_at")) is not None for run in runs_by_task.get(task_id, []))
         for task_id, role in roles.items()
     )
-    archived_unrun = sum(
-        roles.get(task_id) == "developer"
+    archived_unrun_ids = [
+        task_id for task_id, task in tasks.items()
+        if roles.get(task_id) == "developer"
         and str(task.get("status") or "") == "archived"
         and not runs_by_task.get(task_id)
-        for task_id, task in tasks.items()
-    )
+    ]
     infra_retry_count = sum(
         str(run.get("outcome") or "").casefold() in {"crashed", "timed_out", "failed", "spawn_failed", "reclaimed"}
         for run in runs
@@ -756,8 +771,10 @@ def _counts_report(
         "task_roles": {
             "developer_total": role_counts.get("developer", 0),
             "developer_work_rounds": implementation_rounds,
+            "developer_work_rounds_excluding_archived_unrun_canary": implementation_rounds,
             "reviewer_rounds": role_counts.get("reviewer", 0),
             "investigator_rounds": role_counts.get("investigator", 0),
+            "investigator_runs": role_counts.get("investigator", 0),
             "designer_rounds": role_counts.get("designer", 0),
         },
         "task_runs": len(runs),
@@ -770,16 +787,19 @@ def _counts_report(
         "reviewer_rework_count": verdicts.get("REWORK", 0),
         "first_pass_success": {
             "value": True if first_verdict == "PASS" else (False if first_verdict == "REWORK" else None),
+            "status": first_verdict or "UNKNOWN",
             "availability": "known" if first_verdict in {"PASS", "REWORK"} else "unknown",
         },
         "implementation_review_rounds": {"implementation": implementation_rounds, "review": role_counts.get("reviewer", 0)},
         "infrastructure_retries": {
             "value": infra_retry_count,
+            "count": infra_retry_count,
             "availability": "known",
             "definition": "terminal crash/timeout/spawn/runtime failure runs only",
         },
         "operator_intervention": {
             "block_unblock_pairs": operator_pairs,
+            "operator_block_unblock_pairs": operator_pairs,
             "pair_duration_seconds": _paired_wait_seconds(
                 events,
                 start_predicate=_event_is_operator_block,
@@ -790,10 +810,14 @@ def _counts_report(
         },
         "investigation_model_refresh": {
             "candidate_count_after_initial": max(0, role_counts.get("investigator", 0) - 1),
+            "candidates_after_initial": max(0, role_counts.get("investigator", 0) - 1),
             "confirmed_count": confirmed_refresh if confirmed_refresh else None,
             "confirmed_availability": "known" if confirmed_refresh else "unknown",
         },
-        "archived_unrun_canary": archived_unrun,
+        "archived_unrun_canary": {
+            "task_id": archived_unrun_ids[0] if archived_unrun_ids else None,
+            "count": len(archived_unrun_ids),
+        },
     }
 
 
@@ -984,6 +1008,12 @@ def build_trajectory_report(
         "schema_version": SCHEMA_VERSION,
         "schema_id": SCHEMA_ID,
         "generated_at": generated,
+        "freshness": {
+            "report_generated_at": generated,
+            "kanban_observed_at": generated if not kanban_error else None,
+            "profile_state_observed_at": generated if usage["availability"] != "unavailable" else None,
+            "github_fetched_at": github.get("fetched_at"),
+        },
         "read_only": True,
         "status": status,
         "identity": identity,
@@ -1022,6 +1052,51 @@ def build_trajectory_report(
         },
         "summary": _human_summary(repository, issue, counts, github),
     }
+
+
+def discover_root_candidates(
+    db_path: Path | str, *, repository: Optional[str] = None,
+    issue: Optional[int] = None, from_epoch: Optional[int] = None,
+    to_epoch: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Find exact GitHub issue roots for an optional repository/time scope."""
+    if repository is not None:
+        repository = _validate_repository(repository)
+    issue_number = int(issue) if issue is not None else None
+    try:
+        conn = _read_only_connection(Path(db_path))
+    except (OSError, sqlite3.Error):
+        return []
+    try:
+        columns = _table_columns(conn, "tasks")
+        if not {"id", "idempotency_key"}.issubset(columns):
+            return []
+        created = '"created_at"' if "created_at" in columns else "0"
+        rows = conn.execute(
+            f"SELECT id, idempotency_key, {created} AS created_at FROM tasks "
+            "WHERE idempotency_key LIKE 'github:%' ORDER BY created_at, id"
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            match = re.fullmatch(r"github:([^:]+/[^:]+):issue:(\d+)", str(row["idempotency_key"] or ""))
+            if not match:
+                continue
+            row_repository, row_issue = match.group(1), int(match.group(2))
+            if repository is not None and row_repository != repository:
+                continue
+            if issue_number is not None and row_issue != issue_number:
+                continue
+            created_at = _as_int(row["created_at"]) or 0
+            if from_epoch is not None and created_at < int(from_epoch):
+                continue
+            if to_epoch is not None and created_at > int(to_epoch):
+                continue
+            results.append({"root_task_id": str(row["id"]), "repository": row_repository, "issue": row_issue, "created_at": created_at})
+        return results
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
 
 
 def discover_root_task_ids(
@@ -1081,6 +1156,7 @@ def aggregate_trajectory_reports(
     tokens: list[int] = []
     seconds: list[int] = []
     model_totals: dict[str, dict[str, Any]] = {}
+    model_eligible = 0
     for report in selected:
         counts = report.get("counts") or {}
         first = counts.get("first_pass_success") or {}
@@ -1097,22 +1173,30 @@ def aggregate_trajectory_reports(
         worker = _as_int((report.get("timing") or {}).get("summed_worker_seconds"))
         if worker is not None:
             seconds.append(worker)
-        for key, value in ((report.get("usage") or {}).get("by_effective_model") or {}).items():
+        model_rows = (report.get("usage") or {}).get("by_effective_model") or {}
+        if model_rows:
+            model_eligible += 1
+        for key, value in model_rows.items():
             bucket = model_totals.setdefault(key, {"provider": value.get("provider"), "model": value.get("model"), "total_tokens": 0, "reports": 0})
             bucket["total_tokens"] += _as_int(value.get("total_tokens")) or 0
+            bucket["total_tokens_input_plus_output"] = bucket["total_tokens"]
             bucket["reports"] += 1
+    generated = int(time.time())
     return {
         "schema_version": SCHEMA_VERSION,
         "schema_id": SCHEMA_ID,
         "read_only": True,
+        "generated_at": generated,
+        "freshness": {"report_generated_at": generated},
         "from": from_epoch,
         "to": to_epoch,
         "report_count": len(selected),
-        "eligible_denominators": {"first_pass_success": len(first_pass), "average_rework": len(reworks), "token_efficiency": min(len(tokens), len(seconds))},
+        "eligible_denominators": {"first_pass_success": len(first_pass), "average_rework": len(reworks), "token_efficiency": min(len(tokens), len(seconds)), "model_provider_comparison": model_eligible},
         "first_pass_success": {"successes": sum(first_pass), "eligible": len(first_pass), "rate": sum(first_pass) / len(first_pass) if first_pass else None, "unknown": unknown_first},
         "average_rework": {"value": sum(reworks) / len(reworks) if reworks else None, "eligible": len(reworks), "unknown": len(selected) - len(reworks)},
         "token_efficiency": {"total_tokens": sum(tokens) if tokens else None, "worker_seconds": sum(seconds) if seconds else None, "tokens_per_worker_second": sum(tokens) / sum(seconds) if tokens and seconds and sum(seconds) else None, "availability": "known" if tokens and seconds else "partial"},
         "by_effective_model": dict(sorted(model_totals.items())),
-        "unknown_counts": {"first_pass_success": unknown_first, "reports_without_token_total": len(selected) - len(tokens), "reports_without_worker_seconds": len(selected) - len(seconds)},
+        "model_provider_comparison": dict(sorted(model_totals.items())),
+        "unknown_counts": {"first_pass_success": unknown_first, "reports_without_token_total": len(selected) - len(tokens), "reports_without_worker_seconds": len(selected) - len(seconds), "model_provider_comparison": len(selected) - model_eligible},
         "reports": [{"repository": (report.get("identity") or {}).get("repository"), "issue_number": (report.get("identity") or {}).get("issue_number"), "status": report.get("status"), "summary": report.get("summary")} for report in selected],
     }

@@ -153,6 +153,7 @@ def test_fixture_reconstructs_linked_rounds_and_separates_github_outcome(tmp_pat
     assert report["counts"]["operator_intervention"]["block_unblock_pairs"] == 1
     assert report["usage"]["availability"] == "known"
     assert report["usage"]["totals"]["total_tokens"] == 90
+    assert report["usage"]["totals"]["total_tokens_input_plus_output"] == 90
     assert report["usage"]["totals"]["tool_call_count"] == 12
     assert report["usage"]["tool_failures"]["value"] == 1
     assert report["usage"]["tool_failures"]["availability"] == "known"
@@ -248,4 +249,5 @@ def test_plugin_router_registers_single_and_period_reports() -> None:
     spec.loader.exec_module(plugin)
     paths = {getattr(route, "path", None) for route in getattr(plugin.router, "routes", [])}
     assert "/trajectory-report" in paths
+    assert "/trajectory-report/aggregate" in paths
     assert "/trajectory-report/period" in paths
