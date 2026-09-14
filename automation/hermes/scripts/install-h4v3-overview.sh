@@ -44,6 +44,39 @@ done
 }
 [[ -d "$HERMES_HOME" ]] || { echo "Hermes home not found: $HERMES_HOME" >&2; exit 2; }
 
+# Emit deployment-context evidence before any candidate write. This deliberately
+# distinguishes "no host Docker control" from "no access to the runtime I am
+# already executing inside" so workers do not misclassify nested Docker absence
+# as a capability blocker.
+EXECUTION_NAMESPACE="host"
+if [[ -e /.dockerenv ]]; then
+  EXECUTION_NAMESPACE="container"
+elif [[ -r /proc/1/cgroup ]] && grep -Eq '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null; then
+  EXECUTION_NAMESPACE="container"
+fi
+
+DOCKER_CLI="absent"
+if command -v docker >/dev/null 2>&1; then
+  DOCKER_CLI="present"
+fi
+
+DIRECT_RUNTIME_ACCESS="false"
+if [[ -r "$HERMES_HOME" && -w "$HERMES_HOME" ]]; then
+  DIRECT_RUNTIME_ACCESS="true"
+fi
+
+NESTED_DOCKER_REQUIRED="unknown"
+if [[ "$DIRECT_RUNTIME_ACCESS" == "true" ]]; then
+  NESTED_DOCKER_REQUIRED="false"
+fi
+
+printf 'H4V3_RUNTIME_CONTEXT execution_namespace=%s hermes_home=%q direct_runtime_access=%s docker_cli=%s nested_docker_required=%s\n' \
+  "$EXECUTION_NAMESPACE" "$HERMES_HOME" "$DIRECT_RUNTIME_ACCESS" "$DOCKER_CLI" "$NESTED_DOCKER_REQUIRED"
+
+if [[ "$EXECUTION_NAMESPACE" == "container" && "$HERMES_HOME" == "/home/hermes/.hermes" && "$DIRECT_RUNTIME_ACCESS" == "true" ]]; then
+  echo "runtime-context: already inside the current Hermes runtime namespace; invoke this installer directly. Missing docker CLI is not a capability blocker."
+fi
+
 # Candidate validation: the backend must compile with the host python3 before
 # anything is written (the dashboard imports it as a module on restart).
 python3 -m py_compile "$SOURCE/dashboard/plugin_api.py" "$SOURCE/dashboard/trajectory_report.py" "$SOURCE/__init__.py" || {
