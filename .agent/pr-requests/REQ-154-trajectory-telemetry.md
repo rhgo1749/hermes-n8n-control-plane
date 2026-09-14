@@ -6,6 +6,7 @@
 - Repository: `rhgo1749/hermes-n8n-control-plane`
 - Issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/154
 - Intake/root task: `t_e0acd722`
+- Intake idempotency key: github:rhgo1749/hermes-n8n-control-plane:issue:154
 - Kanban implementation task: `t_4359ef0c`
 - Investigator handoff: `t_eed82c1b`
 - Source base used: `4043ec1bb8db4383dce822ec77d377da44bfee9b`
@@ -66,6 +67,8 @@ preflight/dry-run in the worker's current namespace and record its
   canonical bridge are both unavailable, with the exact preflight evidence.
 
 ## Automation stop state
+
+Automation stop state: HUMAN_VALIDATION_REQUIRED (PR review/merge remains human authority).
 
 Automation may create/update the delivery PR and report local validation. It
 must not merge or enable auto-merge. The final PR body must contain the exact

@@ -126,6 +126,9 @@ def _github_fixture() -> dict[str, object]:
             "head": {"sha": "f23000b9771772b6210593d5e611b782e88ba351"},
             "merge_commit_sha": "4043ec1bb8db4383dce822ec77d377da44bfee9b",
             "base": {"repo": {"full_name": REPOSITORY}},
+            "closingIssuesReferences": {
+                "nodes": [{"number": 138, "repository": {"full_name": REPOSITORY}}],
+            },
         },
     }
 
@@ -167,6 +170,12 @@ def test_fixture_reconstructs_linked_rounds_and_separates_github_outcome(tmp_pat
     assert report["github"]["observed_pr_head_sha"] == "f23000b9771772b6210593d5e611b782e88ba351"
     assert report["github"]["merge_commit_sha"] == "4043ec1bb8db4383dce822ec77d377da44bfee9b"
     assert report["github"]["issue_closure_authoritative"] is True
+    assert report["freshness"] == {
+        "report_generated_at": 200,
+        "kanban_observed_at": 200,
+        "profile_state_observed_at": 200,
+        "github_fetched_at": 200,
+    }
     assert report["status"] == "complete"
     assert hashlib.sha256(board.read_bytes()).hexdigest() == before
     encoded = json.dumps(report)
@@ -194,6 +203,189 @@ def test_missing_usage_is_not_numeric_zero_and_period_is_known_only(tmp_path: Pa
     aggregate = trajectory.aggregate_trajectory_reports([report])
     assert aggregate["eligible_denominators"]["token_efficiency"] == 1
     assert aggregate["token_efficiency"]["availability"] == "known"
+
+
+def test_default_fetcher_discovers_timeline_pr_and_validates_closing_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    board, profiles = _make_fixture(tmp_path)
+    calls: list[object] = []
+    issue_data = {
+        "state": "closed",
+        "full_name": REPOSITORY,
+        "closed_at": "2026-09-14T00:00:00Z",
+    }
+    pr_data = {
+        "number": 149,
+        "state": "closed",
+        "merged_at": "2026-09-14T00:00:00Z",
+        "head": {"sha": "f23000b9771772b6210593d5e611b782e88ba351"},
+        "merge_commit_sha": "4043ec1bb8db4383dce822ec77d377da44bfee9b",
+        "base": {"repo": {"full_name": REPOSITORY}},
+    }
+
+    def rest(path: str) -> object:
+        calls.append(path)
+        if path == f"/repos/{REPOSITORY}/issues/138":
+            return issue_data
+        if path == f"/repos/{REPOSITORY}/issues/138/timeline?per_page=100":
+            return [{
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "number": 149,
+                        "pull_request": {"url": "https://api.github.com/repos/x/pulls/149"},
+                    }
+                },
+            }]
+        if path == f"/repos/{REPOSITORY}/pulls/149":
+            return pr_data
+        raise AssertionError(f"unexpected REST path: {path}")
+
+    def graphql(query: str, variables: dict[str, object]) -> dict[str, object]:
+        calls.append(("graphql", dict(variables)))
+        assert "closingIssuesReferences" in query
+        assert variables == {"owner": "rhgo1749", "name": "hermes-n8n-control-plane", "number": 149}
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": 149,
+                    "closingIssuesReferences": {
+                        "nodes": [{
+                            "number": 138,
+                            "repository": {"nameWithOwner": REPOSITORY},
+                        }],
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(trajectory, "_default_github_fetch", rest)
+    monkeypatch.setattr(trajectory, "_default_github_graphql_fetch", graphql)
+    report = trajectory.build_trajectory_report(
+        board,
+        board_slug="hermes-n8n-control-plane",
+        repository=REPOSITORY,
+        issue=138,
+        task_ids=[],
+        profile_root=profiles,
+        generated_at=200,
+    )
+    assert calls == [
+        f"/repos/{REPOSITORY}/issues/138",
+        f"/repos/{REPOSITORY}/issues/138/timeline?per_page=100",
+        f"/repos/{REPOSITORY}/pulls/149",
+        ("graphql", {"owner": "rhgo1749", "name": "hermes-n8n-control-plane", "number": 149}),
+    ]
+    assert report["github"]["availability"] == "known"
+    assert report["github"]["pr_number"] == 149
+    assert report["github"]["observed_pr_head_sha"] == "f23000b9771772b6210593d5e611b782e88ba351"
+    assert report["github"]["merge_commit_sha"] == "4043ec1bb8db4383dce822ec77d377da44bfee9b"
+    assert report["github"]["closing_reference_verified"] is True
+    assert report["github"]["pr_discovery"] == "issue_timeline"
+    assert report["github"]["outcome"] == "merged"
+
+
+def test_non_closing_candidate_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    board, profiles = _make_fixture(tmp_path)
+
+    def rest(path: str) -> object:
+        if path == f"/repos/{REPOSITORY}/issues/138":
+            return {"state": "closed", "full_name": REPOSITORY}
+        if path == f"/repos/{REPOSITORY}/issues/138/timeline?per_page=100":
+            return [{
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "number": 150,
+                        "pull_request": {"url": "x"},
+                    }
+                },
+            }]
+        if path == f"/repos/{REPOSITORY}/pulls/150":
+            return {
+                "number": 150,
+                "state": "closed",
+                "merged_at": "2026-09-14T00:00:00Z",
+                "head": {"sha": "f23000b9771772b6210593d5e611b782e88ba351"},
+                "merge_commit_sha": "4043ec1bb8db4383dce822ec77d377da44bfee9b",
+                "base": {"repo": {"full_name": REPOSITORY}},
+            }
+        raise AssertionError(f"unexpected REST path: {path}")
+
+    def graphql(_query: str, _variables: dict[str, object]) -> dict[str, object]:
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": 150,
+                    "closingIssuesReferences": {"nodes": [{"number": 71}]},
+                },
+            },
+        }
+
+    monkeypatch.setattr(trajectory, "_default_github_fetch", rest)
+    monkeypatch.setattr(trajectory, "_default_github_graphql_fetch", graphql)
+    report = trajectory.build_trajectory_report(
+        board,
+        board_slug="hermes-n8n-control-plane",
+        repository=REPOSITORY,
+        issue=138,
+        task_ids=[],
+        profile_root=profiles,
+        generated_at=200,
+    )
+    assert report["github"]["availability"] == "partial"
+    assert report["github"]["pr_number"] is None
+    assert report["github"]["observed_pr_head_sha"] is None
+    assert report["github"]["error"] == "github_pr_closing_reference_unavailable"
+
+
+def test_partial_usage_buckets_preserve_null_fields_and_coverage(tmp_path: Path) -> None:
+    board, profiles = _make_fixture(tmp_path)
+    with sqlite3.connect(profiles / "kanban-reviewer" / "state.db") as conn:
+        conn.execute("UPDATE sessions SET input_tokens = NULL WHERE id = 'session-review'")
+        conn.execute("UPDATE session_model_usage SET output_tokens = NULL WHERE session_id = 'session-review'")
+        conn.commit()
+
+    report = trajectory.build_trajectory_report(
+        board,
+        board_slug="hermes-n8n-control-plane",
+        repository=REPOSITORY,
+        issue=138,
+        profile_root=profiles,
+        github_evidence=_github_fixture(),
+        generated_at=200,
+    )
+    profile = report["usage"]["by_profile"]["kanban-reviewer"]
+    assert profile["total_runs"] == 1
+    assert profile["known_runs"] == 1
+    assert profile["input_tokens"] is None
+    assert profile["output_tokens"] == 20
+    assert profile["total_tokens"] is None
+    assert profile["availability"] == "partial"
+    assert profile["field_availability"]["input_tokens"] == "unavailable"
+    assert profile["coverage"]["input_tokens"] == {"known": 0, "total": 1, "fraction": 0.0}
+    assert profile["known_only_totals"]["output_tokens"] == 20
+
+    model = report["usage"]["by_effective_model"]["provider-review:model-review"]
+    assert model["known_rows"] == 1
+    assert model["input_tokens"] == 10
+    assert model["output_tokens"] is None
+    assert model["total_tokens"] is None
+    assert model["availability"] == "partial"
+    assert model["field_availability"]["output_tokens"] == "unavailable"
+    assert model["coverage"]["output_tokens"] == {"known": 0, "total": 1, "fraction": 0.0}
+    assert model["known_only_totals"]["input_tokens"] == 10
+
+    aggregate = trajectory.aggregate_trajectory_reports([report])
+    aggregate_model = aggregate["by_effective_model"]["provider-review:model-review"]
+    assert aggregate_model["total_tokens"] is None
+    assert aggregate_model["availability"] == "unavailable"
+
+
+def test_req_154_records_exact_intake_provenance_and_stop_state() -> None:
+    req = (MODULE_PATH.parents[3] / ".agent" / "pr-requests" / "REQ-154-trajectory-telemetry.md").read_text()
+    assert "Intake idempotency key: github:rhgo1749/hermes-n8n-control-plane:issue:154" in req
+    assert "Automation stop state: HUMAN_VALIDATION_REQUIRED" in req
+    assert "publishing commit SHA" not in req.casefold()
 
 
 def test_root_discovery_uses_exact_source_key_and_not_issue_text(tmp_path: Path) -> None:
