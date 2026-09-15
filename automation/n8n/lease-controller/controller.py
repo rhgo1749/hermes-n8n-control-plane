@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,7 @@ ACTUATOR_TIMEOUT_SECONDS = float(
     os.environ.get("LEASE_ACTUATOR_TIMEOUT_SECONDS", "920")
 )
 ACTUATOR_MAX_RESPONSE_BYTES = 64 * 1024
+ACTUATOR_BUSY_RETRY_SECONDS = (1, 5, 15, 30, 60, 120)
 
 TOKEN_FILE = Path(
     os.environ.get(
@@ -167,13 +169,25 @@ def _call_actuator(authorization: str) -> tuple[int, bytes]:
         ) from exc
 
 
+def _call_actuator_serialized(authorization: str) -> tuple[int, bytes]:
+    """Serialize intake and boundedly retry the actuator's busy response."""
+    with _TRIGGER_LOCK:
+        for attempt in range(len(ACTUATOR_BUSY_RETRY_SECONDS) + 1):
+            status, body = _call_actuator(authorization)
+            if status != HTTPStatus.CONFLICT:
+                return status, body
+            if attempt >= len(ACTUATOR_BUSY_RETRY_SECONDS):
+                return status, body
+            time.sleep(ACTUATOR_BUSY_RETRY_SECONDS[attempt])
+    raise RuntimeError("intake actuator retry loop exhausted")
+
+
 def _trigger_intake_in_background(
     lease: str,
     authorization: str,
 ) -> None:
     try:
-        with _TRIGGER_LOCK:
-            status, _body = _call_actuator(authorization)
+        status, _body = _call_actuator_serialized(authorization)
     except RuntimeError as exc:
         with _REQUEST_LOCK:
             state = _load_state()
