@@ -103,6 +103,10 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
         assert "### Dependency waiting state" in main_soul
         assert "Do not use `initial_status=blocked` merely because a parent is still open" in main_soul
         assert "Reviewer todo (parent=Developer)" in main_soul
+        assert "### GitHub-backed root join" in main_soul
+        assert "direct parent of the intake root" in main_soul
+        assert "fresh-read the root dependency graph" in main_soul
+        assert "do not call root `kanban_complete`" in main_soul
 
         investigator = (home / "profiles/kanban-investigator/SOUL.md").read_text(encoding="utf-8")
         expected = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8").rstrip() + "\n"
@@ -140,8 +144,24 @@ def test_profile_deployer_updates_managed_block_idempotently() -> None:
         assert "Do not fall back to `hermes kanban create`, `git worktree add`" in refreshed
         assert "### Dependency waiting state" in refreshed
         assert "Do not use `initial_status=blocked` merely because a parent is still open" in refreshed
+        assert "### GitHub-backed root join" in refreshed
+        assert "direct parent of the intake root" in refreshed
+        assert "fresh-read the root dependency graph" in refreshed
+        assert "do not call root `kanban_complete`" in refreshed
         assert refreshed.count(deployer.MARKER_BEGIN) == 1
         assert refreshed.count(deployer.MARKER_END) == 1
+
+
+def test_canonical_role_contract_closes_specialist_graph_onto_root() -> None:
+    role_contract = (ROOT / "docs/KANBAN_ROLE_CONTRACTS.md").read_text(encoding="utf-8")
+    completion_contract = (ROOT / "docs/GITHUB_COMPLETION_LIFECYCLE.md").read_text(encoding="utf-8")
+
+    assert "### GitHub-backed root join invariant" in role_contract
+    assert "terminal specialist -> intake root" in role_contract
+    assert "direct parent of the intake root" in role_contract
+    assert "must not call root `kanban_complete`" in role_contract
+    assert "task_links.child_id = intake_task.id" in completion_contract
+    assert "Every direct parent must be" in completion_contract
 
 
 def test_profile_deployer_fails_closed_before_any_write_when_investigator_missing() -> None:

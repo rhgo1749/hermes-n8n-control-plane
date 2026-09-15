@@ -40,6 +40,14 @@ When Main creates a downstream specialist that must wait for one or more parent 
 
 `blocked` is not a synonym for "not runnable yet". Reserve an initially blocked specialist for an explicit human/operator hold that is independent of ordinary parent completion. In particular, the normal `Developer -> Reviewer` graph is `Developer running` plus `Reviewer todo (parent=Developer)`, not a pre-blocked Reviewer.
 
+### GitHub-backed root join
+
+For every GitHub-backed bounded specialist graph, the graph must close back onto the existing intake root before Main releases its worker slot. The current graph's terminal specialist — normally `kanban-reviewer`, or the approved final design-review specialist when that phase is the terminal gate — must be encoded as a **direct parent of the intake root** through the canonical Kanban dependency mutation surface.
+
+A task-body/comment line such as `Root Kanban task: t_...` is provenance only and does not satisfy this join. After creating the join, Main must fresh-read the root dependency graph and verify the exact terminal specialist appears as an unresolved direct parent while that specialist is non-terminal. If the join cannot be created or verified, fail closed and surface the lifecycle/provenance problem; do not call root `kanban_complete` and do not let the root fall through to GitHub edge projection.
+
+Once the verified terminal-specialist -> root join exists, Main stops consuming a worker slot through the ordinary dependency wait path. The root becomes eligible for core `kanban_complete` only after that current terminal parent is `done` or `archived`. A later rework round must attach its new terminal specialist to the same root before Main yields again; already-terminal historical parents may remain as durable history.
+
 Investigator may be omitted only for a genuinely mechanical task with no meaningful Issue/PR/history synthesis and no implementation decision that investigation could change. Never omit it for regressions, existing-PR rework, runtime-vs-test mismatch, a failed prior root-cause hypothesis, or repeated implementation rounds.
 
 If Reviewer returns REWORK because of a clear local implementation mistake while the root-cause model remains valid, Main may send bounded rework directly to Developer using the existing Investigator handoff. If runtime evidence contradicts tests, the failure boundary remains unclear, the prior hypothesis failed, or the same problem survives rework, create a fresh Investigator phase before another Developer round.
