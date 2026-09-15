@@ -9,19 +9,45 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
+import os
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
 
 try:
+    from .trajectory_report import (
+        TrajectoryInputError,
+        aggregate_trajectory_reports,
+        build_trajectory_report,
+        discover_root_candidates,
+    )
+except ImportError:  # The dashboard loader imports plugin_api.py by path.
+    _trajectory_spec = importlib.util.spec_from_file_location(
+        "h4v3_overview_trajectory_report",
+        Path(__file__).with_name("trajectory_report.py"),
+    )
+    if _trajectory_spec is None or _trajectory_spec.loader is None:
+        raise RuntimeError("H4V3 trajectory report module is unavailable")
+    _trajectory_module = importlib.util.module_from_spec(_trajectory_spec)
+    sys.modules[_trajectory_spec.name] = _trajectory_module
+    _trajectory_spec.loader.exec_module(_trajectory_module)
+    TrajectoryInputError = _trajectory_module.TrajectoryInputError
+    aggregate_trajectory_reports = _trajectory_module.aggregate_trajectory_reports
+    build_trajectory_report = _trajectory_module.build_trajectory_report
+    discover_root_candidates = _trajectory_module.discover_root_candidates
+
+try:
     from fastapi import APIRouter as _FastAPIRouter  # type: ignore[assignment]
     from fastapi import (
         HTTPException as _FastAPIHTTPException,  # type: ignore[assignment]
     )
+    from fastapi import Query as _FastAPIQuery  # type: ignore[assignment]
 except Exception:  # pragma: no cover - local pure-helper tests
     class _FastAPIRouter:  # type: ignore[no-redef]
         def get(self, *_args: Any, **_kwargs: Any):
@@ -33,8 +59,12 @@ except Exception:  # pragma: no cover - local pure-helper tests
             self.status_code = status_code
             self.detail = detail
 
+    def _FastAPIQuery(default: Any = None, **_kwargs: Any) -> Any:
+        return default
+
 APIRouter: Any = _FastAPIRouter
 HTTPException: Any = _FastAPIHTTPException
+Query: Any = _FastAPIQuery
 
 try:
     kanban_db = importlib.import_module("hermes_cli.kanban_db")
@@ -869,3 +899,150 @@ def overview() -> dict[str, Any]:
 @router.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "read_only": True}
+
+
+def _trajectory_board(slug: str) -> Mapping[str, Any]:
+    if kanban_db is None:
+        raise RuntimeError("Hermes kanban_db is unavailable")
+    wanted = str(slug or "default").strip()
+    for item in kanban_db.list_boards(include_archived=False):
+        metadata = dict(item)
+        if str(metadata.get("slug") or "") == wanted:
+            return metadata
+    raise TrajectoryInputError(f"board not found: {wanted}")
+
+
+def _trajectory_profiles_root() -> Path:
+    configured = str(os.environ.get("HERMES_PROFILES_ROOT") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".hermes" / "profiles"
+
+
+def _trajectory_request(
+    *,
+    board: str,
+    repository: Optional[str],
+    issue: Optional[int],
+    root_task_id: Optional[str],
+) -> dict[str, Any]:
+    if not repository:
+        raise TrajectoryInputError("repository is required")
+    if issue is None or int(issue) <= 0:
+        raise TrajectoryInputError("issue must be a positive integer")
+    metadata = _trajectory_board(board)
+    return build_trajectory_report(
+        Path(str(metadata.get("db_path") or "")),
+        board_slug=str(metadata.get("slug") or board),
+        repository=repository,
+        issue=int(issue),
+        root_task_id=root_task_id,
+        profile_root=_trajectory_profiles_root(),
+    )
+
+
+@router.get("/trajectory-report")
+def trajectory_report(
+    board: str = "default",
+    repository: Optional[str] = None,
+    issue: Optional[int] = None,
+    root_task_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return one root-task trajectory without mutating any source."""
+    try:
+        return _trajectory_request(
+            board=board, repository=repository, issue=issue,
+            root_task_id=root_task_id,
+        )
+    except TrajectoryInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Trajectory unavailable: {_safe_text(exc)}") from exc
+
+
+def _trajectory_boards(slug: Optional[str]) -> Sequence[Mapping[str, Any]]:
+    if kanban_db is None:
+        raise RuntimeError("Hermes kanban_db is unavailable")
+    boards = [dict(item) for item in kanban_db.list_boards(include_archived=False)]
+    if slug is None:
+        return boards
+    wanted = str(slug).strip()
+    matches = [item for item in boards if str(item.get("slug") or "") == wanted]
+    if not matches:
+        raise TrajectoryInputError(f"board not found: {wanted}")
+    return matches
+
+
+def _validate_period_bounds(from_epoch: Optional[int], to_epoch: Optional[int]) -> None:
+    if from_epoch is not None and to_epoch is not None and int(from_epoch) > int(to_epoch):
+        raise TrajectoryInputError("from must not be greater than to")
+
+
+def _query_epoch(value: Any) -> Optional[int]:
+    """Normalize FastAPI Query defaults for direct Python callers/tests."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    default = getattr(value, "default", None)
+    return int(default) if isinstance(default, int) and not isinstance(default, bool) else None
+
+
+@router.get("/trajectory-report/aggregate")
+@router.get("/trajectory-report/period")
+def trajectory_period(
+    board: Optional[str] = None,
+    repository: Optional[str] = None,
+    issue: Optional[int] = None,
+    from_epoch: Optional[int] = Query(None, alias="from"),
+    to_epoch: Optional[int] = Query(None, alias="to"),
+) -> dict[str, Any]:
+    """Return known-only aggregates over exact GitHub intake roots."""
+    try:
+        from_value, to_value = _query_epoch(from_epoch), _query_epoch(to_epoch)
+        _validate_period_bounds(from_value, to_value)
+        if issue is not None and int(issue) <= 0:
+            raise TrajectoryInputError("issue must be a positive integer")
+        reports: list[Mapping[str, Any]] = []
+        root_candidates: list[dict[str, Any]] = []
+        board_slugs: list[str] = []
+        for metadata in _trajectory_boards(board):
+            board_slug = str(metadata.get("slug") or board or "default")
+            board_slugs.append(board_slug)
+            db_path = Path(str(metadata.get("db_path") or ""))
+            candidates = discover_root_candidates(
+                db_path, repository=repository, issue=issue,
+                from_epoch=from_value, to_epoch=to_value,
+            )
+            for candidate in candidates:
+                candidate = dict(candidate)
+                candidate["board_slug"] = board_slug
+                root_candidates.append(candidate)
+                reports.append(
+                    build_trajectory_report(
+                        db_path, board_slug=board_slug,
+                        repository=str(candidate["repository"]),
+                        issue=int(candidate["issue"]),
+                        root_task_id=str(candidate["root_task_id"]),
+                        profile_root=_trajectory_profiles_root(),
+                    )
+                )
+        aggregate = aggregate_trajectory_reports(
+            reports, from_epoch=from_value, to_epoch=to_value,
+        )
+        aggregate["source"] = {
+            "board_slugs": sorted(set(board_slugs)),
+            "repository": repository,
+            "issue": issue,
+            "from": from_value,
+            "to": to_value,
+            "root_candidates": root_candidates,
+            "read_only": True,
+        }
+        return aggregate
+    except TrajectoryInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Trajectory aggregate unavailable: {_safe_text(exc)}") from exc
