@@ -129,6 +129,11 @@ them; a missing structured field or numeric operator policy is a capability
 hold and Main must fail closed. Prompt wording, `goal_max_turns`, and
 post-run telemetry are not cumulative token enforcement.
 
+The canonical lifecycle pre-tool guard rejects candidate IDs outside A/B,
+non-matching selector parents, fan-out values other than 2/1, missing candidate
+runtime caps, and unavailable cumulative token/retry admission before task
+mutation. Terminal/wrapper bypasses are covered by the same lifecycle guard.
+
 The candidate handoff must expose the applicable closure fields
 `observed_failure`, `root_cause_model`, `generalized_invariant`,
 `equivalence_classes`, `falsification_plan`, `completion_oracle`, and

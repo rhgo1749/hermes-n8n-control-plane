@@ -56,6 +56,9 @@ SPECIALIST_ASSIGNEES = frozenset(
     }
 )
 LOCAL_ONLY = "local-only"
+_INVESTIGATION_SEARCH_SCHEMA = "h4v3-investigation-search-v1"
+_INVESTIGATION_SEARCH_PHASES = frozenset({"candidate", "selector"})
+_INVESTIGATION_SEARCH_CANDIDATES = frozenset({"A", "B"})
 _LOG_PATH = Path(
     os.environ.get(
         "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG",
@@ -903,6 +906,96 @@ def _option_values(args: list[str], option: str) -> list[str]:
     return values
 
 
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _search_block(message: str, assignee: str) -> int:
+    return _block(
+        "H4V3 bounded Investigator search admission failed closed: " + message
+        + " No task mutation was performed.",
+        assignee=assignee,
+        source="kanban_create:investigation_search",
+    )
+
+
+def _evaluate_investigation_search_create(
+    raw_input: Mapping[str, Any], assignee: str,
+) -> int:
+    """Admit only the bounded portion visible to the creation hook.
+
+    The structured tool currently has no cumulative token/retry admission
+    fields. Search candidates therefore remain blocked until the canonical
+    runtime exposes and enforces those limits; this is deliberate fail-closed
+    behavior, not a prompt-level substitute.
+    """
+    if "investigation_search" not in raw_input:
+        return 0
+    marker = raw_input.get("investigation_search")
+    if not isinstance(marker, Mapping):
+        return _search_block("investigation_search must be an object", assignee)
+    schema = marker.get("schema_id") or marker.get("schema")
+    search_id = marker.get("search_id")
+    phase = marker.get("phase")
+    if (
+        schema != _INVESTIGATION_SEARCH_SCHEMA
+        or not isinstance(search_id, str) or not search_id.strip()
+        or phase not in _INVESTIGATION_SEARCH_PHASES
+    ):
+        return _search_block(
+            "marker schema_id, search_id, and phase=candidate|selector are required",
+            assignee,
+        )
+    budget = marker.get("budget")
+    if not isinstance(budget, Mapping):
+        return _search_block("an explicit budget object is required", assignee)
+    if budget.get("max_candidates") != 2 or budget.get("max_expansions") != 1:
+        return _search_block(
+            "fan-out must be exactly two candidates with one expansion",
+            assignee,
+        )
+    expansion_count = marker.get("expansion_count", 0)
+    if not isinstance(expansion_count, int) or isinstance(expansion_count, bool) or not 0 <= expansion_count <= 1:
+        return _search_block("expansion_count must be 0 or 1", assignee)
+
+    if phase == "candidate":
+        candidate_id = marker.get("candidate_id")
+        if assignee != "kanban-investigator" or candidate_id not in _INVESTIGATION_SEARCH_CANDIDATES:
+            return _search_block(
+                "candidate_id must be A or B and the assignee must be kanban-investigator",
+                assignee,
+            )
+        if not _positive_int(raw_input.get("max_runtime_seconds")):
+            return _search_block(
+                "each candidate requires a positive dispatcher-enforced max_runtime_seconds",
+                assignee,
+            )
+        return _search_block(
+            "canonical runtime does not expose durable cumulative token/retry admission; "
+            "operator/runtime policy is required before dispatch",
+            assignee,
+        )
+
+    if assignee != "kanban-main":
+        return _search_block("the selector must be assigned to kanban-main", assignee)
+    candidate_task_ids = _string_list(marker.get("candidate_task_ids"))
+    parents = _string_list(raw_input.get("parents"))
+    if len(candidate_task_ids) != 2 or len(set(candidate_task_ids)) != 2:
+        return _search_block("the selector must name exactly two distinct candidate task IDs", assignee)
+    if sorted(candidate_task_ids) != sorted(parents):
+        return _search_block(
+            "selector parents must be exactly the two candidate task IDs",
+            assignee,
+        )
+    return 0
+
+
 def _evaluate_structured(payload: Mapping[str, Any]) -> int:
     raw_input = payload.get("tool_input")
     if not isinstance(raw_input, Mapping):
@@ -913,7 +1006,17 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
         )
     assignee = _specialist(raw_input.get("assignee"))
     if assignee is None:
+        if (
+            str(raw_input.get("assignee") or "").strip().casefold() == "kanban-main"
+            and "investigation_search" in raw_input
+        ):
+            search_decision = _evaluate_investigation_search_create(raw_input, "kanban-main")
+            if search_decision != 0:
+                return search_decision
         return 0
+    search_decision = _evaluate_investigation_search_create(raw_input, assignee)
+    if search_decision != 0:
+        return search_decision
     if _structured_has_parent(raw_input) and _initial_status_is_blocked(
         raw_input.get("initial_status")
     ):

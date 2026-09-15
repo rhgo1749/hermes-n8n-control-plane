@@ -229,6 +229,78 @@ def test_structured_specialists_reject_repository_contract() -> None:
         _assert_blocked(result, assignee)
 
 
+def _search_create_input(
+    *,
+    phase: str = "candidate",
+    candidate_id: str = "A",
+    candidate_task_ids: list[str] | None = None,
+    parents: list[str] | None = None,
+    max_runtime_seconds: int | None = 900,
+    max_candidates: int = 2,
+    max_expansions: int = 1,
+) -> dict[str, Any]:
+    return {
+        "title": "bounded investigation search phase",
+        "assignee": "kanban-investigator" if phase == "candidate" else "kanban-main",
+        "parents": parents or ([] if phase == "candidate" else ["candidate-a", "candidate-b"]),
+        "max_runtime_seconds": max_runtime_seconds,
+        "investigation_search": {
+            "schema_id": "h4v3-investigation-search-v1",
+            "search_id": "search-155",
+            "phase": phase,
+            "candidate_id": candidate_id,
+            "candidate_task_ids": candidate_task_ids or ["candidate-a", "candidate-b"],
+            "budget": {
+                "max_candidates": max_candidates,
+                "max_expansions": max_expansions,
+            },
+        },
+    }
+
+
+def test_bounded_search_guard_rejects_candidate_c_before_mutation() -> None:
+    result = _run({
+        "tool_name": "kanban_create",
+        "tool_input": _search_create_input(candidate_id="C"),
+    })
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "candidate_id must be A or B" in json.loads(result.stdout)["message"]
+    assert "No task mutation was performed" in result.stdout
+
+
+def test_bounded_search_guard_requires_dispatcher_time_cap() -> None:
+    result = _run({
+        "tool_name": "kanban_create",
+        "tool_input": _search_create_input(max_runtime_seconds=None),
+    })
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "max_runtime_seconds" in json.loads(result.stdout)["message"]
+
+
+def test_bounded_search_guard_holds_missing_token_retry_admission() -> None:
+    result = _run({
+        "tool_name": "kanban_create",
+        "tool_input": _search_create_input(),
+    })
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "cumulative token/retry admission" in json.loads(result.stdout)["message"]
+
+
+def test_bounded_search_guard_requires_exact_selector_fan_in() -> None:
+    result = _run({
+        "tool_name": "kanban_create",
+        "tool_input": _search_create_input(
+            phase="selector", candidate_task_ids=["candidate-a"], parents=["candidate-a"],
+        ),
+    })
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "exactly two distinct candidate task IDs" in json.loads(result.stdout)["message"]
+
+
 def test_structured_specialist_rejects_exact_pr_contract() -> None:
     result = _run(
         {

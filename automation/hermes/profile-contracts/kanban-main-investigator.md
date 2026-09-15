@@ -98,6 +98,12 @@ final selector is done. The hard fan-out bound is two total candidates and one
 expansion per `search_id`; a duplicate/idempotent replay does not consume a
 new candidate slot.
 
+The canonical lifecycle pre-tool guard consumes the same nested marker on
+`kanban_create`: candidate IDs other than A/B, non-matching selector parents,
+fan-out values other than 2/1, missing candidate runtime caps, and unavailable
+cumulative token/retry admission are rejected before task mutation. Do not
+bypass this guard through terminal or a wrapper.
+
 Every search task and selector records a nested
 `investigation_search` object with schema `h4v3-investigation-search-v1` in
 durable task/run completion metadata. It includes `search_id`, `candidate_id`
