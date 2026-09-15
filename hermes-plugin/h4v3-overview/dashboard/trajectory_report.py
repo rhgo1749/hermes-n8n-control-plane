@@ -331,11 +331,6 @@ def _select_scope(
             task_id for task_id, task in all_tasks.items()
             if str(task.get("idempotency_key") or "").startswith(exact_key + ":")
         )
-        canary_prefix = f"issue{issue}-canary-"
-        selected.update(
-            task_id for task_id, task in all_tasks.items()
-            if str(task.get("idempotency_key") or "").startswith(canary_prefix)
-        )
     adjacency: dict[str, set[str]] = defaultdict(set)
     for link in links:
         parent, child = link["parent_id"], link["child_id"]
@@ -802,6 +797,15 @@ def _has_closing_reference(
     return False, True
 
 
+def _candidate_merged_at(
+    candidate: Mapping[str, Any], graphql: Optional[Mapping[str, Any]],
+) -> Any:
+    merged_at = candidate.get("merged_at")
+    if merged_at is None and graphql is not None:
+        merged_at = graphql.get("mergedAt")
+    return merged_at
+
+
 def _graphql_pull_request(
     fetcher: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
     repository: str, number: int,
@@ -944,6 +948,10 @@ def _github_outcome(
     selected_number: Optional[int] = None
     selected_source: Optional[str] = None
     closure_unavailable = False
+    unresolved_candidate_count = 0
+    verified_candidates: list[
+        tuple[int, Mapping[str, Any], Optional[Mapping[str, Any]], str]
+    ] = []
     for candidate in sorted(candidates):
         candidate_data = (
             pr_data
@@ -957,8 +965,10 @@ def _github_outcome(
                     candidate_data = fetched_pr
                     fetched_at = fetched_at if fetched_at is not None else generated_at
             except (OSError, HTTPError, URLError, ValueError, TypeError, RuntimeError):
+                unresolved_candidate_count += 1
                 continue
         if candidate_data is None:
+            unresolved_candidate_count += 1
             continue
 
         matches, closure_available = _has_closing_reference(
@@ -975,21 +985,44 @@ def _github_outcome(
                 )
             except (OSError, HTTPError, URLError, ValueError, TypeError, RuntimeError):
                 closure_unavailable = True
+                unresolved_candidate_count += 1
                 continue
         if not closure_available:
             closure_unavailable = True
+            unresolved_candidate_count += 1
             continue
         if not matches:
             continue
-        selected_pr = candidate_data
-        selected_graphql = candidate_graphql
-        selected_number = candidate
-        selected_source = candidate_sources.get(candidate, "candidate")
-        break
+        verified_candidates.append((
+            candidate,
+            candidate_data,
+            candidate_graphql,
+            candidate_sources.get(candidate, "candidate"),
+        ))
+
+    merged_candidates = [
+        item for item in verified_candidates
+        if _candidate_merged_at(item[1], item[2]) is not None
+    ]
+    ambiguous_candidates = (
+        len(merged_candidates) > 1
+        or (not merged_candidates and len(verified_candidates) > 1)
+        or bool(unresolved_candidate_count and verified_candidates)
+    )
+    if not ambiguous_candidates:
+        selected_candidate = (
+            merged_candidates[0]
+            if len(merged_candidates) == 1
+            else verified_candidates[0]
+            if len(verified_candidates) == 1
+            else None
+        )
+        if selected_candidate is not None:
+            selected_number, selected_pr, selected_graphql, selected_source = selected_candidate
 
     issue_state = str(issue_data.get("state") or "").lower() or None
     if selected_pr is None:
-        error = (
+        error = "github_pr_closing_reference_ambiguous" if ambiguous_candidates else (
             "github_pr_closing_reference_unavailable"
             if closure_unavailable or candidates
             else "github_pr_unavailable"
@@ -998,6 +1031,7 @@ def _github_outcome(
             repository, issue, fetched_at=fetched_at or generated_at,
             issue_data=issue_data, error=error,
         )
+        result["closing_candidate_count"] = len(verified_candidates)
         result["repository_anchor_verified"] = repository_anchor
         result["issue_closure_authoritative"] = (
             repository_anchor and issue_state == "closed"
@@ -1018,9 +1052,7 @@ def _github_outcome(
             pr_repo = graphql_repo.get("nameWithOwner") or graphql_repo.get("full_name")
     anchor_ok = repository_anchor and pr_repo in (None, repository)
     pr_state = str(selected_pr.get("state") or "").lower() or None
-    merged_at = selected_pr.get("merged_at")
-    if merged_at is None and isinstance(selected_graphql, Mapping):
-        merged_at = selected_graphql.get("mergedAt")
+    merged_at = _candidate_merged_at(selected_pr, selected_graphql)
     head = selected_pr.get("head")
     observed_head = head.get("sha") if isinstance(head, Mapping) else None
     if observed_head is None and isinstance(selected_graphql, Mapping):

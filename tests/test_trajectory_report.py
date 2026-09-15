@@ -561,6 +561,7 @@ def test_archived_unrun_canary_is_visible_but_not_a_work_round(tmp_path: Path) -
         "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ("canary", "archived", "kanban-developer", "kanban-main", 121, None, None, None, "issue138-canary-probe", "canary", "canary"),
     )
+    conn.execute("INSERT INTO task_links VALUES (?, ?)", ("root", "canary"))
     conn.commit()
     conn.close()
     report = trajectory.build_trajectory_report(
@@ -570,6 +571,37 @@ def test_archived_unrun_canary_is_visible_but_not_a_work_round(tmp_path: Path) -
     assert report["counts"]["archived_unrun_canary"] == {"task_id": "canary", "count": 1}
     assert report["counts"]["task_roles"]["developer_total"] == 2
     assert report["counts"]["task_roles"]["developer_work_rounds"] == 1
+
+
+def test_canary_scope_is_repository_qualified_or_root_linked() -> None:
+    tasks = {
+        "root_a": {"id": "root_a", "idempotency_key": "github:ownerA/repoA:issue:138"},
+        "root_b": {"id": "root_b", "idempotency_key": "github:ownerB/repoB:issue:138"},
+        "qualified_a": {
+            "id": "qualified_a",
+            "idempotency_key": "github:ownerA/repoA:issue:138:canary:qualified",
+        },
+        "qualified_b": {
+            "id": "qualified_b",
+            "idempotency_key": "github:ownerB/repoB:issue:138:canary:qualified",
+        },
+        "linked_a": {"id": "linked_a", "idempotency_key": "issue138-canary-linked-a"},
+        "linked_b": {"id": "linked_b", "idempotency_key": "issue138-canary-linked-b"},
+        "unlinked": {"id": "unlinked", "idempotency_key": "issue138-canary-unlinked"},
+    }
+    _root_id, _root_status, _root, selected, _provenance = trajectory._select_scope(
+        tasks,
+        [
+            {"parent_id": "root_a", "child_id": "linked_a"},
+            {"parent_id": "root_b", "child_id": "linked_b"},
+        ],
+        repository="ownerA/repoA",
+        issue=138,
+        root_task_id=None,
+        task_ids=None,
+    )
+
+    assert set(selected) == {"root_a", "qualified_a", "linked_a"}
 
 
 def test_github_failure_is_partial_and_observer_only(tmp_path: Path) -> None:
@@ -588,6 +620,118 @@ def test_github_failure_is_partial_and_observer_only(tmp_path: Path) -> None:
     assert report["github"]["issue_closure_authoritative"] is False
     assert report["counts"]["specialist_tasks"] == 4
     assert hashlib.sha256(board.read_bytes()).hexdigest() == before
+
+
+def test_github_outcome_prefers_sole_merged_closing_candidate() -> None:
+    issue_data = {"state": "closed", "full_name": REPOSITORY}
+    pull_requests = {
+        149: {
+            "number": 149,
+            "state": "closed",
+            "merged_at": None,
+            "head": {"sha": "1111111111111111111111111111111111111111"},
+            "base": {"repo": {"full_name": REPOSITORY}},
+        },
+        150: {
+            "number": 150,
+            "state": "closed",
+            "merged_at": "2026-09-14T01:00:00Z",
+            "head": {"sha": "2222222222222222222222222222222222222222"},
+            "merge_commit_sha": "3333333333333333333333333333333333333333",
+            "base": {"repo": {"full_name": REPOSITORY}},
+        },
+    }
+
+    def rest(path: str) -> object:
+        if path == f"/repos/{REPOSITORY}/issues/138":
+            return issue_data
+        if path == f"/repos/{REPOSITORY}/issues/138/timeline?per_page=100":
+            return [
+                {"event": "cross-referenced", "source": {"issue": {"number": 149, "pull_request": {"url": "x"}}}},
+                {"event": "cross-referenced", "source": {"issue": {"number": 150, "pull_request": {"url": "x"}}}},
+            ]
+        if path in {f"/repos/{REPOSITORY}/pulls/149", f"/repos/{REPOSITORY}/pulls/150"}:
+            return pull_requests[int(path.rsplit("/", 1)[1])]
+        raise AssertionError(f"unexpected REST path: {path}")
+
+    def graphql(_query: str, variables: dict[str, object]) -> dict[str, object]:
+        number = int(str(variables["number"]))
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": number,
+                    "repository": {"nameWithOwner": REPOSITORY},
+                    "closingIssuesReferences": {
+                        "nodes": [{"number": 138, "repository": {"nameWithOwner": REPOSITORY}}],
+                    },
+                },
+            },
+        }
+
+    result = trajectory._github_outcome(
+        REPOSITORY,
+        138,
+        [],
+        github_evidence=None,
+        github_fetcher=rest,
+        github_graphql_fetcher=graphql,
+        generated_at=200,
+    )
+
+    assert result["pr_number"] == 150
+    assert result["outcome"] == "merged"
+    assert result["observed_pr_head_sha"] == "2222222222222222222222222222222222222222"
+    assert result["merge_commit_sha"] == "3333333333333333333333333333333333333333"
+    assert result["closing_reference_verified"] is True
+
+
+def test_github_outcome_fails_closed_for_ambiguous_unmerged_closing_candidates() -> None:
+    issue_data = {"state": "closed", "full_name": REPOSITORY}
+
+    def rest(path: str) -> object:
+        if path == f"/repos/{REPOSITORY}/issues/138":
+            return issue_data
+        if path == f"/repos/{REPOSITORY}/issues/138/timeline?per_page=100":
+            return [
+                {"event": "cross-referenced", "source": {"issue": {"number": 149, "pull_request": {"url": "x"}}}},
+                {"event": "cross-referenced", "source": {"issue": {"number": 150, "pull_request": {"url": "x"}}}},
+            ]
+        if path in {f"/repos/{REPOSITORY}/pulls/149", f"/repos/{REPOSITORY}/pulls/150"}:
+            number = int(path.rsplit("/", 1)[1])
+            return {
+                "number": number,
+                "state": "closed",
+                "merged_at": None,
+                "base": {"repo": {"full_name": REPOSITORY}},
+            }
+        raise AssertionError(f"unexpected REST path: {path}")
+
+    def graphql(_query: str, variables: dict[str, object]) -> dict[str, object]:
+        return {
+            "repository": {
+                "pullRequest": {
+                    "number": int(str(variables["number"])),
+                    "repository": {"nameWithOwner": REPOSITORY},
+                    "closingIssuesReferences": {
+                        "nodes": [{"number": 138, "repository": {"nameWithOwner": REPOSITORY}}],
+                    },
+                },
+            },
+        }
+
+    result = trajectory._github_outcome(
+        REPOSITORY,
+        138,
+        [],
+        github_evidence=None,
+        github_fetcher=rest,
+        github_graphql_fetcher=graphql,
+        generated_at=200,
+    )
+
+    assert result["availability"] == "partial"
+    assert result["pr_number"] is None
+    assert result["error"] == "github_pr_closing_reference_ambiguous"
 
 
 def test_bad_repository_is_rejected() -> None:
