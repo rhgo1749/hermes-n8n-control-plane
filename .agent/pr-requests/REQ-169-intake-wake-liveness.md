@@ -48,8 +48,9 @@ Host/network exposure: `NONE`.
 1. Chain exactly one canonical wake after a fresh ACK/requeue/pending transition when another eligible durable scope remains.
 2. Recover an already-durable eligible queue once at router startup without creating an immediate full scan.
 3. Resume the latest persisted lease-controller `pending` trigger on controller startup; do not replay active/paused/failed leases.
-4. If a supported managed PR direct edge wake fails, preserve it as the existing repository-scoped durable intake scope and wake canonical intake; later reconciliation must fresh-read GitHub.
-5. Add focused regression and update `docs/GITHUB_EVENT_CONCURRENCY.md`.
+4. Boundedly retry the fixed actuator's `409` busy response inside the existing serialized lease trigger instead of immediately abandoning the accepted wake.
+5. If a supported managed PR direct edge wake fails, preserve it as the existing repository-scoped durable intake scope and wake canonical intake; later reconciliation must fresh-read GitHub.
+6. Add focused regression and update `docs/GITHUB_EVENT_CONCURRENCY.md`.
 
 ## 4. Explicit non-goals
 
@@ -64,9 +65,10 @@ Host/network exposure: `NONE`.
 ## 5. Implementation requirements
 
 - Preserve one-claim-per-intake-invocation isolation and existing claim fencing/backoff/pending semantics.
-- A chained wake happens only after the scope transition is durably committed. Wake failure must not roll back or falsify the committed transition.
+- A chained wake happens only after the scope transition is durably committed. Queue read-back/wake failure must not roll back or falsify the committed transition.
 - Startup queue recovery is bounded and only runs when an eligible durable scope already exists; it must not enqueue a full scope.
 - Pending-lease recovery reuses the fixed actuator and existing `_TRIGGER_LOCK`; persisted non-pending lease states are not replayed.
+- Actuator `409` contention recovery must be finite and serialized. Exhaustion remains an explicit failed lease, not an infinite retry loop.
 - PR durable defer is allowed only for the existing supported edge events: merged PR and trusted `agent-rework`. Unsupported PR events keep existing behavior.
 - If durable defer itself cannot be established/woken, preserve current retryability by surfacing failure so the router releases the delivery dedupe claim.
 - Later intake/edge reconciliation must derive current state from fresh GitHub/Kanban evidence.
