@@ -175,6 +175,36 @@ the observed PR head is `f23000b9771772b6210593d5e611b782e88ba351` and the merge
 commit is `4043ec1bb8db4383dce822ec77d377da44bfee9b`. These values are verified
 by tests as separate fields; historical Kanban rows are never rewritten.
 
+### Bounded Investigator search projection (Issue #155)
+
+The trajectory report also exposes additive `investigation_search` fields when
+durable task/run completion metadata contains the explicit
+`h4v3-investigation-search-v1` marker. A role name, an Investigator count, a
+`model_refresh` marker, or a generic rework run is not a search marker and is
+never reinterpreted as one. With no marker the projection remains
+`availability=unavailable`, `used=null`, and zero candidate/search counts are
+not reported as observed work.
+
+The projection groups by `search_id` and preserves candidate identity,
+`candidate_id` A/B, candidate task IDs, trigger codes, selector status,
+selected candidate task ID, and bounded budget metadata. Candidate cost is
+reported separately from the whole trajectory: input+output token totals and
+worker seconds are known only when their source rows are complete. Partial
+values are exposed as `known_only_*`; complete totals remain null, and
+monetary cost remains unavailable without an authoritative per-task charge.
+Selection status and selected IDs do not imply that an implementation passed;
+the Reviewer verdict, model-refresh classification, infrastructure retry, and
+GitHub closure fields remain separate.
+
+The aggregate route sums only explicit search markers and keeps candidate and
+selection denominators. It never estimates absent usage, treats an unselected
+candidate as selected, or collapses `investigation_search` into the existing
+`investigation_model_refresh.candidate_count_after_initial` compatibility
+metric. The report is read-only and does not enforce dispatch budgets; runtime
+fan-out/token/time/retry enforcement remains the Main/controller admission
+gate, and a missing canonical enforcement surface must fail closed rather than
+being represented by telemetry.
+
 ## Telegram notification policy
 
 Telegram is an **action channel, not a second Kanban event log**. The intake

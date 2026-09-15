@@ -158,6 +158,9 @@ def test_fixture_reconstructs_linked_rounds_and_separates_github_outcome(tmp_pat
     assert report["counts"]["reviewer_verdicts"] == {"PASS": 0, "REWORK": 1, "UNKNOWN": 0}
     assert report["counts"]["reviewer_rework_count"] == 1
     assert report["counts"]["investigation_model_refresh"]["confirmed_count"] == 1
+    assert report["counts"]["investigation_search"]["used"] is None
+    assert report["investigation_search"]["availability"] == "unavailable"
+    assert report["investigation_search"]["candidate_count"] == 0
     assert report["counts"]["operator_intervention"]["block_unblock_pairs"] == 1
     assert report["usage"]["availability"] == "known"
     assert report["usage"]["totals"]["total_tokens"] == 90
@@ -546,6 +549,242 @@ def test_req_154_records_exact_intake_provenance_and_stop_state() -> None:
     assert "Intake idempotency key: github:rhgo1749/hermes-n8n-control-plane:issue:154" in req
     assert "Automation stop state: HUMAN_VALIDATION_REQUIRED" in req
     assert "publishing commit SHA" not in req.casefold()
+
+
+def _search_run(
+    run_id: int,
+    task_id: str,
+    phase: str,
+    *,
+    candidate_id: str | None = None,
+    started_at: int = 10,
+    ended_at: int = 20,
+    **marker_fields: object,
+) -> dict[str, object]:
+    marker: dict[str, object] = {
+        "schema_id": trajectory.INVESTIGATION_SEARCH_SCHEMA_ID,
+        "search_id": "search-155",
+        "phase": phase,
+        "trigger_codes": ["RUNTIME_TEST_CONTRADICTION"],
+        "budget": {
+            "max_candidates": 2,
+            "max_expansions": 1,
+            "max_runtime_seconds": 900,
+            "max_retries": 1,
+            "max_total_tokens": 32000,
+        },
+        **marker_fields,
+    }
+    if candidate_id is not None:
+        marker["candidate_id"] = candidate_id
+    return {
+        "id": run_id,
+        "task_id": task_id,
+        "profile": "kanban-investigator" if phase == "candidate" else "kanban-main",
+        "status": "done",
+        "outcome": "completed",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "metadata": json.dumps({
+            "worker_session_id": f"session-{task_id}",
+            "investigation_search": marker,
+        }),
+    }
+
+
+def test_explicit_investigation_search_projects_candidates_selection_and_cost() -> None:
+    runs = [
+        _search_run(
+            11, "candidate-a", "candidate", candidate_id="A", ended_at=20,
+            candidate_task_id="candidate-a", closure_status="sufficient",
+            confidence="HIGH", independence_basis="independent-boundary-a",
+        ),
+        _search_run(
+            12, "candidate-b", "candidate", candidate_id="B", started_at=12,
+            ended_at=32, candidate_task_id="candidate-b", closure_status="sufficient",
+            confidence="MEDIUM", independence_basis="independent-boundary-b",
+        ),
+        _search_run(
+            13, "selector", "selector", started_at=33, ended_at=35,
+            candidate_task_ids=["candidate-a", "candidate-b"],
+            selected_candidate_task_id="candidate-b", selection_status="selected",
+            selection_reason_code="clearer_falsification",
+        ),
+    ]
+    usage = [
+        {"run_id": 11, "session": {"input_tokens": 10, "output_tokens": 20}},
+        {"run_id": 12, "session": {"input_tokens": 30, "output_tokens": 40}},
+    ]
+
+    report = trajectory._investigation_search_report(runs, [], usage)
+
+    assert report["availability"] == "known"
+    assert report["used"] is True
+    assert report["search_count"] == 1
+    assert report["candidate_count"] == 2
+    search = report["searches"][0]
+    assert search["candidate_task_ids"] == ["candidate-a", "candidate-b"]
+    assert search["selected_candidate_task_ids"] == ["candidate-b"]
+    assert search["selection_status"] == "selected"
+    assert search["cost"] == {
+        "total_tokens": 100,
+        "known_only_total_tokens": 100,
+        "token_availability": "known",
+        "worker_seconds": 30,
+        "known_only_worker_seconds": 30,
+        "worker_seconds_availability": "known",
+        "monetary": {
+            "value": None,
+            "availability": "unavailable",
+            "reason": "no_authoritative_per_task_charge",
+        },
+    }
+    assert report["cost"]["total_tokens"] == 100
+    assert report["outcomes"] == {"selected": 1}
+
+
+def test_search_projection_keeps_missing_marker_and_model_refresh_distinct() -> None:
+    refresh = {
+        "id": 14,
+        "task_id": "refresh",
+        "profile": "kanban-investigator",
+        "status": "done",
+        "outcome": "completed",
+        "metadata": json.dumps({
+            "worker_session_id": "session-refresh",
+            "investigation_model_refresh": True,
+        }),
+    }
+
+    report = trajectory._investigation_search_report([refresh], [], [])
+
+    assert report["availability"] == "unavailable"
+    assert report["used"] is None
+    assert report["search_count"] == 0
+    assert report["candidate_count"] == 0
+
+
+def test_malformed_candidate_marker_is_not_counted_as_search_work() -> None:
+    malformed = {
+        "id": 15,
+        "task_id": "candidate-c",
+        "profile": "kanban-investigator",
+        "status": "done",
+        "outcome": "completed",
+        "metadata": json.dumps({
+            "investigation_search": {
+                "schema_id": trajectory.INVESTIGATION_SEARCH_SCHEMA_ID,
+                "search_id": "search-155",
+                "phase": "candidate",
+                "candidate_id": "C",
+            },
+        }),
+    }
+
+    report = trajectory._investigation_search_report([malformed], [], [])
+
+    assert report["availability"] == "unavailable"
+    assert report["candidate_count"] == 0
+
+
+def test_partial_candidate_usage_is_null_total_not_zero() -> None:
+    runs = [
+        _search_run(
+            21, "candidate-a", "candidate", candidate_id="A",
+            candidate_task_id="candidate-a", closure_status="sufficient",
+        ),
+        _search_run(
+            22, "candidate-b", "candidate", candidate_id="B",
+            candidate_task_id="candidate-b", closure_status="sufficient",
+        ),
+    ]
+    usage = [
+        {"run_id": 21, "session": {"input_tokens": 10, "output_tokens": 20}},
+        {"run_id": 22, "session": {"input_tokens": 30, "output_tokens": None}},
+    ]
+
+    report = trajectory._investigation_search_report(runs, [], usage)
+    cost = report["searches"][0]["cost"]
+
+    assert cost["total_tokens"] is None
+    assert cost["known_only_total_tokens"] == 60
+    assert cost["token_availability"] == "partial"
+
+
+def test_reviewer_rework_classification_is_explicit_and_not_inferred() -> None:
+    marker = {
+        "schema_id": trajectory.INVESTIGATION_SEARCH_SCHEMA_ID,
+        "search_id": "search-155",
+        "phase": "selector",
+        "rework_class": "implementation_gap",
+    }
+    counts = trajectory._counts_report(
+        {"review": {"status": "done"}},
+        [{
+            "id": 25,
+            "task_id": "review",
+            "profile": "kanban-reviewer",
+            "status": "done",
+            "outcome": "completed",
+            "metadata": json.dumps({"verdict": "REWORK", "investigation_search": marker}),
+        }],
+        [],
+        {"review": "reviewer"},
+    )
+    unmarked = trajectory._counts_report(
+        {"review": {"status": "done"}},
+        [{
+            "id": 26,
+            "task_id": "review",
+            "profile": "kanban-reviewer",
+            "status": "done",
+            "outcome": "completed",
+            "metadata": json.dumps({"verdict": "REWORK"}),
+        }],
+        [],
+        {"review": "reviewer"},
+    )
+
+    assert counts["reviewer_rework_classification"] == {
+        "implementation_gap": 1,
+        "investigation_model_refresh": 0,
+        "UNKNOWN": 0,
+        "classified_rework": 1,
+        "availability": "known",
+    }
+    assert unmarked["reviewer_rework_classification"]["implementation_gap"] == 0
+    assert unmarked["reviewer_rework_classification"]["UNKNOWN"] == 1
+
+
+def test_aggregate_investigation_search_preserves_candidate_denominators() -> None:
+    search = trajectory._investigation_search_report(
+        [
+            _search_run(
+                31, "candidate-a", "candidate", candidate_id="A",
+                candidate_task_id="candidate-a", closure_status="sufficient",
+            ),
+            _search_run(
+                32, "candidate-b", "candidate", candidate_id="B",
+                candidate_task_id="candidate-b", closure_status="sufficient",
+            ),
+            _search_run(
+                33, "selector", "selector", candidate_task_ids=["candidate-a", "candidate-b"],
+                selected_candidate_task_id="candidate-a", selection_status="selected",
+            ),
+        ],
+        [],
+        [
+            {"run_id": 31, "session": {"input_tokens": 1, "output_tokens": 2}},
+            {"run_id": 32, "session": {"input_tokens": 3, "output_tokens": 4}},
+        ],
+    )
+
+    aggregate = trajectory.aggregate_trajectory_reports([{"investigation_search": search}])
+
+    assert aggregate["investigation_search"]["search_count"] == 1
+    assert aggregate["investigation_search"]["candidate_count"] == 2
+    assert aggregate["investigation_search"]["selected_candidate_task_ids"] == ["candidate-a"]
+    assert aggregate["investigation_search"]["cost"]["total_tokens"] == 10
 
 
 def test_root_discovery_uses_exact_source_key_and_not_issue_text(tmp_path: Path) -> None:

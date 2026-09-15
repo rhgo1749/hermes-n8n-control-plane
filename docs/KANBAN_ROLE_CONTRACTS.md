@@ -80,6 +80,97 @@ The restriction is role/task-specific, not profile-global GitHub disablement. `k
 
 The deployed control plane enforces this boundary with a fail-closed `pre_tool_call` guard on `kanban_create` plus the literal terminal `create`/`assign`/`reassign` paths. Rejected calls perform no task mutation. A create must be retried with `local-only`; assignment of an already PR-aware task requires explicit operator recovery rather than moving the contract to a different H4V3 graph node.
 
+### Bounded Investigator search contract
+
+The ordinary H4V3 path is one Investigator followed by a Main selector:
+
+```text
+Main -> Investigator A -> Main selector -> Developer -> Reviewer -> intake root
+```
+
+The selector is a bounded `kanban-main` phase and must be a dependency parent
+of Developer. A mechanical task may use the default N=1 path only when no
+source Issue/PR/history or implementation decision needs investigation.
+
+Main may enter a bounded search only for one of these explicit trigger codes:
+
+```text
+LOW_CONFIDENCE_OR_BLOCKING_UNKNOWN
+IMPLEMENTATION_OR_REWORK_ROUND_GE_2
+RUNTIME_TEST_CONTRADICTION
+TRUSTED_REVIEWER_MODEL_REFRESH
+COMPETING_BOUNDARIES_UNRESOLVED
+NEW_EQUIVALENCE_CLASS_BYPASS_AFTER_PASS
+ACCEPTANCE_PASS_RUNTIME_ORACLE_FALSE_NEGATIVE
+```
+
+Before dispatch, Main records
+`investigation_search.schema_id=h4v3-investigation-search-v1` and a unique
+`search_id`. A pre-dispatch trigger creates exactly two independent sibling
+Investigators, `candidate_id=A` and `candidate_id=B`, and a selector with both
+candidate task IDs as parents. A trigger discovered after A may cause exactly
+one expansion to B and one final selector; it may not create C or recursively
+expand. A duplicate/idempotent replay does not consume a candidate slot.
+
+```text
+Main -> Investigator A ─┐
+                        ├-> Main selector -> Developer -> Reviewer -> intake root
+Main -> Investigator B ─┘
+```
+
+Every candidate and selector writes the same explicit marker to durable
+task/run completion metadata. The marker carries `search_id`, `phase`,
+`candidate_id`, trigger codes, candidate task IDs, selected candidate task ID
+or null, `selection_status`, evidence-based comparison/reason, independence
+basis, and the bounded `budget`. Candidate task creation must carry a positive
+dispatcher-enforced `max_runtime_seconds`. Retry and cumulative token limits
+are hard gates only when the canonical runtime durably admits and enforces
+them; a missing structured field or numeric operator policy is a capability
+hold and Main must fail closed. Prompt wording, `goal_max_turns`, and
+post-run telemetry are not cumulative token enforcement.
+
+The candidate handoff must expose the applicable closure fields
+`observed_failure`, `root_cause_model`, `generalized_invariant`,
+`equivalence_classes`, `falsification_plan`, `completion_oracle`, and
+`residual_unknowns`, along with `required_RED_regression`,
+`preserved_contracts`, evidence provenance, and `independence_basis`.
+LOW-confidence, contradicted, duplicate/non-independent, missing, or
+implementation-blocking-UNKNOWN candidates remain incomplete and are not
+Developer-ready. Non-blocking unknowns remain explicit.
+
+Main compares only closure-sufficient candidates using failure-boundary fit,
+preserved contracts, invariant/equivalence coverage, falsification strength,
+completion-oracle strength, residual unknowns, confidence, and validation
+cost. It records why the selected candidate wins and returns
+`selection_status=selected` only when the evidence clearly closes the problem
+space. Otherwise it records `selection_status=no_selection` and does not
+release Developer. There is no majority vote or arbitrary score.
+
+Developer receives the selected handoff only. Search ID and unselected task
+IDs may be retained as provenance references, but unselected candidate text,
+transcripts, and hypotheses must not be copied into the Developer task or
+completion metadata. The terminal Reviewer still joins the intake root using
+the direct dependency invariant above.
+
+### Reviewer rework classification
+
+Reviewer must classify every `REWORK` under the explicit search marker as
+exactly one of:
+
+- `rework_class=implementation_gap`: the selected invariant, equivalence
+  classes, and completion oracle remain valid; Main may route one bounded
+  Developer rework round.
+- `rework_class=investigation_model_refresh`: runtime evidence contradicts the
+  tests/model, the first failing boundary is unclear, equivalence coverage was
+  falsified, or the same issue survived bounded rework; Main must run a fresh
+  bounded Investigator search before another Developer round and set
+  `investigation_model_refresh=true`.
+
+The literal word `REWORK`, a count, or a generic failed run is not enough to
+request model refresh. Missing or ambiguous classification is `UNKNOWN` and
+is not direct Developer authorization. Reviewer never creates rework tasks,
+changes lifecycle labels, or invokes GitHub merge authority.
+
 ## 2. Hermes Kanban Controller
 
 Controller is deterministic lifecycle/reconciliation logic, not the default reasoning agent.

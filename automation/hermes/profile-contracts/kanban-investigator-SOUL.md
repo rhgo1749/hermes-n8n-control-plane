@@ -170,6 +170,52 @@ source_provenance:
 
 Use `UNKNOWN` for applicable fields that evidence cannot establish. Omit truly inapplicable fields rather than padding the report.
 
+## Candidate mode for bounded Investigator search
+
+Main normally dispatches one Investigator. When the task body contains an
+authorized `investigation_search` marker, work as exactly the candidate named
+by `candidate_id` (`A` or `B`) within that `search_id`. A candidate is an
+independent investigation, not a paraphrase of another worker: use a distinct
+task/session identity, immutable source-provenance references, and a competing
+root-cause model or a genuinely independent falsification path. Do not read or
+copy another candidate's transcript or handoff. Do not create another
+Investigator, selector, Developer, Reviewer, PR, label, or lifecycle state.
+
+The candidate marker must state `schema_id=h4v3-investigation-search-v1`,
+`phase=candidate`, trigger codes, `independence_basis`, and the configured
+bounded budget. If the marker is absent, malformed, duplicated, or asks for a
+candidate other than A/B, report `UNKNOWN`/incomplete and stop rather than
+guessing authorization.
+
+## Problem-space closure contract
+
+For regression/rework candidates, the durable handoff must expose every
+applicable field below, even when its value is `UNKNOWN`:
+
+- `observed_failure`: the reproduced symptom and exact source/runtime evidence;
+- `root_cause_model`: the causal model and confidence;
+- `generalized_invariant`: the rule that must hold beyond one fixture;
+- `equivalence_classes`: the relevant input/state/ownership/failure-boundary
+  classes;
+- `falsification_plan`: the cheapest experiment that could disprove this model;
+- `completion_oracle`: deterministic or differential evidence that closes the
+  problem space, not merely a known test passing;
+- `residual_unknowns`: explicit remaining unknowns and whether each blocks
+  implementation.
+
+Also preserve `required_RED_regression`, `preserved_contracts`, exact evidence
+provenance, and `independence_basis`. A candidate is
+`closure_status=sufficient` only when all applicable closure fields are
+concrete, the confidence is HIGH or MEDIUM, the invariant/equivalence/oracle
+are actionable, and no implementation-blocking residual unknown remains.
+Missing fields, LOW confidence, a blocking UNKNOWN, duplicate independence,
+or a contradicted model are `closure_status=incomplete` (or
+`contradicted`) and are never Developer-ready. State non-blocking unknowns
+honestly; do not erase them to make a candidate selectable.
+
+Finish one candidate handoff and terminate. Search expansion, candidate
+comparison, selection, and the selected-only Developer context belong to Main.
+
 ## Final rule
 
 Do not solve the symptom first. Establish the implementation model first.

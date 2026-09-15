@@ -53,3 +53,79 @@ Investigator may be omitted only for a genuinely mechanical task with no meaning
 If Reviewer returns REWORK because of a clear local implementation mistake while the root-cause model remains valid, Main may send bounded rework directly to Developer using the existing Investigator handoff. If runtime evidence contradicts tests, the failure boundary remains unclear, the prior hypothesis failed, or the same problem survives rework, create a fresh Investigator phase before another Developer round.
 
 All H4V3 specialist tasks including `kanban-investigator` use `completion_contract=local-only` (or omit it so Hermes defaults to local-only). GitHub acceptance/merge remains root-card edge authority.
+
+### Bounded Investigator search
+
+The default remains one Investigator. Do not fan out merely because a task is
+GitHub-backed or because a second opinion is inexpensive.
+
+For a normal task, the graph is:
+
+```text
+Main -> Investigator A -> Main selector -> Developer -> Reviewer -> Main
+```
+
+The selector is a bounded `kanban-main` phase. Developer must depend on the
+selector, never directly on Investigator A. The selector may accept the one
+closure-sufficient candidate without creating another Investigator.
+
+Use exactly one of these deterministic trigger codes when search is justified:
+
+```text
+LOW_CONFIDENCE_OR_BLOCKING_UNKNOWN
+IMPLEMENTATION_OR_REWORK_ROUND_GE_2
+RUNTIME_TEST_CONTRADICTION
+TRUSTED_REVIEWER_MODEL_REFRESH
+COMPETING_BOUNDARIES_UNRESOLVED
+NEW_EQUIVALENCE_CLASS_BYPASS_AFTER_PASS
+ACCEPTANCE_PASS_RUNTIME_ORACLE_FALSE_NEGATIVE
+```
+
+When a trigger is known before dispatch, create exactly two sibling,
+independent Investigator tasks (`candidate_id=A` and `candidate_id=B`) and one
+selector with both Investigator task IDs as parents:
+
+```text
+Main -> Investigator A ─┐
+                        ├-> Main selector -> Developer -> Reviewer
+Main -> Investigator B ─┘
+```
+
+When the first handoff reveals a trigger, the current selector may perform one
+bounded expansion by creating B and a final selector over A+B. It must never
+recursively expand, create candidate C, or make Developer ready before the
+final selector is done. The hard fan-out bound is two total candidates and one
+expansion per `search_id`; a duplicate/idempotent replay does not consume a
+new candidate slot.
+
+Every search task and selector records a nested
+`investigation_search` object with schema `h4v3-investigation-search-v1` in
+durable task/run completion metadata. It includes `search_id`, `candidate_id`
+(`A`/`B` for candidates), `phase` (`candidate`/`selector`), trigger codes,
+candidate task IDs, selected candidate task ID or null, selection status and
+reason, closure comparison, independence basis, and an explicit `budget`.
+Use task IDs and immutable source-provenance references for identity; never
+copy the other candidate's transcript or handoff into a candidate body.
+
+The budget is an admission contract, not prose: fan-out is exactly two,
+`max_runtime_seconds` is required on every candidate and must be enforced by
+the dispatcher, and retry/token limits must be durably admitted by the
+canonical runtime before a candidate is dispatched. The current structured
+Hermes surface does not expose cumulative per-task tokens; therefore a missing
+or unverified token/retry enforcement surface is a capability hold, not a
+prompt default. Never call prompt wording, `goal_max_turns`, post-run
+telemetry, or a missing value a hard cumulative token cap. Main must fail closed
+instead of dispatching an unbounded candidate.
+
+The selector rejects contradictory, duplicate/non-independent, LOW, or
+closure-incomplete candidates. Among remaining candidates it records an
+evidence-based comparison of failure-boundary fit, preserved contracts,
+generalized-invariant/equivalence coverage, falsification strength, completion
+oracle, residual unknowns, confidence, and validation cost. It must select one
+candidate only when the evidence clearly closes the problem space; otherwise
+it records `selection_status=no_selection` and does not create a Developer
+task. There is no majority vote or arbitrary numeric score.
+
+Developer context contains the selected handoff only, plus references to the
+search and unselected task IDs for provenance. Unselected candidate content is
+not copied into the Developer body, prompt, or completion metadata.
