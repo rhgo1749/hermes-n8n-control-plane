@@ -49,6 +49,14 @@ kanban-investigator
 
 Designer phases are conditional; Investigator, Developer, and Reviewer are the normal implementation path. Main may omit Investigator only for a genuinely mechanical task where there is no source Issue/PR/history to synthesize and no implementation decision can change based on investigation. A regression, existing-PR rework, runtime-vs-test mismatch, failed prior root-cause hypothesis, or second-or-later implementation round is never such an exception.
 
+### GitHub-backed root join invariant
+
+The specialist chain above is incomplete until the current bounded graph closes back onto the existing GitHub-backed intake root. Before Main releases its worker slot, the current graph's terminal specialist — normally `kanban-reviewer`, or the approved final design-review specialist when that phase is the terminal gate — must be encoded through the canonical Kanban dependency mutation surface as a **direct parent of the intake root**.
+
+The durable shape is therefore `... -> terminal specialist -> intake root`, not merely `... -> terminal specialist` plus a task-body/comment reference to the root. Body/comment references are provenance only and never substitute for `task_links` dependency state. Main must fresh-read the root dependency graph after the mutation and verify that exact terminal specialist is an unresolved direct parent while it remains non-terminal. If the join cannot be created or verified, Main fails closed and must not call root `kanban_complete` or otherwise hand the root to external GitHub completion projection.
+
+Once the verified terminal-specialist -> root join exists, the root waits through the ordinary dependency path without keeping Main RUNNING. Core root completion becomes eligible only after that current terminal parent is `done` or `archived`. Every later bounded rework graph must attach its new terminal specialist to the same root before Main yields again; already-terminal historical parents may remain as durable history.
+
 Main reads the source Issue/root task to establish identity and authorization, but it should not make every Developer reconstruct the entire Issue/PR discussion. The Investigator handoff is the default implementation context, with exact source references retained for bounded verification.
 
 For dispatchable H4V3 specialist creation, Main uses structured `kanban_create` with a canonical project binding: `workspace_kind="worktree"`, the repository's Hermes `project` id/slug, and a stable `idempotency_key`. `workspace_path`, `branch`, and `branch_name` are not supplied on that structured path; Hermes core derives the task-id worktree and deterministic project branch, and the creation preflight verifies the durable binding/read-back before dispatch. A rejected structured create is not permission to shell out to `hermes kanban create` or run `git worktree add` manually; Main must repair the structured provenance/binding or surface the controller/operator blocker.
@@ -267,9 +275,9 @@ The PR-side `agent-rework` label is a separate trusted maintainer one-shot contr
 
 For an Issue-backed root card with a linked PR:
 
-1. specialist investigation/design/implementation/review work completes through Kanban dependencies;
+1. specialist investigation/design/implementation/review work completes through Kanban dependencies, and the current bounded graph's terminal specialist is a verified direct parent of the intake root before Main yields;
 2. no specialist remains RUNNING solely to wait for GitHub Actions, human review, merge, or future comments;
-3. the root worker terminates with core `kanban_complete` when its required internal graph is satisfied;
+3. the root worker terminates with core `kanban_complete` only when its required internal graph is satisfied and the current terminal root parent is terminal;
 4. that core `done` is provisional and is not GitHub merge evidence. Main Agent must not declare work "merged" or "delivered" based on internal graph completion;
 5. edge reconciliation projects an OPEN or closed-unmerged required PR to parked `review` and clears worker ownership;
 6. only trusted PR-side rework admission may make the GitHub-backed card runnable again; an internal specialist `REWORK` verdict does not synthesize that GitHub signal;
