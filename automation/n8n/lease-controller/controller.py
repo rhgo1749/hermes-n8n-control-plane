@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,7 @@ ACTUATOR_TIMEOUT_SECONDS = float(
     os.environ.get("LEASE_ACTUATOR_TIMEOUT_SECONDS", "920")
 )
 ACTUATOR_MAX_RESPONSE_BYTES = 64 * 1024
+ACTUATOR_BUSY_RETRY_SECONDS = (1, 5, 15, 30, 60, 120)
 
 TOKEN_FILE = Path(
     os.environ.get(
@@ -167,13 +169,25 @@ def _call_actuator(authorization: str) -> tuple[int, bytes]:
         ) from exc
 
 
+def _call_actuator_serialized(authorization: str) -> tuple[int, bytes]:
+    """Serialize intake and boundedly retry the actuator's busy response."""
+    with _TRIGGER_LOCK:
+        for attempt in range(len(ACTUATOR_BUSY_RETRY_SECONDS) + 1):
+            status, body = _call_actuator(authorization)
+            if status != HTTPStatus.CONFLICT:
+                return status, body
+            if attempt >= len(ACTUATOR_BUSY_RETRY_SECONDS):
+                return status, body
+            time.sleep(ACTUATOR_BUSY_RETRY_SECONDS[attempt])
+    raise RuntimeError("intake actuator retry loop exhausted")
+
+
 def _trigger_intake_in_background(
     lease: str,
     authorization: str,
 ) -> None:
     try:
-        with _TRIGGER_LOCK:
-            status, _body = _call_actuator(authorization)
+        status, _body = _call_actuator_serialized(authorization)
     except RuntimeError as exc:
         with _REQUEST_LOCK:
             state = _load_state()
@@ -221,6 +235,37 @@ def _trigger_intake_in_background(
                 "upstream_status": status,
             }
         )
+
+
+def _canonical_lease_id(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip() or not value:
+        return ""
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return ""
+    canonical = str(parsed)
+    return canonical if canonical == value else ""
+
+
+def _resume_pending_trigger_on_startup() -> bool:
+    """Resume only the latest accepted trigger that never left pending state."""
+    with _REQUEST_LOCK:
+        state = _load_state()
+        if state.get("status") != "pending":
+            return False
+        lease = _canonical_lease_id(state.get("lease"))
+        if not lease:
+            return False
+        authorization = f"Bearer {_read_token()}"
+
+    threading.Thread(
+        target=_trigger_intake_in_background,
+        args=(lease, authorization),
+        daemon=True,
+        name=f"hermes-intake-resume-{lease[:8]}",
+    ).start()
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -415,8 +460,6 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            # Direct actuator has no persistent schedule to pause. The delayed
-            # router cleanup now closes only this lease locally.
             _write_state(
                 {
                     "lease": lease,
@@ -447,10 +490,12 @@ def main() -> int:
         Handler,
     )
 
+    resumed = _resume_pending_trigger_on_startup()
     print(
         f"lease-controller listening on "
         f"http://{LISTEN_HOST}:{LISTEN_PORT}; "
-        f"actuator={ACTUATOR_BASE_URL}",
+        f"actuator={ACTUATOR_BASE_URL}; "
+        f"pending_resumed={resumed}",
         flush=True,
     )
 

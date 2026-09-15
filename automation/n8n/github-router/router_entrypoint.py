@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Small event-routing overlay for the GitHub router.
+"""Routing overlay plus bounded liveness recovery for the GitHub router.
 
-The canonical router intentionally owns signature verification, delivery dedupe,
-owner/managed-repository admission and generic intake scope persistence. This
-entrypoint leaves those boundaries unchanged and adds two bounded wake hints:
+The canonical router keeps ownership of signature verification, delivery
+dedupe, repository admission and durable scope persistence. This entrypoint
+adds only wake hints/recovery around those existing boundaries:
 
-* a low-latency edge wake for a PR conversation ``issue_comment(created)`` whose
-  first non-empty line is exactly ``AGENT_REWORK_COMPLETE``;
-* a low-frequency full-intake safety wake that reuses the canonical durable
-  scope queue so a missed ``agent-ready`` webhook cannot strand an Issue
-  indefinitely.
+* completion-comment low-latency edge wake;
+* durable-scope chain wake after a committed scope transition;
+* durable defer when a supported direct PR edge wake is temporarily unavailable;
+* bounded startup recovery for already-queued eligible work; and
+* the existing low-frequency full-intake safety wake.
 
-Neither hint is lifecycle authority. The completion-comment path only asks the
-existing edge owner to fresh-read GitHub. The periodic path only enqueues a
-canonical ``full`` intake scope and wakes the lease-controller/direct-actuator
-intake path; it never reads or writes Issue/Kanban lifecycle state directly and
-it never runs webhook reconciliation.
+None of these paths decides GitHub/Kanban lifecycle state. Canonical intake and
+edge reconciliation always fresh-read authoritative state.
 """
 from __future__ import annotations
 
@@ -23,6 +20,7 @@ import importlib.util
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -32,6 +30,12 @@ _HINT = threading.local()
 _PERIODIC_FULL_INTAKE_DELIVERY = "router-periodic-full-intake"
 _DEFAULT_FALLBACK_INTERVAL_SECONDS = 3600
 _MIN_FALLBACK_INTERVAL_SECONDS = 300
+_STARTUP_RECOVERY_ATTEMPTS = 3
+_STARTUP_RECOVERY_DELAY_SECONDS = 1.0
+_STARTUP_RECOVERY_INITIAL_DELAY_SECONDS = 1.0
+_DELAYED_SCOPE_WAKE_LOCK = threading.Lock()
+_DELAYED_SCOPE_WAKE_DEADLINE: int | None = None
+_DELAYED_SCOPE_WAKE_GENERATION = 0
 
 
 def _load_core() -> ModuleType:
@@ -70,77 +74,337 @@ def _is_pr_completion_comment(event: str, payload: dict[str, Any]) -> bool:
     return _first_nonempty_line(comment.get("body")) == _COMPLETION_MARKER
 
 
-def install(core: ModuleType) -> ModuleType:
-    """Install the bounded completion-comment wake overlay once."""
-    if getattr(core, "_completion_comment_wake_installed", False):
-        return core
-
-    original_event_repositories = core._event_repositories
-    original_enqueue_scope = core._enqueue_scope
-
-    def event_repositories(event: str, payload: dict[str, Any]) -> list[str]:
-        # ThreadingHTTPServer uses one request thread per delivery. Always
-        # clear any prior hint before parsing the current signed event.
-        _HINT.completion_comment = False
-        repositories = original_event_repositories(event, payload)
-        if len(repositories) == 1 and _is_pr_completion_comment(event, payload):
-            _HINT.completion_comment = True
-        return repositories
-
-    def enqueue_scope(
-        *,
-        full: bool,
-        repository: str | None = None,
-        repositories: list[str] | tuple[str, ...] | None = None,
-        delivery_id: str | None = None,
-    ) -> dict[str, Any]:
-        result = original_enqueue_scope(
-            full=full,
-            repository=repository,
-            repositories=repositories,
-            delivery_id=delivery_id,
-        )
-        try:
-            if full or not bool(getattr(_HINT, "completion_comment", False)):
-                return result
-            scoped = (
-                list(repositories)
-                if repositories is not None
-                else ([repository] if repository is not None else [])
+def _supported_direct_edge_event(event: object) -> bool:
+    if not isinstance(event, dict):
+        return False
+    return (
+        event.get("event") == "pull_request"
+        and (
+            (
+                event.get("action") == "closed"
+                and event.get("merged") is True
             )
-            if len(scoped) != 1 or not delivery_id:
-                return result
-            target = scoped[0]
-            # Unknown/App-first-discovery repositories must finish onboarding
-            # before they can use the managed-repository low-latency lane.
-            if not core._managed_repository(target):
-                return result
+            or (
+                event.get("action") == "labeled"
+                and event.get("label") == "agent-rework"
+            )
+        )
+    )
 
-            # /v1/edge-sync currently exposes a deliberately tiny wake
-            # allowlist. Reuse its existing rework wake envelope internally;
-            # this payload is a control-plane trigger only and is never used as
-            # PR state evidence. The edge immediately fresh-reads GitHub.
-            wake = core._n8n_edge_sync(
-                {
-                    "repository": target,
-                    "event": "pull_request",
-                    "action": "labeled",
-                    "merged": False,
-                    "label": "agent-rework",
-                    "delivery": delivery_id,
-                }
+
+def _earliest_scope_not_before(
+    core: ModuleType,
+    *,
+    now: int | None = None,
+) -> int | None:
+    current = int(time.time()) if now is None else int(now)
+    with core._STATE_LOCK:
+        state = core._load_state_unlocked()
+        core._recover_scope_claims_unlocked(state, current)
+        queue = state.get("scope_queue")
+        if not isinstance(queue, list):
+            queue = []
+        state["scope_queue"] = queue
+        deadlines = [
+            int(item.get("not_before") or 0)
+            for item in queue
+            if isinstance(item, dict)
+        ]
+        core._write_state_unlocked(state)
+    return min(deadlines) if deadlines else None
+
+
+def _clear_delayed_scope_wake(generation: int) -> None:
+    global _DELAYED_SCOPE_WAKE_DEADLINE
+    with _DELAYED_SCOPE_WAKE_LOCK:
+        if generation == _DELAYED_SCOPE_WAKE_GENERATION:
+            _DELAYED_SCOPE_WAKE_DEADLINE = None
+
+
+def _delayed_scope_wake_background(
+    core: ModuleType,
+    not_before: int,
+    generation: int,
+) -> None:
+    time.sleep(max(0.0, float(not_before) - time.time()))
+    with _DELAYED_SCOPE_WAKE_LOCK:
+        if (
+            generation != _DELAYED_SCOPE_WAKE_GENERATION
+            or _DELAYED_SCOPE_WAKE_DEADLINE != not_before
+        ):
+            return
+
+    try:
+        earliest = _earliest_scope_not_before(core)
+    except Exception as exc:  # noqa: BLE001 - durable queue remains authoritative
+        print(
+            "github-router delayed scope queue read-back warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        _clear_delayed_scope_wake(generation)
+        return
+
+    current = int(time.time())
+    if earliest is None:
+        _clear_delayed_scope_wake(generation)
+        return
+    if earliest > current:
+        _clear_delayed_scope_wake(generation)
+        _schedule_delayed_scope_wake(core, earliest)
+        return
+
+    try:
+        wake = core._wake()
+        print(
+            "github-router delayed scope wake "
+            f"not_before={not_before} "
+            f"upstream_status={wake.get('upstream_status', '')}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - hourly fallback remains available
+        print(
+            "github-router delayed scope wake warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+    finally:
+        _clear_delayed_scope_wake(generation)
+
+
+def _schedule_delayed_scope_wake(
+    core: ModuleType,
+    not_before: int,
+) -> dict[str, Any]:
+    global _DELAYED_SCOPE_WAKE_DEADLINE, _DELAYED_SCOPE_WAKE_GENERATION
+    deadline = int(not_before)
+    with _DELAYED_SCOPE_WAKE_LOCK:
+        current_deadline = _DELAYED_SCOPE_WAKE_DEADLINE
+        if current_deadline is not None and current_deadline <= deadline:
+            return {
+                "accepted": True,
+                "mode": "delayed",
+                "not_before": current_deadline,
+                "coalesced": True,
+            }
+        _DELAYED_SCOPE_WAKE_GENERATION += 1
+        generation = _DELAYED_SCOPE_WAKE_GENERATION
+        _DELAYED_SCOPE_WAKE_DEADLINE = deadline
+
+    threading.Thread(
+        target=_delayed_scope_wake_background,
+        args=(core, deadline, generation),
+        daemon=True,
+        name="github-router-delayed-scope-wake",
+    ).start()
+    return {
+        "accepted": True,
+        "mode": "delayed",
+        "not_before": deadline,
+        "coalesced": False,
+    }
+
+
+def _chain_scope_wake(core: ModuleType, result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("status") not in {"acknowledged", "requeued", "pending"}:
+        return result
+    try:
+        earliest = _earliest_scope_not_before(core)
+    except Exception as exc:  # noqa: BLE001 - transition is already durable
+        print(
+            "github-router scope queue read-back warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return {
+            **result,
+            "next_wake": {
+                "accepted": False,
+                "reason": "queue_check_failed",
+            },
+        }
+    if earliest is None:
+        return {
+            **result,
+            "next_wake": {
+                "accepted": False,
+                "reason": "queue_empty",
+            },
+        }
+    if earliest > int(time.time()):
+        return {
+            **result,
+            "next_wake": _schedule_delayed_scope_wake(core, earliest),
+        }
+    try:
+        wake = core._wake()
+    except Exception as exc:  # noqa: BLE001 - transition is already durable
+        print(
+            "github-router scope chain wake warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return {
+            **result,
+            "next_wake": {
+                "accepted": False,
+                "reason": "wake_failed",
+            },
+        }
+    return {
+        **result,
+        "next_wake": {
+            "accepted": True,
+            "mode": "immediate",
+            "upstream_status": wake.get("upstream_status"),
+        },
+    }
+
+
+def _install_liveness_recovery(core: ModuleType) -> None:
+    if getattr(core, "_scope_liveness_recovery_installed", False):
+        return
+    required = ("_ack_scope", "_requeue_scope", "_n8n_edge_sync", "_wake")
+    if not all(callable(getattr(core, name, None)) for name in required):
+        return
+
+    original_ack_scope = core._ack_scope
+    original_requeue_scope = core._requeue_scope
+    original_edge_sync = core._n8n_edge_sync
+
+    def ack_scope(scope_id: str, claim_token: str) -> dict[str, Any]:
+        return _chain_scope_wake(
+            core,
+            original_ack_scope(scope_id, claim_token),
+        )
+
+    def requeue_scope(
+        scope_id: str,
+        reason: str,
+        claim_token: str,
+    ) -> dict[str, Any]:
+        return _chain_scope_wake(
+            core,
+            original_requeue_scope(scope_id, reason, claim_token),
+        )
+
+    def edge_sync(event: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return original_edge_sync(event)
+        except core.RouterError as edge_error:
+            if not _supported_direct_edge_event(event):
+                raise
+            repository = event.get("repository")
+            delivery_id = event.get("delivery")
+            if not isinstance(repository, str) or not isinstance(delivery_id, str):
+                raise
+            prior_completion_hint = bool(
+                getattr(_HINT, "completion_comment", False)
+            )
+            _HINT.completion_comment = False
+            try:
+                scope = core._enqueue_scope(
+                    full=False,
+                    repository=repository,
+                    delivery_id=delivery_id,
+                )
+                if scope.get("in_flight") or scope.get("pending"):
+                    wake = {
+                        "skipped": True,
+                        "reason": "scope_already_active_or_pending",
+                    }
+                else:
+                    wake = core._wake()
+            except Exception as defer_error:  # noqa: BLE001 - preserve retryability
+                raise core.RouterError("edge_sync_defer_failed") from defer_error
+            finally:
+                _HINT.completion_comment = prior_completion_hint
+            print(
+                "github-router direct edge wake deferred to durable scope "
+                f"repository={repository} "
+                f"scope={scope.get('id', '')} "
+                f"wake_skipped={bool(wake.get('skipped'))}",
+                flush=True,
             )
             return {
-                **result,
-                "completion_edge_sync": True,
-                "completion_edge_sync_status": wake.get("status"),
+                "status": 202,
+                "body": {
+                    "ok": True,
+                    "deferred": True,
+                    "reason": "edge_sync_deferred",
+                    "scope_id": scope.get("id", ""),
+                    "direct_error": type(edge_error).__name__,
+                },
             }
-        finally:
-            _HINT.completion_comment = False
 
-    core._event_repositories = event_repositories
-    core._enqueue_scope = enqueue_scope
-    core._completion_comment_wake_installed = True
+    core._ack_scope = ack_scope
+    core._requeue_scope = requeue_scope
+    core._n8n_edge_sync = edge_sync
+    core._scope_liveness_recovery_installed = True
+
+
+def install(core: ModuleType) -> ModuleType:
+    """Install the bounded event-routing and liveness overlays once."""
+    if not getattr(core, "_completion_comment_wake_installed", False):
+        original_event_repositories = core._event_repositories
+        original_enqueue_scope = core._enqueue_scope
+
+        def event_repositories(event: str, payload: dict[str, Any]) -> list[str]:
+            _HINT.completion_comment = False
+            repositories = original_event_repositories(event, payload)
+            if len(repositories) == 1 and _is_pr_completion_comment(event, payload):
+                _HINT.completion_comment = True
+            return repositories
+
+        def enqueue_scope(
+            *,
+            full: bool,
+            repository: str | None = None,
+            repositories: list[str] | tuple[str, ...] | None = None,
+            delivery_id: str | None = None,
+        ) -> dict[str, Any]:
+            result = original_enqueue_scope(
+                full=full,
+                repository=repository,
+                repositories=repositories,
+                delivery_id=delivery_id,
+            )
+            try:
+                if full or not bool(getattr(_HINT, "completion_comment", False)):
+                    return result
+                scoped = (
+                    list(repositories)
+                    if repositories is not None
+                    else ([repository] if repository is not None else [])
+                )
+                if len(scoped) != 1 or not delivery_id:
+                    return result
+                target = scoped[0]
+                if not core._managed_repository(target):
+                    return result
+                wake = core._n8n_edge_sync(
+                    {
+                        "repository": target,
+                        "event": "pull_request",
+                        "action": "labeled",
+                        "merged": False,
+                        "label": "agent-rework",
+                        "delivery": delivery_id,
+                    }
+                )
+                return {
+                    **result,
+                    "completion_edge_sync": True,
+                    "completion_edge_sync_status": wake.get("status"),
+                }
+            finally:
+                _HINT.completion_comment = False
+
+        core._event_repositories = event_repositories
+        core._enqueue_scope = enqueue_scope
+        core._completion_comment_wake_installed = True
+
+    _install_liveness_recovery(core)
     return core
 
 
@@ -152,7 +416,9 @@ def _fallback_interval_seconds() -> int:
     try:
         interval = int(raw)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS must be an integer") from exc
+        raise RuntimeError(
+            "GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS must be an integer"
+        ) from exc
     if interval < _MIN_FALLBACK_INTERVAL_SECONDS:
         raise RuntimeError(
             "GITHUB_ROUTER_FALLBACK_INTERVAL_SECONDS must be at least "
@@ -162,14 +428,6 @@ def _fallback_interval_seconds() -> int:
 
 
 def _periodic_full_intake_once(core: ModuleType) -> dict[str, Any]:
-    """Enqueue one idempotent full-intake safety scope and wake canonical intake.
-
-    A stable synthetic delivery identity deduplicates only while the same safety
-    scope is queued, in-flight, or pending. Once an acknowledged scope leaves
-    those stores, the next interval may create a fresh full scan. If a prior
-    wake failed after enqueue, the next tick sees the queued scope and re-wakes
-    it rather than adding a duplicate.
-    """
     scope = core._enqueue_scope(
         full=True,
         delivery_id=_PERIODIC_FULL_INTAKE_DELIVERY,
@@ -190,7 +448,6 @@ def _periodic_full_intake_loop(
     interval_seconds: int,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Run the safety wake at a bounded cadence, never immediately at startup."""
     stop = stop_event if stop_event is not None else threading.Event()
     while not stop.wait(interval_seconds):
         try:
@@ -205,12 +462,82 @@ def _periodic_full_intake_loop(
                 f"upstream_status={wake.get('upstream_status', '')}",
                 flush=True,
             )
-        except Exception as exc:  # noqa: BLE001 - next interval is the bounded retry
+        except Exception as exc:  # noqa: BLE001 - next interval is bounded retry
             print(
                 "github-router periodic full intake warning: "
                 f"{type(exc).__name__}",
                 flush=True,
             )
+
+
+def _startup_queue_recovery(
+    core: ModuleType,
+    *,
+    attempts: int = _STARTUP_RECOVERY_ATTEMPTS,
+    delay_seconds: float = _STARTUP_RECOVERY_DELAY_SECONDS,
+) -> dict[str, Any]:
+    earliest = _earliest_scope_not_before(core)
+    if earliest is None:
+        return {"skipped": True, "reason": "queue_empty"}
+    if earliest > int(time.time()):
+        scheduled = _schedule_delayed_scope_wake(core, earliest)
+        return {
+            "skipped": False,
+            **scheduled,
+        }
+
+    last_error = ""
+    for attempt in range(max(1, attempts)):
+        try:
+            wake = core._wake()
+        except Exception as exc:  # noqa: BLE001 - bounded startup recovery
+            last_error = type(exc).__name__
+            if attempt + 1 < max(1, attempts):
+                time.sleep(max(0.0, delay_seconds))
+                continue
+            return {
+                "skipped": False,
+                "accepted": False,
+                "reason": "wake_failed",
+                "error_type": last_error,
+            }
+        return {
+            "skipped": False,
+            "accepted": True,
+            "mode": "immediate",
+            "upstream_status": wake.get("upstream_status"),
+        }
+    return {
+        "skipped": False,
+        "accepted": False,
+        "reason": "wake_failed",
+        "error_type": last_error,
+    }
+
+
+def _startup_queue_recovery_background(
+    core: ModuleType,
+    *,
+    initial_delay_seconds: float = _STARTUP_RECOVERY_INITIAL_DELAY_SECONDS,
+) -> None:
+    """Let the router bind first, then recover only already-durable work."""
+    time.sleep(max(0.0, initial_delay_seconds))
+    try:
+        recovery = _startup_queue_recovery(core)
+    except Exception as exc:  # noqa: BLE001 - periodic fallback remains available
+        print(
+            "github-router startup queue recovery warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return
+    print(
+        "github-router startup queue recovery "
+        f"skipped={bool(recovery.get('skipped'))} "
+        f"accepted={bool(recovery.get('accepted'))} "
+        f"reason={recovery.get('reason', '')}",
+        flush=True,
+    )
 
 
 _core = install(_load_core())
@@ -222,6 +549,12 @@ def __getattr__(name: str):
 
 def main() -> int:
     interval = _fallback_interval_seconds()
+    threading.Thread(
+        target=_startup_queue_recovery_background,
+        args=(_core,),
+        daemon=True,
+        name="github-router-startup-queue-recovery",
+    ).start()
     threading.Thread(
         target=_periodic_full_intake_loop,
         args=(_core, interval),
