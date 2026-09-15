@@ -193,6 +193,10 @@ def _install_liveness_recovery(core: ModuleType) -> None:
             delivery_id = event.get("delivery")
             if not isinstance(repository, str) or not isinstance(delivery_id, str):
                 raise
+            prior_completion_hint = bool(
+                getattr(_HINT, "completion_comment", False)
+            )
+            _HINT.completion_comment = False
             try:
                 scope = core._enqueue_scope(
                     full=False,
@@ -208,6 +212,8 @@ def _install_liveness_recovery(core: ModuleType) -> None:
                     wake = core._wake()
             except Exception as defer_error:  # noqa: BLE001 - preserve retryability
                 raise core.RouterError("edge_sync_defer_failed") from defer_error
+            finally:
+                _HINT.completion_comment = prior_completion_hint
             print(
                 "github-router direct edge wake deferred to durable scope "
                 f"repository={repository} "
