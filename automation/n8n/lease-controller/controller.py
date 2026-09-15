@@ -223,6 +223,37 @@ def _trigger_intake_in_background(
         )
 
 
+def _canonical_lease_id(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip() or not value:
+        return ""
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return ""
+    canonical = str(parsed)
+    return canonical if canonical == value else ""
+
+
+def _resume_pending_trigger_on_startup() -> bool:
+    """Resume only the latest accepted trigger that never left pending state."""
+    with _REQUEST_LOCK:
+        state = _load_state()
+        if state.get("status") != "pending":
+            return False
+        lease = _canonical_lease_id(state.get("lease"))
+        if not lease:
+            return False
+        authorization = f"Bearer {_read_token()}"
+
+    threading.Thread(
+        target=_trigger_intake_in_background,
+        args=(lease, authorization),
+        daemon=True,
+        name=f"hermes-intake-resume-{lease[:8]}",
+    ).start()
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HermesIntakeLeaseController/3"
 
@@ -415,8 +446,6 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            # Direct actuator has no persistent schedule to pause. The delayed
-            # router cleanup now closes only this lease locally.
             _write_state(
                 {
                     "lease": lease,
@@ -447,10 +476,12 @@ def main() -> int:
         Handler,
     )
 
+    resumed = _resume_pending_trigger_on_startup()
     print(
         f"lease-controller listening on "
         f"http://{LISTEN_HOST}:{LISTEN_PORT}; "
-        f"actuator={ACTUATOR_BASE_URL}",
+        f"actuator={ACTUATOR_BASE_URL}; "
+        f"pending_resumed={resumed}",
         flush=True,
     )
 
