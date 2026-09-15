@@ -588,6 +588,10 @@ def test_canary_scope_is_repository_qualified_or_root_linked() -> None:
         "linked_a": {"id": "linked_a", "idempotency_key": "issue138-canary-linked-a"},
         "linked_b": {"id": "linked_b", "idempotency_key": "issue138-canary-linked-b"},
         "unlinked": {"id": "unlinked", "idempotency_key": "issue138-canary-unlinked"},
+        "verified_legacy": {
+            "id": "verified_legacy",
+            "idempotency_key": "issue138-canary-" + ("1" * 40),
+        },
     }
     _root_id, _root_status, _root, selected, _provenance = trajectory._select_scope(
         tasks,
@@ -602,6 +606,20 @@ def test_canary_scope_is_repository_qualified_or_root_linked() -> None:
     )
 
     assert set(selected) == {"root_a", "qualified_a", "linked_a"}
+
+    _root_id, _root_status, _root, selected, _provenance = trajectory._select_scope(
+        tasks,
+        [
+            {"parent_id": "root_a", "child_id": "linked_a"},
+            {"parent_id": "root_b", "child_id": "linked_b"},
+        ],
+        repository="ownerA/repoA",
+        issue=138,
+        root_task_id=None,
+        task_ids=None,
+        verified_canary_ids=("1" * 40,),
+    )
+    assert set(selected) == {"root_a", "qualified_a", "linked_a", "verified_legacy"}
 
 
 def test_github_failure_is_partial_and_observer_only(tmp_path: Path) -> None:

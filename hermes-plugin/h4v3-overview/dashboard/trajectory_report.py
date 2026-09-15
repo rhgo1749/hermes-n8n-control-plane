@@ -285,6 +285,7 @@ def _select_scope(
     issue: int,
     root_task_id: Optional[str],
     task_ids: Optional[Sequence[str]],
+    verified_canary_ids: Optional[Sequence[str]] = None,
 ) -> tuple[Optional[str], str, Optional[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
     """Select by exact provenance and graph edges; never title/body text."""
     exact_key = f"github:{repository}:issue:{issue}"
@@ -318,6 +319,26 @@ def _select_scope(
         method = "strict_idempotency_scope"
         root_task_id = None
 
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for link in links:
+        parent, child = link["parent_id"], link["child_id"]
+        adjacency[parent].add(child)
+        adjacency[child].add(parent)
+
+    root_graph_ids: set[str] = set()
+    if root_task_id:
+        root_queue = [root_task_id]
+        root_graph_ids.add(root_task_id)
+        while root_queue:
+            current = root_queue.pop(0)
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in root_graph_ids:
+                    root_graph_ids.add(neighbor)
+                    root_queue.append(neighbor)
+
+    verified_legacy_canaries = {
+        value for value in (_safe_id(item) for item in (verified_canary_ids or ())) if value
+    }
     selected: set[str] = set()
     if task_ids is not None:
         method = "explicit_task_manifest"
@@ -331,11 +352,17 @@ def _select_scope(
             task_id for task_id, task in all_tasks.items()
             if str(task.get("idempotency_key") or "").startswith(exact_key + ":")
         )
-    adjacency: dict[str, set[str]] = defaultdict(set)
-    for link in links:
-        parent, child = link["parent_id"], link["child_id"]
-        adjacency[parent].add(child)
-        adjacency[child].add(parent)
+        canary_prefix = f"issue{issue}-canary-"
+        for task_id, task in all_tasks.items():
+            key = str(task.get("idempotency_key") or "")
+            if not key.startswith(canary_prefix):
+                continue
+            suffix = key[len(canary_prefix):]
+            # Legacy canary keys omitted the repository. They are safe only
+            # when the exact root graph proves their relationship, or when a
+            # fresh repository-anchored GitHub result verifies the suffix.
+            if task_id in root_graph_ids or suffix in verified_legacy_canaries:
+                selected.add(task_id)
     queue = list(selected)
     seen = set(selected)
     while queue:
@@ -1132,6 +1159,17 @@ def _sha_or_none(value: Any) -> Optional[str]:
     return value if _SHA_RE.fullmatch(value) else None
 
 
+def _verified_canary_ids(github: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return legacy canary suffixes proven by fresh repository evidence."""
+    if (
+        github.get("repository_anchor_verified") is not True
+        or github.get("closing_reference_verified") is not True
+    ):
+        return ()
+    observed_head = _sha_or_none(github.get("observed_pr_head_sha"))
+    return (observed_head,) if observed_head is not None else ()
+
+
 def _infra_failure_domain(value: Any) -> Optional[str]:
     """Return a bounded infrastructure domain from structured evidence."""
     text = str(value or "").strip().casefold()
@@ -1424,6 +1462,7 @@ def build_trajectory_report(
     root_status = "unavailable"
     root: Optional[dict[str, Any]] = None
     tasks: dict[str, dict[str, Any]] = {}
+    all_tasks: dict[str, dict[str, Any]] = {}
     links: list[dict[str, str]] = []
     runs: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -1472,6 +1511,28 @@ def build_trajectory_report(
         github_fetcher=github_fetcher, github_graphql_fetcher=github_graphql_fetcher,
         generated_at=generated,
     )
+    verified_canary_ids = _verified_canary_ids(github)
+    if not kanban_error and task_ids is None and verified_canary_ids:
+        candidate_scope = _select_scope(
+            all_tasks, links, repository=repository, issue=issue,
+            root_task_id=root_task_id, task_ids=task_ids,
+            verified_canary_ids=verified_canary_ids,
+        )
+        candidate_tasks = candidate_scope[3]
+        if set(candidate_tasks) != set(tasks):
+            try:
+                refresh_conn = _read_only_connection(path)
+                try:
+                    refreshed_runs = _select_runs(refresh_conn, list(candidate_tasks))
+                    refreshed_events = _select_events(refresh_conn, list(candidate_tasks))
+                finally:
+                    refresh_conn.close()
+            except (OSError, sqlite3.Error):
+                kanban_error = "kanban_db_unavailable"
+            else:
+                root_id, root_status, root, tasks, provenance = candidate_scope
+                runs = refreshed_runs
+                events = refreshed_events
     root_row = None
     if root is not None:
         root_row = {
