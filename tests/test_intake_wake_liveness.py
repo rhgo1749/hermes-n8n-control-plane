@@ -362,3 +362,44 @@ def test_lease_busy_response_is_boundedly_retried() -> None:
             "status": "active",
             "upstream_status": 200,
         }
+
+
+def test_completion_comment_edge_failure_defers_without_recursive_enqueue() -> None:
+    entrypoint = _entrypoint()
+    with tempfile.TemporaryDirectory() as td:
+        core = _fresh_core(entrypoint, edge_failure=True)
+        _configure_router_state(core, Path(td))
+        core._write_state_unlocked(
+            {
+                "scope_queue": [],
+                "managed_repositories": ["rhgo1749/ctrl-hangul"],
+            }
+        )
+        wakes = _wake_recorder(core)
+        payload = {
+            "action": "created",
+            "repository": {"full_name": "rhgo1749/ctrl-hangul"},
+            "issue": {
+                "number": 115,
+                "pull_request": {
+                    "url": "https://api.github.com/repos/rhgo1749/ctrl-hangul/pulls/115"
+                },
+            },
+            "comment": {
+                "body": "AGENT_REWORK_COMPLETE\ntask=t_b03e4f35\nvalidation=passed"
+            },
+        }
+
+        repositories = core._event_repositories("issue_comment", payload)
+        result = core._enqueue_scope(
+            full=False,
+            repositories=repositories,
+            delivery_id="completion-defer",
+        )
+
+        assert result["completion_edge_sync"] is True
+        assert result["completion_edge_sync_status"] == 202
+        assert wakes == ["wake"]
+        state = core._load_state_unlocked()
+        assert len(state["scope_queue"]) == 1
+        assert state["scope_queue"][0]["delivery"] == "completion-defer"
