@@ -1,6 +1,6 @@
 # REQ-155: 고불확실성 bounded Investigator search 경로
 
-- Status: Draft
+- Status: Implemented; PR #171 open; human validation required
 - Project: `hermes-n8n-control-plane`
 - Product type: `HERMES_PLUGIN` / `DOCS_ONLY`
 - Validation profiles: `STATIC_UNIT` / `HERMES_PLUGIN` / `HOST_DASHBOARD`
