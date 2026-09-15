@@ -334,3 +334,31 @@ def test_invalid_pending_lease_identity_is_not_replayed() -> None:
 
         assert controller._resume_pending_trigger_on_startup() is False
         assert calls == []
+
+
+def test_lease_busy_response_is_boundedly_retried() -> None:
+    controller = _load(
+        LEASE_CONTROLLER,
+        f"test_intake_wake_lease_controller_{uuid.uuid4().hex}",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        _configure_lease_state(controller, Path(td))
+        lease = str(uuid.uuid4())
+        controller._write_state({"lease": lease, "status": "pending"})
+        controller.ACTUATOR_BUSY_RETRY_SECONDS = (0, 0)
+        statuses = [409, 409, 200]
+        calls: list[str] = []
+
+        def call_actuator(authorization: str):
+            calls.append(authorization)
+            return statuses.pop(0), b"{}"
+
+        controller._call_actuator = call_actuator
+        controller._trigger_intake_in_background(lease, "Bearer test-token")
+
+        assert len(calls) == 3
+        assert controller._load_state() == {
+            "lease": lease,
+            "status": "active",
+            "upstream_status": 200,
+        }
