@@ -109,7 +109,22 @@ def _eligible_scope_waiting(core: ModuleType, *, now: int | None = None) -> bool
 def _chain_scope_wake(core: ModuleType, result: dict[str, Any]) -> dict[str, Any]:
     if result.get("status") not in {"acknowledged", "requeued", "pending"}:
         return result
-    if not _eligible_scope_waiting(core):
+    try:
+        eligible = _eligible_scope_waiting(core)
+    except Exception as exc:  # noqa: BLE001 - transition is already durable
+        print(
+            "github-router scope queue read-back warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return {
+            **result,
+            "next_wake": {
+                "accepted": False,
+                "reason": "queue_check_failed",
+            },
+        }
+    if not eligible:
         return {
             **result,
             "next_wake": {
