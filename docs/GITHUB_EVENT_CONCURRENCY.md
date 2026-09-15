@@ -21,23 +21,27 @@ GitHub App webhook (or reconciled repository webhook)
             -> allowlisted filter/normalization
             -> fixed actuator :5682
                  -> kanban-github-sync.py --board <slug> --json
+            -> supported direct-wake failure: durable repository scope
+                 -> lease-controller :5680 -> fixed intake actuator :5682
        -> new/unknown or other intake event: durable FIFO wake-scope queue
             -> lease-controller :5680
                  -> fixed intake actuator :5682
                       -> deployed github-agent-ready-kanban-intake.py
+       -> router startup: re-wake only already-durable eligible queue work
        -> hourly safety tick: durable full-intake scope
             -> same lease-controller and same direct actuator
 ```
 
 The App webhook is the discovery boundary for repositories that are not yet in
 the read-only registry. `installation`, `installation_repositories`,
-`repository` (the documented `archived` action), `public`, `issues`, `issue_comment`, `pull_request`, and
-`pull_request_review` deliveries are accepted only for the configured owner
-scope. An installation delivery may contain up to 100 repositories; duplicate
-names are folded case-insensitively before one FIFO scope is queued. A valid
-owner installation delivery for an unknown repository is queued rather than
-rejected as `repository_not_managed`, allowing the intake worker to perform the
-fresh metadata/topic/contract checks and checkout provisioning asynchronously.
+`repository` (the documented `archived` action), `public`, `issues`,
+`issue_comment`, `pull_request`, and `pull_request_review` deliveries are
+accepted only for the configured owner scope. An installation delivery may
+contain up to 100 repositories; duplicate names are folded case-insensitively
+before one FIFO scope is queued. A valid owner installation delivery for an
+unknown repository is queued rather than rejected as
+`repository_not_managed`, allowing the intake worker to perform the fresh
+metadata/topic/contract checks and checkout provisioning asynchronously.
 Installation deliveries without repository candidates are an acknowledged
 no-op. Foreign owners, invalid repository identities, oversized batches, and
 missing repository objects fail closed without queueing.
@@ -58,33 +62,58 @@ live canary; its absence is valid on current hosts. An accepted lease invokes
 the fixed actuator, and delayed cleanup closes only the lease locally rather
 than pausing a persistent schedule.
 
+The lease-controller persists a new trigger as `pending` before starting its
+background actuator call. On controller restart, only the latest canonical UUID
+lease still persisted as `pending` is resumed; `active`, `paused`, and `failed`
+leases are never replayed. The controller serializes actuator calls through the
+existing `_TRIGGER_LOCK`. A fixed actuator `409` busy response is retried with
+the bounded backoff sequence `1, 5, 15, 30, 60, 120` seconds before the lease is
+marked failed. This is bounded contention recovery, not a scheduler or polling
+loop, and it introduces no new state store.
+
 The router entrypoint runs a bounded full-intake safety wake with a default
 interval of 3600 seconds and rejects configured intervals below 300 seconds.
-The first safety wake occurs only after one full interval; router startup does
-not immediately scan. Each tick calls the existing `_enqueue_scope(full=True)`
-and `_wake()` boundaries only. A stable synthetic scope identity prevents a
-queued, in-flight, or durable-pending safety scope from being duplicated. A
-queued scope may be re-woken after an earlier wake failure; in-flight or pending
-work is not double-woken. The safety tick does not call webhook reconciliation,
-does not inspect `agent-*` labels itself, and introduces no new state store or
-lifecycle owner. Normal signed webhook delivery remains the primary intake
-path.
+The first **full** safety wake occurs only after one full interval. Router
+startup never creates a full scope, but it does inspect the already-durable
+scope queue and, when an eligible queued scope already exists, performs one
+logical recovery wake with up to three bounded trigger attempts to cover
+service-start ordering. Each periodic tick calls the existing
+`_enqueue_scope(full=True)` and `_wake()` boundaries only. A stable synthetic
+scope identity prevents a queued, in-flight, or durable-pending safety scope
+from being duplicated. A queued scope may be re-woken after an earlier wake
+failure; in-flight or pending work is not double-woken. The safety tick and
+startup recovery do not call webhook reconciliation, do not inspect `agent-*`
+labels themselves, and introduce no new lifecycle owner. Normal signed webhook
+delivery remains the primary intake path.
 
 Each non-PR intake event, including a first App delivery for an unknown
 repository, enqueues its repository scope before waking the direct actuator.
-Each intake invocation claims exactly one queued scope. Expired unclaimed scopes are
-recovered with a bounded attempt/backoff or retained in the durable pending list
-when the retry limit is reached; they are never silently dropped. Claimed scopes
-carry a restart-safe lease and a fencing token. A worker must acknowledge with
-that token only after onboarding, board bootstrap, and task work complete; a
-stale worker cannot acknowledge a scope reclaimed by a later worker. Retryable
-API/clone/lock/registry/board failures are requeued, while permanent repository
-validation skips are acknowledged with structured skip evidence. A PR event is
-sent only as bounded normalized data to the private n8n Webhook; n8n never
-receives the external signature boundary or a caller-controlled command. The
-persisted lease-controller remains the stale delayed-cleanup correctness guard
-for the direct-actuator path; n8n's `N8N_CONCURRENCY_PRODUCTION_LIMIT=1`
-remains only a load limiter.
+Each intake invocation claims exactly one queued scope. Expired unclaimed scopes
+are recovered with a bounded attempt/backoff or retained in the durable pending
+list when the retry limit is reached; they are never silently dropped. Claimed
+scopes carry a restart-safe lease and a fencing token. A worker must acknowledge
+with that token only after onboarding, board bootstrap, and task work complete;
+a stale worker cannot acknowledge a scope reclaimed by a later worker.
+Retryable API/clone/lock/registry/board failures are requeued, while permanent
+repository validation skips are acknowledged with structured skip evidence.
+
+After a **fresh** successful `/scope/ack` or `/scope/requeue` transition is
+persisted, the deployed router entrypoint re-reads the durable queue. If another
+scope is already eligible, it issues exactly one canonical `_wake()` hint. The
+current intake invocation still processes only one scope; the next invocation
+must claim the next scope through the same authenticated/fenced control path.
+An `already_acknowledged`/`already_requeued` replay never emits another chained
+wake. A requeued item still inside its backoff window is not considered
+eligible. If the post-transition queue read or wake fails, the already-committed
+transition remains successful and the durable queue plus startup/hourly recovery
+remain the self-heal evidence; the transition is never rolled back or reported
+as uncommitted merely because the advisory next wake failed.
+
+A PR event is sent only as bounded normalized data to the private n8n Webhook;
+n8n never receives the external signature boundary or a caller-controlled
+command. The persisted lease-controller remains the stale delayed-cleanup
+correctness guard for the direct-actuator path; n8n's
+`N8N_CONCURRENCY_PRODUCTION_LIMIT=1` remains only a load limiter.
 
 The router exposes the worker control contract only through authenticated POST
 requests: `/scope/claim` returns one scope plus `claim_token`, `/scope/ack`
@@ -92,6 +121,7 @@ releases that exact claim, and `/scope/requeue` records the bounded retry reason
 The acknowledgment and requeue endpoints are not safe GET operations; a stale or
 mismatched token is rejected without changing queue state.
 
+The low-latency PR actuator allowlist is exactly:
 
 - `pull_request` + `action=closed` + `merged=true`;
 - `pull_request` + `action=labeled` + `label=agent-rework`.
@@ -99,6 +129,17 @@ mismatched token is rejected without changing queue state.
 All other PR actions finish as an explicit no-op. The actuator repeats the
 allowlist, resolves repository → board through the existing registry/task
 provenance, and runs exactly `kanban-github-sync.py --board <slug> --json`.
+
+If a supported managed-PR direct wake cannot reach or complete the private
+n8n/actuator hop, the deployed router entrypoint does not invent lifecycle state
+from the webhook payload. It enqueues/reuses the same repository-scoped durable
+intake scope keyed by that delivery and wakes canonical intake. The later
+intake/edge run fresh-reads GitHub and Kanban to decide the current PR/rework
+state. If establishing or waking that durable defer also fails, the core router
+keeps the existing retryable failure behavior: the delivery dedupe claim is
+released so GitHub redelivery/operator resend can reuse the already-durable
+scope instead of duplicating it. Unsupported PR actions are not promoted into
+this durable edge-failure fallback.
 
 ## Edge reconciliation single-flight
 
@@ -110,8 +151,8 @@ reconciliation read or side effect:
 - Linux `fcntl.flock(LOCK_EX)` guards
   `$HERMES_HOME/kanban/.resource-locks/github-edge-sync.lock`;
 - the runtime root, lock directory, and lock file are validated fail-closed
-  against symlink/path substitution, and the lock is outside tracked
-  repository state;
+  against symlink/path substitution, and the lock is outside tracked repository
+  state;
 - the actuator's process-local `_RUN_LOCK` remains a fast admission guard, but
   the filesystem lock is the correctness boundary shared with direct plugin
   wakes;
@@ -132,12 +173,12 @@ retried. Only when that fresh retry also times out is the completion wake
 reported as a final `edge_retry_timeout` failure.
 
 The process-level regression deliberately starts an owner before the simulated
-completion is committed, so the owner's snapshot cannot contain that completion.
-The first completion child is forced to expire in lock contention; the test
-passes only when a post-owner retry actually enters the canonical edge and sees
-the later committed snapshot. A focused unit contract separately verifies that
-a task already projected away from `DONE` suppresses the retry. A timeout
-diagnostic by itself is therefore not success evidence.
+completion is committed, so the owner's snapshot cannot contain that
+completion. The first completion child is forced to expire in lock contention;
+the test passes only when a post-owner retry actually enters the canonical edge
+and sees the later committed snapshot. A focused unit contract separately
+verifies that a task already projected away from `DONE` suppresses the retry. A
+timeout diagnostic by itself is therefore not success evidence.
 
 This serializes the complete edge run, including GitHub reads and Kanban/GitHub
 side effects, without introducing a queue database, task store, or second
@@ -158,26 +199,26 @@ every signed intake event:
   delivery ID) before the event is processed, then enqueued and dispatched as
   usual.
 - A redelivered (duplicate) delivery ID inside its TTL is a `202` no-op with
-  `duplicate=true` and `reason=duplicate_delivery`; it enqueues no scope and
-  calls no `_wake()`, and its TTL is not refreshed.
+  `duplicate=true` and `reason=duplicate_delivery`; it enqueues no new scope
+  and calls no new primary dispatch, and its TTL is not refreshed.
 - Different delivery IDs are independent events even when the payload body is
   identical.
 - Invalid or missing signatures are rejected before deduplication and never
   recorded, so a forged replay cannot poison the store and a later valid
   delivery of the same ID still processes.
-- A delivery that fails dispatch (HTTP 502 from the lease controller) has its
-  record released so the GitHub 5xx retry or an operator resend can dispatch
-  again.
+- A dispatch that cannot be preserved by the durable fallback has its delivery
+  record released so GitHub 5xx retry or an operator resend can dispatch again.
+  For a supported PR whose direct edge wake fails but durable defer succeeds,
+  the delivery remains accepted because the repository-scoped scope is now the
+  restart-safe recovery record.
 - The store is bounded on both dimensions: entries expire after
   `GITHUB_ROUTER_DELIVERY_TTL_SECONDS` (default `3600`) and the map is capped
   at `GITHUB_ROUTER_DELIVERY_MAX_ENTRIES` (default `4096`) with oldest-entry
   eviction. It persists in the router state file, so restarts keep deduplicating
   within the TTL window.
-- The dedupe store is the only new state in the router state file; the scope
-  queue, managed-repository registry, stale-pause lease, and reconciliation
-  behavior are unchanged. Operator-sent canary events must therefore use a
-  fresh `X-GitHub-Delivery` UUID each time; reusing one within the TTL is a
-  valid duplicate no-op by contract.
+- The dedupe store, durable scope queue and persisted lease remain bounded
+  transport state only; none is GitHub/Kanban lifecycle authority. Operator
+  canary events must use a fresh `X-GitHub-Delivery` UUID each time.
 
 ## Registry reconciliation and fallback
 
@@ -202,5 +243,6 @@ calling `/reconcile`; no tracked n8n workflow or n8n Schedule Trigger calls
 `automation/n8n/scripts/import-workflows.sh` binds its loopback Header Auth
 credential, publishes it, and runs an unsupported-action production canary.
 A live signed GitHub delivery or redelivery remains the host-runtime evidence
-gate for the primary event path; a live safety-wake read-back is the additional
-evidence gate for missed-webhook self-heal.
+gate for the primary event path; live startup/chain-wake read-back is the
+additional evidence gate for durable liveness recovery, and a live safety-wake
+read-back remains the final evidence gate for missed-webhook self-heal.
