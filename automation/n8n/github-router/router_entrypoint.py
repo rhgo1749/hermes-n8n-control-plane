@@ -33,6 +33,9 @@ _MIN_FALLBACK_INTERVAL_SECONDS = 300
 _STARTUP_RECOVERY_ATTEMPTS = 3
 _STARTUP_RECOVERY_DELAY_SECONDS = 1.0
 _STARTUP_RECOVERY_INITIAL_DELAY_SECONDS = 1.0
+_DELAYED_SCOPE_WAKE_LOCK = threading.Lock()
+_DELAYED_SCOPE_WAKE_DEADLINE: int | None = None
+_DELAYED_SCOPE_WAKE_GENERATION = 0
 
 
 def _load_core() -> ModuleType:
@@ -89,7 +92,11 @@ def _supported_direct_edge_event(event: object) -> bool:
     )
 
 
-def _eligible_scope_waiting(core: ModuleType, *, now: int | None = None) -> bool:
+def _earliest_scope_not_before(
+    core: ModuleType,
+    *,
+    now: int | None = None,
+) -> int | None:
     current = int(time.time()) if now is None else int(now)
     with core._STATE_LOCK:
         state = core._load_state_unlocked()
@@ -98,20 +105,111 @@ def _eligible_scope_waiting(core: ModuleType, *, now: int | None = None) -> bool
         if not isinstance(queue, list):
             queue = []
         state["scope_queue"] = queue
-        eligible = any(
-            isinstance(item, dict)
-            and int(item.get("not_before") or 0) <= current
+        deadlines = [
+            int(item.get("not_before") or 0)
             for item in queue
-        )
+            if isinstance(item, dict)
+        ]
         core._write_state_unlocked(state)
-    return eligible
+    return min(deadlines) if deadlines else None
+
+
+def _clear_delayed_scope_wake(generation: int) -> None:
+    global _DELAYED_SCOPE_WAKE_DEADLINE
+    with _DELAYED_SCOPE_WAKE_LOCK:
+        if generation == _DELAYED_SCOPE_WAKE_GENERATION:
+            _DELAYED_SCOPE_WAKE_DEADLINE = None
+
+
+def _delayed_scope_wake_background(
+    core: ModuleType,
+    not_before: int,
+    generation: int,
+) -> None:
+    time.sleep(max(0.0, float(not_before) - time.time()))
+    with _DELAYED_SCOPE_WAKE_LOCK:
+        if (
+            generation != _DELAYED_SCOPE_WAKE_GENERATION
+            or _DELAYED_SCOPE_WAKE_DEADLINE != not_before
+        ):
+            return
+
+    try:
+        earliest = _earliest_scope_not_before(core)
+    except Exception as exc:  # noqa: BLE001 - durable queue remains authoritative
+        print(
+            "github-router delayed scope queue read-back warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        _clear_delayed_scope_wake(generation)
+        return
+
+    current = int(time.time())
+    if earliest is None:
+        _clear_delayed_scope_wake(generation)
+        return
+    if earliest > current:
+        _clear_delayed_scope_wake(generation)
+        _schedule_delayed_scope_wake(core, earliest)
+        return
+
+    try:
+        wake = core._wake()
+        print(
+            "github-router delayed scope wake "
+            f"not_before={not_before} "
+            f"upstream_status={wake.get('upstream_status', '')}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - hourly fallback remains available
+        print(
+            "github-router delayed scope wake warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+    finally:
+        _clear_delayed_scope_wake(generation)
+
+
+def _schedule_delayed_scope_wake(
+    core: ModuleType,
+    not_before: int,
+) -> dict[str, Any]:
+    global _DELAYED_SCOPE_WAKE_DEADLINE, _DELAYED_SCOPE_WAKE_GENERATION
+    deadline = int(not_before)
+    with _DELAYED_SCOPE_WAKE_LOCK:
+        current_deadline = _DELAYED_SCOPE_WAKE_DEADLINE
+        if current_deadline is not None and current_deadline <= deadline:
+            return {
+                "accepted": True,
+                "mode": "delayed",
+                "not_before": current_deadline,
+                "coalesced": True,
+            }
+        _DELAYED_SCOPE_WAKE_GENERATION += 1
+        generation = _DELAYED_SCOPE_WAKE_GENERATION
+        _DELAYED_SCOPE_WAKE_DEADLINE = deadline
+
+    threading.Thread(
+        target=_delayed_scope_wake_background,
+        args=(core, deadline, generation),
+        daemon=True,
+        name="github-router-delayed-scope-wake",
+    ).start()
+    return {
+        "accepted": True,
+        "mode": "delayed",
+        "not_before": deadline,
+        "coalesced": False,
+    }
 
 
 def _chain_scope_wake(core: ModuleType, result: dict[str, Any]) -> dict[str, Any]:
     if result.get("status") not in {"acknowledged", "requeued", "pending"}:
         return result
     try:
-        eligible = _eligible_scope_waiting(core)
+        earliest = _earliest_scope_not_before(core)
     except Exception as exc:  # noqa: BLE001 - transition is already durable
         print(
             "github-router scope queue read-back warning: "
@@ -125,13 +223,18 @@ def _chain_scope_wake(core: ModuleType, result: dict[str, Any]) -> dict[str, Any
                 "reason": "queue_check_failed",
             },
         }
-    if not eligible:
+    if earliest is None:
         return {
             **result,
             "next_wake": {
                 "accepted": False,
-                "reason": "no_eligible_scope",
+                "reason": "queue_empty",
             },
+        }
+    if earliest > int(time.time()):
+        return {
+            **result,
+            "next_wake": _schedule_delayed_scope_wake(core, earliest),
         }
     try:
         wake = core._wake()
@@ -152,6 +255,7 @@ def _chain_scope_wake(core: ModuleType, result: dict[str, Any]) -> dict[str, Any
         **result,
         "next_wake": {
             "accepted": True,
+            "mode": "immediate",
             "upstream_status": wake.get("upstream_status"),
         },
     }
@@ -372,8 +476,16 @@ def _startup_queue_recovery(
     attempts: int = _STARTUP_RECOVERY_ATTEMPTS,
     delay_seconds: float = _STARTUP_RECOVERY_DELAY_SECONDS,
 ) -> dict[str, Any]:
-    if not _eligible_scope_waiting(core):
-        return {"skipped": True, "reason": "no_eligible_scope"}
+    earliest = _earliest_scope_not_before(core)
+    if earliest is None:
+        return {"skipped": True, "reason": "queue_empty"}
+    if earliest > int(time.time()):
+        scheduled = _schedule_delayed_scope_wake(core, earliest)
+        return {
+            "skipped": False,
+            **scheduled,
+        }
+
     last_error = ""
     for attempt in range(max(1, attempts)):
         try:
@@ -392,6 +504,7 @@ def _startup_queue_recovery(
         return {
             "skipped": False,
             "accepted": True,
+            "mode": "immediate",
             "upstream_status": wake.get("upstream_status"),
         }
     return {

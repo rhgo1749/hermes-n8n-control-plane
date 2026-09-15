@@ -27,7 +27,7 @@ GitHub App webhook (or reconciled repository webhook)
             -> lease-controller :5680
                  -> fixed intake actuator :5682
                       -> deployed github-agent-ready-kanban-intake.py
-       -> router startup: re-wake only already-durable eligible queue work
+       -> router startup: recover earliest already-durable queue deadline
        -> hourly safety tick: durable full-intake scope
             -> same lease-controller and same direct actuator
 ```
@@ -74,10 +74,16 @@ loop, and it introduces no new state store.
 The router entrypoint runs a bounded full-intake safety wake with a default
 interval of 3600 seconds and rejects configured intervals below 300 seconds.
 The first **full** safety wake occurs only after one full interval. Router
-startup never creates a full scope, but it does inspect the already-durable
-scope queue and, when an eligible queued scope already exists, performs one
-logical recovery wake with up to three bounded trigger attempts to cover
-service-start ordering. Each periodic tick calls the existing
+startup never creates a full scope. Instead it fresh-reads the already-durable
+scope queue and derives the earliest `not_before`: an already-eligible deadline
+gets one logical recovery wake with up to three bounded trigger attempts to
+cover service-start ordering, while a future deadline installs one daemon
+one-shot wake for that time. The one-shot carries no lifecycle or durable state;
+multiple future hints are coalesced to the earliest in-process deadline. When it
+fires it fresh-reads the durable queue again, no-ops if the work disappeared,
+and reschedules only when the durable earliest `not_before` itself moved later.
+A router restart can therefore reconstruct a lost volatile timer from the same
+durable queue without polling. Each periodic tick calls the existing
 `_enqueue_scope(full=True)` and `_wake()` boundaries only. A stable synthetic
 scope identity prevents a queued, in-flight, or durable-pending safety scope
 from being duplicated. A queued scope may be re-woken after an earlier wake
@@ -98,16 +104,21 @@ Retryable API/clone/lock/registry/board failures are requeued, while permanent
 repository validation skips are acknowledged with structured skip evidence.
 
 After a **fresh** successful `/scope/ack` or `/scope/requeue` transition is
-persisted, the deployed router entrypoint re-reads the durable queue. If another
-scope is already eligible, it issues exactly one canonical `_wake()` hint. The
-current intake invocation still processes only one scope; the next invocation
-must claim the next scope through the same authenticated/fenced control path.
-An `already_acknowledged`/`already_requeued` replay never emits another chained
-wake. A requeued item still inside its backoff window is not considered
-eligible. If the post-transition queue read or wake fails, the already-committed
-transition remains successful and the durable queue plus startup/hourly recovery
-remain the self-heal evidence; the transition is never rolled back or reported
-as uncommitted merely because the advisory next wake failed.
+persisted, the deployed router entrypoint re-reads the durable queue and derives
+its earliest `not_before`. If that deadline is already eligible, it issues
+exactly one canonical `_wake()` hint. If the earliest remaining scope is still
+inside its retry backoff, it installs the same coalesced one-shot wake for that
+future deadline instead of waiting for another GitHub event or the hourly safety
+tick. The current intake invocation still processes only one scope; the next
+invocation must claim the next scope through the same authenticated/fenced
+control path. The delayed thread never mutates scope state and fresh-reads the
+queue before waking, so a scope already consumed through another event/wake is a
+no-op rather than duplicate processing. An `already_acknowledged` or
+`already_requeued` replay does not itself create a new chained transition. If
+the post-transition queue read or wake fails, the already-committed transition
+remains successful and the durable queue plus startup/hourly recovery remain the
+self-heal evidence; the transition is never rolled back or reported as
+uncommitted merely because the advisory next wake failed.
 
 A PR event is sent only as bounded normalized data to the private n8n Webhook;
 n8n never receives the external signature boundary or a caller-controlled

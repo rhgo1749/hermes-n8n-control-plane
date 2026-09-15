@@ -84,35 +84,34 @@ def test_ack_chains_exactly_one_wake_for_next_eligible_scope() -> None:
         assert core._queue_status()["queued_scopes"] == 1
 
 
-def test_ack_does_not_wake_when_only_backoff_scope_remains() -> None:
+def test_single_requeue_backoff_schedules_one_delayed_wake_then_reclaims() -> None:
     entrypoint = _entrypoint()
     with tempfile.TemporaryDirectory() as td:
         core = _fresh_core(entrypoint)
         _configure_router_state(core, Path(td))
-        core.SCOPE_RETRY_BACKOFF_SECONDS = (60, 60)
+        core.SCOPE_RETRY_BACKOFF_SECONDS = (1, 1)
         wakes = _wake_recorder(core)
 
-        core._enqueue_scope(full=True, delivery_id="scope-a")
-        core._enqueue_scope(
-            full=False,
-            repository="rhgo1749/ctrl-hangul",
-            delivery_id="scope-b",
-        )
+        queued = core._enqueue_scope(full=True, delivery_id="scope-a")
         first = core._claim_scope()
-        second = core._claim_scope()
 
         requeued = core._requeue_scope(
-            second["id"],
+            first["id"],
             "scope_retryable",
-            second["claim_token"],
+            first["claim_token"],
         )
-        acknowledged = core._ack_scope(first["id"], first["claim_token"])
 
         assert requeued["status"] == "requeued"
-        assert requeued["next_wake"]["reason"] == "no_eligible_scope"
-        assert acknowledged["status"] == "acknowledged"
-        assert acknowledged["next_wake"]["reason"] == "no_eligible_scope"
+        assert requeued["next_wake"]["accepted"] is True
+        assert requeued["next_wake"]["mode"] == "delayed"
         assert wakes == []
+
+        _wait_for(lambda: len(wakes) == 1, timeout=2.5)
+        assert wakes == ["wake"]
+
+        reclaimed = core._claim_scope()
+        assert reclaimed["id"] == queued["id"]
+        assert reclaimed["attempts"] == 1
 
 
 def test_requeue_chains_wake_for_other_eligible_scope() -> None:
@@ -230,6 +229,7 @@ def test_startup_recovery_wakes_existing_eligible_scope_without_full_enqueue() -
         )
 
         assert result["accepted"] is True
+        assert result["mode"] == "immediate"
         assert wakes == ["wake"]
         state = core._load_state_unlocked()
         assert len(state["scope_queue"]) == 1
@@ -250,7 +250,95 @@ def test_startup_recovery_skips_empty_queue() -> None:
             delay_seconds=0,
         )
 
-        assert result == {"skipped": True, "reason": "no_eligible_scope"}
+        assert result == {"skipped": True, "reason": "queue_empty"}
+        assert wakes == []
+
+
+def test_startup_recovery_reschedules_future_not_before_without_full_enqueue() -> None:
+    entrypoint = _entrypoint()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        original_core = entrypoint._load_core()
+        _configure_router_state(original_core, root)
+        original_core.SCOPE_RETRY_BACKOFF_SECONDS = (1, 1)
+        queued = original_core._enqueue_scope(
+            full=False,
+            repository="rhgo1749/ctrl-hangul",
+            delivery_id="restart-future",
+        )
+        claimed = original_core._claim_scope()
+        requeued = original_core._requeue_scope(
+            claimed["id"],
+            "scope_retryable",
+            claimed["claim_token"],
+        )
+        assert requeued["status"] == "requeued"
+
+        restarted_entrypoint = _entrypoint()
+        restarted_core = restarted_entrypoint._load_core()
+        _configure_router_state(restarted_core, root)
+        wakes = _wake_recorder(restarted_core)
+
+        result = restarted_entrypoint._startup_queue_recovery(
+            restarted_core,
+            attempts=1,
+            delay_seconds=0,
+        )
+
+        assert result["skipped"] is False
+        assert result["accepted"] is True
+        assert result["mode"] == "delayed"
+        assert wakes == []
+        state = restarted_core._load_state_unlocked()
+        assert len(state["scope_queue"]) == 1
+        assert state["scope_queue"][0]["id"] == queued["id"]
+        assert state["scope_queue"][0]["mode"] == "event"
+
+        _wait_for(lambda: len(wakes) == 1, timeout=2.5)
+        assert wakes == ["wake"]
+
+
+def test_duplicate_future_wake_hints_coalesce_to_one_thread() -> None:
+    entrypoint = _entrypoint()
+    with tempfile.TemporaryDirectory() as td:
+        core = entrypoint._load_core()
+        _configure_router_state(core, Path(td))
+        wakes = _wake_recorder(core)
+        core._enqueue_scope(full=True, delivery_id="coalesced-delayed")
+        deadline = int(time.time()) + 1
+
+        first = entrypoint._schedule_delayed_scope_wake(core, deadline)
+        second = entrypoint._schedule_delayed_scope_wake(core, deadline)
+
+        assert first["coalesced"] is False
+        assert second["coalesced"] is True
+        assert wakes == []
+        _wait_for(lambda: len(wakes) == 1, timeout=2.5)
+        assert wakes == ["wake"]
+
+
+def test_stale_delayed_wake_fresh_reads_empty_queue_and_noops() -> None:
+    entrypoint = _entrypoint()
+    with tempfile.TemporaryDirectory() as td:
+        core = entrypoint._load_core()
+        _configure_router_state(core, Path(td))
+        wakes = _wake_recorder(core)
+        queued = core._enqueue_scope(full=True, delivery_id="stale-delayed")
+
+        scheduled = entrypoint._schedule_delayed_scope_wake(
+            core,
+            int(time.time()) + 1,
+        )
+        assert scheduled["accepted"] is True
+        assert scheduled["mode"] == "delayed"
+
+        claimed = core._claim_scope()
+        assert claimed["id"] == queued["id"]
+        acknowledged = core._ack_scope(claimed["id"], claimed["claim_token"])
+        assert acknowledged["status"] == "acknowledged"
+        assert core._queue_status()["queued_scopes"] == 0
+
+        time.sleep(1.2)
         assert wakes == []
 
 

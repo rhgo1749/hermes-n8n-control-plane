@@ -32,7 +32,7 @@ Make accepted GitHub intake/rework work converge from durable state even when vo
 
 - CtrlHangul PR #115 received a fresh maintainer `agent-rework` on 2026-09-15, while a repository-scoped intake event was also arriving.
 - Live router evidence showed the CtrlHangul durable scope still queued with `attempts=0`, no in-flight claim, an idle actuator, and a paused lease after another scope had completed.
-- Current intake invocation claims exactly one queued scope; fresh ACK/requeue does not chain another wake.
+- Current intake invocation claims exactly one queued scope. The first hotfix draft chained only work eligible at that instant; a sole retry scope with future `not_before` could therefore remain stranded until another event or the hourly safety wake.
 - Lease `/trigger` persists `pending` and then relies on a daemon background thread; current startup has no resume for an accepted persisted `pending` trigger.
 - Managed PR rework/merge uses the low-latency n8n → fixed edge actuator path. Intake and edge-sync share the actuator `_RUN_LOCK`; a busy failure is retryable externally but has no durable repository-scoped internal fallback.
 - Exact historical thread/process loss cannot be proven from retained logs. The implementation targets the confirmed liveness gaps rather than claiming an unobserved failure line.
@@ -45,8 +45,8 @@ Host/network exposure: `NONE`.
 
 ## 3. In scope
 
-1. Chain exactly one canonical wake after a fresh ACK/requeue/pending transition when another eligible durable scope remains.
-2. Recover an already-durable eligible queue once at router startup without creating an immediate full scan.
+1. After a fresh ACK/requeue/pending transition, derive the earliest durable queue `not_before`: wake immediately when due, otherwise install one coalesced one-shot wake for that deadline.
+2. At router startup, recover the earliest already-durable queue deadline without creating an immediate full scan; future deadlines must be re-scheduled from durable state.
 3. Resume the latest persisted lease-controller `pending` trigger on controller startup; do not replay active/paused/failed leases.
 4. Boundedly retry the fixed actuator's `409` busy response inside the existing serialized lease trigger instead of immediately abandoning the accepted wake.
 5. If a supported managed PR direct edge wake fails, preserve it as the existing repository-scoped durable intake scope and wake canonical intake; later reconciliation must fresh-read GitHub.
@@ -65,8 +65,9 @@ Host/network exposure: `NONE`.
 ## 5. Implementation requirements
 
 - Preserve one-claim-per-intake-invocation isolation and existing claim fencing/backoff/pending semantics.
-- A chained wake happens only after the scope transition is durably committed. Queue read-back/wake failure must not roll back or falsify the committed transition.
-- Startup queue recovery is bounded and only runs when an eligible durable scope already exists; it must not enqueue a full scope.
+- A chained wake or delayed reservation happens only after the scope transition is durably committed. Queue read-back/wake failure must not roll back or falsify the committed transition.
+- Delayed retry liveness is a volatile one-shot hint derived from the durable queue, not a polling scheduler or new state store. Coalesce future hints to the earliest in-process deadline; at firing time fresh-read the queue, no-op if the work was already consumed, and re-schedule only if the durable earliest `not_before` moved later.
+- Startup queue recovery is bounded, reads the earliest durable `not_before`, and must not enqueue a full scope. An eligible deadline wakes immediately; a future deadline installs the same one-shot so process restart reconstructs a lost volatile timer from durable state.
 - Pending-lease recovery reuses the fixed actuator and existing `_TRIGGER_LOCK`; persisted non-pending lease states are not replayed.
 - Actuator `409` contention recovery must be finite and serialized. Exhaustion remains an explicit failed lease, not an infinite retry loop.
 - PR durable defer is allowed only for the existing supported edge events: merged PR and trusted `agent-rework`. Unsupported PR events keep existing behavior.
@@ -79,6 +80,7 @@ Required repository-local validation:
 
 ```bash
 python3 tests/test_intake_wake_liveness.py
+pytest -q tests/test_intake_wake_liveness.py
 python3 tests/test_github_router_completion_comment_wake.py
 python3 tests/test_periodic_full_intake_fallback.py
 python3 tests/test_github_router.py
