@@ -32,6 +32,7 @@ _DEFAULT_FALLBACK_INTERVAL_SECONDS = 3600
 _MIN_FALLBACK_INTERVAL_SECONDS = 300
 _STARTUP_RECOVERY_ATTEMPTS = 3
 _STARTUP_RECOVERY_DELAY_SECONDS = 1.0
+_STARTUP_RECOVERY_INITIAL_DELAY_SECONDS = 1.0
 
 
 def _load_core() -> ModuleType:
@@ -401,6 +402,31 @@ def _startup_queue_recovery(
     }
 
 
+def _startup_queue_recovery_background(
+    core: ModuleType,
+    *,
+    initial_delay_seconds: float = _STARTUP_RECOVERY_INITIAL_DELAY_SECONDS,
+) -> None:
+    """Let the router bind first, then recover only already-durable work."""
+    time.sleep(max(0.0, initial_delay_seconds))
+    try:
+        recovery = _startup_queue_recovery(core)
+    except Exception as exc:  # noqa: BLE001 - periodic fallback remains available
+        print(
+            "github-router startup queue recovery warning: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return
+    print(
+        "github-router startup queue recovery "
+        f"skipped={bool(recovery.get('skipped'))} "
+        f"accepted={bool(recovery.get('accepted'))} "
+        f"reason={recovery.get('reason', '')}",
+        flush=True,
+    )
+
+
 _core = install(_load_core())
 
 
@@ -410,14 +436,12 @@ def __getattr__(name: str):
 
 def main() -> int:
     interval = _fallback_interval_seconds()
-    recovery = _startup_queue_recovery(_core)
-    print(
-        "github-router startup queue recovery "
-        f"skipped={bool(recovery.get('skipped'))} "
-        f"accepted={bool(recovery.get('accepted'))} "
-        f"reason={recovery.get('reason', '')}",
-        flush=True,
-    )
+    threading.Thread(
+        target=_startup_queue_recovery_background,
+        args=(_core,),
+        daemon=True,
+        name="github-router-startup-queue-recovery",
+    ).start()
     threading.Thread(
         target=_periodic_full_intake_loop,
         args=(_core, interval),
