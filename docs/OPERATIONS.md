@@ -175,6 +175,9 @@ docker exec hermes-cloudcli-agent bash -lc '
     --hermes-bin /home/hermes/.local/bin/hermes &&
   automation/hermes/scripts/install-github-completion-dispatch-safety-wake.sh \
     --hermes-home /home/hermes/.hermes \
+    --hermes-bin /home/hermes/.local/bin/hermes &&
+  automation/hermes/scripts/install-kanban-protocol-loop-guard.sh \
+    --hermes-home /home/hermes/.hermes \
     --hermes-bin /home/hermes/.local/bin/hermes
 '
 ```
@@ -184,6 +187,13 @@ atomic plugin-directory switch, retains a timestamped backup, enables only the
 named primary plugin, and prints rollback commands. The safety-wake installer
 installs/enables only its bounded companion plugin; it requires the primary
 completion plugin and deployed edge runtime to be present.
+`install-kanban-protocol-loop-guard.sh` independently installs the H4V3 retry
+safety observer. It does not modify Hermes core: clean-exit lifecycle protocol
+violations are observed on `on_kanban_worker_exited`, max-runtime timeouts are
+observed on `on_kanban_dispatch_tick`, and five consecutive failures across
+those two classes are converted to one explicit sticky operator block.
+`rate_limited` runs do not consume or break that safety streak. Restart the
+long-lived gateway/dispatcher after installing or updating this plugin.
 
 ### 4b. Intake/edge lifecycle-guard deployment and recovery
 

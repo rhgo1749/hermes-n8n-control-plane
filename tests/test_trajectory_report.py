@@ -571,7 +571,7 @@ def _search_run(
         "budget": {
             "max_candidates": 2,
             "max_expansions": 1,
-            "max_runtime_seconds": 900,
+            "max_runtime_seconds": 1800,
             "max_retries": 2,
             "max_total_tokens": 32000,
         },
@@ -725,20 +725,20 @@ def test_search_projection_aggregates_retry_runs_and_uses_latest_authoritative_m
         {
             "max_candidates": 0,
             "max_expansions": 1,
-            "max_runtime_seconds": 900,
+            "max_runtime_seconds": 1800,
             "max_total_tokens": 32000,
             "max_retries": 2,
         },
         {
             "max_candidates": 2,
             "max_expansions": 1,
-            "max_runtime_seconds": 900,
+            "max_runtime_seconds": 1800,
             "max_total_tokens": 32000,
         },
         {
             "max_candidates": 2,
             "max_expansions": 1,
-            "max_runtime_seconds": 900,
+            "max_runtime_seconds": 1800,
             "max_total_tokens": 32001,
             "max_retries": 2,
         },
@@ -771,7 +771,7 @@ def test_search_projection_marks_missing_or_invalid_budget_non_compliant(
         ("max_total_tokens", "32000"),
         ("max_total_tokens", 32000.5),
         ("max_total_tokens", True),
-        ("max_runtime_seconds", "900"),
+        ("max_runtime_seconds", "1800"),
     ],
     ids=["string-tokens", "float-tokens", "bool-tokens", "string-runtime"],
 )

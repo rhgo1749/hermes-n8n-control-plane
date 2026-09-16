@@ -287,7 +287,7 @@ def _search_create_input(
     candidate_id: str = "A",
     candidate_task_ids: list[str] | None = None,
     parents: list[str] | None = None,
-    max_runtime_seconds: int | None = 900,
+    max_runtime_seconds: int | None = 1800,
     max_candidates: int = 2,
     max_expansions: int = 1,
     max_total_tokens: int = 32000,
@@ -309,6 +309,7 @@ def _search_create_input(
         "assignee": "kanban-investigator" if phase == "candidate" else "kanban-main",
         "parents": parents or ([] if phase == "candidate" else ["candidate-a", "candidate-b"]),
         "max_runtime_seconds": max_runtime_seconds,
+        "max_retries": 5,
         "idempotency_key": idempotency_key,
         "investigation_search": {
             "schema_id": "h4v3-investigation-search-v1",
@@ -323,7 +324,7 @@ def _search_create_input(
             "budget": {
                 "max_candidates": max_candidates,
                 "max_expansions": max_expansions,
-                "max_runtime_seconds": 900,
+                "max_runtime_seconds": 1800,
                 "max_total_tokens": max_total_tokens,
                 "max_retries": max_retries,
             },
@@ -673,7 +674,7 @@ def test_bounded_search_guard_binds_terminal_surface_and_rejects_unmarked_bypass
             "tool_input": {
                 "command": (
                     "hermes kanban create candidate-b --assignee kanban-investigator "
-                    f"--body {body} --max-runtime 15m --max-retries 2 "
+                    f"--body {body} --max-runtime 30m --max-retries 5 "
                     "--idempotency-key candidate-b"
                 ),
             },
@@ -710,7 +711,7 @@ def test_bounded_search_guard_fails_closed_on_conflicting_duplicate_terminal_opt
     marker_body = shlex.quote(json.dumps({"investigation_search": marker}))
     command = (
         "hermes kanban create candidate-b --assignee kanban-investigator "
-        f"--body {marker_body} --max-runtime 15m --max-retries 2 "
+        f"--body {marker_body} --max-runtime 30m --max-retries 5 "
         "--idempotency-key candidate-b"
     )
     if option == "--body":

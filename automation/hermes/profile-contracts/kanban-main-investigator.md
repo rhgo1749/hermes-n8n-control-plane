@@ -132,6 +132,18 @@ admission function. Missing, zero, non-numeric, inconsistent, or exhausted
 values fail closed. Prompt wording, `goal_max_turns`, and post-run telemetry
 are not token/retry enforcement and must never be used as substitutes.
 
+### Slow-local worker runtime and retry policy
+
+All newly created H4V3 execution cards must carry an explicit dispatcher wall-time
+cap and `max_retries=5`; do not leave either field unset. Use 1800 seconds (30
+minutes) for Investigator candidates and bounded Main selectors, 3600 seconds (60
+minutes) for Developer/Reviewer/Designer work, and 5400 seconds (90 minutes) only
+for an explicitly large implementation whose task body records `runtime_class=large`.
+A max-runtime timeout and a clean-exit lifecycle protocol violation both consume the
+same five-attempt safety budget; rate-limit exits do not. Do not shorten these values
+merely because a cloud model would finish faster: the production local model may spend
+several minutes in one reasoning/tool round.
+
 The selector rejects contradictory, duplicate/non-independent, LOW, or
 closure-incomplete candidates. Among remaining candidates it records an
 evidence-based comparison of failure-boundary fit, preserved contracts,

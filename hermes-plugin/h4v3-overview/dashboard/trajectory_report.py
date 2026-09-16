@@ -287,7 +287,7 @@ def _investigation_search_budget_validation(
         values["max_candidates"] != 2
         or values["max_expansions"] != 1
         or values["max_total_tokens"] > 32_000
-        or values["max_runtime_seconds"] > 900
+        or values["max_runtime_seconds"] > 1800
         or values["max_retries"] != 2
     ):
         return values, "non_compliant"

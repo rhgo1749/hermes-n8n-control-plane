@@ -46,7 +46,7 @@
 
 ## Budget gate
 
-Fan-out is hard-capped at exactly two candidates and one expansion. The canonical lifecycle guard now records an atomic admission event in the existing root task's `task_events` ledger before each candidate mutation: each candidate reserves `ceil(max_total_tokens / 2)` tokens and one retry, with `max_total_tokens<=32000`, `max_retries=2`, and `max_runtime_seconds<=900`. The existing dispatcher enforces the per-task runtime cap; prompt wording, `goal_max_turns`, and post-run telemetry are not substitutes. Admission is keyed by `search_id`, root task, candidate identity, and idempotency key; exhaustion fails closed before mutation. The trajectory report treats missing or malformed budget as unavailable/non-compliant rather than inferring compliance.
+Fan-out is hard-capped at exactly two candidates and one expansion. The canonical lifecycle guard now records an atomic admission event in the existing root task's `task_events` ledger before each candidate mutation: each candidate reserves `ceil(max_total_tokens / 2)` tokens and one retry, with `max_total_tokens<=32000`, `max_retries=2`, and `max_runtime_seconds<=1800`. The existing dispatcher enforces the per-task runtime cap; prompt wording, `goal_max_turns`, and post-run telemetry are not substitutes. Admission is keyed by `search_id`, root task, candidate identity, and idempotency key; exhaustion fails closed before mutation. The trajectory report treats missing or malformed budget as unavailable/non-compliant rather than inferring compliance.
 
 ## Required validation
 
@@ -67,3 +67,10 @@ Implementation worker stops after local evidence and PR publication/current-stat
 - Repair boundary: H4V3 guard only; Hermes core remains unchanged. For native structured `kanban_create`, recover the direct dispatcher worker identity only when the hook carries a normal one-shot turn UUID and the canonical board proves one live task with the exact workspace, worker PID, and current run. Delegate-task identities (`sa-*`) do not recover the parent task.
 - Validation: bounded-search guard `20 passed`; completion/parser/workspace guard suite `305 passed`; Investigator/trajectory suite `42 passed`; changed Python `py_compile`, deployer dry-run, live apply, source/live SHA-256 read-back, six hook-config semantic read-back, and no deploy-candidate residue all passed.
 - Runtime configuration follow-up is intentionally outside Hermes core: all five H4V3 Kanban profiles use `approvals.single_query_mode=approve` and `terminal.timeout=180` so unattended `chat -q` workers do not dead-end on ordinary approval prompts or zero-second file-operation timeouts. Hardline approval floors and H4V3 fail-closed lifecycle guards remain active.
+
+## 2026-09-17 slow-local runtime hotfix
+
+- Bounded Investigator candidate/selector wall time is raised from 900s to 1800s for the local production model.
+- The search admission budget remains two candidate retry reservations (`budget.max_retries=2`); this is distinct from the actual Kanban task breaker, which is now explicitly `max_retries=5`.
+- Main creates Developer/Reviewer/Designer work with a 3600s cap by default and uses 5400s only when the task body explicitly records `runtime_class=large`.
+- The repository-owned Kanban loop guard treats max-runtime timeouts and clean-exit protocol violations as the same five-attempt safety class; rate-limit exits remain excluded. Hermes core is unchanged.

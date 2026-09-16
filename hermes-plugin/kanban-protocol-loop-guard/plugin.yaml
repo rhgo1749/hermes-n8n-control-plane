@@ -1,0 +1,11 @@
+name: kanban-protocol-loop-guard
+version: "1.1.0"
+description: "Bound repeated Kanban timeout/protocol failures without modifying Hermes core."
+author: hermes-n8n-control-plane
+kind: standalone
+hooks:
+  - on_kanban_worker_exited
+  - on_kanban_dispatch_tick
+provides_hooks:
+  - on_kanban_worker_exited
+  - on_kanban_dispatch_tick

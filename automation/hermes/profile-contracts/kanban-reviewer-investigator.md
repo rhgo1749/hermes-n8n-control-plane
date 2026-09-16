@@ -32,3 +32,11 @@ Never infer model refresh from the word `REWORK`, a high rework count, or a
 generic failed run. Do not create rework tasks or GitHub `agent-rework`; those
 remain Main and edge responsibilities. A missing/ambiguous classification is
 `UNKNOWN` and must not be treated as a direct Developer rework authorization.
+
+## Worker runtime budget
+
+The creating Main task should give this specialist `max_retries=5` and a 3600-second
+wall-time cap. A 5400-second cap is reserved for an explicitly large implementation
+whose task body records `runtime_class=large`; ordinary work must not silently become
+unbounded. A max-runtime timeout consumes the same five-attempt retry safety budget as
+a lifecycle protocol violation.

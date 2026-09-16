@@ -33,7 +33,7 @@ values fails closed before admission because argparse would mutate with
 the last value while the admitted payload could describe another. The
 ledger atomically
 reserves two candidate slots, a 32000-token cumulative budget, two retry
-reservations, and a 900-second dispatcher cap. Reassignment reads only the
+reservations, and a 1800-second dispatcher cap. Reassignment reads only the
 canonical task row; unreadable/ambiguous state fails closed and is never
 rewritten by this guard.
 
@@ -73,7 +73,8 @@ _INVESTIGATION_SEARCH_MAX_CANDIDATES = 2
 _INVESTIGATION_SEARCH_MAX_EXPANSIONS = 1
 _INVESTIGATION_SEARCH_MAX_TOTAL_TOKENS = 32_000
 _INVESTIGATION_SEARCH_MAX_RETRIES = 2
-_INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS = 900
+_INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS = 1800
+_KANBAN_TASK_RETRY_LIMIT = 5
 _INVESTIGATION_SEARCH_TRIGGER_CODES = frozenset(
     {
         "LOW_CONFIDENCE_OR_BLOCKING_UNKNOWN",
@@ -1007,7 +1008,7 @@ def _search_budget(marker: Mapping[str, Any]) -> tuple[dict[str, int] | None, st
     if parsed["max_retries"] != _INVESTIGATION_SEARCH_MAX_RETRIES:
         return None, "budget.max_retries must be exactly two cumulative retry reservations"
     if parsed["max_runtime_seconds"] > _INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS:
-        return None, "budget.max_runtime_seconds exceeds the 900-second search cap"
+        return None, "budget.max_runtime_seconds exceeds the 1800-second search cap"
     return parsed, None
 
 
@@ -1725,15 +1726,15 @@ def _evaluate_investigation_search_create(
     if budget_error is not None or budget is None:
         return _search_block(budget_error or "the bounded budget is invalid", assignee)
     raw_runtime = raw_input.get("max_runtime_seconds")
-    if raw_runtime is not None and raw_runtime != budget["max_runtime_seconds"]:
+    if not _positive_int(raw_runtime) or raw_runtime != budget["max_runtime_seconds"]:
         return _search_block(
-            "max_runtime_seconds must match the declared bounded budget",
+            "max_runtime_seconds must be present and match the declared bounded budget",
             assignee,
         )
     raw_retries = raw_input.get("max_retries")
-    if raw_retries is not None and raw_retries != budget["max_retries"]:
+    if raw_retries != _KANBAN_TASK_RETRY_LIMIT:
         return _search_block(
-            "max_retries must match the declared cumulative retry budget",
+            "task max_retries must be exactly five so timeout/protocol retry loops share the same safety limit",
             assignee,
         )
     expansion_count = marker.get("expansion_count", 0)
@@ -1747,12 +1748,6 @@ def _evaluate_investigation_search_create(
         if assignee != "kanban-investigator" or candidate_id not in _INVESTIGATION_SEARCH_CANDIDATES:
             return _search_block(
                 "candidate_id must be A or B and the assignee must be kanban-investigator",
-                assignee,
-            )
-        runtime = raw_input.get("max_runtime_seconds")
-        if not _positive_int(runtime) or runtime != budget["max_runtime_seconds"]:
-            return _search_block(
-                "each candidate requires a matching positive dispatcher-enforced max_runtime_seconds",
                 assignee,
             )
         if not _nonempty_string(raw_input.get("idempotency_key")):
