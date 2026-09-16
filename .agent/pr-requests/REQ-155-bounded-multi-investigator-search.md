@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#155`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/155
-- Kanban task ID: `t_5b9947dd` (root: `t_41397dad`, Investigator: `t_54669e81`)
+- Kanban task ID: `t_5b9947dd` (root: `t_41397dad`, Investigator: `t_54669e81`; bounded-admission rework: `t_e55b55bb`)
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:155`
 - Planning/lead owner: `kanban-main`
 - Implementation owner: `kanban-developer`
@@ -46,7 +46,7 @@
 
 ## Budget gate
 
-Fan-out is hard-capped at exactly two candidates and one expansion. `max_runtime_seconds` is the existing dispatcher-enforced per-task cap; `max_retries` is only treated as enforced when the canonical creation/runtime surface durably admits it. The current structured Hermes tool schema has no cumulative per-task token field, and numeric token/runtime/retry policy is not supplied by Issue #155. Until an authorized runtime admission mechanism and numeric operator policy exist, Main must fail closed instead of calling prompt wording or telemetry a hard token/retry cap; this remains an explicit operator/manual gate.
+Fan-out is hard-capped at exactly two candidates and one expansion. The canonical lifecycle guard now records an atomic admission event in the existing root task's `task_events` ledger before each candidate mutation: each candidate reserves `ceil(max_total_tokens / 2)` tokens and one retry, with `max_total_tokens<=32000`, `max_retries=2`, and `max_runtime_seconds<=900`. The existing dispatcher enforces the per-task runtime cap; prompt wording, `goal_max_turns`, and post-run telemetry are not substitutes. Admission is keyed by `search_id`, root task, candidate identity, and idempotency key; exhaustion fails closed before mutation. The trajectory report treats missing or malformed budget as unavailable/non-compliant rather than inferring compliance.
 
 ## Required validation
 

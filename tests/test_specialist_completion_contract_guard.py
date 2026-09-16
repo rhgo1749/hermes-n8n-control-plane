@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -229,6 +230,52 @@ def test_structured_specialists_reject_repository_contract() -> None:
         _assert_blocked(result, assignee)
 
 
+def _search_admission_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                assignee TEXT,
+                idempotency_key TEXT
+            );
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT,
+                run_id INTEGER,
+                kind TEXT,
+                payload TEXT,
+                created_at INTEGER
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO tasks VALUES (?, ?, ?)",
+            [
+                ("root", "kanban-main", "root-key"),
+                ("candidate-a", "kanban-investigator", "candidate-a"),
+                ("candidate-b", "kanban-investigator", "candidate-b"),
+                ("selector", "kanban-main", "selector"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO task_links VALUES (?, ?)",
+            [("root", "candidate-a"), ("root", "candidate-b"), ("root", "selector")],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _search_env(path: Path, current_task_id: str = "root") -> dict[str, str]:
+    return {
+        "HERMES_KANBAN_DB": str(path),
+        "HERMES_KANBAN_TASK": current_task_id,
+    }
+
+
 def _search_create_input(
     *,
     phase: str = "candidate",
@@ -238,22 +285,44 @@ def _search_create_input(
     max_runtime_seconds: int | None = 900,
     max_candidates: int = 2,
     max_expansions: int = 1,
+    max_total_tokens: int = 32000,
+    max_retries: int = 2,
+    root_task_id: str = "root",
+    search_id: str = "search-155",
+    idempotency_key: str | None = None,
+    expansion_count: int = 0,
+    selection_status: str | None = None,
 ) -> dict[str, Any]:
+    if idempotency_key is None:
+        idempotency_key = "selector" if phase == "selector" else f"candidate-{candidate_id.lower()}"
+    marker_fields: dict[str, Any] = {}
+    if selection_status is not None:
+        marker_fields["selection_status"] = selection_status
     return {
         "title": "bounded investigation search phase",
+        "workspace_kind": "worktree",
         "assignee": "kanban-investigator" if phase == "candidate" else "kanban-main",
         "parents": parents or ([] if phase == "candidate" else ["candidate-a", "candidate-b"]),
         "max_runtime_seconds": max_runtime_seconds,
+        "idempotency_key": idempotency_key,
         "investigation_search": {
             "schema_id": "h4v3-investigation-search-v1",
-            "search_id": "search-155",
+            "search_id": search_id,
+            "root_task_id": root_task_id,
+            "idempotency_key": idempotency_key,
             "phase": phase,
+            "trigger_codes": ["RUNTIME_TEST_CONTRADICTION"],
+            "expansion_count": expansion_count,
             "candidate_id": candidate_id,
             "candidate_task_ids": candidate_task_ids or ["candidate-a", "candidate-b"],
             "budget": {
                 "max_candidates": max_candidates,
                 "max_expansions": max_expansions,
+                "max_runtime_seconds": 900,
+                "max_total_tokens": max_total_tokens,
+                "max_retries": max_retries,
             },
+            **marker_fields,
         },
     }
 
@@ -269,6 +338,37 @@ def test_bounded_search_guard_rejects_candidate_c_before_mutation() -> None:
     assert "No task mutation was performed" in result.stdout
 
 
+
+def test_bounded_search_guard_requires_marker_and_tool_idempotency_match(tmp_path: Path) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    tool_input = _search_create_input(candidate_id="A")
+    tool_input["idempotency_key"] = "tool-does-not-match-marker"
+    result = _run(
+        {"tool_name": "kanban_create", "tool_input": tool_input},
+        env_updates=_search_env(db),
+        guard_path=COMPLETION_GUARD,
+    )
+    assert result.returncode == 2
+    assert "matching marker/tool idempotency_key" in json.loads(result.stdout)["message"]
+
+
+@pytest.mark.parametrize("trigger_codes", [None, ["UNSUPPORTED_TRIGGER"]])
+def test_bounded_search_guard_requires_explicit_authorized_trigger(
+    trigger_codes: list[str] | None,
+) -> None:
+    tool_input = _search_create_input()
+    if trigger_codes is None:
+        del tool_input["investigation_search"]["trigger_codes"]
+    else:
+        tool_input["investigation_search"]["trigger_codes"] = trigger_codes
+    result = _run(
+        {"tool_name": "kanban_create", "tool_input": tool_input},
+    )
+    assert result.returncode == 2
+    assert "investigation trigger code" in json.loads(result.stdout)["message"]
+
+
 def test_bounded_search_guard_requires_dispatcher_time_cap() -> None:
     result = _run({
         "tool_name": "kanban_create",
@@ -279,14 +379,16 @@ def test_bounded_search_guard_requires_dispatcher_time_cap() -> None:
     assert "max_runtime_seconds" in json.loads(result.stdout)["message"]
 
 
-def test_bounded_search_guard_holds_missing_token_retry_admission() -> None:
+def test_bounded_search_guard_requires_durable_search_context() -> None:
     result = _run({
         "tool_name": "kanban_create",
         "tool_input": _search_create_input(),
     })
 
     assert result.returncode == 2, (result.stdout, result.stderr)
-    assert "cumulative token/retry admission" in json.loads(result.stdout)["message"]
+    message = json.loads(result.stdout)["message"]
+    assert "current durable task context" in message
+    assert "No task mutation was performed" in message
 
 
 def test_bounded_search_guard_requires_exact_selector_fan_in() -> None:
@@ -300,6 +402,310 @@ def test_bounded_search_guard_requires_exact_selector_fan_in() -> None:
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "exactly two distinct candidate task IDs" in json.loads(result.stdout)["message"]
 
+
+
+def test_bounded_search_guard_admits_two_candidates_and_selector_once(tmp_path: Path) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    first = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    second = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="B")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    assert second.returncode == 0, (second.stdout, second.stderr)
+
+    duplicate = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A", idempotency_key="other-a")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert duplicate.returncode == 2
+    assert "different idempotency key" in json.loads(duplicate.stdout)["message"]
+
+    selector = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(phase="selector")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert selector.returncode == 0, (selector.stdout, selector.stderr)
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT kind FROM task_events ORDER BY id"
+        ).fetchall()
+    assert [row[0] for row in rows] == [
+        "investigation_search_admission",
+        "investigation_search_candidate_admitted",
+        "investigation_search_candidate_admitted",
+        "investigation_search_selector_admitted",
+    ]
+
+
+
+def test_bounded_search_guard_allows_one_selector_expansion_then_closes_search(tmp_path: Path) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    root_env = _search_env(db)
+    first = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=root_env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+
+    selector_env = _search_env(db, "selector")
+    pending = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(
+                phase="selector",
+                candidate_task_ids=["candidate-a"],
+                parents=["candidate-a"],
+                selection_status="awaiting_expansion",
+                idempotency_key="selector-pending",
+            ),
+        },
+        env_updates=selector_env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert pending.returncode == 0, (pending.stdout, pending.stderr)
+
+    second = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="B")},
+        env_updates=selector_env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert second.returncode == 0, (second.stdout, second.stderr)
+
+    final = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(
+                phase="selector",
+                expansion_count=1,
+                idempotency_key="selector-final",
+            ),
+        },
+        env_updates=selector_env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert final.returncode == 0, (final.stdout, final.stderr)
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT kind, payload FROM task_events ORDER BY id"
+        ).fetchall()
+    assert [row[0] for row in rows] == [
+        "investigation_search_admission",
+        "investigation_search_candidate_admitted",
+        "investigation_search_selector_admitted",
+        "investigation_search_candidate_admitted",
+        "investigation_search_selector_admitted",
+    ]
+    assert json.loads(rows[2][1])["state"] == "pending"
+    assert json.loads(rows[4][1])["state"] == "closed"
+
+
+def test_bounded_search_guard_allows_selector_to_accept_a_without_expansion(tmp_path: Path) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    first = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+
+    selector = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(
+                phase="selector",
+                candidate_task_ids=["candidate-a"],
+                parents=["candidate-a"],
+                selection_status="selected",
+                idempotency_key="selector-a",
+            ),
+        },
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert selector.returncode == 0, (selector.stdout, selector.stderr)
+
+    with sqlite3.connect(db) as conn:
+        state = conn.execute(
+            "SELECT json_extract(payload, '$.state') FROM task_events "
+            "WHERE kind = 'investigation_search_selector_admitted'"
+        ).fetchone()[0]
+    assert state == "closed"
+
+
+def test_bounded_search_guard_rejects_expansion_without_pending_selector(tmp_path: Path) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    first = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    second = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="B")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    final = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(phase="selector", expansion_count=1),
+        },
+        env_updates=_search_env(db, "selector"),
+        guard_path=COMPLETION_GUARD,
+    )
+    assert final.returncode == 2
+    assert "preceding pending selector" in json.loads(final.stdout)["message"]
+
+
+def test_bounded_search_guard_binds_terminal_surface_and_rejects_unmarked_bypass(tmp_path: Path) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    first = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+
+    marker = _search_create_input(candidate_id="B")["investigation_search"]
+    body = shlex.quote(json.dumps({"investigation_search": marker}))
+    terminal = _run(
+        {
+            "tool_name": "terminal",
+            "tool_input": {
+                "command": (
+                    "hermes kanban create candidate-b --assignee kanban-investigator "
+                    f"--body {body} --max-runtime 15m --max-retries 2 "
+                    "--idempotency-key candidate-b"
+                ),
+            },
+        },
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert terminal.returncode == 0, (terminal.stdout, terminal.stderr)
+
+    bypass = _run(
+        {
+            "tool_name": "terminal",
+            "tool_input": {
+                "command": "hermes kanban create bypass --assignee kanban-investigator",
+            },
+        },
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert bypass.returncode == 2
+    assert "same investigation_search marker" in json.loads(bypass.stdout)["message"]
+
+
+def test_bounded_search_guard_allows_idempotent_candidate_replay_after_selector_close(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    candidate = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert candidate.returncode == 0, (candidate.stdout, candidate.stderr)
+    selector = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(
+                phase="selector",
+                candidate_task_ids=["candidate-a"],
+                parents=["candidate-a"],
+                selection_status="selected",
+                idempotency_key="selector-a",
+            ),
+        },
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert selector.returncode == 0, (selector.stdout, selector.stderr)
+
+    replay = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert replay.returncode == 0, (replay.stdout, replay.stderr)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE kind = 'investigation_search_candidate_admitted'"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "needle"),
+    [
+        ("token_reservation", 32000, "cumulative token admission"),
+        ("retry_reservation", 2, "cumulative retry admission"),
+    ],
+)
+def test_bounded_search_guard_enforces_numeric_cumulative_budget(
+    tmp_path: Path, field: str, value: int, needle: str,
+) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    first = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="A")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE kind = 'investigation_search_candidate_admitted'"
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[1])
+        payload[field] = value
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), row[0]),
+        )
+        conn.commit()
+
+    second = _run(
+        {"tool_name": "kanban_create", "tool_input": _search_create_input(candidate_id="B")},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert second.returncode == 2
+    assert needle in json.loads(second.stdout)["message"]
+    with sqlite3.connect(db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE kind = 'investigation_search_candidate_admitted'"
+        ).fetchone()[0]
+    assert count == 1
 
 def test_structured_specialist_rejects_exact_pr_contract() -> None:
     result = _run(

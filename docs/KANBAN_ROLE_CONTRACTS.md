@@ -119,20 +119,24 @@ Main -> Investigator B ─┘
 ```
 
 Every candidate and selector writes the same explicit marker to durable
-task/run completion metadata. The marker carries `search_id`, `phase`,
-`candidate_id`, trigger codes, candidate task IDs, selected candidate task ID
-or null, `selection_status`, evidence-based comparison/reason, independence
-basis, and the bounded `budget`. Candidate task creation must carry a positive
-dispatcher-enforced `max_runtime_seconds`. Retry and cumulative token limits
-are hard gates only when the canonical runtime durably admits and enforces
-them; a missing structured field or numeric operator policy is a capability
-hold and Main must fail closed. Prompt wording, `goal_max_turns`, and
-post-run telemetry are not cumulative token enforcement.
+task/run completion metadata. The marker carries `schema_id`, `search_id`,
+`root_task_id`, `phase`, a stable `idempotency_key`, `candidate_id`, trigger
+codes, candidate task IDs, selected candidate task ID or null,
+`selection_status`, evidence-based comparison/reason, independence basis, and
+the bounded `budget`. The budget is exact: `max_candidates=2`,
+`max_expansions=1`, positive dispatcher-enforced `max_runtime_seconds<=900`,
+`max_total_tokens<=32000`, and `max_retries=2`. The canonical pre-tool guard
+atomically reserves each candidate's rounded-up token share and one retry in
+the existing root task-event ledger before task mutation; idempotent replays
+do not consume another reservation. Prompt wording, `goal_max_turns`, and
+post-run telemetry are not cumulative token/retry enforcement.
 
-The canonical lifecycle pre-tool guard rejects candidate IDs outside A/B,
-non-matching selector parents, fan-out values other than 2/1, missing candidate
-runtime caps, and unavailable cumulative token/retry admission before task
-mutation. Terminal/wrapper bypasses are covered by the same lifecycle guard.
+The canonical lifecycle guard rejects candidate IDs outside A/B,
+non-matching selector parents, fan-out values other than 2/1, missing runtime
+caps/root/idempotency binding, malformed or exhausted numeric admission, and
+terminal/wrapper bypasses before task mutation. A selector may first be recorded as `selection_status=awaiting_expansion`
+with A only; it may close over A without expansion, or authorize one B
+candidate and then close with a final selector over exactly A and B.
 
 The candidate handoff must expose the applicable closure fields
 `observed_failure`, `root_cause_model`, `generalized_invariant`,

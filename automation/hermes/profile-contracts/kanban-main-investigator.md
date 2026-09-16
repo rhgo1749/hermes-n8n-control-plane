@@ -91,7 +91,8 @@ Main -> Investigator A ─┐
 Main -> Investigator B ─┘
 ```
 
-When the first handoff reveals a trigger, the current selector may perform one
+When the first handoff reveals a trigger, the current selector may either
+close over A (`selection_status=selected`/`no_selection`) or perform one
 bounded expansion by creating B and a final selector over A+B. It must never
 recursively expand, create candidate C, or make Developer ready before the
 final selector is done. The hard fan-out bound is two total candidates and one
@@ -99,29 +100,37 @@ expansion per `search_id`; a duplicate/idempotent replay does not consume a
 new candidate slot.
 
 The canonical lifecycle pre-tool guard consumes the same nested marker on
-`kanban_create`: candidate IDs other than A/B, non-matching selector parents,
-fan-out values other than 2/1, missing candidate runtime caps, and unavailable
-cumulative token/retry admission are rejected before task mutation. Do not
-bypass this guard through terminal or a wrapper.
+`kanban_create` and on executable terminal/wrapper commands. It records an
+atomic admission ledger in the existing `task_events` table before allowing the
+mutation; no second dispatcher or database is involved. Candidate IDs other
+than A/B, non-matching selector parents, fan-out values other than 2/1, missing
+candidate runtime caps, missing root/idempotency binding, and exhausted
+numeric admission are rejected before task mutation. A pending selector may
+name A once (`selection_status=awaiting_expansion`); it may perform exactly
+one B expansion, after which the final selector must name A and B.
 
 Every search task and selector records a nested
 `investigation_search` object with schema `h4v3-investigation-search-v1` in
-durable task/run completion metadata. It includes `search_id`, `candidate_id`
-(`A`/`B` for candidates), `phase` (`candidate`/`selector`), trigger codes,
-candidate task IDs, selected candidate task ID or null, selection status and
-reason, closure comparison, independence basis, and an explicit `budget`.
+durable task/run completion metadata. It includes `search_id`, `root_task_id`, a stable `idempotency_key`,
+`candidate_id` (`A`/`B` for candidates), `phase` (`candidate`/`selector`),
+trigger codes, candidate task IDs, selected candidate task ID or null,
+selection status and reason, closure comparison, independence basis, and an
+explicit `budget`.
 Use task IDs and immutable source-provenance references for identity; never
 copy the other candidate's transcript or handoff into a candidate body.
 
-The budget is an admission contract, not prose: fan-out is exactly two,
-`max_runtime_seconds` is required on every candidate and must be enforced by
-the dispatcher, and retry/token limits must be durably admitted by the
-canonical runtime before a candidate is dispatched. The current structured
-Hermes surface does not expose cumulative per-task tokens; therefore a missing
-or unverified token/retry enforcement surface is a capability hold, not a
-prompt default. Never call prompt wording, `goal_max_turns`, post-run
-telemetry, or a missing value a hard cumulative token cap. Main must fail closed
-instead of dispatching an unbounded candidate.
+The budget is a numeric admission contract, not prose. Every marker must carry
+`max_candidates=2`, `max_expansions=1`, a positive `max_runtime_seconds` no
+larger than 900, `max_total_tokens` no larger than 32000, and
+`max_retries=2`. The guard reserves half of the cumulative token budget (rounded
+up) and one retry reservation per candidate in the existing task-event ledger;
+concurrent/replayed requests use the same transaction and idempotency key.
+`max_runtime_seconds` remains the real dispatcher wall-time cap. Structured
+requests and terminal commands must carry the same marker, root task ID, and
+stable idempotency key; terminal JSON bodies are normalized into the same
+admission function. Missing, zero, non-numeric, inconsistent, or exhausted
+values fail closed. Prompt wording, `goal_max_turns`, and post-run telemetry
+are not token/retry enforcement and must never be used as substitutes.
 
 The selector rejects contradictory, duplicate/non-independent, LOW, or
 closure-incomplete candidates. Among remaining candidates it records an

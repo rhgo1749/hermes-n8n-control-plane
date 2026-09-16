@@ -26,9 +26,12 @@ The structured ``kanban_create`` tool is the canonical creation path. The
 bypasses without treating quoted documentation or echo/printf data as commands.
 Unsupported shell grouping is not flattened into the supported command-chain
 grammar: a relevant mutation inside ``(...)`` or ``{...;}`` fails closed before
-the terminal command can execute. Reassignment reads only the canonical task
-row; unreadable/ambiguous state fails closed and is never rewritten by this
-guard.
+the terminal command can execute. Search candidates and selectors use the same
+canonical task_events admission ledger on every surface; the ledger atomically
+reserves two candidate slots, a 32000-token cumulative budget, two retry
+reservations, and a 900-second dispatcher cap. Reassignment reads only the
+canonical task row; unreadable/ambiguous state fails closed and is never
+rewritten by this guard.
 
 ``evaluate_payload`` is importable by the already-approved lifecycle hook
 wrapper so this policy does not need a second shell-hook command or a second
@@ -59,6 +62,25 @@ LOCAL_ONLY = "local-only"
 _INVESTIGATION_SEARCH_SCHEMA = "h4v3-investigation-search-v1"
 _INVESTIGATION_SEARCH_PHASES = frozenset({"candidate", "selector"})
 _INVESTIGATION_SEARCH_CANDIDATES = frozenset({"A", "B"})
+_INVESTIGATION_SEARCH_ADMISSION_KIND = "investigation_search_admission"
+_INVESTIGATION_SEARCH_CANDIDATE_KIND = "investigation_search_candidate_admitted"
+_INVESTIGATION_SEARCH_SELECTOR_KIND = "investigation_search_selector_admitted"
+_INVESTIGATION_SEARCH_MAX_CANDIDATES = 2
+_INVESTIGATION_SEARCH_MAX_EXPANSIONS = 1
+_INVESTIGATION_SEARCH_MAX_TOTAL_TOKENS = 32_000
+_INVESTIGATION_SEARCH_MAX_RETRIES = 2
+_INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS = 900
+_INVESTIGATION_SEARCH_TRIGGER_CODES = frozenset(
+    {
+        "LOW_CONFIDENCE_OR_BLOCKING_UNKNOWN",
+        "IMPLEMENTATION_OR_REWORK_ROUND_GE_2",
+        "RUNTIME_TEST_CONTRADICTION",
+        "TRUSTED_REVIEWER_MODEL_REFRESH",
+        "COMPETING_BOUNDARIES_UNRESOLVED",
+        "NEW_EQUIVALENCE_CLASS_BYPASS_AFTER_PASS",
+        "ACCEPTANCE_PASS_RUNTIME_ORACLE_FALSE_NEGATIVE",
+    }
+)
 _LOG_PATH = Path(
     os.environ.get(
         "KANBAN_SPECIALIST_COMPLETION_GUARD_LOG",
@@ -925,18 +947,647 @@ def _search_block(message: str, assignee: str) -> int:
     )
 
 
+def _nonempty_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _search_budget(marker: Mapping[str, Any]) -> tuple[dict[str, int] | None, str | None]:
+    budget = marker.get("budget")
+    if not isinstance(budget, Mapping):
+        return None, "an explicit budget object is required"
+    required = (
+        "max_candidates",
+        "max_expansions",
+        "max_runtime_seconds",
+        "max_total_tokens",
+        "max_retries",
+    )
+    parsed: dict[str, int] = {}
+    for field in required:
+        value = budget.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return None, f"budget.{field} must be a positive integer"
+        parsed[field] = value
+    if parsed["max_candidates"] != _INVESTIGATION_SEARCH_MAX_CANDIDATES:
+        return None, "budget.max_candidates must be exactly two"
+    if parsed["max_expansions"] != _INVESTIGATION_SEARCH_MAX_EXPANSIONS:
+        return None, "budget.max_expansions must be exactly one"
+    if parsed["max_total_tokens"] > _INVESTIGATION_SEARCH_MAX_TOTAL_TOKENS:
+        return None, "budget.max_total_tokens exceeds the 32000-token search cap"
+    if parsed["max_retries"] != _INVESTIGATION_SEARCH_MAX_RETRIES:
+        return None, "budget.max_retries must be exactly two cumulative retry reservations"
+    if parsed["max_runtime_seconds"] > _INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS:
+        return None, "budget.max_runtime_seconds exceeds the 900-second search cap"
+    return parsed, None
+
+
+def _search_trigger_error(marker: Mapping[str, Any]) -> str | None:
+    raw_codes = marker.get("trigger_codes")
+    if raw_codes is None:
+        raw_codes = marker.get("triggers")
+    if not isinstance(raw_codes, (list, tuple, set, frozenset)) or not raw_codes:
+        return "at least one explicit investigation trigger code is required"
+    codes = [code.strip() for code in raw_codes if isinstance(code, str) and code.strip()]
+    if len(codes) != len(raw_codes) or any(
+        code not in _INVESTIGATION_SEARCH_TRIGGER_CODES for code in codes
+    ):
+        return "investigation trigger codes must use the canonical bounded-search allowlist"
+    return None
+
+
+def _search_connection(board: str, *, read_only: bool = False) -> sqlite3.Connection:
+    path = _board_db_path(board)
+    if read_only:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2)
+    else:
+        conn = sqlite3.connect(str(path), timeout=2)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _search_require_schema(conn: sqlite3.Connection) -> None:
+    required_tables = {"tasks", "task_links", "task_events"}
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    missing = required_tables - tables
+    if missing:
+        raise RuntimeError(
+            "board DB is missing durable admission tables: " + ", ".join(sorted(missing))
+        )
+    task_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if not {"id", "assignee", "idempotency_key"}.issubset(task_columns):
+        raise RuntimeError("board DB tasks schema cannot bind search tasks")
+    event_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(task_events)")
+    }
+    if not {"task_id", "run_id", "kind", "payload", "created_at"}.issubset(event_columns):
+        raise RuntimeError("board DB task_events schema cannot record search admission")
+
+
+def _search_task_descends_from(
+    conn: sqlite3.Connection, root_task_id: str, task_id: str,
+) -> bool:
+    if root_task_id == task_id:
+        return True
+    pending = [root_task_id]
+    visited = {root_task_id}
+    while pending:
+        parent_id = pending.pop()
+        for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (parent_id,),
+        ):
+            child_id = str(row[0])
+            if child_id == task_id:
+                return True
+            if child_id not in visited:
+                visited.add(child_id)
+                pending.append(child_id)
+    return False
+
+
+def _search_event_payload(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        value = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _search_payload_identity(
+    payload: Mapping[str, Any], *, root_task_id: str, search_id: str,
+) -> bool:
+    return (
+        payload.get("schema_id") == _INVESTIGATION_SEARCH_SCHEMA
+        and payload.get("search_id") == search_id
+        and payload.get("root_task_id") == root_task_id
+    )
+
+
+def _search_validate_admission_payload(
+    payload: Mapping[str, Any], *, root_task_id: str, search_id: str,
+    budget: Mapping[str, int],
+) -> None:
+    if not _search_payload_identity(payload, root_task_id=root_task_id, search_id=search_id):
+        raise RuntimeError("malformed investigation search admission identity")
+    if not _nonempty_string(payload.get("idempotency_key")):
+        raise RuntimeError("investigation search admission is missing its idempotency key")
+    if payload.get("state") != "active" or payload.get("budget") != dict(budget):
+        raise RuntimeError("investigation search admission has inconsistent state or budget")
+
+
+def _search_validate_candidate_events(
+    candidate_events: list[dict[str, Any]], *, root_task_id: str, search_id: str,
+    budget: Mapping[str, int],
+) -> None:
+    candidate_ids: set[str] = set()
+    idempotency_keys: set[str] = set()
+    for payload in candidate_events:
+        if not _search_payload_identity(payload, root_task_id=root_task_id, search_id=search_id):
+            raise RuntimeError("malformed investigation search candidate identity")
+        candidate_id = payload.get("candidate_id")
+        idempotency_key = _nonempty_string(payload.get("idempotency_key"))
+        token_reservation = payload.get("token_reservation")
+        retry_reservation = payload.get("retry_reservation")
+        if candidate_id not in _INVESTIGATION_SEARCH_CANDIDATES:
+            raise RuntimeError("investigation search candidate ledger contains an invalid candidate ID")
+        if not idempotency_key:
+            raise RuntimeError("investigation search candidate ledger is missing an idempotency key")
+        if (
+            not isinstance(token_reservation, int)
+            or isinstance(token_reservation, bool)
+            or token_reservation <= 0
+            or not isinstance(retry_reservation, int)
+            or isinstance(retry_reservation, bool)
+            or retry_reservation <= 0
+        ):
+            raise RuntimeError("investigation search candidate ledger contains an invalid reservation")
+        token_reservation_value = token_reservation
+        retry_reservation_value = retry_reservation
+        if (
+            token_reservation_value > budget["max_total_tokens"]
+            or retry_reservation_value > budget["max_retries"]
+        ):
+            raise RuntimeError("investigation search candidate ledger reservation exceeds its budget")
+        if candidate_id in candidate_ids or idempotency_key in idempotency_keys:
+            raise RuntimeError("investigation search candidate ledger contains a duplicate admission")
+        candidate_ids.add(candidate_id)
+        idempotency_keys.add(idempotency_key)
+
+
+def _search_validate_selector_events(
+    selector_events: list[dict[str, Any]], *, root_task_id: str, search_id: str,
+) -> None:
+    idempotency_keys: set[str] = set()
+    pending_count = 0
+    closed_count = 0
+    for payload in selector_events:
+        if not _search_payload_identity(payload, root_task_id=root_task_id, search_id=search_id):
+            raise RuntimeError("malformed investigation search selector identity")
+        idempotency_key = _nonempty_string(payload.get("idempotency_key"))
+        state = payload.get("state")
+        raw_candidate_task_ids = payload.get("candidate_task_ids")
+        candidate_task_ids = _string_list(raw_candidate_task_ids)
+        if (
+            not idempotency_key
+            or state not in {"pending", "closed"}
+            or not isinstance(raw_candidate_task_ids, (list, tuple, set, frozenset))
+            or not candidate_task_ids
+            or len(candidate_task_ids) != len(raw_candidate_task_ids)
+            or len(candidate_task_ids) != len(set(candidate_task_ids))
+        ):
+            raise RuntimeError("investigation search selector ledger contains an invalid admission")
+        if idempotency_key in idempotency_keys:
+            raise RuntimeError("investigation search selector ledger contains a duplicate admission")
+        idempotency_keys.add(idempotency_key)
+        if state == "pending":
+            pending_count += 1
+        else:
+            closed_count += 1
+    if pending_count > 1:
+        raise RuntimeError("investigation search selector ledger contains duplicate pending admissions")
+    if closed_count > 1:
+        raise RuntimeError("investigation search selector ledger contains duplicate closed admissions")
+
+
+def _search_events(
+    conn: sqlite3.Connection, root_task_id: str, kind: str | None = None,
+) -> list[tuple[sqlite3.Row, dict[str, Any]]]:
+    if kind is None:
+        rows = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? "
+            "AND kind IN (?, ?, ?) ORDER BY created_at ASC, id ASC",
+            (
+                root_task_id,
+                _INVESTIGATION_SEARCH_ADMISSION_KIND,
+                _INVESTIGATION_SEARCH_CANDIDATE_KIND,
+                _INVESTIGATION_SEARCH_SELECTOR_KIND,
+            ),
+        )
+    else:
+        rows = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY created_at ASC, id ASC",
+            (root_task_id, kind),
+        )
+    return [(row, _search_event_payload(row)) for row in rows]
+
+
+def _search_root_authorized(
+    conn: sqlite3.Connection, root_task_id: str, current_task_id: str,
+) -> None:
+    root = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (root_task_id,)
+    ).fetchone()
+    current = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (current_task_id,)
+    ).fetchone()
+    if root is None or current is None:
+        raise RuntimeError("root/current task is missing from the resolved board")
+    if str(root["assignee"] or "").strip().casefold() != "kanban-main":
+        raise RuntimeError("root task is not assigned to kanban-main")
+    if str(current["assignee"] or "").strip().casefold() != "kanban-main":
+        raise RuntimeError("only a kanban-main task may open a search admission")
+    if not _search_task_descends_from(conn, root_task_id, current_task_id):
+        raise RuntimeError("current task is not a descendant of the declared search root")
+
+
+def _search_insert_event(
+    conn: sqlite3.Connection, root_task_id: str, kind: str, payload: Mapping[str, Any],
+) -> None:
+    conn.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, NULL, ?, ?, ?)",
+        (root_task_id, kind, json.dumps(dict(payload), sort_keys=True), int(time.time())),
+    )
+
+
+def _search_active_contexts(
+    conn: sqlite3.Connection, current_task_id: str,
+) -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
+    admission_roots = conn.execute(
+        "SELECT DISTINCT task_id FROM task_events WHERE kind = ?",
+        (_INVESTIGATION_SEARCH_ADMISSION_KIND,),
+    )
+    for root_row in admission_roots:
+        root_task_id = str(root_row[0])
+        if not _search_task_descends_from(conn, root_task_id, current_task_id):
+            continue
+        for _, payload in _search_events(
+            conn, root_task_id, _INVESTIGATION_SEARCH_ADMISSION_KIND
+        ):
+            search_id = _nonempty_string(payload.get("search_id"))
+            if not search_id:
+                raise RuntimeError("investigation search admission is missing its search ID")
+            budget, budget_error = _search_budget(payload)
+            if budget_error is not None or budget is None:
+                raise RuntimeError("investigation search admission has an invalid budget")
+            _search_validate_admission_payload(
+                payload,
+                root_task_id=root_task_id,
+                search_id=search_id,
+                budget=budget,
+            )
+            candidate_events = [
+                candidate_payload
+                for row, candidate_payload in _search_events(
+                    conn, root_task_id, _INVESTIGATION_SEARCH_CANDIDATE_KIND
+                )
+                if candidate_payload.get("search_id") == search_id
+            ]
+            _search_validate_candidate_events(
+                candidate_events,
+                root_task_id=root_task_id,
+                search_id=search_id,
+                budget=budget,
+            )
+            selector_events = [
+                selector_payload
+                for row, selector_payload in _search_events(
+                    conn, root_task_id, _INVESTIGATION_SEARCH_SELECTOR_KIND
+                )
+                if selector_payload.get("search_id") == search_id
+            ]
+            _search_validate_selector_events(
+                selector_events,
+                root_task_id=root_task_id,
+                search_id=search_id,
+            )
+            selector_exists = any(
+                _nonempty_string(selector_payload.get("search_id")) == search_id
+                and selector_payload.get("state") == "closed"
+                for _, selector_payload in _search_events(
+                    conn, root_task_id, _INVESTIGATION_SEARCH_SELECTOR_KIND
+                )
+            )
+            if not selector_exists:
+                active.append(payload)
+    return active
+
+
+def _search_admit(
+    raw_input: Mapping[str, Any], marker: Mapping[str, Any], assignee: str,
+    budget: Mapping[str, int], phase: str, candidate_id: str | None,
+) -> int:
+    board = str(raw_input.get("board") or "")
+    current_task_id = _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
+    root_task_id = _nonempty_string(marker.get("root_task_id"))
+    search_id = _nonempty_string(marker.get("search_id"))
+    idempotency_key = _nonempty_string(raw_input.get("idempotency_key"))
+    marker_idempotency_key = _nonempty_string(marker.get("idempotency_key"))
+    if not current_task_id or not root_task_id or root_task_id != marker.get("root_task_id"):
+        return _search_block(
+            "root_task_id must be explicit and match the current durable task context",
+            assignee,
+        )
+    if not search_id or not idempotency_key or marker_idempotency_key != idempotency_key:
+        return _search_block(
+            "search_id and matching marker/tool idempotency_key are required for replay-safe admission",
+            assignee,
+        )
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _search_connection(board)
+        _search_require_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        _search_root_authorized(conn, root_task_id, current_task_id)
+        events = _search_events(conn, root_task_id)
+        admissions = [
+            payload for row, payload in events
+            if row["kind"] == _INVESTIGATION_SEARCH_ADMISSION_KIND
+            and payload.get("search_id") == search_id
+        ]
+        if len(admissions) > 1:
+            raise RuntimeError("investigation search admission ledger contains duplicate admissions")
+        active_other = [
+            payload for payload in _search_active_contexts(conn, current_task_id)
+            if payload.get("search_id") != search_id
+        ]
+        if not admissions:
+            if active_other:
+                conn.rollback()
+                return _search_block(
+                    "another search_id is already active for the current root",
+                    assignee,
+                )
+            _search_insert_event(
+                conn,
+                root_task_id,
+                _INVESTIGATION_SEARCH_ADMISSION_KIND,
+                {
+                    "schema_id": _INVESTIGATION_SEARCH_SCHEMA,
+                    "search_id": search_id,
+                    "root_task_id": root_task_id,
+                    "idempotency_key": idempotency_key,
+                    "budget": dict(budget),
+                    "state": "active",
+                },
+            )
+            admissions = [{
+                "schema_id": _INVESTIGATION_SEARCH_SCHEMA,
+                "search_id": search_id,
+                "root_task_id": root_task_id,
+                "idempotency_key": idempotency_key,
+                "budget": dict(budget),
+                "state": "active",
+            }]
+        _search_validate_admission_payload(
+            admissions[0], root_task_id=root_task_id, search_id=search_id, budget=budget,
+        )
+
+        candidate_events = [
+            payload for row, payload in _search_events(
+                conn, root_task_id, _INVESTIGATION_SEARCH_CANDIDATE_KIND
+            )
+            if payload.get("search_id") == search_id
+        ]
+        _search_validate_candidate_events(
+            candidate_events, root_task_id=root_task_id, search_id=search_id, budget=budget,
+        )
+        selector_events = [
+            payload for row, payload in _search_events(
+                conn, root_task_id, _INVESTIGATION_SEARCH_SELECTOR_KIND
+            )
+            if payload.get("search_id") == search_id
+        ]
+        _search_validate_selector_events(
+            selector_events, root_task_id=root_task_id, search_id=search_id,
+        )
+        closed_selector_events = [
+            payload for payload in selector_events if payload.get("state") == "closed"
+        ]
+        if phase == "candidate":
+            matching = [
+                payload for payload in candidate_events
+                if payload.get("candidate_id") == candidate_id
+            ]
+            if any(
+                payload.get("idempotency_key") == idempotency_key
+                and payload.get("candidate_id") != candidate_id
+                for payload in candidate_events
+            ):
+                conn.rollback()
+                return _search_block(
+                    "the candidate idempotency_key is already bound to another candidate",
+                    assignee,
+                )
+            if matching:
+                if any(payload.get("idempotency_key") == idempotency_key for payload in matching):
+                    conn.commit()
+                    return 0
+                conn.rollback()
+                return _search_block(
+                    f"candidate {candidate_id} already has a different idempotency key",
+                    assignee,
+                )
+            if closed_selector_events:
+                conn.rollback()
+                return _search_block("the search was already closed by its selector", assignee)
+            if len({payload.get("candidate_id") for payload in candidate_events}) >= _INVESTIGATION_SEARCH_MAX_CANDIDATES:
+                conn.rollback()
+                return _search_block("candidate admission would exceed the two-candidate cap", assignee)
+            token_reservation = (
+                int(budget["max_total_tokens"]) + _INVESTIGATION_SEARCH_MAX_CANDIDATES - 1
+            ) // _INVESTIGATION_SEARCH_MAX_CANDIDATES
+            retry_reservation = 1
+            used_tokens = sum(
+                int(payload.get("token_reservation", 0))
+                for payload in candidate_events
+                if isinstance(payload.get("token_reservation"), int)
+            )
+            used_retries = sum(
+                int(payload.get("retry_reservation", 0))
+                for payload in candidate_events
+                if isinstance(payload.get("retry_reservation"), int)
+            )
+            if used_tokens + token_reservation > int(budget["max_total_tokens"]):
+                conn.rollback()
+                return _search_block("cumulative token admission is exhausted", assignee)
+            if used_retries + retry_reservation > int(budget["max_retries"]):
+                conn.rollback()
+                return _search_block("cumulative retry admission is exhausted", assignee)
+            _search_insert_event(
+                conn,
+                root_task_id,
+                _INVESTIGATION_SEARCH_CANDIDATE_KIND,
+                {
+                    "schema_id": _INVESTIGATION_SEARCH_SCHEMA,
+                    "search_id": search_id,
+                    "root_task_id": root_task_id,
+                    "candidate_id": candidate_id,
+                    "idempotency_key": idempotency_key,
+                    "token_reservation": token_reservation,
+                    "retry_reservation": retry_reservation,
+                },
+            )
+            conn.commit()
+            return 0
+
+        pending_selector = (
+            marker.get("selection_status") in {"pending", "awaiting_expansion"}
+            and marker.get("expansion_count", 0) == 0
+        )
+        single_selector = (
+            marker.get("selection_status") in {"selected", "no_selection"}
+            and marker.get("expansion_count", 0) == 0
+        )
+        candidate_task_ids = _string_list(marker.get("candidate_task_ids"))
+        requested_selector_state = "pending" if pending_selector else "closed"
+        matching_selectors = [
+            payload for payload in selector_events
+            if payload.get("idempotency_key") == idempotency_key
+        ]
+        if matching_selectors:
+            if any(
+                payload.get("state") != requested_selector_state
+                or _string_list(payload.get("candidate_task_ids")) != candidate_task_ids
+                for payload in matching_selectors
+            ):
+                conn.rollback()
+                return _search_block(
+                    "selector idempotency_key is already bound to a different selector admission",
+                    assignee,
+                )
+            conn.commit()
+            return 0
+        if pending_selector and selector_events:
+            conn.rollback()
+            return _search_block("the search already has a different pending selector admission", assignee)
+        if (
+            selector_events
+            and not pending_selector
+            and not single_selector
+            and marker.get("expansion_count") != _INVESTIGATION_SEARCH_MAX_EXPANSIONS
+        ):
+            conn.rollback()
+            return _search_block(
+                "a final selector after pending expansion must declare exactly one expansion",
+                assignee,
+            )
+        if closed_selector_events:
+            conn.rollback()
+            return _search_block("the search already has a different selector admission", assignee)
+        if marker.get("expansion_count") == _INVESTIGATION_SEARCH_MAX_EXPANSIONS and not selector_events:
+            conn.rollback()
+            return _search_block(
+                "one expansion requires a preceding pending selector admission",
+                assignee,
+            )
+        expected_candidate_ids = (
+            {"A"} if pending_selector or single_selector else _INVESTIGATION_SEARCH_CANDIDATES
+        )
+        if {payload.get("candidate_id") for payload in candidate_events} != expected_candidate_ids:
+            conn.rollback()
+            return _search_block(
+                "pending selector admission requires candidate A, final selector requires both A and B",
+                assignee,
+            )
+        candidate_keys = {
+            payload.get("idempotency_key") for payload in candidate_events
+        }
+        for task_id in candidate_task_ids:
+            task = conn.execute(
+                "SELECT assignee, idempotency_key FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                conn.rollback()
+                return _search_block(
+                    f"selector candidate task {task_id} is not present on the durable board",
+                    assignee,
+                )
+            if str(task["assignee"] or "").strip().casefold() != "kanban-investigator":
+                conn.rollback()
+                return _search_block(
+                    f"selector candidate task {task_id} is not assigned to kanban-investigator",
+                    assignee,
+                )
+            if task["idempotency_key"] not in candidate_keys:
+                conn.rollback()
+                return _search_block(
+                    f"selector candidate task {task_id} is not bound to this search admission",
+                    assignee,
+                )
+            if not _search_task_descends_from(conn, root_task_id, task_id):
+                conn.rollback()
+                return _search_block(
+                    f"selector candidate task {task_id} is outside the search root",
+                    assignee,
+                )
+        _search_insert_event(
+            conn,
+            root_task_id,
+            _INVESTIGATION_SEARCH_SELECTOR_KIND,
+            {
+                "schema_id": _INVESTIGATION_SEARCH_SCHEMA,
+                "search_id": search_id,
+                "root_task_id": root_task_id,
+                "candidate_task_ids": candidate_task_ids,
+                "idempotency_key": idempotency_key,
+                "state": "pending" if pending_selector else "closed",
+            },
+        )
+        conn.commit()
+        return 0
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return _search_block(
+            "trusted durable admission is unavailable: " + f"{type(exc).__name__}: {exc}",
+            assignee,
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _active_search_for_current(board: str) -> bool | None:
+    current_task_id = _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
+    if not current_task_id:
+        return False
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _search_connection(board, read_only=True)
+        _search_require_schema(conn)
+        return bool(_search_active_contexts(conn, current_task_id))
+    except (OSError, RuntimeError, sqlite3.Error):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _reject_unmarked_search_create(board: str, assignee: str) -> int:
+    active = _active_search_for_current(board)
+    if active is True:
+        return _search_block(
+            "an active search admission requires the same investigation_search marker on every creation surface",
+            assignee,
+        )
+    if active is None and _nonempty_string(os.environ.get("HERMES_KANBAN_TASK")):
+        return _search_block(
+            "could not read the active search admission from the canonical board DB",
+            assignee,
+        )
+    return 0
+
+
 def _evaluate_investigation_search_create(
     raw_input: Mapping[str, Any], assignee: str,
 ) -> int:
-    """Admit only the bounded portion visible to the creation hook.
-
-    The structured tool currently has no cumulative token/retry admission
-    fields. Search candidates therefore remain blocked until the canonical
-    runtime exposes and enforces those limits; this is deliberate fail-closed
-    behavior, not a prompt-level substitute.
-    """
-    if "investigation_search" not in raw_input:
-        return 0
     marker = raw_input.get("investigation_search")
     if not isinstance(marker, Mapping):
         return _search_block("investigation_search must be an object", assignee)
@@ -952,17 +1603,61 @@ def _evaluate_investigation_search_create(
             "marker schema_id, search_id, and phase=candidate|selector are required",
             assignee,
         )
-    budget = marker.get("budget")
-    if not isinstance(budget, Mapping):
-        return _search_block("an explicit budget object is required", assignee)
-    if budget.get("max_candidates") != 2 or budget.get("max_expansions") != 1:
+    if not _nonempty_string(raw_input.get("title")):
+        return _search_block("every bounded search task requires a non-empty title", assignee)
+    trigger_error = _search_trigger_error(marker)
+    if trigger_error is not None:
+        return _search_block(trigger_error, assignee)
+    if phase == "candidate" and (
+        assignee != "kanban-investigator"
+        or marker.get("candidate_id") not in _INVESTIGATION_SEARCH_CANDIDATES
+    ):
         return _search_block(
-            "fan-out must be exactly two candidates with one expansion",
+            "candidate_id must be A or B and the assignee must be kanban-investigator",
+            assignee,
+        )
+    if phase == "selector":
+        pending_selector = (
+            marker.get("selection_status") in {"pending", "awaiting_expansion"}
+            and marker.get("expansion_count", 0) == 0
+        )
+        single_selector = (
+            marker.get("selection_status") in {"selected", "no_selection"}
+            and marker.get("expansion_count", 0) == 0
+        )
+        expected_count = 1 if pending_selector or single_selector else _INVESTIGATION_SEARCH_MAX_CANDIDATES
+        early_candidate_task_ids = _string_list(marker.get("candidate_task_ids"))
+        early_parents = _string_list(raw_input.get("parents"))
+        if len(early_candidate_task_ids) != expected_count or len(set(early_candidate_task_ids)) != expected_count:
+            return _search_block(
+                "the selector must name one candidate while pending or exactly two distinct candidate task IDs",
+                assignee,
+            )
+        if sorted(early_candidate_task_ids) != sorted(early_parents):
+            return _search_block(
+                "selector parents must be exactly the declared candidate task IDs",
+                assignee,
+            )
+    budget, budget_error = _search_budget(marker)
+    if budget_error is not None or budget is None:
+        return _search_block(budget_error or "the bounded budget is invalid", assignee)
+    raw_runtime = raw_input.get("max_runtime_seconds")
+    if raw_runtime is not None and raw_runtime != budget["max_runtime_seconds"]:
+        return _search_block(
+            "max_runtime_seconds must match the declared bounded budget",
+            assignee,
+        )
+    raw_retries = raw_input.get("max_retries")
+    if raw_retries is not None and raw_retries != budget["max_retries"]:
+        return _search_block(
+            "max_retries must match the declared cumulative retry budget",
             assignee,
         )
     expansion_count = marker.get("expansion_count", 0)
-    if not isinstance(expansion_count, int) or isinstance(expansion_count, bool) or not 0 <= expansion_count <= 1:
+    if not isinstance(expansion_count, int) or isinstance(expansion_count, bool) or not 0 <= expansion_count <= _INVESTIGATION_SEARCH_MAX_EXPANSIONS:
         return _search_block("expansion_count must be 0 or 1", assignee)
+    if not _nonempty_string(marker.get("root_task_id")):
+        return _search_block("root_task_id is required for trusted admission", assignee)
 
     if phase == "candidate":
         candidate_id = marker.get("candidate_id")
@@ -971,29 +1666,42 @@ def _evaluate_investigation_search_create(
                 "candidate_id must be A or B and the assignee must be kanban-investigator",
                 assignee,
             )
-        if not _positive_int(raw_input.get("max_runtime_seconds")):
+        runtime = raw_input.get("max_runtime_seconds")
+        if not _positive_int(runtime) or runtime != budget["max_runtime_seconds"]:
             return _search_block(
-                "each candidate requires a positive dispatcher-enforced max_runtime_seconds",
+                "each candidate requires a matching positive dispatcher-enforced max_runtime_seconds",
                 assignee,
             )
-        return _search_block(
-            "canonical runtime does not expose durable cumulative token/retry admission; "
-            "operator/runtime policy is required before dispatch",
-            assignee,
-        )
+        if not _nonempty_string(raw_input.get("idempotency_key")):
+            return _search_block("each candidate requires a stable idempotency_key", assignee)
+        return _search_admit(raw_input, marker, assignee, budget, "candidate", candidate_id)
 
     if assignee != "kanban-main":
         return _search_block("the selector must be assigned to kanban-main", assignee)
     candidate_task_ids = _string_list(marker.get("candidate_task_ids"))
     parents = _string_list(raw_input.get("parents"))
-    if len(candidate_task_ids) != 2 or len(set(candidate_task_ids)) != 2:
-        return _search_block("the selector must name exactly two distinct candidate task IDs", assignee)
-    if sorted(candidate_task_ids) != sorted(parents):
+    pending_selector = (
+        marker.get("selection_status") in {"pending", "awaiting_expansion"}
+        and marker.get("expansion_count", 0) == 0
+    )
+    single_selector = (
+        marker.get("selection_status") in {"selected", "no_selection"}
+        and marker.get("expansion_count", 0) == 0
+    )
+    expected_count = 1 if pending_selector or single_selector else _INVESTIGATION_SEARCH_MAX_CANDIDATES
+    if len(candidate_task_ids) != expected_count or len(set(candidate_task_ids)) != expected_count:
         return _search_block(
-            "selector parents must be exactly the two candidate task IDs",
+            "the selector must name one candidate while pending or exactly two distinct candidate task IDs",
             assignee,
         )
-    return 0
+    if sorted(candidate_task_ids) != sorted(parents):
+        return _search_block(
+            "selector parents must be exactly the declared candidate task IDs",
+            assignee,
+        )
+    if not _nonempty_string(raw_input.get("idempotency_key")):
+        return _search_block("the selector requires a stable idempotency_key", assignee)
+    return _search_admit(raw_input, marker, assignee, budget, "selector", None)
 
 
 def _evaluate_structured(payload: Mapping[str, Any]) -> int:
@@ -1004,19 +1712,28 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
             "tool_input must be an object. No task mutation was performed.",
             source="kanban_create",
         )
+    board = str(raw_input.get("board") or "")
+    assignee_value = str(raw_input.get("assignee") or "").strip().casefold()
     assignee = _specialist(raw_input.get("assignee"))
     if assignee is None:
-        if (
-            str(raw_input.get("assignee") or "").strip().casefold() == "kanban-main"
-            and "investigation_search" in raw_input
-        ):
-            search_decision = _evaluate_investigation_search_create(raw_input, "kanban-main")
-            if search_decision != 0:
-                return search_decision
+        if assignee_value == "kanban-main":
+            if "investigation_search" in raw_input:
+                search_decision = _evaluate_investigation_search_create(raw_input, "kanban-main")
+                if search_decision != 0:
+                    return search_decision
+            else:
+                search_decision = _reject_unmarked_search_create(board, "kanban-main")
+                if search_decision != 0:
+                    return search_decision
         return 0
-    search_decision = _evaluate_investigation_search_create(raw_input, assignee)
-    if search_decision != 0:
-        return search_decision
+    if "investigation_search" in raw_input:
+        search_decision = _evaluate_investigation_search_create(raw_input, assignee)
+        if search_decision != 0:
+            return search_decision
+    else:
+        search_decision = _reject_unmarked_search_create(board, assignee)
+        if search_decision != 0:
+            return search_decision
     if _structured_has_parent(raw_input) and _initial_status_is_blocked(
         raw_input.get("initial_status")
     ):
@@ -1031,26 +1748,119 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
     return _block(_diagnostic(assignee), assignee=assignee, source="kanban_create")
 
 
+def _terminal_search_marker(args: list[str]) -> Mapping[str, Any] | None:
+    for body in _option_values(args, "--body"):
+        try:
+            value = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, Mapping) and isinstance(value.get("investigation_search"), Mapping):
+            return value["investigation_search"]
+    return None
+
+
+def _terminal_int_option(args: list[str], option: str) -> int | None:
+    values = _option_values(args, option)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise RuntimeError(f"{option} must be supplied exactly once")
+    try:
+        return int(values[0])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{option} must be an integer") from exc
+
+
+def _terminal_runtime_option(args: list[str]) -> int | None:
+    values = _option_values(args, "--max-runtime")
+    if not values:
+        return None
+    if len(values) != 1:
+        raise RuntimeError("--max-runtime must be supplied exactly once")
+    raw = values[0].strip().lower()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if not raw or raw[-1] not in units:
+        raise RuntimeError("--max-runtime must be seconds or a duration such as 15m")
+    try:
+        return int(float(raw[:-1]) * units[raw[-1]])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("--max-runtime must be seconds or a duration such as 15m") from exc
+
+
+def _terminal_search_input(
+    args: list[str], board: str, assignee: str, marker: Mapping[str, Any],
+) -> dict[str, Any]:
+    bodies = _option_values(args, "--body")
+    body: dict[str, Any] = {}
+    if bodies:
+        try:
+            decoded = json.loads(bodies[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = {}
+        if isinstance(decoded, Mapping):
+            body.update(decoded)
+    body["investigation_search"] = marker
+    body["assignee"] = assignee
+    body["board"] = board
+    if args and not args[0].startswith("-"):
+        body["title"] = args[0]
+    body["parents"] = _option_values(args, "--parent")
+    runtime = _terminal_runtime_option(args)
+    retries = _terminal_int_option(args, "--max-retries")
+    if runtime is not None:
+        body["max_runtime_seconds"] = runtime
+    if retries is not None:
+        body["max_retries"] = retries
+    keys = _option_values(args, "--idempotency-key")
+    if keys:
+        body["idempotency_key"] = keys[0]
+    return body
+
+
 def _evaluate_terminal_create(args: list[str], board: str) -> int:
-    del board  # creation policy is local; no DB lookup is needed.
     assignees = _option_values(args, "--assignee")
-    specialist = next((_specialist(value) for value in assignees if _specialist(value)), None)
-    if specialist is None:
+    assignee: str | None = None
+    for value in assignees:
+        normalized = value.strip().casefold()
+        if normalized == "kanban-main":
+            assignee = normalized
+            break
+        specialist = _specialist(value)
+        if specialist is not None:
+            assignee = specialist
+            break
+    if assignee is None:
+        return 0
+    marker = _terminal_search_marker(args)
+    if marker is not None:
+        raw_input = _terminal_search_input(args, board, assignee, marker)
+        search_decision = _evaluate_investigation_search_create(raw_input, assignee)
+        if search_decision != 0:
+            return search_decision
+    else:
+        search_decision = _reject_unmarked_search_create(board, assignee)
+        if search_decision != 0:
+            return search_decision
+    if assignee == "kanban-main":
         return 0
     parents = _option_values(args, "--parent")
     initial_statuses = _option_values(args, "--initial-status")
     if parents and any(_initial_status_is_blocked(value) for value in initial_statuses):
         return _block(
-            _dependency_wait_diagnostic(specialist),
-            assignee=specialist,
+            _dependency_wait_diagnostic(assignee),
+            assignee=assignee,
             source="terminal:create:dependency_wait",
         )
     contracts = _option_values(args, "--completion-contract")
     if not contracts or all(_contract_is_local(value) for value in contracts):
         return 0
     return _block(
-        _diagnostic(specialist),
-        assignee=specialist,
+        _diagnostic(assignee),
+        assignee=assignee,
         source="terminal:create",
     )
 

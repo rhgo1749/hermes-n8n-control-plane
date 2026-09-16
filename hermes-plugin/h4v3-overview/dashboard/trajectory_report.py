@@ -234,9 +234,13 @@ def _investigation_search_marker(value: Any) -> Optional[dict[str, Any]]:
     search_id = _safe_id(marker.get("search_id"))
     phase = str(marker.get("phase") or "").strip().casefold()
     candidate_id = _safe_id(marker.get("candidate_id"))
+    root_task_id = _safe_id(marker.get("root_task_id"))
+    idempotency_key = _safe_id(marker.get("idempotency_key"))
     if (
         schema_id != INVESTIGATION_SEARCH_SCHEMA_ID
         or search_id is None
+        or root_task_id is None
+        or idempotency_key is None
         or phase not in _INVESTIGATION_SEARCH_PHASES
         or (phase == "candidate" and candidate_id not in {"A", "B"})
     ):
@@ -245,7 +249,37 @@ def _investigation_search_marker(value: Any) -> Optional[dict[str, Any]]:
     result["schema_id"] = schema_id
     result["search_id"] = search_id
     result["phase"] = phase
+    _, budget_status = _investigation_search_budget_validation(result)
+    result["_budget_status"] = budget_status
     return result
+
+
+def _investigation_search_budget_validation(
+    marker: Mapping[str, Any],
+) -> tuple[dict[str, int], str]:
+    budget = marker.get("budget")
+    if not isinstance(budget, Mapping):
+        return {}, "missing"
+    values: dict[str, int] = {}
+    for field in (
+        "max_candidates", "max_expansions", "max_total_tokens",
+        "max_runtime_seconds", "max_retries",
+    ):
+        value = _as_int(budget.get(field))
+        if value is None:
+            return values, "invalid"
+        values[field] = value
+    if any(value <= 0 for value in values.values()):
+        return values, "invalid"
+    if (
+        values["max_candidates"] != 2
+        or values["max_expansions"] != 1
+        or values["max_total_tokens"] > 32_000
+        or values["max_runtime_seconds"] > 900
+        or values["max_retries"] != 2
+    ):
+        return values, "non_compliant"
+    return values, "valid"
 
 
 def _investigation_search_budget(marker: Mapping[str, Any]) -> dict[str, int]:
@@ -258,7 +292,7 @@ def _investigation_search_budget(marker: Mapping[str, Any]) -> dict[str, int]:
         "max_runtime_seconds", "max_retries",
     ):
         value = _as_int(budget.get(field))
-        if value is not None and value > 0:
+        if value is not None:
             result[field] = value
     return result
 
@@ -1329,9 +1363,9 @@ def _run_has_infrastructure_failure_cause(
 def _investigation_search_marker_entries(
     runs: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Collect markers while de-duplicating run/event projections."""
+    """Collect every marker while keeping run/event projections traceable."""
     entries: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, Optional[str], Optional[str], Optional[int]]] = set()
+    seen: set[tuple[str, str, Optional[str], Optional[str], Optional[int], Optional[int]]] = set()
 
     def add(
         marker: Optional[dict[str, Any]], source: Mapping[str, Any], *, source_kind: str,
@@ -1341,11 +1375,11 @@ def _investigation_search_marker_entries(
         run_id = _as_int(source.get("id")) if source_kind == "run" else _as_int(source.get("run_id"))
         event_id = _as_int(source.get("id")) if source_kind == "event" else None
         task_id = _safe_id(source.get("task_id"))
-        marker_task_id = _safe_id(marker.get("task_id")) or task_id
+        marker_task_id = _safe_id(marker.get("candidate_task_id")) or task_id
         candidate_id = _safe_id(marker.get("candidate_id"))
         identity = (
             str(marker["search_id"]), str(marker["phase"]), candidate_id,
-            marker_task_id, run_id if run_id is not None else event_id,
+            marker_task_id, run_id, event_id,
         )
         if identity in seen:
             return
@@ -1357,6 +1391,7 @@ def _investigation_search_marker_entries(
             "run_id": run_id,
             "event_id": event_id,
             "task_id": marker_task_id,
+            "created_at": _as_int(source.get("created_at")),
         })
 
     for run in runs:
@@ -1365,7 +1400,8 @@ def _investigation_search_marker_entries(
         add(_investigation_search_marker(_json_dict(event.get("payload"))), event, source_kind="event")
     entries.sort(key=lambda item: (
         str(item["marker"].get("search_id")),
-        _as_int((item.get("run") or {}).get("started_at")) or 0,
+        _as_int((item.get("run") or {}).get("started_at")) or _as_int(item.get("created_at")) or 0,
+        _as_int((item.get("run") or {}).get("ended_at")) or 0,
         _as_int(item.get("run_id")) or 0,
         _as_int(item.get("event_id")) or 0,
     ))
@@ -1394,7 +1430,7 @@ def _investigation_search_report(
     runs: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]],
     usage_records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Project explicit search evidence without inferring search from roles."""
+    """Project explicit search evidence, aggregating every actual worker run."""
     entries = _investigation_search_marker_entries(runs, events)
     usage_by_run = {
         _as_int(record.get("run_id")): record
@@ -1402,44 +1438,87 @@ def _investigation_search_report(
         if _as_int(record.get("run_id")) is not None
     }
     runs_by_task: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    runs_by_id: dict[int, Mapping[str, Any]] = {}
     for run in runs:
+        run_id = _as_int(run.get("id"))
+        if run_id is not None:
+            runs_by_id[run_id] = run
         task_id = _safe_id(run.get("task_id"))
         if task_id:
             runs_by_task[task_id].append(run)
 
-    def usage_for(entry: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-        run_id = _as_int(entry.get("run_id"))
-        if run_id is not None and run_id in usage_by_run:
-            return usage_by_run[run_id]
-        task_id = _safe_id(entry.get("task_id"))
-        candidates = runs_by_task.get(task_id or "", [])
-        if len(candidates) != 1:
-            return None
-        return usage_by_run.get(_as_int(candidates[0].get("id")))
+    def actual_runs(candidate_entries: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        selected: dict[int, Mapping[str, Any]] = {}
+        for entry in candidate_entries:
+            task_id = _safe_id(entry.get("task_id"))
+            if task_id:
+                for run in runs_by_task.get(task_id, []):
+                    fallback_id = _as_int(run.get("id"))
+                    if fallback_id is not None:
+                        selected[fallback_id] = run
+            run_id = _as_int(entry.get("run_id"))
+            if run_id is not None and run_id in runs_by_id:
+                selected[run_id] = runs_by_id[run_id]
+            elif run_id is not None and isinstance(entry.get("run"), Mapping):
+                selected[run_id] = entry["run"]
+        return sorted(
+            selected.values(),
+            key=lambda run: (
+                _as_int(run.get("started_at")) or 0,
+                _as_int(run.get("ended_at")) or 0,
+                _as_int(run.get("id")) or 0,
+            ),
+        )
 
-    def candidate_cost(entry: Mapping[str, Any]) -> dict[str, Any]:
-        usage = usage_for(entry)
-        session = usage.get("session") if isinstance(usage, Mapping) else None
-        input_tokens = _as_int(session.get("input_tokens")) if isinstance(session, Mapping) else None
-        output_tokens = _as_int(session.get("output_tokens")) if isinstance(session, Mapping) else None
-        known_parts = _known_ints((input_tokens, output_tokens))
-        token_status = "known" if input_tokens is not None and output_tokens is not None else (
-            "partial" if known_parts else "unavailable"
-        )
-        token_total = (
-            input_tokens + output_tokens
-            if input_tokens is not None and output_tokens is not None else None
-        )
-        known_only = sum(known_parts) if known_parts else None
-        run = entry.get("run")
-        duration = _run_duration(run if isinstance(run, Mapping) else None)
+    def candidate_cost(candidate_entries: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[Mapping[str, Any]]]:
+        candidate_runs = actual_runs(candidate_entries)
+        token_statuses: list[str] = []
+        worker_statuses: list[str] = []
+        total_tokens: list[int] = []
+        known_only_tokens: list[int] = []
+        worker_seconds: list[int] = []
+        for run in candidate_runs:
+            run_id = _as_int(run.get("id"))
+            usage = usage_by_run.get(run_id) if run_id is not None else None
+            session = usage.get("session") if isinstance(usage, Mapping) else None
+            input_tokens = _as_int(session.get("input_tokens")) if isinstance(session, Mapping) else None
+            output_tokens = _as_int(session.get("output_tokens")) if isinstance(session, Mapping) else None
+            known_parts = _known_ints((input_tokens, output_tokens))
+            if input_tokens is not None and output_tokens is not None:
+                token_statuses.append("known")
+                total_tokens.append(input_tokens + output_tokens)
+            elif known_parts:
+                token_statuses.append("partial")
+            else:
+                token_statuses.append("unavailable")
+            if known_parts:
+                known_only_tokens.append(sum(known_parts))
+            duration = _run_duration(run)
+            if duration is None:
+                worker_statuses.append("unavailable")
+            else:
+                worker_statuses.append("known")
+                worker_seconds.append(duration)
+        if not candidate_runs:
+            token_statuses.append("unavailable")
+            worker_statuses.append("unavailable")
+        token_availability = _search_cost_availability(token_statuses)
+        worker_availability = _search_cost_availability(worker_statuses)
         return {
-            "total_tokens": token_total,
-            "known_only_total_tokens": known_only,
-            "token_availability": token_status,
-            "worker_seconds": duration,
-            "worker_seconds_availability": "known" if duration is not None else "unavailable",
-        }
+            "total_tokens": sum(total_tokens) if token_availability == "known" else None,
+            "known_only_total_tokens": sum(known_only_tokens) if known_only_tokens else None,
+            "token_availability": token_availability,
+            "worker_seconds": sum(worker_seconds) if worker_availability == "known" else None,
+            "known_only_worker_seconds": sum(worker_seconds) if worker_seconds else None,
+            "worker_seconds_availability": worker_availability,
+        }, candidate_runs
+
+    def latest_value(candidate_entries: Sequence[Mapping[str, Any]], field: str) -> Optional[str]:
+        for entry in reversed(candidate_entries):
+            value = _bounded_text(entry["marker"].get(field))
+            if value is not None:
+                return value
+        return None
 
     grouped: dict[str, dict[str, Any]] = {}
     for entry in entries:
@@ -1450,15 +1529,35 @@ def _investigation_search_report(
             "search_id": search_id,
             "triggers": [],
             "budget": {},
+            "budget_statuses": [],
+            "budget_signatures": [],
+            "root_task_ids": set(),
+            "idempotency_keys": set(),
             "candidate_task_ids": [],
-            "candidates": [],
+            "candidate_entries": defaultdict(list),
             "selection": [],
+            "selection_seen": set(),
+            "entries": [],
         })
+        group["entries"].append(entry)
+        root_task_id = _safe_id(marker.get("root_task_id"))
+        idempotency_key = _safe_id(marker.get("idempotency_key"))
+        if root_task_id is not None:
+            group["root_task_ids"].add(root_task_id)
+        if idempotency_key is not None:
+            group["idempotency_keys"].add(idempotency_key)
         group["triggers"] = sorted({
             *group["triggers"],
             *_bounded_id_list(marker.get("trigger_codes") or marker.get("triggers")),
         })
+        budget, budget_status = _investigation_search_budget_validation(marker)
         group["budget"].update(_investigation_search_budget(marker))
+        group["budget_statuses"].append(budget_status)
+        if budget:
+            group["budget_signatures"].append(tuple(budget.get(field) for field in (
+                "max_candidates", "max_expansions", "max_runtime_seconds",
+                "max_total_tokens", "max_retries",
+            )))
         declared = _bounded_id_list(marker.get("candidate_task_ids"))
         if entry.get("task_id") and marker.get("phase") == "candidate":
             declared.append(str(entry["task_id"]))
@@ -1466,21 +1565,8 @@ def _investigation_search_report(
         if marker.get("phase") == "candidate":
             candidate_task_id = _safe_id(marker.get("candidate_task_id")) or _safe_id(entry.get("task_id"))
             candidate_id = _safe_id(marker.get("candidate_id"))
-            cost = candidate_cost(entry)
-            candidate_key = (candidate_task_id or candidate_id, candidate_id)
-            if not any(item.get("_key") == candidate_key for item in group["candidates"]):
-                candidate = {
-                    "candidate_id": candidate_id,
-                    "task_id": candidate_task_id,
-                    "run_id": _as_int(entry.get("run_id")),
-                    "closure_status": _bounded_text(marker.get("closure_status")) or "UNKNOWN",
-                    "confidence": _bounded_text(marker.get("confidence")),
-                    "independence_basis": _bounded_text(marker.get("independence_basis")),
-                    "outcome": _bounded_text(marker.get("outcome")),
-                    **cost,
-                    "_key": candidate_key,
-                }
-                group["candidates"].append(candidate)
+            candidate_key = (candidate_task_id or f"candidate:{candidate_id}", candidate_id)
+            group["candidate_entries"][candidate_key].append(entry)
         else:
             selected = (
                 _safe_id(marker.get("selected_candidate_task_id"))
@@ -1495,79 +1581,118 @@ def _investigation_search_report(
                 "selection_reason_code": _bounded_text(marker.get("selection_reason_code")),
                 "candidate_task_ids": _bounded_id_list(marker.get("candidate_task_ids")),
             }
-            selection_key = (
-                selection["selection_status"], selection["selected_candidate_task_id"],
-                tuple(selection["candidate_task_ids"]),
-            )
-            if not any(item.get("_key") == selection_key for item in group["selection"]):
-                selection["_key"] = selection_key
+            run_id = _as_int(entry.get("run_id"))
+            event_id = _as_int(entry.get("event_id"))
+            source_key = ("run", run_id) if run_id is not None else ("event", event_id)
+            if source_key not in group["selection_seen"]:
+                group["selection_seen"].add(source_key)
                 group["selection"].append(selection)
 
     searches: list[dict[str, Any]] = []
     for group in grouped.values():
-        candidates = group["candidates"]
+        candidates: list[dict[str, Any]] = []
+        for (candidate_task_key, candidate_id), candidate_entries in group["candidate_entries"].items():
+            cost, candidate_runs = candidate_cost(candidate_entries)
+            latest_marker = candidate_entries[-1]["marker"]
+            outcome = latest_value(candidate_entries, "outcome")
+            if outcome is None and candidate_runs:
+                outcome = _bounded_text(candidate_runs[-1].get("outcome") or candidate_runs[-1].get("status"))
+            run_ids = [
+                run_id for run_id in (_as_int(run.get("id")) for run in candidate_runs)
+                if run_id is not None
+            ]
+            candidates.append({
+                "candidate_id": candidate_id,
+                "task_id": _safe_id(latest_marker.get("candidate_task_id")) or candidate_task_key,
+                "run_id": run_ids[-1] if run_ids else _as_int(candidate_entries[-1].get("run_id")),
+                "run_ids": run_ids,
+                "run_count": len(run_ids),
+                "closure_status": latest_value(candidate_entries, "closure_status") or "UNKNOWN",
+                "confidence": latest_value(candidate_entries, "confidence"),
+                "independence_basis": latest_value(candidate_entries, "independence_basis"),
+                "outcome": outcome,
+                **cost,
+            })
+        candidates.sort(key=lambda item: (str(item.get("candidate_id") or ""), str(item.get("task_id") or "")))
         selections = group["selection"]
-        token_statuses = [str(item["token_availability"]) for item in candidates]
-        worker_statuses = [str(item["worker_seconds_availability"]) for item in candidates]
-        known_token_totals = [item["total_tokens"] for item in candidates if item["total_tokens"] is not None]
-        known_only_token_totals = [
-            item["known_only_total_tokens"] for item in candidates
-            if item["known_only_total_tokens"] is not None
+        budget_statuses = [str(status) for status in group["budget_statuses"]]
+        budget_available = (
+            "known" if budget_statuses and all(status == "valid" for status in budget_statuses)
+            else "partial" if any(status == "valid" for status in budget_statuses)
+            else "unavailable"
+        )
+        signatures = {signature for signature in group["budget_signatures"]}
+        budget_consistent = len(signatures) <= 1 and bool(signatures)
+        expansion_values = [entry["marker"].get("expansion_count", 0) for entry in group["entries"]]
+        expansion_within_bound = all(
+            isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= 1
+            for value in expansion_values
+        )
+        declared_budget_matches = (
+            budget_available == "known"
+            and budget_consistent
+            and all(status == "valid" for status in budget_statuses)
+        )
+        valid_used_values = [
+            _optional_bool(entry["marker"].get("used"))
+            for entry in group["entries"]
+            if entry["marker"].get("_budget_status") == "valid"
         ]
-        known_worker_seconds = [item["worker_seconds"] for item in candidates if item["worker_seconds"] is not None]
-        token_availability = _search_cost_availability(token_statuses)
-        worker_availability = _search_cost_availability(worker_statuses)
+        valid_used_values = [value for value in valid_used_values if value is not None]
+        used = True if candidates and budget_available == "known" else (
+            True if any(value is True for value in valid_used_values) else (
+                False if valid_used_values and all(value is False for value in valid_used_values) else None
+            )
+        )
         selected_ids = (
             [str(selections[-1]["selected_candidate_task_id"])]
             if selections and selections[-1].get("selected_candidate_task_id")
             else []
         )
         statuses = sorted({str(item["selection_status"]) for item in selections})
-        used_values = [
-            _optional_bool(entry["marker"].get("used"))
-            for entry in entries if str(entry["marker"].get("search_id")) == group["search_id"]
-        ]
-        used_values = [value for value in used_values if value is not None]
-        used = True if candidates or any(value is True for value in used_values) else (
-            False if used_values and all(value is False for value in used_values) else None
+        token_statuses = [str(item["token_availability"]) for item in candidates]
+        worker_statuses = [str(item["worker_seconds_availability"]) for item in candidates]
+        token_availability = _search_cost_availability(token_statuses)
+        worker_availability = _search_cost_availability(worker_statuses)
+        known_tokens = _known_ints(item["total_tokens"] for item in candidates)
+        known_only_tokens = _known_ints(item["known_only_total_tokens"] for item in candidates)
+        known_worker_seconds = _known_ints(item["worker_seconds"] for item in candidates)
+        search_outcome = (
+            "selected" if selected_ids and selections[-1]["selection_status"] == "selected"
+            else selections[-1]["selection_status"] if selections else "unknown"
         )
-        for candidate in candidates:
-            candidate.pop("_key", None)
-        for selection in selections:
-            selection.pop("_key", None)
         searches.append({
             "schema_id": group["schema_id"],
             "search_id": group["search_id"],
+            "root_task_ids": sorted(group["root_task_ids"]),
+            "idempotency_keys": sorted(group["idempotency_keys"]),
+            "marker_count": len(group["entries"]),
             "used": used,
-            "used_availability": "known" if used_values or candidates else "unknown",
+            "used_availability": "known" if valid_used_values or (candidates and budget_available == "known") else "unknown",
             "triggers": group["triggers"],
             "budget": group["budget"],
             "candidate_task_ids": sorted(set(group["candidate_task_ids"])),
             "candidate_count": len(candidates),
+            "availability": budget_available,
             "bound_compliance": {
                 "max_candidates": 2,
                 "max_expansions": 1,
                 "candidate_count_within_bound": len(candidates) <= 2,
-                "declared_budget_matches_contract": (
-                    group["budget"].get("max_candidates") in (None, 2)
-                    and group["budget"].get("max_expansions") in (None, 1)
-                ),
+                "expansion_count_within_bound": expansion_within_bound,
+                "budget_availability": budget_available,
+                "budget_consistent": budget_consistent,
+                "declared_budget_matches_contract": declared_budget_matches,
             },
-            "candidates": sorted(
-                candidates,
-                key=lambda item: (str(item.get("candidate_id") or ""), str(item.get("task_id") or "")),
-            ),
+            "candidates": candidates,
             "selection": selections,
             "selection_statuses": statuses,
             "selected_candidate_task_ids": selected_ids,
             "selection_status": selections[-1]["selection_status"] if selections else "unknown",
-            "outcome": (
-                "selected" if selected_ids and selections[-1]["selection_status"] == "selected"
-                else selections[-1]["selection_status"] if selections else "unknown"
-            ),
+            "outcome": search_outcome,
             "cost": {
-                "total_tokens": sum(known_token_totals) if token_availability == "known" else None,
-                "known_only_total_tokens": sum(known_only_token_totals) if known_only_token_totals else None,
+                "total_tokens": sum(known_tokens) if token_availability == "known" else None,
+                "known_only_total_tokens": sum(known_only_tokens) if known_only_tokens else None,
                 "token_availability": token_availability,
                 "worker_seconds": sum(known_worker_seconds) if worker_availability == "known" else None,
                 "known_only_worker_seconds": sum(known_worker_seconds) if known_worker_seconds else None,
@@ -1580,6 +1705,7 @@ def _investigation_search_report(
             },
         })
 
+    searches.sort(key=lambda item: item["search_id"])
     candidate_task_ids = sorted({
         task_id for search in searches for task_id in search["candidate_task_ids"]
     })
@@ -1593,15 +1719,18 @@ def _investigation_search_report(
     token_availability = _search_cost_availability(token_statuses)
     worker_availability = _search_cost_availability(worker_statuses)
     known_tokens = _known_ints(candidate.get("total_tokens") for candidate in candidates)
-    known_only_tokens = _known_ints(
-        candidate.get("known_only_total_tokens") for candidate in candidates
-    )
-    known_worker_seconds = _known_ints(
-        candidate.get("worker_seconds") for candidate in candidates
-    )
+    known_only_tokens = _known_ints(candidate.get("known_only_total_tokens") for candidate in candidates)
+    known_worker_seconds = _known_ints(candidate.get("worker_seconds") for candidate in candidates)
+    search_availabilities = [str(search.get("availability") or "unavailable") for search in searches]
+    if not search_availabilities:
+        availability = "unavailable"
+    elif all(value == "known" for value in search_availabilities):
+        availability = "known"
+    else:
+        availability = "partial"
     return {
         "schema_id": INVESTIGATION_SEARCH_SCHEMA_ID,
-        "availability": "known" if searches else "unavailable",
+        "availability": availability,
         "reason": None if searches else "no_explicit_investigation_search_marker",
         "used": True if any(value is True for value in explicit_used) else (
             False if explicit_used and all(value is False for value in explicit_used) else None
@@ -1614,6 +1743,14 @@ def _investigation_search_report(
             "max_expansions": 1,
             "all_searches_within_candidate_bound": all(
                 search["bound_compliance"]["candidate_count_within_bound"]
+                for search in searches
+            ) if searches else None,
+            "all_searches_within_expansion_bound": all(
+                search["bound_compliance"]["expansion_count_within_bound"]
+                for search in searches
+            ) if searches else None,
+            "all_searches_declared_budget_compliant": all(
+                search["bound_compliance"]["declared_budget_matches_contract"]
                 for search in searches
             ) if searches else None,
         },
@@ -1638,7 +1775,7 @@ def _investigation_search_report(
                 "reason": "no_authoritative_per_task_charge",
             },
         },
-        "searches": sorted(searches, key=lambda item: item["search_id"]),
+        "searches": searches,
     }
 
 
