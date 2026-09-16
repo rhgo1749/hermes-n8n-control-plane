@@ -15,3 +15,14 @@ For regressions/rework, preserve the Investigator's observed failure boundary, r
 Implementation owns coding, required deterministic validation, runtime gates executable in the available environment, exact diff inspection, and delivery PR create/update. It does not own reconstructing the investigation from scratch or making unresolved product/UX decisions.
 
 A passing build or internal method-call assertion does not replace the required observable regression evidence when the handoff defines one.
+
+## Selected handoff boundary
+
+When Main uses `investigation_search` (`h4v3-investigation-search-v1`), this
+task is created only after the selector records
+`selection_status=selected`. Consume the selected candidate handoff as the
+primary context and retain `search_id`/unselected task IDs only as provenance.
+Do not copy, request, or reconstruct unselected candidate transcripts,
+hypotheses, or closure text. If the selected handoff is missing, LOW,
+contradicted, or closure-incomplete, stop with a concrete dependency/capability
+diagnostic; do not choose a candidate yourself or dispatch another worker.

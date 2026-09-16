@@ -164,6 +164,45 @@ def test_canonical_role_contract_closes_specialist_graph_onto_root() -> None:
     assert "Every direct parent must be" in completion_contract
 
 
+def test_bounded_search_contract_is_triggered_and_selected_only() -> None:
+    main = (CONTRACT_ROOT / "kanban-main-investigator.md").read_text(encoding="utf-8")
+    investigator = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8")
+    reviewer = (CONTRACT_ROOT / "kanban-reviewer-investigator.md").read_text(encoding="utf-8")
+    role_contract = (ROOT / "docs/KANBAN_ROLE_CONTRACTS.md").read_text(encoding="utf-8")
+    req = (ROOT / ".agent/pr-requests/REQ-155-bounded-multi-investigator-search.md").read_text(encoding="utf-8")
+
+    assert "default remains one Investigator" in main
+    assert "h4v3-investigation-search-v1" in main
+    assert "exactly two sibling" in main
+    assert "bounded expansion" in main
+    assert "candidate C" in main
+    assert "selected handoff only" in main
+    for trigger in (
+        "LOW_CONFIDENCE_OR_BLOCKING_UNKNOWN",
+        "IMPLEMENTATION_OR_REWORK_ROUND_GE_2",
+        "RUNTIME_TEST_CONTRADICTION",
+        "TRUSTED_REVIEWER_MODEL_REFRESH",
+        "COMPETING_BOUNDARIES_UNRESOLVED",
+        "NEW_EQUIVALENCE_CLASS_BYPASS_AFTER_PASS",
+        "ACCEPTANCE_PASS_RUNTIME_ORACLE_FALSE_NEGATIVE",
+    ):
+        assert trigger in main
+        assert trigger in role_contract
+    for field in (
+        "observed_failure", "root_cause_model", "generalized_invariant",
+        "equivalence_classes", "falsification_plan", "completion_oracle",
+        "residual_unknowns", "required_RED_regression", "preserved_contracts",
+        "independence_basis",
+    ):
+        assert field in investigator
+        assert field in role_contract
+    assert "rework_class=implementation_gap" in reviewer
+    assert "rework_class=investigation_model_refresh" in reviewer
+    assert "investigation_model_refresh=true" in reviewer
+    assert "HUMAN_VALIDATION_REQUIRED" in req
+    assert "post-run" in req and "telemetry" in req
+
+
 def test_profile_deployer_fails_closed_before_any_write_when_investigator_missing() -> None:
     deployer = _load("investigator_profile_deployer_missing", DEPLOYER_PATH)
     with tempfile.TemporaryDirectory(prefix="investigator-profile-missing-") as directory:
