@@ -103,6 +103,9 @@ _SHELL_FLAG_ONLY = frozenset(
     }
 )
 _MAX_SHELL_DEPTH = 8
+_DIRECT_WORKER_TURN_TASK_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 
 def _log(entry: Mapping[str, Any]) -> None:
@@ -1033,6 +1036,57 @@ def _search_connection(board: str, *, read_only: bool = False) -> sqlite3.Connec
     return conn
 
 
+def _direct_worker_task_id(payload: Mapping[str, Any], board: str) -> str | None:
+    """Recover dispatcher-owned worker identity after Hermes shell-hook env scrubbing.
+
+    Hermes intentionally removes ``HERMES_KANBAN_TASK`` from every child-process env,
+    including trusted ``pre_tool_call`` shell hooks.  The native structured
+    ``kanban_create`` surface is not exposed to ``delegate_task`` children, but keep
+    this recovery fail-closed anyway: require the direct one-shot turn UUID, the
+    Kanban session source, and an exact durable workspace/PID/run binding.
+    """
+    current = _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
+    if current:
+        return current
+    if os.environ.get("HERMES_SESSION_SOURCE") != "kanban":
+        return None
+    extra = payload.get("extra")
+    turn_task_id = _nonempty_string(extra.get("task_id")) if isinstance(extra, Mapping) else None
+    if not turn_task_id or not _DIRECT_WORKER_TURN_TASK_RE.fullmatch(turn_task_id):
+        return None
+    workspace = _nonempty_string(os.environ.get("HERMES_KANBAN_WORKSPACE"))
+    if not workspace:
+        return None
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _search_connection(board, read_only=True)
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")}
+        required = {"id", "status", "workspace_path", "worker_pid", "current_run_id"}
+        if not required.issubset(columns):
+            raise RuntimeError("board DB tasks schema cannot prove direct worker identity")
+        rows = conn.execute(
+            "SELECT id, status, workspace_path, worker_pid, current_run_id "
+            "FROM tasks WHERE workspace_path = ?",
+            (workspace,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise RuntimeError("worker workspace does not resolve to exactly one durable task")
+        row = rows[0]
+        if str(row["status"] or "") != "running" or row["current_run_id"] is None:
+            raise RuntimeError("worker workspace is not bound to a live durable run")
+        try:
+            worker_pid = int(row["worker_pid"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("worker workspace has no durable worker PID") from exc
+        if worker_pid != os.getppid():
+            raise RuntimeError("shell hook parent PID does not match the durable worker PID")
+        return _nonempty_string(row["id"])
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _search_require_schema(conn: sqlite3.Connection) -> None:
     required_tables = {"tasks", "task_links", "task_events"}
     tables = {
@@ -1303,9 +1357,10 @@ def _search_active_contexts(
 def _search_admit(
     raw_input: Mapping[str, Any], marker: Mapping[str, Any], assignee: str,
     budget: Mapping[str, int], phase: str, candidate_id: str | None,
+    current_task_id: str | None = None,
 ) -> int:
     board = str(raw_input.get("board") or "")
-    current_task_id = _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
+    current_task_id = current_task_id or _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
     root_task_id = _nonempty_string(marker.get("root_task_id"))
     search_id = _nonempty_string(marker.get("search_id"))
     idempotency_key = _nonempty_string(raw_input.get("idempotency_key"))
@@ -1578,8 +1633,10 @@ def _search_admit(
             conn.close()
 
 
-def _active_search_for_current(board: str) -> bool | None:
-    current_task_id = _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
+def _active_search_for_current(
+    board: str, current_task_id: str | None = None,
+) -> bool | None:
+    current_task_id = current_task_id or _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))
     if not current_task_id:
         return False
     conn: sqlite3.Connection | None = None
@@ -1594,14 +1651,16 @@ def _active_search_for_current(board: str) -> bool | None:
             conn.close()
 
 
-def _reject_unmarked_search_create(board: str, assignee: str) -> int:
-    active = _active_search_for_current(board)
+def _reject_unmarked_search_create(
+    board: str, assignee: str, current_task_id: str | None = None,
+) -> int:
+    active = _active_search_for_current(board, current_task_id)
     if active is True:
         return _search_block(
             "an active search admission requires the same investigation_search marker on every creation surface",
             assignee,
         )
-    if active is None and _nonempty_string(os.environ.get("HERMES_KANBAN_TASK")):
+    if active is None and (current_task_id or _nonempty_string(os.environ.get("HERMES_KANBAN_TASK"))):
         return _search_block(
             "could not read the active search admission from the canonical board DB",
             assignee,
@@ -1610,7 +1669,7 @@ def _reject_unmarked_search_create(board: str, assignee: str) -> int:
 
 
 def _evaluate_investigation_search_create(
-    raw_input: Mapping[str, Any], assignee: str,
+    raw_input: Mapping[str, Any], assignee: str, current_task_id: str | None = None,
 ) -> int:
     marker = raw_input.get("investigation_search")
     if not isinstance(marker, Mapping):
@@ -1698,7 +1757,9 @@ def _evaluate_investigation_search_create(
             )
         if not _nonempty_string(raw_input.get("idempotency_key")):
             return _search_block("each candidate requires a stable idempotency_key", assignee)
-        return _search_admit(raw_input, marker, assignee, budget, "candidate", candidate_id)
+        return _search_admit(
+            raw_input, marker, assignee, budget, "candidate", candidate_id, current_task_id
+        )
 
     if assignee != "kanban-main":
         return _search_block("the selector must be assigned to kanban-main", assignee)
@@ -1725,7 +1786,9 @@ def _evaluate_investigation_search_create(
         )
     if not _nonempty_string(raw_input.get("idempotency_key")):
         return _search_block("the selector requires a stable idempotency_key", assignee)
-    return _search_admit(raw_input, marker, assignee, budget, "selector", None)
+    return _search_admit(
+        raw_input, marker, assignee, budget, "selector", None, current_task_id
+    )
 
 
 def _evaluate_structured(payload: Mapping[str, Any]) -> int:
@@ -1737,25 +1800,39 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
             source="kanban_create",
         )
     board = str(raw_input.get("board") or "")
+    try:
+        current_task_id = _direct_worker_task_id(payload, board)
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        return _search_block(
+            "could not prove dispatcher-owned worker identity: "
+            f"{type(exc).__name__}: {exc}",
+            str(raw_input.get("assignee") or ""),
+        )
     assignee_value = str(raw_input.get("assignee") or "").strip().casefold()
     assignee = _specialist(raw_input.get("assignee"))
     if assignee is None:
         if assignee_value == "kanban-main":
             if "investigation_search" in raw_input:
-                search_decision = _evaluate_investigation_search_create(raw_input, "kanban-main")
+                search_decision = _evaluate_investigation_search_create(
+                    raw_input, "kanban-main", current_task_id
+                )
                 if search_decision != 0:
                     return search_decision
             else:
-                search_decision = _reject_unmarked_search_create(board, "kanban-main")
+                search_decision = _reject_unmarked_search_create(
+                    board, "kanban-main", current_task_id
+                )
                 if search_decision != 0:
                     return search_decision
         return 0
     if "investigation_search" in raw_input:
-        search_decision = _evaluate_investigation_search_create(raw_input, assignee)
+        search_decision = _evaluate_investigation_search_create(
+            raw_input, assignee, current_task_id
+        )
         if search_decision != 0:
             return search_decision
     else:
-        search_decision = _reject_unmarked_search_create(board, assignee)
+        search_decision = _reject_unmarked_search_create(board, assignee, current_task_id)
         if search_decision != 0:
             return search_decision
     if _structured_has_parent(raw_input) and _initial_status_is_blocked(

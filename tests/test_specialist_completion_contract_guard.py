@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -238,7 +239,11 @@ def _search_admission_db(path: Path) -> None:
             CREATE TABLE tasks (
                 id TEXT PRIMARY KEY,
                 assignee TEXT,
-                idempotency_key TEXT
+                idempotency_key TEXT,
+                status TEXT DEFAULT 'todo',
+                workspace_path TEXT,
+                worker_pid INTEGER,
+                current_run_id INTEGER
             );
             CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
             CREATE TABLE task_events (
@@ -252,7 +257,7 @@ def _search_admission_db(path: Path) -> None:
             """
         )
         conn.executemany(
-            "INSERT INTO tasks VALUES (?, ?, ?)",
+            "INSERT INTO tasks (id, assignee, idempotency_key) VALUES (?, ?, ?)",
             [
                 ("root", "kanban-main", "root-key"),
                 ("candidate-a", "kanban-investigator", "candidate-a"),
@@ -389,6 +394,79 @@ def test_bounded_search_guard_requires_durable_search_context() -> None:
     message = json.loads(result.stdout)["message"]
     assert "current durable task context" in message
     assert "No task mutation was performed" in message
+
+
+def test_bounded_search_guard_recovers_direct_worker_identity_after_hook_scrub(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    workspace = tmp_path / ".worktrees" / "root"
+    workspace.mkdir(parents=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', workspace_path = ?, worker_pid = ?, "
+            "current_run_id = 42 WHERE id = 'root'",
+            (str(workspace), os.getpid()),
+        )
+        conn.commit()
+    env = {
+        "HERMES_KANBAN_DB": str(db),
+        "HERMES_KANBAN_WORKSPACE": str(workspace),
+        "HERMES_SESSION_SOURCE": "kanban",
+    }
+    result = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(candidate_id="A"),
+            "extra": {"task_id": str(uuid.uuid4())},
+        },
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    with sqlite3.connect(db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = 'investigation_search_candidate_admitted'"
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_bounded_search_guard_does_not_recover_parent_identity_for_delegate_child(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    workspace = tmp_path / ".worktrees" / "root"
+    workspace.mkdir(parents=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', workspace_path = ?, worker_pid = ?, "
+            "current_run_id = 42 WHERE id = 'root'",
+            (str(workspace), os.getpid()),
+        )
+        conn.commit()
+    env = {
+        "HERMES_KANBAN_DB": str(db),
+        "HERMES_KANBAN_WORKSPACE": str(workspace),
+        "HERMES_SESSION_SOURCE": "kanban",
+    }
+    result = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(candidate_id="A"),
+            "extra": {"task_id": "sa-0-deadbeef"},
+        },
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "current durable task context" in json.loads(result.stdout)["message"]
+    with sqlite3.connect(db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind LIKE 'investigation_search%'"
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_bounded_search_guard_requires_exact_selector_fan_in() -> None:

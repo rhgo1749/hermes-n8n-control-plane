@@ -60,3 +60,10 @@ Fan-out is hard-capped at exactly two candidates and one expansion. The canonica
 ## Stop state
 
 Implementation worker stops after local evidence and PR publication/current-state read-back. Pending CI, human review, live dashboard/profile restart, operator budget policy, and merge are external/manual gates; none may keep a worker running.
+
+## 2026-09-17 runtime guard follow-up
+
+- Observed live failure: Hermes correctly scrubs `HERMES_KANBAN_TASK` from shell-hook child environments, so the H4V3 bounded-search guard could not prove the dispatcher-owned Main task and repeatedly failed closed while the worker kept reasoning.
+- Repair boundary: H4V3 guard only; Hermes core remains unchanged. For native structured `kanban_create`, recover the direct dispatcher worker identity only when the hook carries a normal one-shot turn UUID and the canonical board proves one live task with the exact workspace, worker PID, and current run. Delegate-task identities (`sa-*`) do not recover the parent task.
+- Validation: bounded-search guard `20 passed`; completion/parser/workspace guard suite `305 passed`; Investigator/trajectory suite `42 passed`; changed Python `py_compile`, deployer dry-run, live apply, source/live SHA-256 read-back, six hook-config semantic read-back, and no deploy-candidate residue all passed.
+- Runtime configuration follow-up is intentionally outside Hermes core: all five H4V3 Kanban profiles use `approvals.single_query_mode=approve` and `terminal.timeout=180` so unattended `chat -q` workers do not dead-end on ordinary approval prompts or zero-second file-operation timeouts. Hardline approval floors and H4V3 fail-closed lifecycle guards remain active.
