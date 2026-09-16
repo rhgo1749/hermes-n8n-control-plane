@@ -55,6 +55,18 @@ def _as_int(value: Any) -> Optional[int]:
         return None
 
 
+def _strict_int(value: Any) -> Optional[int]:
+    """Return the value only when it is already a true integer.
+
+    Trajectory budget fields are a compliance contract, not arithmetic
+    input: ``'32000'``, ``32000.5``, and ``True`` are malformed declarations
+    and must never be normalized into a known integer.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _known_ints(values: Iterable[Any]) -> list[int]:
     result: list[int] = []
     for value in values:
@@ -265,7 +277,7 @@ def _investigation_search_budget_validation(
         "max_candidates", "max_expansions", "max_total_tokens",
         "max_runtime_seconds", "max_retries",
     ):
-        value = _as_int(budget.get(field))
+        value = _strict_int(budget.get(field))
         if value is None:
             return values, "invalid"
         values[field] = value
@@ -291,7 +303,7 @@ def _investigation_search_budget(marker: Mapping[str, Any]) -> dict[str, int]:
         "max_candidates", "max_expansions", "max_total_tokens",
         "max_runtime_seconds", "max_retries",
     ):
-        value = _as_int(budget.get(field))
+        value = _strict_int(budget.get(field))
         if value is not None:
             result[field] = value
     return result

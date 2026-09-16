@@ -619,6 +619,46 @@ def test_bounded_search_guard_binds_terminal_surface_and_rejects_unmarked_bypass
     assert "same investigation_search marker" in json.loads(bypass.stdout)["message"]
 
 
+@pytest.mark.parametrize(
+    "option", ("--body", "--assignee", "--idempotency-key"),
+)
+def test_bounded_search_guard_fails_closed_on_conflicting_duplicate_terminal_options(
+    tmp_path: Path, option: str,
+) -> None:
+    db = tmp_path / "kanban.db"
+    _search_admission_db(db)
+    env = _search_env(db)
+    marker = _search_create_input(candidate_id="B")["investigation_search"]
+    marker_body = shlex.quote(json.dumps({"investigation_search": marker}))
+    command = (
+        "hermes kanban create candidate-b --assignee kanban-investigator "
+        f"--body {marker_body} --max-runtime 15m --max-retries 2 "
+        "--idempotency-key candidate-b"
+    )
+    if option == "--body":
+        command = f"{command} --body {shlex.quote(json.dumps({'junk': True}))}"
+    elif option == "--assignee":
+        command = f"{command} --assignee kanban-main"
+    else:
+        command = f"{command} --idempotency-key conflicting-key"
+
+    result = _run(
+        {"tool_name": "terminal", "tool_input": {"command": command}},
+        env_updates=env,
+        guard_path=COMPLETION_GUARD,
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    message = json.loads(result.stdout)["message"]
+    assert "conflicting duplicate" in message
+    assert option in message
+    with sqlite3.connect(db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE kind LIKE 'investigation_search%'"
+        ).fetchone()[0]
+    assert count == 0
+
+
 def test_bounded_search_guard_allows_idempotent_candidate_replay_after_selector_close(
     tmp_path: Path,
 ) -> None:

@@ -14,7 +14,7 @@
 - Merge authority: Human/user only
 - Source issue: `rhgo1749/hermes-n8n-control-plane#155`
 - Source issue URL: https://github.com/rhgo1749/hermes-n8n-control-plane/issues/155
-- Kanban task ID: `t_5b9947dd` (root: `t_41397dad`, Investigator: `t_54669e81`; bounded-admission rework: `t_e55b55bb`)
+- Kanban task ID: `t_5b9947dd` (root: `t_41397dad`, Investigator: `t_54669e81`; bounded-admission rework: `t_e55b55bb`; round-2 rework: `t_79b8a5dd`)
 - Intake idempotency key: `github:rhgo1749/hermes-n8n-control-plane:issue:155`
 - Planning/lead owner: `kanban-main`
 - Implementation owner: `kanban-developer`

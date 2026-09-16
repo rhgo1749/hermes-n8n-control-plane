@@ -765,6 +765,39 @@ def test_search_projection_marks_missing_or_invalid_budget_non_compliant(
     assert search["bound_compliance"]["declared_budget_matches_contract"] is False
     assert report["bound_compliance"]["all_searches_declared_budget_compliant"] is False
 
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("max_total_tokens", "32000"),
+        ("max_total_tokens", 32000.5),
+        ("max_total_tokens", True),
+        ("max_runtime_seconds", "900"),
+    ],
+    ids=["string-tokens", "float-tokens", "bool-tokens", "string-runtime"],
+)
+def test_search_projection_rejects_coerced_budget_values(
+    field: str, malformed: object,
+) -> None:
+    run = _search_run(
+        11, "candidate-a", "candidate", candidate_id="A",
+        candidate_task_id="candidate-a",
+    )
+    raw_metadata = run["metadata"]
+    assert isinstance(raw_metadata, str)
+    metadata = json.loads(raw_metadata)
+    metadata["investigation_search"]["budget"][field] = malformed
+    run["metadata"] = json.dumps(metadata)
+
+    report = trajectory._investigation_search_report([run], [], [])
+    search = report["searches"][0]
+
+    assert search["availability"] == "unavailable"
+    assert search["used"] is None
+    assert field not in search["budget"]
+    assert search["bound_compliance"]["declared_budget_matches_contract"] is False
+    assert report["bound_compliance"]["all_searches_declared_budget_compliant"] is False
+
+
 def test_search_projection_requires_durable_marker_identity() -> None:
     run = _search_run(
         16,

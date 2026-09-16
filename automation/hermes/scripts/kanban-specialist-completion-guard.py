@@ -27,7 +27,11 @@ bypasses without treating quoted documentation or echo/printf data as commands.
 Unsupported shell grouping is not flattened into the supported command-chain
 grammar: a relevant mutation inside ``(...)`` or ``{...;}`` fails closed before
 the terminal command can execute. Search candidates and selectors use the same
-canonical task_events admission ledger on every surface; the ledger atomically
+canonical task_events admission ledger on every surface, and a terminal
+create that repeats --body/--assignee/--idempotency-key with differing
+values fails closed before admission because argparse would mutate with
+the last value while the admitted payload could describe another. The
+ledger atomically
 reserves two candidate slots, a 32000-token cumulative budget, two retry
 reservations, and a 900-second dispatcher cap. Reassignment reads only the
 canonical task row; unreadable/ambiguous state fails closed and is never
@@ -926,6 +930,26 @@ def _option_values(args: list[str], option: str) -> list[str]:
             values.append(value.split("=", 1)[1])
         index += 1
     return values
+
+
+_SINGLE_VALUE_TERMINAL_OPTIONS = ("--body", "--assignee", "--idempotency-key")
+
+
+def _require_unique_terminal_options(args: list[str]) -> None:
+    """Reject conflicting repeated options before any admission decision.
+
+    Canonical argparse mutates with the LAST value of a repeated option, so
+    an admitted payload built from a different value would describe a task
+    that is not the one about to be created. Identical repeats are
+    semantically harmless; differing values are ambiguous and fail closed.
+    """
+    for option in _SINGLE_VALUE_TERMINAL_OPTIONS:
+        values = _option_values(args, option)
+        if len(set(values)) > 1:
+            raise RuntimeError(
+                f"conflicting duplicate {option} option values are ambiguous: "
+                "canonical argparse would mutate with the last value"
+            )
 
 
 def _positive_int(value: Any) -> bool:
@@ -1835,6 +1859,7 @@ def _evaluate_terminal_create(args: list[str], board: str) -> int:
             break
     if assignee is None:
         return 0
+    _require_unique_terminal_options(args)
     marker = _terminal_search_marker(args)
     if marker is not None:
         raw_input = _terminal_search_input(args, board, assignee, marker)
