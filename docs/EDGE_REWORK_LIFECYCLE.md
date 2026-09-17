@@ -239,7 +239,7 @@ valid completed round projects `agent-review-ready`.
 | `DONE + OPEN PR` repair | delivered round + card re-completed by a worker/reviewer while the PR is OPEN | classic `apply_decision` DONE `→` REVIEW (`github_pr_sync` event, assignee/claim/completed_at cleared) + labels `→ agent-review-ready`; dry-run predicts `repair_predicted: done_open_pr_repaired` |
 | `DONE + OPEN PR` incomplete delivery repair | current-round marker/delivery evidence is absent, stale, malformed, or unproven | repair to REVIEW with `rework_human_attention`, clear consumed execution/output labels, and never synthesize `agent-rework` or project `agent-review-ready` |
 | `DONE + OPEN PR` fresh rework conflict repair | one trusted, current `agent-rework` event accompanies stale `agent-working` | repair to REVIEW, remove stale execution/output labels, preserve the exact `agent-rework` command, and record `recovery_pending_rework_event_id` provenance; do not project `agent-review-ready` |
-| `agent-working` → READY (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | clear consumed lifecycle labels; task requeued `→ ready` from durable `github_pr_rework_retry` evidence, failure counted against `kanban.failure_limit` (circuit breaker preserved); the edge never re-creates `agent-rework`. A canonical `github_pr_rework`/`github_pr_rework_retry` event newer than the latest completed run is also an explicit dispatcher re-run authorization: the *** respawn overlay may waive core `recent_success`/`active_pr` only after strict round/PR/head provenance validation. Stale or malformed evidence leaves both core guards intact. |
+| `agent-working` → READY (safe retry) | worker crash / run failure / head mismatch / no marker, no human-attention text | clear consumed lifecycle labels; task requeued `→ ready` from durable `github_pr_rework_retry` evidence, failure counted against `kanban.failure_limit` (circuit breaker preserved); the edge never re-creates `agent-rework`. A canonical `github_pr_rework`/`github_pr_rework_retry` event newer than the latest completed run is also an explicit dispatcher re-run authorization: the control-plane respawn overlay may waive core `recent_success`/`active_pr` only after strict round/PR/head provenance validation. Stale or malformed evidence leaves both core guards intact. |
 | BLOCKED or operator-recovered REVIEW attention hold → new round | preferred: a fresh trusted `agent-rework` label addition after the current round's attention; compatibility fallback: an exact trusted `AGENT_REWORK_RETRY` whole-comment; source Issue open + `agent-ready` | the fresh label returns to the classic `apply_rework` intake and opens an ordinary label-requested round; the fallback comment opens `trigger: maintainer_retry` with `retry_comment_id`; stale/untrusted/edge-owned label projections do not qualify, and dispatch projects `agent-working` only after claim |
 | `agent-working` → attention hold | ambiguous: completion marker missing / malformed / no run, or worker text asks for human input | clear consumed lifecycle labels; emit idempotent `HERMES_KANBAN_REWORK_ATTENTION` PR feedback + Kanban `github_pr_rework_attention`; only a later trusted maintainer command may open another round |
 | labels removed | PR merged | cleanup + classic REVIEW→DONE transition in the same pass |
@@ -273,8 +273,13 @@ valid completed round projects `agent-review-ready`.
    is the preferred one-shot maintainer command, including after a current-round
    attention hold. The label addition must be **newer than the governing
    round/attention evidence**; stale, untrusted, or edge-owned same-round label
-   projections do not qualify. A qualifying label returns to the classic path
-   in the same wake and opens an ordinary label-requested round.
+   projections do not qualify. GitHub label timestamps are second-granular, so
+   two commands in the same second are distinguished only by their stable
+   positive timeline event ids and the exact `label_event_id` stored on the
+   governing round. A missing/malformed identity fails closed, and an event id
+   never overrides a DB event timestamp that is clearly later. A qualifying
+   label returns to the classic path in the same wake and opens an ordinary
+   label-requested round.
 6. `AGENT_REWORK_RETRY` remains a backwards-compatible fallback for a consumed
    round with current-round `github_pr_rework_attention`, including an
    operator-recovered `REVIEW`. Its exact trusted comment id is consumed
@@ -295,8 +300,11 @@ valid completed round projects `agent-review-ready`.
    REVIEW → READY evaluation in the **same reconciliation pass**. If that
    refetch fails, reconciliation stops fail-closed until the next wake. The
    normalization baseline is either the prior `github_pr_rework_delivery` event
-   or an explicit `github_pr_sync` event proving `DONE → REVIEW` for the same PR;
-   missing or ambiguous timestamp/PR evidence still fails closed.
+   or an explicit `github_pr_sync` event proving `DONE → REVIEW` for the same PR.
+   A recovery parking event may also bind the exact pending command by its
+   `recovery_pending_rework_event_id`; that causal identity preserves the same
+   command without pretending its older GitHub timestamp postdates the parking
+   write. Missing or ambiguous timestamp/PR/identity evidence still fails closed.
 10. All GitHub label mutations are a single atomic PATCH with read-back
     verification. A claim-time PATCH non-2xx or stale read-back is recorded as
     one structured `github_pr_rework_projection_failure` event with the task,

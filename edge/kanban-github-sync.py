@@ -1013,6 +1013,65 @@ def _labeled_events(client: Any, ref: GithubTaskRef, pr_number: int) -> list[tup
     return events
 
 
+def _latest_labeled_event(
+    events: list[tuple[int, str, Optional[int]]],
+) -> Optional[tuple[int, str, Optional[int]]]:
+    """Return the newest label command without losing same-second identity.
+
+    GitHub timeline timestamps are only second-granular here.  Stable positive
+    REST event ids are therefore used only to order label additions that share
+    the exact same timestamp.  A malformed/missing id in that newest timestamp
+    bucket makes the bucket ambiguous and fails closed.
+    """
+    if not events:
+        return None
+    newest_at = max(item[0] for item in events)
+    newest = [item for item in events if item[0] == newest_at]
+    ambiguous = next((item for item in newest if item[2] is None), None)
+    if ambiguous is not None:
+        return ambiguous
+    return max(newest, key=lambda item: cast(int, item[2]))
+
+
+def _label_event_is_newer_than_baseline(
+    event: tuple[int, str, Optional[int]],
+    *,
+    event_at: int,
+    current_label_at: Optional[int] = None,
+    current_label_event_id: Optional[int] = None,
+) -> bool:
+    """Compare a GitHub label command with durable round provenance.
+
+    Timestamps remain authoritative across different seconds/clocks.  Event ids
+    are consulted only when the candidate and the exact command bound to the
+    durable round share one timestamp.  That prevents a larger GitHub id from
+    overriding a DB event that is clearly newer in time.
+    """
+    label_at, _, label_event_id = event
+    if type(label_event_id) is not int or label_event_id <= 0:
+        return False
+    try:
+        durable_at = int(event_at)
+    except (TypeError, ValueError):
+        return False
+    bound_at: Optional[int] = None
+    if current_label_at is not None:
+        try:
+            bound_at = int(current_label_at)
+        except (TypeError, ValueError):
+            return False
+    baseline = max(durable_at, bound_at or 0)
+    if label_at > baseline:
+        return True
+    if label_at < baseline:
+        return False
+    if bound_at is None or label_at != bound_at or durable_at > bound_at:
+        return False
+    if type(current_label_event_id) is not int or current_label_event_id <= 0:
+        return False
+    return label_event_id > current_label_event_id
+
+
 def _rework_request_comment_id(
     client: Any,
     ref: GithubTaskRef,
@@ -1042,6 +1101,8 @@ def evaluate_rework(
     *,
     current_status: str,
     last_rework_at: Optional[int],
+    last_rework_label_at: Optional[int] = None,
+    last_rework_label_event_id: Optional[int] = None,
 ) -> Optional[ReworkDecision]:
     """Evaluate the one-shot agent-rework request.
 
@@ -1071,7 +1132,10 @@ def evaluate_rework(
     if not events:
         # Label present without any labeled event: data anomaly — do nothing.
         return ReworkDecision(reason="rework_label_event_missing", pr_number=pr.number, label_present=True)
-    label_added_at, label_actor, label_event_id = max(events, key=lambda item: item[0])
+    latest_event = _latest_labeled_event(events)
+    if latest_event is None:
+        return ReworkDecision(reason="rework_label_event_missing", pr_number=pr.number, label_present=True)
+    label_added_at, label_actor, label_event_id = latest_event
     if label_event_id is None:
         return ReworkDecision(reason="rework_label_event_identity_missing",
                               pr_number=pr.number, label_present=True)
@@ -1089,7 +1153,12 @@ def evaluate_rework(
             label_actor=label_actor,
             label_event_id=label_event_id,
         )
-    if last_rework_at is not None and label_added_at <= last_rework_at:
+    if last_rework_at is not None and not _label_event_is_newer_than_baseline(
+        latest_event,
+        event_at=last_rework_at,
+        current_label_at=last_rework_label_at,
+        current_label_event_id=last_rework_label_event_id,
+    ):
         # The request remains visible until the dispatcher has claimed the
         # Kanban task.  Do not remove it merely because the DB event exists.
         return ReworkDecision(
@@ -3806,12 +3875,8 @@ def _reconcile_blocked(
 
     # Precedence 2: one-shot trusted agent-rework on exactly one open PR.
     try:
-        rework = evaluate_rework(
-            client,
-            ref,
-            decision,
-            current_status="blocked",
-            last_rework_at=_last_rework_event_at(conn, task_id),
+        rework = _evaluate_rework_for_task(
+            conn, client, ref, decision, task_id, current_status="blocked"
         )
     except GithubCompletionError as exc:
         rework = ReworkDecision(reason="rework_query_failed", error=str(exc), authoritative=False)
@@ -4114,6 +4179,45 @@ def _latest_rework_event(
         payload,
         int(_attention_row_value(row, "created_at", 1) or 0),
         str(_attention_row_value(row, "kind", 2)),
+    )
+
+
+def _latest_rework_command_baseline(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return durable round time plus its exact label-command provenance."""
+    event = _latest_rework_event(conn, task_id)
+    if event is None:
+        return None, None, None
+    payload, event_at, _ = event
+    label_at = payload.get("label_added_at")
+    label_id = payload.get("label_event_id")
+    return (
+        event_at,
+        label_at if type(label_at) is int else None,
+        label_id if type(label_id) is int and label_id > 0 else None,
+    )
+
+
+def _evaluate_rework_for_task(
+    conn: sqlite3.Connection,
+    client: Any,
+    ref: GithubTaskRef,
+    decision: GithubCompletionDecision,
+    task_id: str,
+    *,
+    current_status: str,
+) -> Optional[ReworkDecision]:
+    event_at, label_at, label_event_id = _latest_rework_command_baseline(conn, task_id)
+    return evaluate_rework(
+        client,
+        ref,
+        decision,
+        current_status=current_status,
+        last_rework_at=event_at,
+        last_rework_label_at=label_at,
+        last_rework_label_event_id=label_event_id,
     )
 
 
@@ -5180,6 +5284,7 @@ def _rework_delivery_evidence(
         pr.number,
         rework_at,
         current_label_at=payload.get("label_added_at"),
+        current_label_event_id=payload.get("label_event_id"),
     ):
         return False, "delivery_superseded_by_new_rework", {"rework_at": rework_at}
     run = _task_run_after_rework(
@@ -6286,6 +6391,7 @@ def _label_is_newer_than_event(
     pr_number: int,
     event_at: int,
     current_label_at: Optional[int] = None,
+    current_label_event_id: Optional[int] = None,
 ) -> bool:
     """True when a newer agent-rework label addition follows this round.
 
@@ -6295,12 +6401,15 @@ def _label_is_newer_than_event(
     the event to the label that opened the round; legacy events fall back to
     the event timestamp.
     """
-    events = _labeled_events(client, ref, pr_number)
-    if not events:
+    latest = _latest_labeled_event(_labeled_events(client, ref, pr_number))
+    if latest is None:
         return False
-    latest_label_at, _, _ = max(events, key=lambda item: item[0])
-    baseline = max(int(event_at), int(current_label_at or 0))
-    return latest_label_at > baseline
+    return _label_event_is_newer_than_baseline(
+        latest,
+        event_at=event_at,
+        current_label_at=current_label_at,
+        current_label_event_id=current_label_event_id,
+    )
 
 
 def _latest_delivery_head(
@@ -6445,19 +6554,12 @@ def _event_targets_pr(payload: Mapping[str, Any], pr_number: int) -> bool:
         return False
 
 
-def _last_review_parking_event_at(
+def _last_review_parking_event(
     conn: sqlite3.Connection,
     task_id: str,
     pr_number: int,
-) -> int | None:
-    """Epoch time of a prior GitHub sync that parked this PR in REVIEW.
-
-    ``github_pr_sync`` is the durable provenance for the ordinary
-    ``DONE -> REVIEW`` open-PR repair.  It is a valid stale
-    ``agent-review-ready`` baseline even when no rework delivery event exists
-    for the prior round.  Malformed or unrelated events are ignored so they
-    cannot manufacture a normalization decision.
-    """
+) -> Optional[tuple[dict[str, Any], int]]:
+    """Newest durable DONE -> REVIEW parking event for this PR."""
     rows = conn.execute(
         "SELECT payload, created_at FROM task_events "
         "WHERE task_id = ? AND kind = 'github_pr_sync' "
@@ -6476,10 +6578,32 @@ def _last_review_parking_event_at(
         if not _event_targets_pr(payload, pr_number):
             continue
         try:
-            return int(row["created_at"])
+            return payload, int(row["created_at"])
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _last_review_parking_event_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pr_number: int,
+) -> int | None:
+    """Epoch time wrapper for callers that do not need parking identity."""
+    parking = _last_review_parking_event(conn, task_id, pr_number)
+    return parking[1] if parking is not None else None
+
+
+def _latest_rework_label_event(
+    client: Any,
+    ref: GithubTaskRef,
+    pr_number: int,
+) -> Optional[tuple[int, str, int]]:
+    """Newest unambiguous rework command, preserving stable event identity."""
+    latest = _latest_labeled_event(_labeled_events(client, ref, pr_number))
+    if latest is None or latest[2] is None:
+        return None
+    return latest[0], latest[1], latest[2]
 
 
 def _latest_rework_label_at(
@@ -6487,12 +6611,9 @@ def _latest_rework_label_at(
     ref: GithubTaskRef,
     pr_number: int,
 ) -> Optional[int]:
-    """Epoch time of the newest agent-rework label addition, if any."""
-    events = _labeled_events(client, ref, pr_number)
-    if not events:
-        return None
-    added_at, _, _ = max(events, key=lambda item: item[0])
-    return added_at
+    """Epoch time of the newest unambiguous agent-rework label addition."""
+    latest = _latest_rework_label_event(client, ref, pr_number)
+    return latest[0] if latest is not None else None
 
 
 def _delivery_review_transition(
@@ -6562,11 +6683,47 @@ def _normalize_stale_review_ready(
     addition provably postdates one of those prior review-parking events.
     """
     delivery_at = _last_delivery_event_at(conn, task_id)
-    parking_at = _last_review_parking_event_at(conn, task_id, pr_number)
-    baselines = [value for value in (delivery_at, parking_at) if value is not None]
-    request_at = _latest_rework_label_at(client, ref, pr_number)
-    if not baselines or request_at is None or request_at <= max(baselines):
+    parking = _last_review_parking_event(conn, task_id, pr_number)
+    baselines = [value for value in (delivery_at, parking[1] if parking else None) if value is not None]
+    request = _latest_rework_label_event(client, ref, pr_number)
+    if not baselines or request is None:
         return None
+    request_at, _, request_event_id = request
+
+    # A delivery baseline has no GitHub command identity, so only a strictly
+    # later timestamp can supersede it.  Never use an event id as a cross-clock
+    # ordering substitute.
+    if delivery_at is not None and request_at <= delivery_at:
+        return None
+
+    if parking is not None:
+        parking_payload, parking_at = parking
+        recovery_at = parking_payload.get("recovery_pending_rework_label_added_at")
+        recovery_id = parking_payload.get("recovery_pending_rework_event_id")
+        exact_recovery_command = (
+            type(recovery_at) is int
+            and type(recovery_id) is int
+            and recovery_id > 0
+            and request_at == recovery_at
+            and request_event_id == recovery_id
+        )
+        if not exact_recovery_command:
+            if request_at > parking_at:
+                pass
+            elif (
+                type(recovery_at) is int
+                and type(recovery_id) is int
+                and recovery_id > 0
+                and request_at == recovery_at
+                and parking_at <= recovery_at
+                and request_event_id > recovery_id
+            ):
+                # Same-second re-add after the exact command that caused the
+                # parking event.  This is safe only when the DB parking clock
+                # is not clearly later than that GitHub second.
+                pass
+            else:
+                return None
     if dry_run:
         return {
             "task_id": task_id,
@@ -7339,14 +7496,26 @@ def _reconcile_rework_lifecycle(
                 )
             except GithubCompletionError:
                 context_block = None
+            governing_payload = (
+                context["event"][0] if isinstance(context["event"][0], dict) else {}
+            )
             pending = evaluate_rework(
                 client, ref, decision, current_status="review",
-                last_rework_at=max(
-                    int(context["event_at"]),
-                    int(context["event"][0].get("label_added_at") or 0),
-                    int(_last_delivery_event_at(conn, task_id) or 0),
-                ),
+                last_rework_at=int(context["event_at"]),
+                last_rework_label_at=governing_payload.get("label_added_at"),
+                last_rework_label_event_id=governing_payload.get("label_event_id"),
             )
+            last_delivery_at = _last_delivery_event_at(conn, task_id)
+            if (
+                pending is not None
+                and pending.reason == "agent_rework"
+                and last_delivery_at is not None
+                and (pending.label_added_at is None or pending.label_added_at <= last_delivery_at)
+            ):
+                # Delivery events do not carry label-command identity.  When
+                # that DB clock is as-new-or-newer, do not use a GitHub event
+                # id to manufacture cross-clock freshness.
+                pending = None
             if pending is not None and pending.reason != "agent_rework":
                 pending = None
             with conn:
@@ -7455,6 +7624,7 @@ def _reconcile_rework_lifecycle(
         if _label_is_newer_than_event(
             client, ref, int(context["pr_number"]), int(context["event"][1]),
             current_label_at=context["event"][0].get("label_added_at") if isinstance(context["event"][0], dict) else None,
+            current_label_event_id=context["event"][0].get("label_event_id") if isinstance(context["event"][0], dict) else None,
         ):
             return None
         # Explicit maintainer retry (new round ingress): a fresh trusted
@@ -7658,6 +7828,7 @@ def _reconcile_rework_lifecycle(
         int(context["pr_number"]),
         int(context["event_at"]),
         current_label_at=context["event"][0].get("label_added_at"),
+        current_label_event_id=context["event"][0].get("label_event_id"),
     ):
         # RC2 (t_aff9017c incident): a fresh rework request postdating the
         # round means the worker is gone — any lingering agent-working label
@@ -7763,6 +7934,7 @@ def _reconcile_rework_lifecycle(
                         int(context["pr_number"]),
                         int(context["event_at"]),
                         current_label_at=context["event"][0].get("label_added_at"),
+                        current_label_event_id=context["event"][0].get("label_event_id"),
                     )
                     try:
                         _, label_reason, label_evidence = _project_pr_lifecycle_labels(
@@ -9130,12 +9302,9 @@ def sync_board(
             rework: Optional[ReworkDecision] = None
             if decision.authoritative and row["status"] in {"review", "ready"}:
                 try:
-                    rework = evaluate_rework(
-                        client,
-                        ref,
-                        decision,
+                    rework = _evaluate_rework_for_task(
+                        conn, client, ref, decision, task_id,
                         current_status=row["status"],
-                        last_rework_at=_last_rework_event_at(conn, task_id),
                     )
                 except GithubCompletionError as exc:
                     rework = ReworkDecision(

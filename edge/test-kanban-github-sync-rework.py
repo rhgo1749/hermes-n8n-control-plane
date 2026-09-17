@@ -856,6 +856,91 @@ def test_rework_label_event_identity_missing_fails_closed():
     check("reason recorded", r.get("rework", {}).get("reason") == "rework_label_event_identity_missing", str(r))
 
 
+def test_same_second_rework_readd_uses_stable_event_id():
+    print("same-second re-add -> exact stable event id distinguishes the fresh command")
+    fake = fresh_env()
+    rework_scenario(fake, label_ts=LABEL_ADDED_OLD)
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD, event_id=173001)
+    tid = new_task("review")
+
+    first = run_sync(fake)
+    rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("same-second: first command recorded",
+          len(rounds) == 1 and rounds[-1]["payload"].get("label_event_id") == 173001,
+          str((first, rounds)))
+
+    same_epoch = mod._parse_iso_ts(LABEL_ADDED_OLD)
+    assert same_epoch is not None
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'github_pr_rework'",
+            (same_epoch, tid),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'review', completed_at = NULL, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (tid,),
+        )
+        conn.commit()
+
+    # Re-observing the already-consumed command is stale, even though its
+    # second-granular timestamp exactly equals the governing DB event.
+    fake.pr_labels[PR_N] = ["agent-rework"]
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD, event_id=173001)
+    stale = run_sync(fake)
+    stale_rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("same-second: old event id stays consumed", len(stale_rounds) == 1, str(stale))
+
+    # A remove/re-add in the same GitHub second has a different durable event
+    # identity. The higher id is the newer command within that timestamp only.
+    fake.pr_timeline[PR_N] = (
+        labeled_timeline(LABEL_ADDED_OLD, event_id=173001)
+        + labeled_timeline(LABEL_ADDED_OLD, event_id=173002)
+    )
+    fresh = run_sync(fake)
+    fresh_rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("same-second: newer event id opens one fresh round",
+          len(fresh_rounds) == 2
+          and fresh_rounds[-1]["payload"].get("label_event_id") == 173002,
+          str((fresh, fresh_rounds)))
+
+
+def test_same_second_rework_identity_ambiguity_fails_closed():
+    print("same-second label bucket with malformed identity -> fail closed")
+    fake = fresh_env()
+    rework_scenario(fake, label_ts=LABEL_ADDED_NEW)
+    fake.pr_timeline[PR_N] = (
+        labeled_timeline(LABEL_ADDED_NEW, event_id=173001)
+        + labeled_timeline(LABEL_ADDED_NEW, event_id=None)
+    )
+    tid = new_task("review")
+    results = run_sync(fake)
+    check("same-second malformed bucket: no round",
+          not [e for e in task_events(tid) if e["kind"] == "github_pr_rework"],
+          str(results))
+    check("same-second malformed bucket: identity missing diagnostic",
+          any(r.get("rework", {}).get("reason") == "rework_label_event_identity_missing"
+              for r in results), str(results))
+
+
+def test_same_second_event_id_never_overrides_newer_db_clock():
+    print("same-second GitHub id cannot override a clearly newer DB event")
+    fake = fresh_env()
+    rework_scenario(fake, label_ts=LABEL_ADDED_NEW)
+    fake.pr_timeline[PR_N] = (
+        labeled_timeline(LABEL_ADDED_NEW, event_id=173001)
+        + labeled_timeline(LABEL_ADDED_NEW, event_id=173002)
+    )
+    epoch = mod._parse_iso_ts(LABEL_ADDED_NEW)
+    assert epoch is not None
+    ref = mod.GithubTaskRef(REPO, ISSUE_N)
+    newer = mod._label_is_newer_than_event(
+        fake, ref, PR_N, epoch + 1,
+        current_label_at=epoch, current_label_event_id=173001,
+    )
+    check("cross-clock: DB timestamp wins", newer is False, str(newer))
+
+
 def test_15_dry_run_predicts_rework():
     print("15. dry-run predicts the rework without mutating anything")
     fake = fresh_env()
@@ -6249,6 +6334,9 @@ def main() -> int:
         test_12_existing_review_done_regression, test_13_multiple_rework_prs,
         test_14_untrusted_label_actor, test_15_dry_run_predicts_rework,
         test_rework_label_event_identity_missing_fails_closed,
+        test_same_second_rework_readd_uses_stable_event_id,
+        test_same_second_rework_identity_ambiguity_fails_closed,
+        test_same_second_event_id_never_overrides_newer_db_clock,
         test_16_blocked_merged_done, test_17_blocked_open_pr_review, test_18_blocked_draft,
         test_19_blocked_no_pr_projection, test_20_projection_idempotent,
         test_21_projection_reason_update, test_22_projection_write_failure,
