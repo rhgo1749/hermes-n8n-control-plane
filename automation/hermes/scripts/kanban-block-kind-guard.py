@@ -2,28 +2,28 @@
 """Dispatch the approved H4V3 Kanban pre-tool guard command.
 
 The historical block-kind hook command is already trusted by the live Hermes
-shell-hook allowlist. Keep that exact command path stable and route both
-lifecycle policies behind it:
+shell-hook allowlist. Keep that exact command path stable and route lifecycle
+policies behind it:
 
 * ``kanban_block`` -> the preserved block-kind core guard;
-* ``kanban_create`` -> specialist completion and workspace-binding policies;
-* ``terminal`` -> block-kind core first, then both specialist policies.
+* ``kanban_create`` -> structured retry compatibility, specialist completion,
+  retry materialization, and workspace-binding policies;
+* ``terminal`` -> block-kind core first, then specialist/workspace policies.
 
 Keeping one approved ``pre_tool_call`` command avoids introducing a second
-shell-hook consent boundary during a hotfix. The completion policy stays
-in-process. The workspace-binding policy runs under the Python interpreter
-beside the active ``hermes`` launcher so its canonical ``hermes_cli`` DB/parser
-imports do not depend on the shell-hook subprocess cwd or the generic
-``python3`` selected by PATH.
+shell-hook consent boundary during a hotfix. The structured retry compatibility
+only fills the model-facing schema gap; it does not change Hermes core.
 """
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
+import sqlite3
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -32,6 +32,11 @@ HERE = Path(__file__).resolve().parent
 BLOCK_KIND_CORE = HERE / "kanban-block-kind-guard-core.py"
 SPECIALIST_COMPLETION_GUARD = HERE / "kanban-specialist-completion-guard.py"
 WORKSPACE_BINDING_GUARD = HERE / "kanban-workspace-binding-guard.py"
+TASK_RETRY_LIMIT = 5
+SPECIALIST_ASSIGNEES = frozenset(
+    {"kanban-investigator", "kanban-developer", "kanban-reviewer", "kanban-designer"}
+)
+SEARCH_SCHEMA = "h4v3-investigation-search-v1"
 
 
 def _hard_block(message: str) -> int:
@@ -49,17 +54,12 @@ def _hard_block(message: str) -> int:
 
 def _load_specialist_policy() -> ModuleType:
     if not SPECIALIST_COMPLETION_GUARD.is_file():
-        raise RuntimeError(
-            f"guard dependency missing: {SPECIALIST_COMPLETION_GUARD.name}"
-        )
+        raise RuntimeError(f"guard dependency missing: {SPECIALIST_COMPLETION_GUARD.name}")
     spec = importlib.util.spec_from_file_location(
-        "h4v3_specialist_completion_guard",
-        SPECIALIST_COMPLETION_GUARD,
+        "h4v3_specialist_completion_guard", SPECIALIST_COMPLETION_GUARD
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(
-            f"cannot load guard dependency: {SPECIALIST_COMPLETION_GUARD.name}"
-        )
+        raise RuntimeError(f"cannot load guard dependency: {SPECIALIST_COMPLETION_GUARD.name}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -68,6 +68,82 @@ def _load_specialist_policy() -> ModuleType:
             f"guard dependency has no evaluate_payload: {SPECIALIST_COMPLETION_GUARD.name}"
         )
     return module
+
+
+def _load_workspace_policy() -> ModuleType:
+    if not WORKSPACE_BINDING_GUARD.is_file():
+        raise RuntimeError(f"guard dependency missing: {WORKSPACE_BINDING_GUARD.name}")
+    spec = importlib.util.spec_from_file_location(
+        "h4v3_workspace_binding_for_retry", WORKSPACE_BINDING_GUARD
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load guard dependency: {WORKSPACE_BINDING_GUARD.name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _is_blocked_quarantine(raw: Mapping[str, Any]) -> bool:
+    value = raw.get("initial_status")
+    return isinstance(value, str) and value.strip().casefold() == "blocked"
+
+
+def _verify_retry_readback(workspace: ModuleType, raw: Mapping[str, Any]) -> None:
+    board = raw.get("board") if isinstance(raw.get("board"), str) else None
+    key = workspace._exact_idempotency_key(raw.get("idempotency_key"))
+    db_path = Path(workspace._board_db_path(board)).expanduser()
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=2)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")}
+        required = {
+            "id",
+            "assignee",
+            "idempotency_key",
+            "max_retries",
+            "created_at",
+            "status",
+        }
+        if not required.issubset(columns):
+            raise RuntimeError("board DB tasks schema cannot prove durable max_retries")
+        rows = conn.execute(
+            "SELECT id, assignee, max_retries, created_at FROM tasks "
+            "WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC",
+            (key,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        raise RuntimeError("materialized task disappeared before retry read-back")
+    newest = rows[0]["created_at"]
+    if sum(row["created_at"] == newest for row in rows) > 1:
+        raise RuntimeError(
+            "same-key rows have tied creation timestamps; retry read-back is ambiguous"
+        )
+    row = rows[0]
+    if _normalize_assignee(row["assignee"]) != _normalize_assignee(raw.get("assignee")):
+        raise RuntimeError("durable assignee does not match retry-compatible create")
+    if row["max_retries"] != TASK_RETRY_LIMIT:
+        raise RuntimeError("durable max_retries is not exactly five")
+
+
+def _evaluate_retry_materializer(payload: Mapping[str, Any]) -> int:
+    if str(payload.get("tool_name") or "") != "kanban_create":
+        return 0
+    raw = payload.get("tool_input")
+    if not isinstance(raw, Mapping) or not _retry_compat_target(raw):
+        return 0
+    if raw.get("max_retries") != TASK_RETRY_LIMIT:
+        raise RuntimeError("canonicalized structured create must carry max_retries=5")
+    if _is_blocked_quarantine(raw):
+        return 0
+    workspace = _load_workspace_policy()
+    binding = workspace._resolve_binding(raw)
+    workspace._materialize_and_verify(raw, binding)
+    _verify_retry_readback(workspace, raw)
+    return 0
 
 
 def _run_block_kind(raw: str) -> tuple[int, str, str]:
@@ -114,14 +190,7 @@ def _run_specialist_policy(payload: dict[str, Any]) -> int:
 
 
 def _hermes_python() -> Path:
-    """Resolve the interpreter that owns the active Hermes installation.
-
-    Shell hooks intentionally keep the historical command ``python3 <guard>``
-    for consent identity. In the container runtime that generic ``python3`` is
-    not the Hermes venv and cannot import ``hermes_cli``. The launcher itself
-    is stable and resolves into its owning venv, so use its sibling interpreter
-    for the workspace policy that must call the canonical Kanban DB owner.
-    """
+    """Resolve the interpreter that owns the active Hermes installation."""
     launcher = shutil.which("hermes")
     if not launcher:
         raise RuntimeError("active hermes launcher is not on PATH")
@@ -136,28 +205,45 @@ def _hermes_python() -> Path:
 def _workspace_binding_subprocess_env(payload: dict[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
     if str(payload.get("tool_name") or "") == "kanban_create":
-        # Shell hooks are ordinary worker descendants. Hermes therefore stamps the
-        # hook subprocess with HERMES_DELEGATED_CHILD_CONTEXT even when the caller
-        # is the dispatcher-owned root worker. The workspace guard intentionally
-        # calls canonical create_task() to atomically materialize+verify a valid
-        # structured create, so carrying that descendant fence into the nested
-        # guard makes every legitimate root create fail before mutation.
-        #
-        # Remove the subprocess-only fence for the *native structured tool* path.
-        # Hermes hides/refuses kanban_* tools for real delegate_task children before
-        # pre_tool_call hooks run, so this does not grant a delegated child a board
-        # mutation route. Keep the fence for terminal: a delegated child can invoke
-        # terminal, and H4V3 explicitly forbids CLI/ad-hoc create as a fallback.
         env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
     return env
 
 
-def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
-    if not WORKSPACE_BINDING_GUARD.is_file():
-        return _hard_block(f"guard dependency missing: {WORKSPACE_BINDING_GUARD.name}")
+def _run_python_policy(path: Path, payload: dict[str, Any]) -> int:
+    if not path.is_file():
+        return _hard_block(f"guard dependency missing: {path.name}")
     try:
         result = subprocess.run(
-            [str(_hermes_python()), str(WORKSPACE_BINDING_GUARD)],
+            [str(_hermes_python()), str(path)],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+            env=_workspace_binding_subprocess_env(payload),
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        return _hard_block(f"{path.name}: {type(exc).__name__}: {exc}")
+    stdout = result.stdout or ""
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 0:
+        if stdout.strip():
+            return _hard_block(f"{path.name} emitted unexpected output on allow")
+        return 0
+    if result.returncode == 2 and stdout:
+        sys.stdout.write(stdout)
+        return 2
+    return _hard_block(stderr or f"{path.name} exited {result.returncode}")
+
+
+def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
+    return _run_python_policy(WORKSPACE_BINDING_GUARD, payload)
+
+
+def _run_retry_materializer(payload: dict[str, Any]) -> int:
+    try:
+        result = subprocess.run(
+            [str(_hermes_python()), str(Path(__file__).resolve()), "--materialize-retry"],
             input=json.dumps(payload, ensure_ascii=False),
             text=True,
             capture_output=True,
@@ -167,29 +253,87 @@ def _run_workspace_binding_policy(payload: dict[str, Any]) -> int:
         )
     except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         return _hard_block(
-            f"{WORKSPACE_BINDING_GUARD.name}: {type(exc).__name__}: {exc}"
+            f"structured retry materializer: {type(exc).__name__}: {exc}"
         )
     stdout = result.stdout or ""
     stderr = (result.stderr or "").strip()
     if result.returncode == 0:
         if stdout.strip():
             return _hard_block(
-                f"{WORKSPACE_BINDING_GUARD.name} emitted unexpected output on allow"
+                "structured retry materializer emitted unexpected output on allow"
             )
         return 0
     if result.returncode == 2 and stdout:
         sys.stdout.write(stdout)
         return 2
-    return _hard_block(
-        stderr or f"{WORKSPACE_BINDING_GUARD.name} exited {result.returncode}"
+    return _hard_block(stderr or f"structured retry materializer exited {result.returncode}")
+
+
+def _normalize_assignee(value: Any) -> str:
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def _is_search_selector(raw: Mapping[str, Any]) -> bool:
+    if _normalize_assignee(raw.get("assignee")) != "kanban-main":
+        return False
+    marker = raw.get("investigation_search")
+    return (
+        isinstance(marker, Mapping)
+        and marker.get("schema_id") == SEARCH_SCHEMA
+        and marker.get("phase") == "selector"
     )
 
 
+def _retry_compat_target(raw: Mapping[str, Any]) -> bool:
+    return (
+        _normalize_assignee(raw.get("assignee")) in SPECIALIST_ASSIGNEES
+        or _is_search_selector(raw)
+    )
+
+
+def _canonicalize_structured_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fill the upstream structured-schema gap before policy admission.
+
+    This is a pure payload transformation. It performs no DB/task mutation, so
+    bounded-search admission still runs before the retry materializer creates a
+    row. Explicit future values other than five fail closed rather than being
+    silently overwritten.
+    """
+    if str(payload.get("tool_name") or "") != "kanban_create":
+        return payload
+    raw = payload.get("tool_input")
+    if not isinstance(raw, Mapping) or not _retry_compat_target(raw):
+        return payload
+    current = raw.get("max_retries")
+    if current is not None and (
+        isinstance(current, bool) or current != TASK_RETRY_LIMIT
+    ):
+        raise ValueError("H4V3 execution task max_retries must be exactly five")
+    normalized = dict(payload)
+    normalized_input = dict(raw)
+    normalized_input["max_retries"] = TASK_RETRY_LIMIT
+    normalized["tool_input"] = normalized_input
+    return normalized
+
+
 def _run_specialist_policies(payload: dict[str, Any]) -> int:
-    decision = _run_specialist_policy(payload)
+    prepared = payload
+    if str(payload.get("tool_name") or "") == "kanban_create":
+        try:
+            prepared = _canonicalize_structured_retry_payload(payload)
+        except ValueError as exc:
+            return _hard_block(str(exc))
+
+    decision = _run_specialist_policy(prepared)
     if decision != 0:
         return decision
-    return _run_workspace_binding_policy(payload)
+
+    if str(prepared.get("tool_name") or "") == "kanban_create":
+        decision = _run_retry_materializer(prepared)
+        if decision != 0:
+            return decision
+
+    return _run_workspace_binding_policy(prepared)
 
 
 def main() -> int:
@@ -203,6 +347,14 @@ def main() -> int:
     if not isinstance(payload, dict):
         return 0
 
+    if sys.argv[1:] == ["--materialize-retry"]:
+        try:
+            return _evaluate_retry_materializer(payload)
+        except Exception as exc:
+            return _hard_block(
+                f"structured retry materializer: {type(exc).__name__}: {exc}"
+            )
+
     tool_name = str(payload.get("tool_name") or "")
     if tool_name == "kanban_block":
         return _delegate_block_kind(raw)
@@ -211,9 +363,6 @@ def main() -> int:
     if tool_name != "terminal":
         return 0
 
-    # terminal is shared by both policies. The historical block-kind policy
-    # runs first; only if it allows the command do we evaluate specialist task
-    # creation semantics.
     returncode, stdout, stderr = _run_block_kind(raw)
     if returncode != 0:
         if returncode == 2 and stdout:
@@ -221,8 +370,6 @@ def main() -> int:
             return 2
         return _hard_block(stderr.strip() or f"{BLOCK_KIND_CORE.name} exited {returncode}")
     if stdout:
-        # Defensive: a successful blocking guard must not silently emit an
-        # unexpected directive and then have the wrapper ignore it.
         try:
             directive = json.loads(stdout)
         except json.JSONDecodeError:
