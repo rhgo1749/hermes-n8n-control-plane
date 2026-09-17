@@ -1599,7 +1599,7 @@ def _safe_git_environment(
     askpass: Path | None = None,
     token: str | None = None,
 ) -> dict[str, str]:
-    """Run Git without inherited hooks, config, prompts, or trace output."""
+    """Run Git without inherited hooks, config, prompts, or lazy fetches."""
     env = os.environ.copy()
     for variable in (
         "GITHUB_TOKEN",
@@ -1615,6 +1615,7 @@ def _safe_git_environment(
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CONFIG_PARAMETERS",
+        "GIT_NO_LAZY_FETCH",
         "GIT_SSH_COMMAND",
         "GIT_PROXY_COMMAND",
         "GIT_TEMPLATE_DIR",
@@ -1639,6 +1640,9 @@ def _safe_git_environment(
             "GIT_CONFIG_KEY_1": "core.fsmonitor",
             "GIT_CONFIG_VALUE_1": "false",
             "GIT_TERMINAL_PROMPT": "0",
+            # Promisor hydration is allowed only for the final authenticated
+            # fast-forward merge, which overrides this value explicitly.
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_TRACE": "0",
             "GIT_TRACE_CURL": "0",
             "GIT_CURL_VERBOSE": "0",
@@ -1730,6 +1734,10 @@ def _onboarding_local_materialization_is_safe(
         entries.pop()
 
     origin_urls: list[str] = []
+    partial_clone: dict[str, list[str]] = {
+        "remote.origin.promisor": [],
+        "remote.origin.partialclonefilter": [],
+    }
     for entry in entries:
         try:
             raw_key, raw_value = entry.split(bytes((10,)), 1)
@@ -1739,6 +1747,9 @@ def _onboarding_local_materialization_is_safe(
             raise _onboarding_error("checkout_materialization_unsafe") from None
         if key == "remote.origin.url":
             origin_urls.append(value)
+            continue
+        if key in partial_clone:
+            partial_clone[key].append(value)
             continue
         if (
             key.startswith(
@@ -1773,6 +1784,16 @@ def _onboarding_local_materialization_is_safe(
             )
         ):
             raise _onboarding_error("checkout_materialization_unsafe")
+
+    promisor_values = partial_clone["remote.origin.promisor"]
+    filter_values = partial_clone["remote.origin.partialclonefilter"]
+    if (promisor_values or filter_values) and (
+        len(promisor_values) != 1
+        or len(filter_values) != 1
+        or promisor_values[0].casefold() != "true"
+        or filter_values[0] != "blob:none"
+    ):
+        raise _onboarding_error("checkout_materialization_unsafe")
 
     if (
         len(origin_urls) != 1
@@ -2106,12 +2127,18 @@ def _self_heal_stale_checkout(
             raise _onboarding_error("checkout_diverged")
         if code != 0:
             raise _onboarding_error("checkout_ancestry_failed")
-        code, _, _ = _git_onboarding(
+        # The preceding origin, target-tree, exact-SHA fetch, and ancestry
+        # checks all run with lazy hydration disabled.  Only this authenticated
+        # ff-only merge may hydrate the reviewed blob:none checkout.
+        code, _, _ = _git_onboarding_with_environment(
             checkout,
             "merge",
             "--ff-only",
             "--no-verify",
             f"origin/{metadata.default_branch}",
+            askpass=askpass,
+            token=token,
+            extra_environment={"GIT_NO_LAZY_FETCH": "0"},
         )
         if code != 0:
             raise _onboarding_error("checkout_fast_forward_failed")
