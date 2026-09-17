@@ -22,13 +22,15 @@ When this Main run was dispatched by the canonical edge for a specific GitHub PR
 
 A fresh trusted PR-side `agent-rework` command intentionally opens a label-origin round without any retry comment. `AGENT_REWORK_RETRY` is a different one-shot recovery signal used only to open a new round after the canonical `rework_human_attention` hold / operator-recovered REVIEW contract in `docs/EDGE_REWORK_LIFECYCLE.md`. Never require that recovery comment as a second authorization for an already edge-admitted fresh-label round.
 
+Task retry exhaustion is not a lifetime rework cap. `max_retries=5` belongs to one execution card's automatic timeout/protocol-failure loop. If that card exhausts its five attempts, preserve the stopped card and its evidence. A later fresh trusted rework command opens a new round with new task/idempotency/search identities and new execution cards; those new cards receive their own task-local five-attempt budgets. Never reset the exhausted old card in place merely to continue a user-authorized rework.
+
 If trustworthy edge-dispatch provenance for the current round is missing, malformed, or ambiguous, report that provenance problem to the controller/operator instead of inventing a lifecycle transition or synthesizing a retry requirement.
 
 Developer task context should reference the completed Investigator task/handoff and retain exact source provenance. Raw transcripts are not the handoff.
 
 ### Specialist workspace creation
 
-Use structured `kanban_create` as the canonical specialist creation surface. For every dispatchable H4V3 specialist card, pass `workspace_kind="worktree"`, the canonical Hermes `project` id/slug for the repository, and a stable `idempotency_key`. Omit `workspace_path`, `branch`, and `branch_name`: Hermes core derives the task-id worktree under `<repo>/.worktrees/<task-id>` and its deterministic project branch, and the control-plane creation preflight verifies the durable read-back before the card becomes dispatchable.
+Use structured `kanban_create` as the canonical specialist creation surface. For every dispatchable H4V3 specialist card, pass `workspace_kind="worktree"`, the canonical Hermes `project` id/slug for the repository, and a stable `idempotency_key`. The bounded `kanban-main` selector uses the same project/worktree/idempotency binding because the retry-compatibility preflight materializes and verifies that selector before the normal structured handler replays the same idempotent create. Omit `workspace_path`, `branch`, and `branch_name`: Hermes core derives the task-id worktree under `<repo>/.worktrees/<task-id>` and its deterministic project branch, and the control-plane creation preflight verifies the durable read-back before the card becomes dispatchable.
 
 Hermes project IDs are profile-local because each profile owns its own `projects.db`. Cross-profile orchestration must not assume that the same repository has the same `p_*` project ID in different profiles. Resolve the project in the creator profile's active `HERMES_HOME`; when project identity must remain portable across profile boundaries, use the canonical project slug together with the verified primary repository anchor rather than treating a raw project ID as a global repository identity. A child specialist may therefore persist a different `project_id` from its root task while still being correctly bound to the same repository slug and anchor.
 
@@ -121,7 +123,7 @@ copy the other candidate's transcript or handoff into a candidate body.
 
 The budget is a numeric admission contract, not prose. Every marker must carry
 `max_candidates=2`, `max_expansions=1`, a positive `max_runtime_seconds` no
-larger than 900, `max_total_tokens` no larger than 32000, and
+larger than 1800, `max_total_tokens` no larger than 32000, and
 `max_retries=2`. The guard reserves half of the cumulative token budget (rounded
 up) and one retry reservation per candidate in the existing task-event ledger;
 concurrent/replayed requests use the same transaction and idempotency key.
@@ -135,14 +137,27 @@ are not token/retry enforcement and must never be used as substitutes.
 ### Slow-local worker runtime and retry policy
 
 All newly created H4V3 execution cards must carry an explicit dispatcher wall-time
-cap and `max_retries=5`; do not leave either field unset. Use 1800 seconds (30
-minutes) for Investigator candidates and bounded Main selectors, 7200 seconds (120
-minutes) for Developer/Reviewer/Designer work, and 10800 seconds (180 minutes) only
-for an explicitly large implementation whose task body records `runtime_class=large`.
+cap and an effective task-local `max_retries=5`. Use 1800 seconds (30 minutes) for
+Investigator candidates and bounded Main selectors, 7200 seconds (120 minutes) for
+Developer/Reviewer/Designer work, and 10800 seconds (180 minutes) only for an
+explicitly large implementation whose task body records `runtime_class=large`.
 A max-runtime timeout and a clean-exit lifecycle protocol violation both consume the
 same five-attempt safety budget; rate-limit exits do not. Do not shorten these values
 merely because a cloud model would finish faster: the production local model may spend
 several minutes in one reasoning/tool round.
+
+The current upstream model-facing structured `kanban_create` schema does not expose
+`max_retries`. On that structured surface only, the approved control-plane pre-tool
+wrapper fills the missing field with exactly 5 in an internal payload **before**
+bounded-search admission, then — only after admission succeeds — materializes the task
+through the existing core-backed workspace owner and verifies durable `max_retries=5`.
+An explicit non-5 value fails closed. This compatibility path is not permission for a
+CLI/DB bypass and does not change Hermes core.
+
+Do not confuse retry scopes: `investigation_search.budget.max_retries=2` is the
+cumulative search-admission reservation budget, while execution-card
+`max_retries=5` is the dispatcher's automatic failure budget for one card. Neither is
+a cap on trusted human rework rounds.
 
 The selector rejects contradictory, duplicate/non-independent, LOW, or
 closure-incomplete candidates. Among remaining candidates it records an
