@@ -29,8 +29,8 @@ diagnostic; do not choose a candidate yourself or dispatch another worker.
 
 ## Worker runtime budget
 
-The creating Main task should give this specialist `max_retries=5` and a 3600-second
-wall-time cap. A 5400-second cap is reserved for an explicitly large implementation
+The creating Main task should give this specialist `max_retries=5` and a 7200-second
+wall-time cap. A 10800-second cap is reserved for an explicitly large implementation
 whose task body records `runtime_class=large`; ordinary work must not silently become
 unbounded. A max-runtime timeout consumes the same five-attempt retry safety budget as
 a lifecycle protocol violation.

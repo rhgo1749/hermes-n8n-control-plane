@@ -135,8 +135,8 @@ post-run telemetry are not cumulative token/retry enforcement.
 
 H4V3 execution tasks use explicit local-model-aware bounds: Investigator candidates
 and bounded Main selectors use 1800 seconds, Developer/Reviewer/Designer tasks use
-3600 seconds by default, and an explicitly marked `runtime_class=large` implementation
-may use 5400 seconds. Every newly created H4V3 execution task carries
+7200 seconds by default, and an explicitly marked `runtime_class=large` implementation
+may use 10800 seconds. Every newly created H4V3 execution task carries
 `max_retries=5`. Max-runtime timeouts and clean-exit lifecycle protocol violations are
 counted toward the same five-attempt safety stop; rate-limit exits are excluded.
 

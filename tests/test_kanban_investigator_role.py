@@ -109,8 +109,8 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
         assert "do not call root `kanban_complete`" in main_soul
         assert "### Slow-local worker runtime and retry policy" in main_soul
         assert "1800 seconds (30" in main_soul
-        assert "3600 seconds (60" in main_soul
-        assert "5400 seconds (90" in main_soul
+        assert "7200 seconds (120" in main_soul
+        assert "10800 seconds (180" in main_soul
         assert "max_retries=5" in main_soul
 
         investigator = (home / "profiles/kanban-investigator/SOUL.md").read_text(encoding="utf-8")

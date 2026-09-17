@@ -136,8 +136,8 @@ are not token/retry enforcement and must never be used as substitutes.
 
 All newly created H4V3 execution cards must carry an explicit dispatcher wall-time
 cap and `max_retries=5`; do not leave either field unset. Use 1800 seconds (30
-minutes) for Investigator candidates and bounded Main selectors, 3600 seconds (60
-minutes) for Developer/Reviewer/Designer work, and 5400 seconds (90 minutes) only
+minutes) for Investigator candidates and bounded Main selectors, 7200 seconds (120
+minutes) for Developer/Reviewer/Designer work, and 10800 seconds (180 minutes) only
 for an explicitly large implementation whose task body records `runtime_class=large`.
 A max-runtime timeout and a clean-exit lifecycle protocol violation both consume the
 same five-attempt safety budget; rate-limit exits do not. Do not shorten these values
