@@ -70,9 +70,17 @@ that ref, and an ordinary `git switch <default-branch>` succeeds without
 stealing a branch held by another worktree. Local repository configuration
 that can select filters, merge drivers, URL rewrites, remote helpers, or alternate
 attribute files, and any `$GIT_DIR/info/attributes` file, is rejected before the
-cleanliness check, switch, fetch, or merge. Fetch, unshallow, and fast-forward
-failures use bounded semantic reasons, and the final head/ref/contract/cleanliness
-gate is rerun.
+cleanliness check, switch, fetch, or merge. The sole local partial-clone
+exception is the coupled bookkeeping pair
+`remote.origin.promisor=true` (case-insensitive value) and
+`remote.origin.partialclonefilter=blob:none`, with each key present exactly
+once; an orphaned, duplicate, non-canonical, or other filter value fails closed.
+This metadata does not authorize any other `remote.*` key or URL rewrite.
+Inspection, ancestry proof, and exact-SHA fetch disable lazy hydration; only the
+final authenticated `git merge --ff-only --no-verify` may hydrate a reviewed
+`blob:none` checkout after those proofs pass. Fetch, unshallow, and
+fast-forward failures use bounded semantic reasons, and the final
+head/ref/contract/cleanliness gate is rerun.
 A later registry or board failure leaves a newly registered checkout in place
 and reports the partial onboarding state for the next idempotent intake.
 

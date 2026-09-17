@@ -30,7 +30,9 @@ def git(*args: str) -> str:
     return completed.stdout.strip()
 
 
-def make_fixture(root: Path, *, shallow: bool = True, attributes: bool = False):
+def make_fixture(
+    root: Path, *, shallow: bool = True, attributes: bool = False, partial: bool = False,
+):
     bare = root / "remote.git"
     source = root / "source"
     git("init", "--bare", str(bare))
@@ -52,6 +54,9 @@ def make_fixture(root: Path, *, shallow: bool = True, attributes: bool = False):
 
     checkout = root / "checkout"
     clone_args = ["clone"]
+    if partial:
+        git("-C", str(bare), "config", "uploadpack.allowFilter", "true")
+        clone_args.append("--filter=blob:none")
     if shallow:
         clone_args.extend(["--depth=1"])
     clone_args.extend(["--branch", "main", f"file://{bare}", str(checkout)])
@@ -144,6 +149,152 @@ def git_state(checkout: Path) -> tuple[object, ...]:
         (checkout / "value.txt").read_bytes(),
         object_fingerprint(checkout),
     )
+
+
+@pytest.mark.parametrize("promisor", ("true", "TRUE"))
+def test_partial_clone_hydrates_only_at_authenticated_merge(tmp_path, monkeypatch, promisor):
+    bare, checkout, first, target, metadata = make_fixture(
+        tmp_path, shallow=False, partial=True,
+    )
+    git("-C", str(checkout), "config", "remote.origin.promisor", promisor)
+    config_before = (checkout / ".git/config").read_bytes()
+    sentinel = tmp_path / "hook-ran"
+    hook = checkout / ".git/hooks/post-merge"
+    hook.write_text(f"#!/bin/sh\ntouch {sentinel}\n", encoding="utf-8")
+    hook.chmod(0o700)
+    blob = git("-C", str(tmp_path / "source"), "rev-parse", f"{target}:value.txt")
+    real_run = mod.subprocess.run
+    events = []
+
+    def routed(command, **kwargs):
+        args = list(command)
+        if args and args[0] == "git" and "env" in kwargs:
+            env = kwargs["env"]
+            if "merge" in args:
+                events.append("merge")
+                assert env.get("GIT_ONBOARDING_TOKEN") == "token"
+                assert Path(env["GIT_ASKPASS"]).is_file()
+                assert env.get("GIT_NO_LAZY_FETCH") == "0"
+                assert "--ff-only" in args and "--no-verify" in args
+            elif "fetch" in args or "merge-base" in args:
+                assert env.get("GIT_NO_LAZY_FETCH") == "1"
+            # Test-only transport routing, including Git's child lazy fetch.
+            # Keep origin and partial-clone config on disk byte-identical.
+            if "fetch" in args or "merge" in args:
+                # Route the canonical HTTPS remote to the local fixture without
+                # changing the checkout's origin or partial-clone config.
+                args[1:1] = [
+                    "-c",
+                    f"url.file://{bare}.insteadOf={EXPECTED_REMOTE}",
+                ]
+            result = real_run(args, **kwargs)
+            if "fetch" in args and str(checkout) in args:
+                events.append("fetch")
+                probe = real_run(
+                    ["git", "-C", str(checkout), "cat-file", "-e", blob],
+                    env={**env, "GIT_NO_LAZY_FETCH": "1"}, capture_output=True,
+                )
+                assert probe.returncode != 0, "exact fetch must leave target blob absent"
+            return result
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", routed)
+    assert mod._self_heal_stale_checkout("token", metadata, checkout) == "healed"
+    assert events == ["fetch", "merge"]
+    assert first != target
+    assert git_state(checkout)[2:7] == (target, target, target, "", b"two\n")
+    assert (checkout / ".git/config").read_bytes() == config_before
+    assert not sentinel.exists()
+    events.clear()
+    assert mod._self_heal_stale_checkout("token", metadata, checkout) == "noop"
+    assert events == []
+
+
+def test_full_and_partial_clone_stale_checkouts_converge(tmp_path, monkeypatch):
+    full_root = tmp_path / "full"
+    partial_root = tmp_path / "partial"
+    full_root.mkdir()
+    partial_root.mkdir()
+    full_bare, full_checkout, _, full_target, full_metadata = make_fixture(
+        full_root, shallow=False,
+    )
+    partial_bare, partial_checkout, _, partial_target, partial_metadata = make_fixture(
+        partial_root, shallow=False, partial=True,
+    )
+    real_run = mod.subprocess.run
+
+    def heal(bare, checkout, metadata):
+        def routed(command, **kwargs):
+            args = list(command)
+            if args and args[0] == "git" and ("fetch" in args or "merge" in args):
+                args[1:1] = [
+                    "-c",
+                    f"url.file://{bare}.insteadOf={EXPECTED_REMOTE}",
+                ]
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(mod.subprocess, "run", routed)
+        assert mod._self_heal_stale_checkout("token", metadata, checkout) == "healed"
+
+    heal(full_bare, full_checkout, full_metadata)
+    heal(partial_bare, partial_checkout, partial_metadata)
+
+    full_state = git_state(full_checkout)
+    partial_state = git_state(partial_checkout)
+    assert full_state[:2] == partial_state[:2] == (0, "main")
+    assert full_state[5:7] == partial_state[5:7] == ("", b"two\n")
+    assert full_state[2:5] == (full_target, full_target, full_target)
+    assert partial_state[2:5] == (partial_target, partial_target, partial_target)
+
+
+@pytest.mark.parametrize("entries", [
+    [("promisor", "true")], [("partialclonefilter", "blob:none")],
+    *[[("promisor", value), ("partialclonefilter", "blob:none")]
+      for value in ("", "false", "yes", "on", "1")],
+    *[[("promisor", "true"), ("partialclonefilter", value)]
+      for value in ("", "blob:limit=10", "tree:0", "sparse:oid=HEAD", "combine:blob:none+tree:0")],
+    [("promisor", "true"), ("promisor", "true"), ("partialclonefilter", "blob:none")],
+    [("promisor", "true"), ("partialclonefilter", "blob:none"), ("partialclonefilter", "blob:none")],
+])
+def test_partial_clone_invalid_metadata_is_mutation_free(tmp_path, monkeypatch, entries):
+    _, checkout, _, _, metadata = make_fixture(tmp_path, shallow=False)
+    for key, value in entries:
+        git("-C", str(checkout), "config", "--add", f"remote.origin.{key}", value)
+    before = git_state(checkout)
+    config_before = (checkout / ".git/config").read_bytes()
+    real_run = mod.subprocess.run
+
+    def reject_fetch(command, **kwargs):
+        assert "fetch" not in command
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", reject_fetch)
+    with pytest.raises(mod.IntakeError, match="^checkout_materialization_unsafe$"):
+        mod._self_heal_stale_checkout("token", metadata, checkout)
+    assert git_state(checkout) == before
+    assert (checkout / ".git/config").read_bytes() == config_before
+
+
+@pytest.mark.parametrize("key", ("remote.origin.uploadpack", "remote.foreign.url"))
+def test_partial_clone_retains_remote_execution_rejection(tmp_path, monkeypatch, key):
+    _, checkout, _, _, metadata = make_fixture(tmp_path, shallow=False, partial=True)
+    sentinel = tmp_path / "helper-ran"
+    helper = tmp_path / "helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 1\n", encoding="utf-8")
+    helper.chmod(0o700)
+    git("-C", str(checkout), "config", key, str(helper))
+    before = git_state(checkout)
+    real_run = mod.subprocess.run
+
+    def reject_fetch(command, **kwargs):
+        assert "fetch" not in command
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", reject_fetch)
+    with pytest.raises(mod.IntakeError, match="^checkout_materialization_unsafe$"):
+        mod._self_heal_stale_checkout("token", metadata, checkout)
+    assert git_state(checkout) == before
+    assert not sentinel.exists()
 
 
 def test_shallow_clean_checkout_is_unshallowed_and_fast_forwarded(tmp_path, monkeypatch):
