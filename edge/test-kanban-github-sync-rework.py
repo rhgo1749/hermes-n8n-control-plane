@@ -95,8 +95,8 @@ def cross_ref_timeline(pr_number):
     }]
 
 
-def labeled_timeline(ts, actor="rhgo1749"):
-    return [{"event": "labeled", "label": {"name": "agent-rework"},
+def labeled_timeline(ts, actor="rhgo1749", event_id: int | None = 1):
+    return [{"id": event_id, "event": "labeled", "label": {"name": "agent-rework"},
              "actor": {"login": actor}, "created_at": ts}]
 
 
@@ -840,6 +840,105 @@ def test_14_untrusted_label_actor():
     check("no transition", r.get("changed") is False)
     check("no label mutation", fake.delete_calls == [])
     check("reason recorded", r.get("rework", {}).get("reason") == "untrusted_rework_label_actor", str(r))
+
+
+def test_rework_label_event_identity_missing_fails_closed():
+    print("agent-rework without a stable timeline event id -> rework forbidden")
+    fake = fresh_env()
+    rework_scenario(fake)
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD, event_id=None)
+    tid = new_task("review")
+    results = run_sync(fake)
+    r = results[0]
+    check("stays review", task_row(tid)["status"] == "review")
+    check("no transition", r.get("changed") is False)
+    check("no label mutation", fake.delete_calls == [])
+    check("reason recorded", r.get("rework", {}).get("reason") == "rework_label_event_identity_missing", str(r))
+
+
+def test_same_second_rework_readd_uses_stable_event_id():
+    print("same-second re-add -> exact stable event id distinguishes the fresh command")
+    fake = fresh_env()
+    rework_scenario(fake, label_ts=LABEL_ADDED_OLD)
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD, event_id=173001)
+    tid = new_task("review")
+
+    first = run_sync(fake)
+    rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("same-second: first command recorded",
+          len(rounds) == 1 and rounds[-1]["payload"].get("label_event_id") == 173001,
+          str((first, rounds)))
+
+    same_epoch = mod._parse_iso_ts(LABEL_ADDED_OLD)
+    assert same_epoch is not None
+    with connect_closing() as conn:
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'github_pr_rework'",
+            (same_epoch, tid),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'review', completed_at = NULL, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (tid,),
+        )
+        conn.commit()
+
+    # Re-observing the already-consumed command is stale, even though its
+    # second-granular timestamp exactly equals the governing DB event.
+    fake.pr_labels[PR_N] = ["agent-rework"]
+    fake.pr_timeline[PR_N] = labeled_timeline(LABEL_ADDED_OLD, event_id=173001)
+    stale = run_sync(fake)
+    stale_rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("same-second: old event id stays consumed", len(stale_rounds) == 1, str(stale))
+
+    # A remove/re-add in the same GitHub second has a different durable event
+    # identity. The higher id is the newer command within that timestamp only.
+    fake.pr_timeline[PR_N] = (
+        labeled_timeline(LABEL_ADDED_OLD, event_id=173001)
+        + labeled_timeline(LABEL_ADDED_OLD, event_id=173002)
+    )
+    fresh = run_sync(fake)
+    fresh_rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    check("same-second: newer event id opens one fresh round",
+          len(fresh_rounds) == 2
+          and fresh_rounds[-1]["payload"].get("label_event_id") == 173002,
+          str((fresh, fresh_rounds)))
+
+
+def test_same_second_rework_identity_ambiguity_fails_closed():
+    print("same-second label bucket with malformed identity -> fail closed")
+    fake = fresh_env()
+    rework_scenario(fake, label_ts=LABEL_ADDED_NEW)
+    fake.pr_timeline[PR_N] = (
+        labeled_timeline(LABEL_ADDED_NEW, event_id=173001)
+        + labeled_timeline(LABEL_ADDED_NEW, event_id=None)
+    )
+    tid = new_task("review")
+    results = run_sync(fake)
+    check("same-second malformed bucket: no round",
+          not [e for e in task_events(tid) if e["kind"] == "github_pr_rework"],
+          str(results))
+    check("same-second malformed bucket: identity missing diagnostic",
+          any(r.get("rework", {}).get("reason") == "rework_label_event_identity_missing"
+              for r in results), str(results))
+
+
+def test_same_second_event_id_never_overrides_newer_db_clock():
+    print("same-second GitHub id cannot override a clearly newer DB event")
+    fake = fresh_env()
+    rework_scenario(fake, label_ts=LABEL_ADDED_NEW)
+    fake.pr_timeline[PR_N] = (
+        labeled_timeline(LABEL_ADDED_NEW, event_id=173001)
+        + labeled_timeline(LABEL_ADDED_NEW, event_id=173002)
+    )
+    epoch = mod._parse_iso_ts(LABEL_ADDED_NEW)
+    assert epoch is not None
+    ref = mod.GithubTaskRef(REPO, ISSUE_N)
+    newer = mod._label_is_newer_than_event(
+        fake, ref, PR_N, epoch + 1,
+        current_label_at=epoch, current_label_event_id=173001,
+    )
+    check("cross-clock: DB timestamp wins", newer is False, str(newer))
 
 
 def test_15_dry_run_predicts_rework():
@@ -3320,6 +3419,9 @@ def test_120_classic_review_label_readdition_unchanged():
 def _make_profile_dir() -> Path:
     profile_dir = Path(os.environ["HERMES_HOME"]) / "profiles" / "kanban-main"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    # Current Hermes profile admission requires an identity marker; an empty
+    # directory is intentionally treated as a ghost profile.
+    (profile_dir / "config.yaml").write_text("# deterministic test profile\n", encoding="utf-8")
     return profile_dir
 
 
@@ -4777,6 +4879,45 @@ def test_123_working_plus_fresh_rework_defers_until_worker_ends():
           str(row))
 
 
+def test_false_terminal_single_command_converges():
+    """The recovery parking event must not invalidate its own ingress."""
+    fake = fresh_env()
+    tid = _rework_ready_task(fake)
+    now = int(time.time())
+    with connect_closing() as conn:
+        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? "
+                     "AND kind = 'github_pr_rework'", (now - 120, tid))
+        conn.execute("UPDATE tasks SET status = 'done', completed_at = ? "
+                     "WHERE id = ?", (now - 90, tid))
+        conn.commit()
+    command_at = now - 60
+    timeline = labeled_timeline(time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(command_at)))
+    timeline[0]["id"] = 173001
+    fake.pr_timeline[PR_N] = timeline
+    fake.pr_labels[PR_N] = ["agent-working", "agent-rework"]
+    run_sync(fake)
+    assert task_row(tid)["status"] == "review"
+    assert "agent-review-ready" not in fake.pr_labels[PR_N]
+    parking = [e for e in task_events(tid) if e["kind"] == "github_pr_sync"][-1]
+    assert command_at < parking["created_at"]
+    # No second label command, retry comment, or timestamp adjustment. The
+    # next ordinary wake consumes the unchanged command and performs the
+    # canonical edge claim.
+    _scratch_workspace(tid, tempfile.mkdtemp(prefix="ws173-"))
+    _make_profile_dir()
+    stub = StubSpawn()
+    results = _run_sync_with_dispatch(fake, stub)
+    assert task_row(tid)["status"] == "running", (results, fake.pr_labels)
+    assert fake.pr_labels[PR_N] == ["agent-working"]
+    assert len(fake.pr_timeline[PR_N]) == 1
+    assert len(stub.calls) == 1, (results, stub.calls)
+    rounds = [e for e in task_events(tid) if e["kind"] == "github_pr_rework"]
+    assert len(rounds) == 2
+    assert rounds[-1]["payload"]["label_event_id"] == 173001
+    assert parking["payload"]["recovery_pending_rework_event_id"] == 173001
+
+
 def test_124_done_open_pr_self_heal_without_any_labels():
     """RC1 invariant sweep: DONE + OPEN PR repairs to REVIEW even when no
     lifecycle label is present at all (pure invariant, no delivery needed).
@@ -6192,6 +6333,10 @@ def main() -> int:
         test_9_second_round, test_10_untrusted_commenter, test_11_marker_idempotency,
         test_12_existing_review_done_regression, test_13_multiple_rework_prs,
         test_14_untrusted_label_actor, test_15_dry_run_predicts_rework,
+        test_rework_label_event_identity_missing_fails_closed,
+        test_same_second_rework_readd_uses_stable_event_id,
+        test_same_second_rework_identity_ambiguity_fails_closed,
+        test_same_second_event_id_never_overrides_newer_db_clock,
         test_16_blocked_merged_done, test_17_blocked_open_pr_review, test_18_blocked_draft,
         test_19_blocked_no_pr_projection, test_20_projection_idempotent,
         test_21_projection_reason_update, test_22_projection_write_failure,
@@ -6297,6 +6442,7 @@ def main() -> int:
         test_121_done_open_pr_valid_delivery_also_review,
         test_122_done_open_pr_new_rework_label_opens_new_round,
         test_123_working_plus_fresh_rework_defers_until_worker_ends,
+        test_false_terminal_single_command_converges,
         test_124_done_open_pr_self_heal_without_any_labels,
         test_125_claim_patch_failure_is_durable_and_retries_once,
         test_126_claim_readback_failure_is_durable_and_retries_once,
