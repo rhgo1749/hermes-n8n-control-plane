@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PLUGIN = (
     Path(__file__).resolve().parents[1]
@@ -81,6 +83,12 @@ GITHUB_BODY = """# Imported GitHub Issue
 ## Canonical Issue body
 hello
 """
+
+
+@pytest.fixture(autouse=True)
+def _clear_pinned_board_for_isolated_db(monkeypatch):
+    """Keep synthetic ``demo`` boards independent from the host board pin."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
 
 
 class FakePrimary:
@@ -222,6 +230,12 @@ def test_still_done_replay_is_bounded_to_two_attempts(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "_board_db_path", lambda board: db)
     monkeypatch.setattr(mod, "_load_primary", lambda: primary)
+    diagnostics: list[tuple[str | None, str | None, str]] = []
+    monkeypatch.setattr(
+        mod,
+        "_diagnostic",
+        lambda board, task_id, code: diagnostics.append((board, task_id, code)),
+    )
     monkeypatch.setattr(mod.time, "time", lambda: 1005)
 
     mod._on_dispatch_tick(board="demo")
@@ -232,6 +246,10 @@ def test_still_done_replay_is_bounded_to_two_attempts(tmp_path, monkeypatch):
     assert primary.calls == [
         ("t_eeeeeeee", "demo"),
         ("t_eeeeeeee", "demo"),
+    ]
+    assert diagnostics == [
+        ("demo", "t_eeeeeeee", "still_done_after_replay"),
+        ("demo", "t_eeeeeeee", "still_done_after_replay"),
     ]
 
 

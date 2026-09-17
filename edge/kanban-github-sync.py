@@ -960,6 +960,7 @@ class ReworkDecision:
     label_present: bool = False
     label_added_at: Optional[int] = None
     label_actor: str = ""
+    label_event_id: Optional[int] = None
     authoritative: bool = True
     error: Optional[str] = None
 
@@ -972,6 +973,7 @@ class ReworkDecision:
             "label_present": self.label_present,
             "label_added_at": self.label_added_at,
             "label_actor": self.label_actor,
+            "label_event_id": self.label_event_id,
             "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
             "authoritative": self.authoritative,
             "error": self.error,
@@ -988,13 +990,13 @@ def _parse_iso_ts(value: Any) -> Optional[int]:
     return int(dt.timestamp())
 
 
-def _labeled_events(client: Any, ref: GithubTaskRef, pr_number: int) -> list[tuple[int, str]]:
-    """Return [(added_at_epoch, actor)] for ``agent-rework`` label additions."""
+def _labeled_events(client: Any, ref: GithubTaskRef, pr_number: int) -> list[tuple[int, str, Optional[int]]]:
+    """Return timestamp, actor and stable REST event id for label additions."""
     items = client.get_paginated(
         f"/repos/{ref.repository}/issues/{pr_number}/timeline",
         {"per_page": 100},
     )
-    events: list[tuple[int, str]] = []
+    events: list[tuple[int, str, Optional[int]]] = []
     for item in items:
         if not isinstance(item, dict) or item.get("event") != "labeled":
             continue
@@ -1004,7 +1006,10 @@ def _labeled_events(client: Any, ref: GithubTaskRef, pr_number: int) -> list[tup
         ts = _parse_iso_ts(item.get("created_at"))
         actor = str((item.get("actor") or {}).get("login") or "")
         if ts is not None:
-            events.append((ts, actor))
+            event_id = item.get("id")
+            if type(event_id) is not int or event_id <= 0:
+                event_id = None
+            events.append((ts, actor, event_id))
     return events
 
 
@@ -1066,7 +1071,10 @@ def evaluate_rework(
     if not events:
         # Label present without any labeled event: data anomaly — do nothing.
         return ReworkDecision(reason="rework_label_event_missing", pr_number=pr.number, label_present=True)
-    label_added_at, label_actor = max(events, key=lambda item: item[0])
+    label_added_at, label_actor, label_event_id = max(events, key=lambda item: item[0])
+    if label_event_id is None:
+        return ReworkDecision(reason="rework_label_event_identity_missing",
+                              pr_number=pr.number, label_present=True)
     request_comment_id = _rework_request_comment_id(
         client, ref, pr.number, label_added_at
     )
@@ -1079,6 +1087,7 @@ def evaluate_rework(
             label_present=True,
             label_added_at=label_added_at,
             label_actor=label_actor,
+            label_event_id=label_event_id,
         )
     if last_rework_at is not None and label_added_at <= last_rework_at:
         # The request remains visible until the dispatcher has claimed the
@@ -1091,6 +1100,7 @@ def evaluate_rework(
             label_present=True,
             label_added_at=label_added_at,
             label_actor=label_actor,
+            label_event_id=label_event_id,
         )
     issue_payload, _ = client.get(f"/repos/{ref.repository}/issues/{ref.issue_number}")
     if not isinstance(issue_payload, dict):
@@ -1106,6 +1116,7 @@ def evaluate_rework(
             label_present=True,
             label_added_at=label_added_at,
             label_actor=label_actor,
+            label_event_id=label_event_id,
         )
     context_block = _build_context_block(client, ref, decision.pull_requests, rework_pr_number=pr.number)
     return ReworkDecision(
@@ -1117,6 +1128,7 @@ def evaluate_rework(
         label_present=True,
         label_added_at=label_added_at,
         label_actor=label_actor,
+        label_event_id=label_event_id,
     )
 
 
@@ -3343,6 +3355,7 @@ def apply_decision(
     *,
     context_block: Optional[str] = None,
     allow_blocked_source: bool = False,
+    recovery_pending_rework: Optional[ReworkDecision] = None,
 ) -> dict[str, Any]:
     """One optimistic transition for one card.  Raises SyncError on refusal;
     returns the result dict otherwise.  The caller owns the transaction.
@@ -3518,6 +3531,16 @@ def apply_decision(
             "auto_merge": False,
         }
     )
+    if (current_status == "done" and desired == "review"
+            and recovery_pending_rework is not None):
+        payload.update({
+            "recovery_reason": "false_terminal_done_open_conflict",
+            "recovery_pending_rework_event_id": recovery_pending_rework.label_event_id,
+            "recovery_pending_rework_label_added_at": recovery_pending_rework.label_added_at,
+            "recovery_pending_rework_actor": recovery_pending_rework.label_actor,
+            "pr_number": recovery_pending_rework.pr_number,
+            "head_sha": recovery_pending_rework.head_sha,
+        })
     _append_sync_event(conn, task_id, payload)
     return {
         "task_id": task_id,
@@ -3690,6 +3713,7 @@ def apply_rework(
         "head_sha": rework.head_sha,
         "request_comment_id": rework.request_comment_id,
         "label_added_at": rework.label_added_at,
+        "label_event_id": rework.label_event_id,
         "reason": "agent_rework",
         "rework_round": rework_round,
         "trusted_actor_policy": sorted(TRUSTED_GITHUB_ACTORS),
@@ -6274,7 +6298,7 @@ def _label_is_newer_than_event(
     events = _labeled_events(client, ref, pr_number)
     if not events:
         return False
-    latest_label_at, _ = max(events, key=lambda item: item[0])
+    latest_label_at, _, _ = max(events, key=lambda item: item[0])
     baseline = max(int(event_at), int(current_label_at or 0))
     return latest_label_at > baseline
 
@@ -6467,7 +6491,7 @@ def _latest_rework_label_at(
     events = _labeled_events(client, ref, pr_number)
     if not events:
         return None
-    added_at, _ = max(events, key=lambda item: item[0])
+    added_at, _, _ = max(events, key=lambda item: item[0])
     return added_at
 
 
@@ -7315,15 +7339,30 @@ def _reconcile_rework_lifecycle(
                 )
             except GithubCompletionError:
                 context_block = None
+            pending = evaluate_rework(
+                client, ref, decision, current_status="review",
+                last_rework_at=max(
+                    int(context["event_at"]),
+                    int(context["event"][0].get("label_added_at") or 0),
+                    int(_last_delivery_event_at(conn, task_id) or 0),
+                ),
+            )
+            if pending is not None and pending.reason != "agent_rework":
+                pending = None
             with conn:
                 db_result = apply_decision(
                     conn, task_id, decision, context_block=context_block,
+                    recovery_pending_rework=pending,
                 )
+            if not db_result.get("changed"):
+                return db_result
             try:
+                # Recovery is not delivery. Preserve the input command but
+                # never manufacture an output label that strands it behind
+                # the parking event this very command just caused.
                 _, label_reason, label_evidence = _project_pr_lifecycle_labels(
                     client, ref, int(context["pr_number"]),
-                    add=(REVIEW_READY_LABEL,),
-                    remove=(WORKING_LABEL,),
+                    remove=(WORKING_LABEL, REVIEW_READY_LABEL),
                 )
             except GithubCompletionError as exc:
                 return {
