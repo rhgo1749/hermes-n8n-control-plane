@@ -113,6 +113,12 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
         assert "10800 seconds (180" in main_soul
         assert "max_retries=5" in main_soul
 
+        developer_soul = (home / "profiles/kanban-developer/SOUL.md").read_text(encoding="utf-8")
+        assert "## Bounded falsification, not reinvestigation" in developer_soul
+        assert "proceed immediately to the required RED reproduction, implementation, and GREEN validation" in developer_soul
+        assert "return the exact contradiction for a fresh Investigator pass" in developer_soul
+        assert "Do not develop a replacement root-cause model" in developer_soul
+
         investigator = (home / "profiles/kanban-investigator/SOUL.md").read_text(encoding="utf-8")
         expected = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8").rstrip() + "\n"
         assert investigator == expected

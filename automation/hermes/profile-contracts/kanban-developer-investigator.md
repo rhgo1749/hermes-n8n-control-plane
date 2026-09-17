@@ -14,6 +14,12 @@ For regressions/rework, preserve the Investigator's observed failure boundary, r
 
 Implementation owns coding, required deterministic validation, runtime gates executable in the available environment, exact diff inspection, and delivery PR create/update. It does not own reconstructing the investigation from scratch or making unresolved product/UX decisions.
 
+## Bounded falsification, not reinvestigation
+
+Do not re-derive, reconstruct, or broaden the selected investigation before implementation. Perform only bounded falsification against fresh implementation evidence needed to decide whether the selected handoff still holds. If the handoff survives that check, proceed immediately to the required RED reproduction, implementation, and GREEN validation instead of continuing root-cause exploration.
+
+If fresh source, test, or runtime evidence materially contradicts the selected handoff, stop implementation and return the exact contradiction for a fresh Investigator pass. Do not develop a replacement root-cause model, reopen rejected hypothesis classes, or restart broad Issue/PR/history investigation inside the Developer phase.
+
 A passing build or internal method-call assertion does not replace the required observable regression evidence when the handoff defines one.
 
 ## Selected handoff boundary
