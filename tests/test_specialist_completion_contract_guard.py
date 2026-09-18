@@ -287,7 +287,7 @@ def _search_create_input(
     candidate_id: str = "A",
     candidate_task_ids: list[str] | None = None,
     parents: list[str] | None = None,
-    max_runtime_seconds: int | None = 1800,
+    max_runtime_seconds: int | None = 7200,
     max_candidates: int = 2,
     max_expansions: int = 1,
     max_total_tokens: int = 32000,
@@ -324,7 +324,7 @@ def _search_create_input(
             "budget": {
                 "max_candidates": max_candidates,
                 "max_expansions": max_expansions,
-                "max_runtime_seconds": 1800,
+                "max_runtime_seconds": 7200,
                 "max_total_tokens": max_total_tokens,
                 "max_retries": max_retries,
             },
@@ -383,6 +383,18 @@ def test_bounded_search_guard_requires_dispatcher_time_cap() -> None:
 
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "max_runtime_seconds" in json.loads(result.stdout)["message"]
+
+
+def test_bounded_search_guard_rejects_runtime_above_7200_seconds() -> None:
+    tool_input = _search_create_input(max_runtime_seconds=7201)
+    tool_input["investigation_search"]["budget"]["max_runtime_seconds"] = 7201
+    result = _run({
+        "tool_name": "kanban_create",
+        "tool_input": tool_input,
+    })
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "7200-second search cap" in json.loads(result.stdout)["message"]
 
 
 def test_bounded_search_guard_requires_durable_search_context() -> None:
@@ -674,7 +686,7 @@ def test_bounded_search_guard_binds_terminal_surface_and_rejects_unmarked_bypass
             "tool_input": {
                 "command": (
                     "hermes kanban create candidate-b --assignee kanban-investigator "
-                    f"--body {body} --max-runtime 30m --max-retries 5 "
+                    f"--body {body} --max-runtime 120m --max-retries 5 "
                     "--idempotency-key candidate-b"
                 ),
             },

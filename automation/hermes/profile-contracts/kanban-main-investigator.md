@@ -123,7 +123,7 @@ copy the other candidate's transcript or handoff into a candidate body.
 
 The budget is a numeric admission contract, not prose. Every marker must carry
 `max_candidates=2`, `max_expansions=1`, a positive `max_runtime_seconds` no
-larger than 1800, `max_total_tokens` no larger than 32000, and
+larger than 7200, `max_total_tokens` no larger than 32000, and
 `max_retries=2`. The guard reserves half of the cumulative token budget (rounded
 up) and one retry reservation per candidate in the existing task-event ledger;
 concurrent/replayed requests use the same transaction and idempotency key.
@@ -137,9 +137,8 @@ are not token/retry enforcement and must never be used as substitutes.
 ### Slow-local worker runtime and retry policy
 
 All newly created H4V3 execution cards must carry an explicit dispatcher wall-time
-cap and an effective task-local `max_retries=5`. Use 1800 seconds (30 minutes) for
-Investigator candidates and bounded Main selectors, 7200 seconds (120 minutes) for
-Developer/Reviewer/Designer work, and 10800 seconds (180 minutes) only for an
+cap and an effective task-local `max_retries=5`. Use 7200 seconds (120 minutes) for Investigator candidates, bounded Main
+selectors, and Developer/Reviewer/Designer work, and 10800 seconds (180 minutes) only for an
 explicitly large implementation whose task body records `runtime_class=large`.
 A max-runtime timeout and a clean-exit lifecycle protocol violation both consume the
 same five-attempt safety budget; rate-limit exits do not. Do not shorten these values

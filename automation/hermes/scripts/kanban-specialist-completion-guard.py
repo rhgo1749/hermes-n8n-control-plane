@@ -73,7 +73,7 @@ _INVESTIGATION_SEARCH_MAX_CANDIDATES = 2
 _INVESTIGATION_SEARCH_MAX_EXPANSIONS = 1
 _INVESTIGATION_SEARCH_MAX_TOTAL_TOKENS = 32_000
 _INVESTIGATION_SEARCH_MAX_RETRIES = 2
-_INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS = 1800
+_INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS = 7200
 _KANBAN_TASK_RETRY_LIMIT = 5
 _INVESTIGATION_SEARCH_TRIGGER_CODES = frozenset(
     {
@@ -1008,7 +1008,7 @@ def _search_budget(marker: Mapping[str, Any]) -> tuple[dict[str, int] | None, st
     if parsed["max_retries"] != _INVESTIGATION_SEARCH_MAX_RETRIES:
         return None, "budget.max_retries must be exactly two cumulative retry reservations"
     if parsed["max_runtime_seconds"] > _INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS:
-        return None, "budget.max_runtime_seconds exceeds the 1800-second search cap"
+        return None, "budget.max_runtime_seconds exceeds the 7200-second search cap"
     return parsed, None
 
 

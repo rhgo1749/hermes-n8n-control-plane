@@ -184,7 +184,7 @@ Investigator, selector, Developer, Reviewer, PR, label, or lifecycle state.
 The candidate marker must state `schema_id=h4v3-investigation-search-v1`,
 `phase=candidate`, `root_task_id`, a stable `idempotency_key`, trigger codes,
 `independence_basis`, and the exact bounded budget. The budget is
-`max_candidates=2`, `max_expansions=1`, positive `max_runtime_seconds<=1800`,
+`max_candidates=2`, `max_expansions=1`, positive `max_runtime_seconds<=7200`,
 `max_total_tokens<=32000`, and `max_retries=2`. The lifecycle guard records the
 candidate's rounded-up token reservation and retry reservation atomically in
 the root task's durable event ledger before dispatch. If the marker is absent,

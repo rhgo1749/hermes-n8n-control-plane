@@ -124,7 +124,7 @@ task/run completion metadata. The marker carries `schema_id`, `search_id`,
 codes, candidate task IDs, selected candidate task ID or null,
 `selection_status`, evidence-based comparison/reason, independence basis, and
 the bounded `budget`. The budget is exact: `max_candidates=2`,
-`max_expansions=1`, positive dispatcher-enforced `max_runtime_seconds<=1800`,
+`max_expansions=1`, positive dispatcher-enforced `max_runtime_seconds<=7200`,
 `max_total_tokens<=32000`, and `max_retries=2`. The canonical pre-tool guard
 atomically reserves each candidate's rounded-up token share and one retry in
 the existing root task-event ledger before task mutation; idempotent replays
@@ -133,9 +133,8 @@ post-run telemetry are not cumulative token/retry enforcement.
 
 ### Slow-local runtime and retry budget
 
-H4V3 execution tasks use explicit local-model-aware bounds: Investigator candidates
-and bounded Main selectors use 1800 seconds, Developer/Reviewer/Designer tasks use
-7200 seconds by default, and an explicitly marked `runtime_class=large` implementation
+H4V3 execution tasks use explicit local-model-aware bounds: Investigator candidates, bounded Main selectors, and Developer/Reviewer/Designer
+tasks use 7200 seconds by default, and an explicitly marked `runtime_class=large` implementation
 may use 10800 seconds. Every newly created H4V3 execution task carries
 `max_retries=5`. Max-runtime timeouts and clean-exit lifecycle protocol violations are
 counted toward the same five-attempt safety stop; rate-limit exits are excluded.
