@@ -94,6 +94,12 @@ delivery remains the primary intake path.
 
 Each non-PR intake event, including a first App delivery for an unknown
 repository, enqueues its repository scope before waking the direct actuator.
+Issue candidate eligibility is evaluated by the deployed intake worker, not by
+the router. An Issue is eligible only while it is open, carries `agent-ready`,
+and does **not** carry `agent-blocked`. The blocked label is a temporary
+hold/veto; `agent-ready` remains the persistent work permission, so removing
+only `agent-blocked` makes the Issue eligible again.
+
 Each intake invocation claims exactly one queued scope. Expired unclaimed scopes
 are recovered with a bounded attempt/backoff or retained in the durable pending
 list when the retry limit is reached; they are never silently dropped. Claimed

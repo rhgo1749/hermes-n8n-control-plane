@@ -62,6 +62,7 @@ DEFAULT_HERMES_HOME = "/home/hermes/.hermes"
 DEFAULT_HERMES_BIN = "/home/hermes/.local/bin/hermes"
 GITHUB_API = "https://api.github.com"
 GITHUB_LABEL = "agent-ready"
+BLOCKED_LABEL = "agent-blocked"
 LEAD_PROFILE = "kanban-main"
 HTTP_TIMEOUT_SECONDS = 30
 MAX_ONBOARDING_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -1169,6 +1170,8 @@ def _iter_agent_ready_issues(token: str, repo: str) -> Iterable[dict[str, Any]]:
                 continue
             labels = {str(label.get("name", "")) for label in item.get("labels", []) if isinstance(label, dict)}
             if GITHUB_LABEL not in labels:
+                continue
+            if BLOCKED_LABEL in labels:
                 continue
             yield item
         if len(data) < 100 or "next" not in headers.get("link", ""):
@@ -4319,6 +4322,8 @@ def _issue_candidates(
             if not config:
                 raise IntakeError(f"fixture repository is not configured: {repo_name}")
             _validate_issue(issue, config)
+            if BLOCKED_LABEL in set(_issue_labels(issue)):
+                continue
             candidates.append((config, issue))
         return candidates
     if not token:
