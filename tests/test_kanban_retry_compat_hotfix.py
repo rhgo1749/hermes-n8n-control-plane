@@ -32,6 +32,7 @@ def _selector_input() -> dict[str, Any]:
         "investigation_search": {
             "schema_id": "h4v3-investigation-search-v1",
             "phase": "selector",
+            "budget": {"max_runtime_seconds": 1800},
         },
     }
 
@@ -52,7 +53,44 @@ def test_structured_retry_compat_injects_five_for_specialist_and_selector() -> N
         prepared = guard._canonicalize_structured_retry_payload(original)
         assert prepared is not original
         assert prepared["tool_input"]["max_retries"] == 5
+        assert prepared["tool_input"]["max_runtime_seconds"] == 7200
+        marker = prepared["tool_input"].get("investigation_search")
+        if isinstance(marker, dict):
+            assert marker["budget"]["max_runtime_seconds"] == 7200
         assert "max_retries" not in raw
+
+
+def test_structured_runtime_canonicalizes_large_implementation() -> None:
+    guard = _load("retry_wrapper_large_runtime", WRAPPER)
+    payload = {
+        "tool_name": "kanban_create",
+        "tool_input": {
+            "title": "large implementation",
+            "body": "runtime_class=large",
+            "assignee": "kanban-developer",
+            "idempotency_key": "large-dev",
+            "max_runtime_seconds": 1800,
+        },
+    }
+    prepared = guard._canonicalize_structured_retry_payload(payload)
+    assert prepared["tool_input"]["max_runtime_seconds"] == 10800
+    assert payload["tool_input"]["max_runtime_seconds"] == 1800
+
+
+def test_large_runtime_requires_explicit_marker_line() -> None:
+    guard = _load("retry_wrapper_large_marker_line", WRAPPER)
+    payload = {
+        "tool_name": "kanban_create",
+        "tool_input": {
+            "title": "ordinary implementation",
+            "body": "Do not treat the phrase runtime_class=large in prose as authorization.",
+            "assignee": "kanban-developer",
+            "idempotency_key": "ordinary-dev",
+            "max_runtime_seconds": 10800,
+        },
+    }
+    prepared = guard._canonicalize_structured_retry_payload(payload)
+    assert prepared["tool_input"]["max_runtime_seconds"] == 7200
 
 
 def test_structured_retry_compat_leaves_ordinary_main_untouched() -> None:
@@ -91,7 +129,7 @@ def test_materializer_persists_and_reads_back_selector_retry(
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT, idempotency_key TEXT, "
-        "max_retries INTEGER, created_at INTEGER, status TEXT)"
+        "max_retries INTEGER, max_runtime_seconds INTEGER, created_at INTEGER, status TEXT)"
     )
     conn.commit()
     conn.close()
@@ -116,12 +154,13 @@ def test_materializer_persists_and_reads_back_selector_retry(
             del binding
             with sqlite3.connect(db) as local:
                 local.execute(
-                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         "t_selector",
                         raw["assignee"],
                         raw["idempotency_key"],
                         raw["max_retries"],
+                        raw["max_runtime_seconds"],
                         1,
                         "todo",
                     ),
@@ -129,16 +168,17 @@ def test_materializer_persists_and_reads_back_selector_retry(
                 local.commit()
 
     monkeypatch.setattr(materializer, "_load_workspace_policy", lambda: FakeWorkspace)
-    raw = _selector_input()
-    raw["max_retries"] = 5
-    rc = materializer._evaluate_retry_materializer(
-        {"tool_name": "kanban_create", "tool_input": raw}
+    prepared = materializer._canonicalize_structured_retry_payload(
+        {"tool_name": "kanban_create", "tool_input": _selector_input()}
     )
+    raw = prepared["tool_input"]
+    rc = materializer._evaluate_retry_materializer(prepared)
     assert rc == 0
     with sqlite3.connect(db) as check:
         assert check.execute(
-            "SELECT assignee, max_retries FROM tasks WHERE id = 't_selector'"
-        ).fetchone() == ("kanban-main", 5)
+            "SELECT assignee, max_retries, max_runtime_seconds FROM tasks "
+            "WHERE id = 't_selector'"
+        ).fetchone() == ("kanban-main", 5, 7200)
 
 
 def test_completion_admission_runs_before_retry_materialization(

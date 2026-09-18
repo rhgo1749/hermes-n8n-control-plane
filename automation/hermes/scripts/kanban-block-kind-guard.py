@@ -6,13 +6,14 @@ shell-hook allowlist. Keep that exact command path stable and route lifecycle
 policies behind it:
 
 * ``kanban_block`` -> the preserved block-kind core guard;
-* ``kanban_create`` -> structured retry compatibility, specialist completion,
-  retry materialization, and workspace-binding policies;
+* ``kanban_create`` -> structured retry/runtime canonicalization, specialist completion,
+  durable materialization, and workspace-binding policies;
 * ``terminal`` -> block-kind core first, then specialist/workspace policies.
 
 Keeping one approved ``pre_tool_call`` command avoids introducing a second
-shell-hook consent boundary during a hotfix. The structured retry compatibility
-only fills the model-facing schema gap; it does not change Hermes core.
+shell-hook consent boundary during a hotfix. Structured execution canonicalization
+fills the model-facing retry/runtime gap at the control-plane boundary; it does not
+change Hermes core.
 """
 from __future__ import annotations
 
@@ -33,6 +34,8 @@ BLOCK_KIND_CORE = HERE / "kanban-block-kind-guard-core.py"
 SPECIALIST_COMPLETION_GUARD = HERE / "kanban-specialist-completion-guard.py"
 WORKSPACE_BINDING_GUARD = HERE / "kanban-workspace-binding-guard.py"
 TASK_RETRY_LIMIT = 5
+STANDARD_RUNTIME_SECONDS = 7200
+LARGE_RUNTIME_SECONDS = 10800
 SPECIALIST_ASSIGNEES = frozenset(
     {"kanban-investigator", "kanban-developer", "kanban-reviewer", "kanban-designer"}
 )
@@ -103,13 +106,14 @@ def _verify_retry_readback(workspace: ModuleType, raw: Mapping[str, Any]) -> Non
             "assignee",
             "idempotency_key",
             "max_retries",
+            "max_runtime_seconds",
             "created_at",
             "status",
         }
         if not required.issubset(columns):
-            raise RuntimeError("board DB tasks schema cannot prove durable max_retries")
+            raise RuntimeError("board DB tasks schema cannot prove durable retry/runtime policy")
         rows = conn.execute(
-            "SELECT id, assignee, max_retries, created_at FROM tasks "
+            "SELECT id, assignee, max_retries, max_runtime_seconds, created_at FROM tasks "
             "WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC",
             (key,),
         ).fetchall()
@@ -127,6 +131,8 @@ def _verify_retry_readback(workspace: ModuleType, raw: Mapping[str, Any]) -> Non
         raise RuntimeError("durable assignee does not match retry-compatible create")
     if row["max_retries"] != TASK_RETRY_LIMIT:
         raise RuntimeError("durable max_retries is not exactly five")
+    if row["max_runtime_seconds"] != raw.get("max_runtime_seconds"):
+        raise RuntimeError("durable max_runtime_seconds does not match canonical H4V3 runtime")
 
 
 def _evaluate_retry_materializer(payload: Mapping[str, Any]) -> int:
@@ -137,6 +143,8 @@ def _evaluate_retry_materializer(payload: Mapping[str, Any]) -> int:
         return 0
     if raw.get("max_retries") != TASK_RETRY_LIMIT:
         raise RuntimeError("canonicalized structured create must carry max_retries=5")
+    if raw.get("max_runtime_seconds") not in {STANDARD_RUNTIME_SECONDS, LARGE_RUNTIME_SECONDS}:
+        raise RuntimeError("canonicalized structured create must carry a canonical H4V3 runtime")
     if _is_blocked_quarantine(raw):
         return 0
     workspace = _load_workspace_policy()
@@ -291,13 +299,59 @@ def _retry_compat_target(raw: Mapping[str, Any]) -> bool:
     )
 
 
+def _body_marks_large_runtime(raw: Mapping[str, Any]) -> bool:
+    body = raw.get("body")
+    if not isinstance(body, str):
+        return False
+    for line in body.splitlines():
+        marker = line.strip()
+        if marker.startswith("- "):
+            marker = marker[2:].strip()
+        if marker.strip("`") == "runtime_class=large":
+            return True
+    return False
+
+
+def _is_investigation_search(raw: Mapping[str, Any]) -> bool:
+    marker = raw.get("investigation_search")
+    return isinstance(marker, Mapping) and marker.get("schema_id") == SEARCH_SCHEMA
+
+
+def _canonical_runtime_seconds(raw: Mapping[str, Any]) -> int:
+    if _is_investigation_search(raw):
+        return STANDARD_RUNTIME_SECONDS
+    assignee = _normalize_assignee(raw.get("assignee"))
+    if (
+        assignee in {"kanban-developer", "kanban-reviewer", "kanban-designer"}
+        and _body_marks_large_runtime(raw)
+    ):
+        return LARGE_RUNTIME_SECONDS
+    return STANDARD_RUNTIME_SECONDS
+
+
+def _canonicalize_search_runtime_marker(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    marker = raw.get("investigation_search")
+    if not isinstance(marker, Mapping):
+        return None
+    normalized_marker = dict(marker)
+    budget = marker.get("budget")
+    if isinstance(budget, Mapping):
+        normalized_budget = dict(budget)
+        normalized_budget["max_runtime_seconds"] = STANDARD_RUNTIME_SECONDS
+        normalized_marker["budget"] = normalized_budget
+    return normalized_marker
+
+
 def _canonicalize_structured_retry_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Fill the upstream structured-schema gap before policy admission.
+    """Canonicalize H4V3 execution retry/runtime policy before admission.
 
     This is a pure payload transformation. It performs no DB/task mutation, so
-    bounded-search admission still runs before the retry materializer creates a
-    row. Explicit future values other than five fail closed rather than being
-    silently overwritten.
+    bounded-search admission still runs before the materializer creates a row.
+    The model does not choose the standard wall-time: ordinary H4V3 execution
+    is always 7200 seconds, while an explicitly marked large implementation is
+    10800 seconds. Search candidate/selector marker budgets are normalized to
+    the same 7200-second bound. Explicit retry values other than five fail
+    closed rather than being silently overwritten.
     """
     if str(payload.get("tool_name") or "") != "kanban_create":
         return payload
@@ -312,6 +366,10 @@ def _canonicalize_structured_retry_payload(payload: dict[str, Any]) -> dict[str,
     normalized = dict(payload)
     normalized_input = dict(raw)
     normalized_input["max_retries"] = TASK_RETRY_LIMIT
+    normalized_input["max_runtime_seconds"] = _canonical_runtime_seconds(raw)
+    marker = _canonicalize_search_runtime_marker(raw)
+    if marker is not None:
+        normalized_input["investigation_search"] = marker
     normalized["tool_input"] = normalized_input
     return normalized
 
