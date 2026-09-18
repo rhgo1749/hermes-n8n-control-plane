@@ -193,6 +193,7 @@ def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_dis
                 "title": "fresh review after developer",
                 "assignee": "kanban-reviewer",
                 "parents": ["t_dev"],
+                "max_runtime_seconds": 7200,
             },
         },
         guard_path=COMPLETION_GUARD,
@@ -206,6 +207,7 @@ def test_structured_specialist_dependency_wait_and_explicit_ops_block_remain_dis
                 "title": "operator-gated specialist",
                 "assignee": "kanban-reviewer",
                 "initial_status": "blocked",
+                "max_runtime_seconds": 7200,
             },
         },
         guard_path=COMPLETION_GUARD,
@@ -376,25 +378,32 @@ def test_bounded_search_guard_requires_explicit_authorized_trigger(
 
 
 def test_bounded_search_guard_requires_dispatcher_time_cap() -> None:
-    result = _run({
-        "tool_name": "kanban_create",
-        "tool_input": _search_create_input(max_runtime_seconds=None),
-    })
+    result = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": _search_create_input(max_runtime_seconds=None),
+        },
+        guard_path=COMPLETION_GUARD,
+    )
 
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "max_runtime_seconds" in json.loads(result.stdout)["message"]
 
 
-def test_bounded_search_guard_rejects_runtime_above_7200_seconds() -> None:
-    tool_input = _search_create_input(max_runtime_seconds=7201)
-    tool_input["investigation_search"]["budget"]["max_runtime_seconds"] = 7201
-    result = _run({
-        "tool_name": "kanban_create",
-        "tool_input": tool_input,
-    })
+@pytest.mark.parametrize("runtime", [1800, 3600, 7201])
+def test_bounded_search_guard_requires_exact_7200_seconds(runtime: int) -> None:
+    tool_input = _search_create_input(max_runtime_seconds=runtime)
+    tool_input["investigation_search"]["budget"]["max_runtime_seconds"] = runtime
+    result = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": tool_input,
+        },
+        guard_path=COMPLETION_GUARD,
+    )
 
     assert result.returncode == 2, (result.stdout, result.stderr)
-    assert "7200-second search cap" in json.loads(result.stdout)["message"]
+    assert "exactly 7200" in json.loads(result.stdout)["message"]
 
 
 def test_bounded_search_guard_requires_durable_search_context() -> None:
@@ -857,6 +866,7 @@ def test_structured_specialist_allows_omitted_and_local_only_contract() -> None:
         tool_input: dict[str, Any] = {
             "title": "bounded specialist work",
             "assignee": "kanban-developer",
+            "max_runtime_seconds": 7200,
         }
         if value is not None:
             tool_input["completion_contract"] = value
@@ -866,6 +876,38 @@ def test_structured_specialist_allows_omitted_and_local_only_contract() -> None:
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert result.stdout == ""
+
+
+def test_structured_specialist_rejects_noncanonical_runtime() -> None:
+    for runtime in (None, 1800, 3600, 10800):
+        tool_input: dict[str, Any] = {
+            "title": "bounded specialist work",
+            "assignee": "kanban-developer",
+        }
+        if runtime is not None:
+            tool_input["max_runtime_seconds"] = runtime
+        result = _run(
+            {"tool_name": "kanban_create", "tool_input": tool_input},
+            guard_path=COMPLETION_GUARD,
+        )
+        assert result.returncode == 2
+        assert "requires max_runtime_seconds=7200" in json.loads(result.stdout)["message"]
+
+
+def test_structured_large_runtime_requires_explicit_marker() -> None:
+    result = _run(
+        {
+            "tool_name": "kanban_create",
+            "tool_input": {
+                "title": "large implementation",
+                "body": "runtime_class=large",
+                "assignee": "kanban-developer",
+                "max_runtime_seconds": 10800,
+            },
+        },
+        guard_path=COMPLETION_GUARD,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
 
 
 def test_non_specialist_pr_contract_is_not_globally_disabled() -> None:
@@ -911,9 +953,9 @@ def test_terminal_literal_and_shell_wrapped_nonlocal_contracts_are_blocked() -> 
 
 def test_terminal_specialist_local_only_or_omitted_contract_is_allowed() -> None:
     commands = (
-        "hermes kanban create x --assignee kanban-developer --completion-contract local-only",
-        "bash -lc 'hermes kanban create x --assignee=kanban-reviewer --completion-contract=local-only'",
-        "hermes kanban create x --assignee kanban-designer",
+        "hermes kanban create x --assignee kanban-developer --completion-contract local-only --max-runtime 7200",
+        "bash -lc 'hermes kanban create x --assignee=kanban-reviewer --completion-contract=local-only --max-runtime=2h'",
+        "hermes kanban create x --assignee kanban-designer --max-runtime 7200",
     )
     for command in commands:
         result = _run(
@@ -921,6 +963,32 @@ def test_terminal_specialist_local_only_or_omitted_contract_is_allowed() -> None
             guard_path=COMPLETION_GUARD,
         )
         assert result.returncode == 0, (command, result.stdout, result.stderr)
+
+
+def test_terminal_specialist_rejects_noncanonical_runtime() -> None:
+    for command in (
+        "hermes kanban create x --assignee kanban-developer --max-runtime 1800",
+        "hermes kanban create x --assignee kanban-reviewer",
+        "hermes kanban create x --assignee kanban-designer --max-runtime 10800",
+    ):
+        result = _run(
+            {"tool_name": "terminal", "tool_input": {"command": command}},
+            guard_path=COMPLETION_GUARD,
+        )
+        assert result.returncode == 2
+        assert "requires max_runtime_seconds=7200" in json.loads(result.stdout)["message"]
+
+
+def test_terminal_large_runtime_requires_explicit_marker() -> None:
+    command = (
+        "hermes kanban create x --assignee kanban-developer "
+        "--body runtime_class=large --max-runtime 10800"
+    )
+    result = _run(
+        {"tool_name": "terminal", "tool_input": {"command": command}},
+        guard_path=COMPLETION_GUARD,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
 
 
 def test_terminal_parent_dependency_preblocked_specialist_is_blocked() -> None:
@@ -935,8 +1003,8 @@ def test_terminal_parent_dependency_preblocked_specialist_is_blocked() -> None:
 
 def test_terminal_dependency_wait_without_preblock_and_explicit_ops_hold_are_allowed() -> None:
     commands = (
-        "hermes kanban create review --assignee kanban-reviewer --parent t_dev",
-        "hermes kanban create ops --assignee kanban-reviewer --initial-status blocked",
+        "hermes kanban create review --assignee kanban-reviewer --parent t_dev --max-runtime 7200",
+        "hermes kanban create ops --assignee kanban-reviewer --initial-status blocked --max-runtime 7200",
     )
     for command in commands:
         result = _run(

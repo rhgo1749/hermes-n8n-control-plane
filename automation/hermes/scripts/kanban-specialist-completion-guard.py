@@ -33,7 +33,7 @@ values fails closed before admission because argparse would mutate with
 the last value while the admitted payload could describe another. The
 ledger atomically
 reserves two candidate slots, a 32000-token cumulative budget, two retry
-reservations, and a 1800-second dispatcher cap. Reassignment reads only the
+reservations, and an exact 7200-second dispatcher cap. Reassignment reads only the
 canonical task row; unreadable/ambiguous state fails closed and is never
 rewritten by this guard.
 
@@ -75,6 +75,9 @@ _INVESTIGATION_SEARCH_MAX_TOTAL_TOKENS = 32_000
 _INVESTIGATION_SEARCH_MAX_RETRIES = 2
 _INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS = 7200
 _KANBAN_TASK_RETRY_LIMIT = 5
+_STANDARD_EXECUTION_RUNTIME_SECONDS = 7200
+_LARGE_EXECUTION_RUNTIME_SECONDS = 10800
+_LARGE_RUNTIME_ASSIGNEES = frozenset({"kanban-developer", "kanban-reviewer", "kanban-designer"})
 _INVESTIGATION_SEARCH_TRIGGER_CODES = frozenset(
     {
         "LOW_CONFIDENCE_OR_BLOCKING_UNKNOWN",
@@ -157,6 +160,45 @@ def _structured_has_parent(raw_input: Mapping[str, Any]) -> bool:
     if isinstance(parents, (list, tuple, set, frozenset)):
         return any(isinstance(value, str) and value.strip() for value in parents)
     return False
+
+
+def _body_marks_large_runtime(raw_input: Mapping[str, Any]) -> bool:
+    body = raw_input.get("body")
+    if not isinstance(body, str):
+        return False
+    for line in body.splitlines():
+        marker = line.strip()
+        if marker.startswith("- "):
+            marker = marker[2:].strip()
+        if marker.strip("`") == "runtime_class=large":
+            return True
+    return False
+
+
+def _expected_execution_runtime(raw_input: Mapping[str, Any], assignee: str) -> int:
+    if isinstance(raw_input.get("investigation_search"), Mapping):
+        return _STANDARD_EXECUTION_RUNTIME_SECONDS
+    if assignee in _LARGE_RUNTIME_ASSIGNEES and _body_marks_large_runtime(raw_input):
+        return _LARGE_EXECUTION_RUNTIME_SECONDS
+    return _STANDARD_EXECUTION_RUNTIME_SECONDS
+
+
+def _evaluate_execution_runtime(
+    raw_input: Mapping[str, Any], assignee: str, *, source: str = "kanban_create:runtime"
+) -> int:
+    expected = _expected_execution_runtime(raw_input, assignee)
+    actual = raw_input.get("max_runtime_seconds")
+    if not isinstance(actual, int) or isinstance(actual, bool) or actual != expected:
+        return _block(
+            "H4V3 execution runtime gate failed closed: "
+            f"{assignee} requires max_runtime_seconds={expected}. "
+            "Standard execution is fixed at 7200 seconds; 10800 is allowed only "
+            "when an eligible implementation task body explicitly records "
+            "runtime_class=large. No task mutation was performed.",
+            assignee=assignee,
+            source=source,
+        )
+    return 0
 
 
 def _dependency_wait_diagnostic(assignee: str) -> str:
@@ -1007,8 +1049,8 @@ def _search_budget(marker: Mapping[str, Any]) -> tuple[dict[str, int] | None, st
         return None, "budget.max_total_tokens exceeds the 32000-token search cap"
     if parsed["max_retries"] != _INVESTIGATION_SEARCH_MAX_RETRIES:
         return None, "budget.max_retries must be exactly two cumulative retry reservations"
-    if parsed["max_runtime_seconds"] > _INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS:
-        return None, "budget.max_runtime_seconds exceeds the 7200-second search cap"
+    if parsed["max_runtime_seconds"] != _INVESTIGATION_SEARCH_MAX_RUNTIME_SECONDS:
+        return None, "budget.max_runtime_seconds must be exactly 7200 for bounded investigation search"
     return parsed, None
 
 
@@ -1839,9 +1881,12 @@ def _evaluate_structured(payload: Mapping[str, Any]) -> int:
             source="kanban_create:dependency_wait",
         )
     contract = raw_input.get("completion_contract")
-    if _contract_is_local(contract):
-        return 0
-    return _block(_diagnostic(assignee), assignee=assignee, source="kanban_create")
+    if not _contract_is_local(contract):
+        return _block(_diagnostic(assignee), assignee=assignee, source="kanban_create")
+    runtime_decision = _evaluate_execution_runtime(raw_input, assignee)
+    if runtime_decision != 0:
+        return runtime_decision
+    return 0
 
 
 def _terminal_search_marker(args: list[str]) -> Mapping[str, Any] | None:
@@ -1953,12 +1998,19 @@ def _evaluate_terminal_create(args: list[str], board: str) -> int:
             source="terminal:create:dependency_wait",
         )
     contracts = _option_values(args, "--completion-contract")
-    if not contracts or all(_contract_is_local(value) for value in contracts):
-        return 0
-    return _block(
-        _diagnostic(assignee),
-        assignee=assignee,
-        source="terminal:create",
+    if contracts and not all(_contract_is_local(value) for value in contracts):
+        return _block(
+            _diagnostic(assignee),
+            assignee=assignee,
+            source="terminal:create",
+        )
+    bodies = _option_values(args, "--body")
+    runtime_input: dict[str, Any] = {
+        "body": bodies[-1] if bodies else "",
+        "max_runtime_seconds": _terminal_runtime_option(args),
+    }
+    return _evaluate_execution_runtime(
+        runtime_input, assignee, source="terminal:create:runtime"
     )
 
 
