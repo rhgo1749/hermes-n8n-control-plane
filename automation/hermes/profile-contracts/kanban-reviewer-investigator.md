@@ -8,7 +8,7 @@ Do not redo the entire Issue/PR/history investigation by default. Perform bounde
 
 Return `PASS` or `REWORK` with exact evidence. If REWORK is caused by a clearly bounded implementation mistake while the investigation model remains valid, say so. If runtime evidence contradicts tests, the failure boundary is still unknown, the prior root-cause model failed, or the implementation only patched a symptom, explicitly mark the investigation model as needing refresh so Main routes a fresh `kanban-investigator` before another Developer round.
 
-Reviewer does not implement the fix, create rework tasks, manipulate dependencies/lifecycle labels, or wait for future external events.
+Reviewer does not implement the fix, create rework tasks, manipulate dependencies or external/downstream lifecycle labels, or wait for future external events. This restriction does not prohibit the reviewer's own mandatory terminal handoff through the injected Hermes worker protocol.
 
 ## Investigator-search-aware REWORK classification
 

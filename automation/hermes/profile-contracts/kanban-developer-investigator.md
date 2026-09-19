@@ -12,7 +12,7 @@ Do not reread the entire source Issue/PR/history by default merely because sourc
 
 For regressions/rework, preserve the Investigator's observed failure boundary, required RED regression, preserved contracts, and rejected workaround classes. If current repository/runtime evidence materially contradicts the handoff, report the contradiction and stop or return bounded evidence for fresh investigation rather than silently replacing the model with another workaround.
 
-Implementation owns coding, required deterministic validation, runtime gates executable in the available environment, exact diff inspection, and delivery PR create/update. It does not own reconstructing the investigation from scratch or making unresolved product/UX decisions.
+Implementation owns coding, required deterministic validation, runtime gates executable in the available environment, exact diff inspection, and delivery PR create/update. It does not own reconstructing the investigation from scratch or making unresolved product/UX decisions. Restrictions on lifecycle ownership do not prohibit the mandatory terminal handoff of the Developer's own assigned task; after the implementation handoff is complete, use the terminal action required by the injected Hermes worker protocol.
 
 A passing build or internal method-call assertion does not replace the required observable regression evidence when the handoff defines one.
 

@@ -74,6 +74,7 @@ For tasks assigned to the dedicated H4V3 specialist profiles `kanban-investigato
 - never reassign an already PR-aware task to one of those specialist profiles; first keep it on a non-specialist path or use an explicit operator recovery to restore its specialist-compatible completion contract;
 - preserve repository, Issue/PR URL, branch, exact head SHA, and relevant commit identities in the task body and structured handoff metadata as evidence, not as terminal policy;
 - a specialist's `done` means that specialist phase completed its bounded internal responsibility; it does **not** mean the PR was accepted, reviewed, or merged;
+- role restrictions on lifecycle reconciliation mean external/downstream/peer lifecycle state, not the worker's own mandatory terminal handoff. Every specialist must terminate its own assigned run through the injected Hermes worker protocol (`kanban_complete`, `kanban_request_review`, `kanban_request_changes`, or `kanban_block` as appropriate to that run);
 - future GitHub checks, human review, and merge remain external state and must not prevent the specialist from terminating once its required executable work and evidence are complete.
 
 The restriction is role/task-specific, not profile-global GitHub disablement. `kanban-main` is not automatically a PR-acceptance owner merely because it is Main, and ordinary standalone Kanban tasks outside the H4V3 specialist graph may still use Hermes core PR-aware completion contracts when their actual terminal condition is remote PR acceptance.
@@ -261,7 +262,7 @@ Investigator must not report a hypothesis as confirmed cause merely because it f
 
 Stop rule:
 
-Once the bounded investigation and structured handoff are complete, Investigator finishes. It does not remain RUNNING while Developer works and does not mutate downstream lifecycle state.
+Once the bounded investigation and structured handoff are complete, Investigator finishes by handing off its own assigned card through the normal Hermes worker protocol (normally `kanban_complete` with the structured investigation handoff). It does not remain RUNNING while Developer works and does not mutate downstream lifecycle state.
 
 ## 4. Hermes Kanban Developer
 

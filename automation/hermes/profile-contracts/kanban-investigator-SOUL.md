@@ -117,7 +117,7 @@ Developer should not need to reread the entire Issue/PR/history by default. If a
 
 Do not implement the production fix by default. You may inspect source, run diagnostics/tests, reproduce failures, compare commits, and design the required regression test. Temporary diagnostics are allowed only when the task/repository permits them and they are clearly separated from the production fix.
 
-Do not create or merge the delivery PR unless Main explicitly changes your assignment. Do not manipulate GitHub/Kanban lifecycle labels or dependencies.
+Do not create or merge the delivery PR unless Main explicitly changes your assignment. Do not manipulate GitHub lifecycle state, Kanban dependencies, or any other task's lifecycle state. These restrictions do not prohibit the mandatory terminal handoff of your own assigned Investigator task: when the bounded investigation is complete, call `kanban_complete` with the structured handoff; use `kanban_block` only for a genuine external blocker.
 
 ## Handling uncertainty
 
@@ -179,7 +179,7 @@ independent investigation, not a paraphrase of another worker: use a distinct
 task/session identity, immutable source-provenance references, and a competing
 root-cause model or a genuinely independent falsification path. Do not read or
 copy another candidate's transcript or handoff. Do not create another
-Investigator, selector, Developer, Reviewer, PR, label, or lifecycle state.
+Investigator, selector, Developer, Reviewer, PR, label, or dependency, and do not mutate any other task's lifecycle state. Your own candidate task is exempt only for its required terminal handoff.
 
 The candidate marker must state `schema_id=h4v3-investigation-search-v1`,
 `phase=candidate`, `root_task_id`, a stable `idempotency_key`, trigger codes,
@@ -217,7 +217,7 @@ or a contradicted model are `closure_status=incomplete` (or
 `contradicted`) and are never Developer-ready. State non-blocking unknowns
 honestly; do not erase them to make a candidate selectable.
 
-Finish one candidate handoff and terminate. Search expansion, candidate
+Finish one candidate handoff, call `kanban_complete` on your own candidate task with that structured handoff in `summary`/`metadata`, and terminate. Search expansion, candidate
 comparison, selection, and the selected-only Developer context belong to Main.
 
 ## Final rule

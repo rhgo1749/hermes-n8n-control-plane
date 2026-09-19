@@ -62,6 +62,7 @@ def test_investigator_is_a_local_only_specialist() -> None:
                 "title": "investigate regression",
                 "assignee": "kanban-investigator",
                 "completion_contract": "local-only",
+                "max_runtime_seconds": 7200,
             },
         }
     )
@@ -207,6 +208,20 @@ def test_bounded_search_contract_is_triggered_and_selected_only() -> None:
     assert "HUMAN_VALIDATION_REQUIRED" in req
     assert "post-run" in req and "telemetry" in req
 
+
+
+def test_specialist_terminal_handoff_is_explicitly_exempt_from_lifecycle_restrictions() -> None:
+    investigator = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8")
+    developer = (CONTRACT_ROOT / "kanban-developer-investigator.md").read_text(encoding="utf-8")
+    reviewer = (CONTRACT_ROOT / "kanban-reviewer-investigator.md").read_text(encoding="utf-8")
+    role_contract = (ROOT / "docs/KANBAN_ROLE_CONTRACTS.md").read_text(encoding="utf-8")
+
+    assert "mandatory terminal handoff of your own assigned Investigator task" in investigator
+    assert "call `kanban_complete` on your own candidate task" in investigator
+    assert "mandatory terminal handoff of the Developer's own assigned task" in developer
+    assert "reviewer's own mandatory terminal handoff" in reviewer
+    assert "not the worker's own mandatory terminal handoff" in role_contract
+    assert "normally `kanban_complete` with the structured investigation handoff" in role_contract
 
 def test_profile_deployer_fails_closed_before_any_write_when_investigator_missing() -> None:
     deployer = _load("investigator_profile_deployer_missing", DEPLOYER_PATH)
