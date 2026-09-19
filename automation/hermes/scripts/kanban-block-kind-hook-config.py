@@ -24,7 +24,13 @@ import tempfile
 from pathlib import Path
 
 GUARD_FILENAME = "kanban-block-kind-guard.py"
+DEFAULT_HERMES_PYTHON = Path(
+    os.environ.get(
+        "HERMES_PYTHON_BIN", "/ws/hermes-agent/venv/bin/python3"
+    )
+)
 LEGACY_WORKSPACE_GUARD_FILENAME = "kanban-workspace-guard.py"
+DEDUP_GUARD_PATH = "/home/hermes/.hermes/scripts/kanban-dedup-guard.py"
 _MATCHERS = ("kanban_block", "kanban_create", "terminal")
 
 
@@ -137,11 +143,24 @@ def render(text: str, command: str) -> str:
     return text + separator + "hooks:\n  pre_tool_call:\n" + "".join(_render_entry_block(command))
 
 
+def _normalize_known_runtime_commands(text: str, command: str) -> str:
+    python_bin = shlex.split(command)[0]
+    canonical = f"{python_bin} {DEDUP_GUARD_PATH}"
+    for prefix in (
+        "python3",
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/opt/venv/bin/python3",
+    ):
+        text = text.replace(f"{prefix} {DEDUP_GUARD_PATH}", canonical)
+    return text
+
+
 def write_candidate(source: Path, destination: Path, command: str) -> None:
     if not source.is_file():
         raise SystemExit(f"config.yaml not found: {source}")
     original = source.read_text(encoding="utf-8")
-    rendered = render(original, command)
+    rendered = _normalize_known_runtime_commands(render(original, command), command)
     destination.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(source.stat().st_mode)
     fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
@@ -163,8 +182,14 @@ def main() -> int:
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--guard", type=Path, required=True)
+    parser.add_argument(
+        "--python",
+        dest="python_bin",
+        type=Path,
+        default=DEFAULT_HERMES_PYTHON,
+    )
     args = parser.parse_args()
-    command = f"python3 {args.guard}"
+    command = f"{args.python_bin} {args.guard}"
     write_candidate(args.source, args.destination, command)
     return 0
 

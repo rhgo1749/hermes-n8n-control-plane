@@ -34,7 +34,7 @@ def test_unit_file_is_installed_before_daemon_reload() -> None:
 def test_unit_stops_exact_in_container_actuator() -> None:
     text = _text()
     exact = (
-        "^/opt/venv/bin/python3[[:space:]]+"
+        "^/ws/hermes-agent/venv/bin/python3[[:space:]]+"
         "/home/hermes/.local/libexec/github_intake_actuator.py$"
     )
     exec_stop = next(

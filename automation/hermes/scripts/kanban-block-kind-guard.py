@@ -29,6 +29,14 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+HERMES_AGENT_SOURCE_ROOT = Path(
+    os.environ.get("HERMES_AGENT_SOURCE_ROOT", "/ws/hermes-agent")
+).expanduser()
+if HERMES_AGENT_SOURCE_ROOT.is_dir():
+    source_root = str(HERMES_AGENT_SOURCE_ROOT)
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+
 HERE = Path(__file__).resolve().parent
 BLOCK_KIND_CORE = HERE / "kanban-block-kind-guard-core.py"
 SPECIALIST_COMPLETION_GUARD = HERE / "kanban-specialist-completion-guard.py"

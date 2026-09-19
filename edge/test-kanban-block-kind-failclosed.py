@@ -619,18 +619,53 @@ def test_overview_projects_blocked_task_as_untyped_when_legacy_kind_is_null(boar
     assert task["block"]["auto_promotable"] is False
 
 
+def test_lifecycle_wrapper_pins_canonical_hermes_source_root():
+    source = GUARD.read_text(encoding="utf-8")
+    assert 'os.environ.get("HERMES_AGENT_SOURCE_ROOT", "/ws/hermes-agent")' in source
+    assert "sys.path.insert(0, source_root)" in source
+
+
 def test_hook_config_render_is_idempotent_and_fail_closed():
     original = """hooks:\n  pre_tool_call:\n    - matcher: other\n      command: python3 /tmp/other.py\n      timeout: 5\n\nlogging:\n  level: INFO\n"""
     helper = _load("issue92_config_helper", CONFIG_HELPER)
-    command = "python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+    command = "/ws/hermes-agent/venv/bin/python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
     rendered = helper.render(original, command)
     again = helper.render(rendered, command)
     assert rendered == again
     assert rendered.count("matcher: kanban_block") == 1
     assert rendered.count("matcher: terminal") == 1
     assert rendered.count("fail_closed: true") == 3
-    assert "command: python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py" in rendered
+    assert "command: /ws/hermes-agent/venv/bin/python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py" in rendered
     assert "logging:\n" in rendered
+
+
+def test_hook_config_write_candidate_normalizes_dedup_python():
+    helper = _load("issue92_config_helper_dedup", CONFIG_HELPER)
+    with tempfile.TemporaryDirectory(prefix="issue92-config-dedup-") as directory:
+        root = Path(directory)
+        source = root / "source.yaml"
+        destination = root / "candidate.yaml"
+        source.write_text(
+            "hooks:\n"
+            "  pre_tool_call:\n"
+            "    - matcher: kanban_create\n"
+            "      command: python3 /home/hermes/.hermes/scripts/kanban-dedup-guard.py\n",
+            encoding="utf-8",
+        )
+        command = (
+            "/ws/hermes-agent/venv/bin/python3 "
+            "/home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+        )
+        helper.write_candidate(source, destination, command)
+        rendered = destination.read_text(encoding="utf-8")
+        assert (
+            "command: /ws/hermes-agent/venv/bin/python3 "
+            "/home/hermes/.hermes/scripts/kanban-dedup-guard.py"
+        ) in rendered
+        assert (
+            "command: python3 /home/hermes/.hermes/scripts/kanban-dedup-guard.py"
+            not in rendered
+        )
 
 
 def test_deployer_dry_run_validates_without_changing_live_config():
@@ -692,7 +727,7 @@ def test_hook_config_preserves_following_sibling_hook():
         "  level: INFO\n"
     )
     helper = _load("issue92_config_helper", CONFIG_HELPER)
-    command = "python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+    command = "/ws/hermes-agent/venv/bin/python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
     rendered = helper.render(original, command)
     again = helper.render(rendered, command)
     assert rendered == again

@@ -1147,7 +1147,7 @@ def test_hook_config_reuses_one_approved_command_idempotently_without_losing_sib
         "logging:\n"
         "  level: INFO\n"
     )
-    command = "python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+    command = "/ws/hermes-agent/venv/bin/python3 /home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
     rendered = helper.render(original, command)
     again = helper.render(rendered, command)
     assert rendered == again

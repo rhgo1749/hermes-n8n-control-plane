@@ -119,7 +119,7 @@ def validate_direct_intake_boundary() -> None:
     assert "PORT = 5682" in actuator
     assert '"/v1/intake"' in actuator
     assert '"/v1/edge-sync"' in actuator
-    assert 'PYTHON_BIN = Path("/opt/venv/bin/python3")' in actuator
+    assert 'PYTHON_BIN = Path("/ws/hermes-agent/venv/bin/python3")' in actuator
     assert (
         '"/home/hermes/.hermes/scripts/'
         'github-agent-ready-kanban-intake.py"'

@@ -144,21 +144,21 @@ export HERMES_AGENT_SOURCE_ROOT="$HERMES_AGENT_SOURCE_ROOT"
 # path from the long-lived Hermes container.
 export PYTHONPATH="$HERMES_AGENT_SOURCE_ROOT"
 
-exec /opt/venv/bin/python3 \
+exec /ws/hermes-agent/venv/bin/python3 \
   /home/hermes/.local/libexec/github_intake_actuator.py
 LAUNCHER
 
 hermes_write "$TMP/launcher" "$LAUNCHER_REMOTE" 0755
 
-hermes_exec /opt/venv/bin/python3 -m py_compile "$ACTUATOR_REMOTE"
-hermes_exec /opt/venv/bin/python3 -m py_compile "$TIMEOUT_REMOTE"
+hermes_exec /ws/hermes-agent/venv/bin/python3 -m py_compile "$ACTUATOR_REMOTE"
+hermes_exec /ws/hermes-agent/venv/bin/python3 -m py_compile "$TIMEOUT_REMOTE"
 
 # Exercise the same interpreter/import boundary used by /v1/edge-sync.  File
 # existence alone is insufficient: a stale editable finder can leave the
 # actuator apparently healthy while every real edge-sync child crashes.
 hermes_exec env \
     "PYTHONPATH=$HERMES_AGENT_SOURCE_ROOT" \
-    /opt/venv/bin/python3 -c \
+    /ws/hermes-agent/venv/bin/python3 -c \
     'import hermes_cli.kanban_db; import hermes_state; import hermes_state_holders' \
     || fail "Hermes edge runtime import preflight failed"
 
@@ -177,7 +177,7 @@ ExecStart=$DOCKER_BIN exec --user 1000:1000 --env HOME=/home/hermes --env HERMES
 # `docker exec` is a host-side client. Killing only that client can leave the
 # exec'd Python process alive inside the container and still bound to :5682.
 # Stop the exact in-container actuator before systemd tears down the client.
-ExecStop=$DOCKER_BIN exec --user 1000:1000 $CONTAINER_NAME sh -c 'pkill -TERM -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true'
+ExecStop=$DOCKER_BIN exec --user 1000:1000 $CONTAINER_NAME sh -c 'pkill -TERM -f "^/ws/hermes-agent/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true'
 Restart=always
 RestartSec=5s
 TimeoutStopSec=15s
@@ -200,12 +200,12 @@ install -o root -g root -m 0644 "$TMP/unit" "$UNIT_PATH"
 systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
 hermes_exec sh -c '
     set -eu
-    pids="$(pgrep -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
+    pids="$(pgrep -f "^/ws/hermes-agent/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
     [ -z "$pids" ] || kill -TERM $pids 2>/dev/null || true
     i=0
     while [ -n "$pids" ] && [ "$i" -lt 20 ]; do
         sleep .1
-        pids="$(pgrep -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
+        pids="$(pgrep -f "^/ws/hermes-agent/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
         i=$((i + 1))
     done
     [ -z "$pids" ] || kill -KILL $pids 2>/dev/null || true
@@ -223,7 +223,7 @@ for _ in $(seq 1 30); do
     if hermes_exec sh -c '
         set -eu
         expected="$1"
-        pids="$(pgrep -f "^/opt/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
+        pids="$(pgrep -f "^/ws/hermes-agent/venv/bin/python3[[:space:]]+/home/hermes/.local/libexec/github_intake_actuator.py$" || true)"
         count="$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)"
         [ "$count" -eq 1 ] || exit 1
         pid="$(printf "%s\n" "$pids" | sed -n "1p")"

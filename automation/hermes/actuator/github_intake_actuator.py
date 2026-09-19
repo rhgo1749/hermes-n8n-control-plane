@@ -52,7 +52,7 @@ TOKEN_FILE = Path(
         "/home/hermes/.hermes/.control-plane/github-intake-control-token",
     )
 )
-PYTHON_BIN = Path("/opt/venv/bin/python3")
+PYTHON_BIN = Path("/ws/hermes-agent/venv/bin/python3")
 INTAKE_SCRIPT = Path(
     "/home/hermes/.hermes/scripts/github-agent-ready-kanban-intake.py"
 )
