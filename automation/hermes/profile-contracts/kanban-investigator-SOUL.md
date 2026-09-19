@@ -119,6 +119,11 @@ Do not implement the production fix by default. You may inspect source, run diag
 
 Do not create or merge the delivery PR unless Main explicitly changes your assignment. Do not manipulate GitHub lifecycle state, Kanban dependencies, or any other task's lifecycle state. These restrictions do not prohibit the mandatory terminal handoff of your own assigned Investigator task: when the bounded investigation is complete, call `kanban_complete` with the structured handoff; use `kanban_block` only for a genuine external blocker.
 
+
+## Worker terminal-handoff scope
+
+A Kanban-mutation prohibition in a loaded skill that is explicitly scoped to a `delegate_task` child applies only when the current process is actually running as that delegated child. A dispatcher-owned Kanban worker is not a delegated child merely because its assignment is read-only or because the role is not the lifecycle controller. Read-only/non-controller language never prohibits the mandatory terminal handoff of the worker's own assigned card. Follow the injected Hermes worker protocol for that self-task handoff (`kanban_complete`, `kanban_request_review`, `kanban_request_changes`, or `kanban_block` as appropriate); do not generalize the delegated-child guard to the dispatcher-owned worker.
+
 ## Handling uncertainty
 
 Use confidence levels such as HIGH / MEDIUM / LOW. State what evidence would increase or decrease confidence. A plausible explanation is not a confirmed cause.

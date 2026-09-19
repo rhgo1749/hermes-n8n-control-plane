@@ -212,15 +212,22 @@ def test_bounded_search_contract_is_triggered_and_selected_only() -> None:
 
 def test_specialist_terminal_handoff_is_explicitly_exempt_from_lifecycle_restrictions() -> None:
     investigator = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8")
+    main = (CONTRACT_ROOT / "kanban-main-investigator.md").read_text(encoding="utf-8")
     developer = (CONTRACT_ROOT / "kanban-developer-investigator.md").read_text(encoding="utf-8")
     reviewer = (CONTRACT_ROOT / "kanban-reviewer-investigator.md").read_text(encoding="utf-8")
+    designer = (CONTRACT_ROOT / "kanban-designer-investigator.md").read_text(encoding="utf-8")
     role_contract = (ROOT / "docs/KANBAN_ROLE_CONTRACTS.md").read_text(encoding="utf-8")
 
     assert "mandatory terminal handoff of your own assigned Investigator task" in investigator
     assert "call `kanban_complete` on your own candidate task" in investigator
     assert "mandatory terminal handoff of the Developer's own assigned task" in developer
     assert "reviewer's own mandatory terminal handoff" in reviewer
+    for contract in (investigator, main, developer, reviewer, designer):
+        assert "`delegate_task` child" in contract
+        assert "dispatcher-owned Kanban worker" in contract
+        assert "Read-only/non-controller language never prohibits" in contract
     assert "not the worker's own mandatory terminal handoff" in role_contract
+    assert "actual delegated child" in role_contract
     assert "normally `kanban_complete` with the structured investigation handoff" in role_contract
 
 def test_profile_deployer_fails_closed_before_any_write_when_investigator_missing() -> None:

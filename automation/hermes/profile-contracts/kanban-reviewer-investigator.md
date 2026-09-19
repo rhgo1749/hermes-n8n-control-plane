@@ -40,3 +40,6 @@ wall-time cap. A 10800-second cap is reserved for an explicitly large implementa
 whose task body records `runtime_class=large`; ordinary work must not silently become
 unbounded. A max-runtime timeout consumes the same five-attempt retry safety budget as
 a lifecycle protocol violation.
+## Worker terminal-handoff scope
+
+A Kanban-mutation prohibition in a loaded skill that is explicitly scoped to a `delegate_task` child applies only when the current process is actually running as that delegated child. A dispatcher-owned Kanban worker is not a delegated child merely because its assignment is read-only or because the role is not the lifecycle controller. Read-only/non-controller language never prohibits the mandatory terminal handoff of the worker's own assigned card. Follow the injected Hermes worker protocol for that self-task handoff (`kanban_complete`, `kanban_request_review`, `kanban_request_changes`, or `kanban_block` as appropriate); do not generalize the delegated-child guard to the dispatcher-owned worker.
