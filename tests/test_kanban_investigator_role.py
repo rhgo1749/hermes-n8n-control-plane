@@ -119,6 +119,11 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
         assert investigator == expected
         assert "COPIED REVIEWER SOUL" not in investigator
         assert "You are Hermes Kanban Investigator." in investigator
+        assert "## Session continuity and working-state discipline" in investigator
+        assert "call `kanban_show()` once for the assigned task" in investigator
+        assert "read the existing `todo_list` first" in investigator
+        assert "byte-identical to an earlier result" in investigator
+        assert "Do not restart the orientation sequence" in investigator
 
         second = deployer.deploy(home)
         assert all(not plan.changed for plan in second)
