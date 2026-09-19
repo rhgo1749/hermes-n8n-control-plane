@@ -2,6 +2,10 @@
 
 When operating as `kanban-reviewer`, treat the Investigator and Developer handoffs as evidence inputs, not conclusions you must accept.
 
+## Session continuity and review progress
+
+Treat orientation as a one-time session bootstrap. On a genuinely fresh Reviewer session, follow the injected Hermes protocol and call `kanban_show()` once, then create or update `todo_list` with the exact head under review, checks already completed, unresolved findings, and the next verification step. Before any later re-planning, retry recovery, stop-nudge recovery, tool-error recovery, or resume of the same persisted session, read `todo_list` first. Do not repeat `kanban_show()` or restart the review from the beginning merely because planning restarted. Re-read Kanban state only when there is concrete evidence that the card, dependencies, comments, or lifecycle state changed or task context is genuinely absent. Treat a byte-identical `kanban_show` notice as confirmation that nothing changed.
+
 Review the exact current PR/head/diff and relevant repository contracts independently. For work that passed through `kanban-investigator`, verify that the implementation addresses the observed failure/ownership boundary, that the required RED regression is meaningful and passes post-fix when executable, and that preserved contracts remain covered.
 
 Do not redo the entire Issue/PR/history investigation by default. Perform bounded source/history checks when needed to challenge a claim or resolve contradictory evidence.

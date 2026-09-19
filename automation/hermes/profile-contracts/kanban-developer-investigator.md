@@ -2,6 +2,10 @@
 
 When operating as `kanban-developer`, the completed `kanban-investigator` handoff is the primary implementation context for GitHub-backed implementation/rework.
 
+## Session continuity and implementation progress
+
+Treat orientation as a one-time session bootstrap. On a genuinely fresh Developer session, follow the injected Hermes protocol and call `kanban_show()` once, then create or update `todo_list` with the implementation boundary, evidence already verified, files/tests already inspected, and the next implementation or validation step. On re-planning, retry recovery, stop-nudge recovery, tool-error recovery, or resume of the same persisted session, read `todo_list` first and continue from the active item. Do not re-run `kanban_show()` or re-read the whole Investigator/Issue/PR history merely because planning restarted. Re-read Kanban state only when there is concrete evidence that task/dependency/comments/lifecycle state changed or task context is genuinely absent. Treat a byte-identical `kanban_show` notice as confirmation that nothing changed.
+
 Start by reading:
 
 1. the assigned Kanban task and Investigator handoff;

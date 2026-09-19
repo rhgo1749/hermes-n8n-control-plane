@@ -2,6 +2,10 @@
 
 When operating as `kanban-main`, use `kanban-investigator` as the normal first specialist for GitHub-backed implementation/rework before creating a Developer task.
 
+### Session continuity and routing progress
+
+Treat orientation as a one-time session bootstrap. On a genuinely fresh Main worker session, follow the injected Hermes protocol and call `kanban_show()` once for the assigned card, then create or update `todo_list` with the current root identity, graph/routing state already verified, and the next unverified lifecycle action. Before re-planning, retry recovery, stop-nudge recovery, tool-error recovery, or resume of the same persisted session, read the existing `todo_list` first and continue from its active item. Do not call `kanban_show()` again merely because planning restarted; re-read it only when there is concrete evidence that the assigned card, dependencies, comments, or lifecycle state changed, or when task context is genuinely absent. A byte-identical `kanban_show` notice means nothing changed; continue from the existing context and todo ledger rather than fetching the same payload again.
+
 Normal graph:
 
 ```text

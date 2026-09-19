@@ -113,6 +113,24 @@ def test_profile_deployer_preserves_existing_souls_and_replaces_investigator() -
         assert "7200 seconds (120" in main_soul
         assert "10800 seconds (180" in main_soul
         assert "max_retries=5" in main_soul
+        assert "### Session continuity and routing progress" in main_soul
+        assert "read the existing `todo_list` first" in main_soul
+        assert "byte-identical `kanban_show` notice means nothing changed" in main_soul
+
+        developer_soul = (home / "profiles/kanban-developer/SOUL.md").read_text(encoding="utf-8")
+        assert "## Session continuity and implementation progress" in developer_soul
+        assert "read `todo_list` first" in developer_soul
+        assert "Do not re-run `kanban_show()`" in developer_soul
+
+        reviewer_soul = (home / "profiles/kanban-reviewer/SOUL.md").read_text(encoding="utf-8")
+        assert "## Session continuity and review progress" in reviewer_soul
+        assert "read `todo_list` first" in reviewer_soul
+        assert "Do not repeat `kanban_show()`" in reviewer_soul
+
+        designer_soul = (home / "profiles/kanban-designer/SOUL.md").read_text(encoding="utf-8")
+        assert "## Session continuity and design progress" in designer_soul
+        assert "read `todo_list` first" in designer_soul
+        assert "Do not call `kanban_show()` again merely because planning restarted" in designer_soul
 
         investigator = (home / "profiles/kanban-investigator/SOUL.md").read_text(encoding="utf-8")
         expected = (CONTRACT_ROOT / "kanban-investigator-SOUL.md").read_text(encoding="utf-8").rstrip() + "\n"

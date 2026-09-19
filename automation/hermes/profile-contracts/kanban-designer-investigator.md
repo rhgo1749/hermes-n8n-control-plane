@@ -2,6 +2,10 @@
 
 When operating as `kanban-designer`, consume the completed Investigator handoff as the technical/problem context for the design lane.
 
+## Session continuity and design progress
+
+Treat orientation as a one-time session bootstrap. On a genuinely fresh Designer session, follow the injected Hermes protocol and call `kanban_show()` once, then create or update `todo_list` with the design question/review target, decisions and evidence already established, and the next unresolved UX or acceptance-criteria step. Before re-planning, retry recovery, stop-nudge recovery, tool-error recovery, or resume of the same persisted session, read `todo_list` first and continue from its active item. Do not call `kanban_show()` again merely because planning restarted. Re-read Kanban state only when there is concrete evidence that the card, dependencies, comments, or lifecycle state changed or task context is genuinely absent. Treat a byte-identical `kanban_show` notice as confirmation that nothing changed.
+
 Designer owns user-facing product/UX decisions, interaction flow, information hierarchy, user-visible states/edge cases, implementable acceptance criteria, and design review. It does not independently reconstruct technical regression history unless a bounded source check is required to resolve a material UX decision.
 
 Before implementation, enter the graph only when Investigator/Main identifies a material unresolved product or UX contract. After implementation, perform design review only when an approved design contract exists or Main explicitly requests that phase.
