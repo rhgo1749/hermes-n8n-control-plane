@@ -34,20 +34,20 @@ DEDUP_GUARD_PATH = "/home/hermes/.hermes/scripts/kanban-dedup-guard.py"
 _MATCHERS = ("kanban_block", "kanban_create", "terminal")
 
 
-def _render_entry_block(command: str) -> list[str]:
+def _render_entry_block(command: str, entry_indent: str = "    ") -> list[str]:
     command_text = shlex.join(shlex.split(command))
+    field_indent = entry_indent + "  "
     lines: list[str] = []
     for matcher in _MATCHERS:
         lines.extend(
             [
-                f"    - matcher: {matcher}\n",
-                f"      command: {command_text}\n",
-                "      timeout: 10\n",
-                "      fail_closed: true\n",
+                f"{entry_indent}- matcher: {matcher}\n",
+                f"{field_indent}command: {command_text}\n",
+                f"{field_indent}timeout: 10\n",
+                f"{field_indent}fail_closed: true\n",
             ]
         )
     return lines
-
 
 def _pre_tool_call_end(lines: list[str], start: int) -> int:
     """End of the ``hooks: pre_tool_call:`` block.
@@ -83,7 +83,7 @@ def _entry_ranges(lines: list[str], start: int, end: int) -> list[tuple[int, int
     starts = [
         index
         for index in range(start + 1, end)
-        if lines[index].startswith("    - ")
+        if lines[index].startswith(("  - ", "    - "))
     ]
     return [
         (entry_start, starts[position + 1] if position + 1 < len(starts) else end)
@@ -126,7 +126,12 @@ def render(text: str, command: str) -> str:
         insertion = len(kept)
         while insertion > 0 and not kept[insertion - 1].strip():
             insertion -= 1
-        kept[insertion:insertion] = _render_entry_block(command)
+        entry_indent = (
+            lines[ranges[0][0]][: len(lines[ranges[0][0]]) - len(lines[ranges[0][0]].lstrip())]
+            if ranges
+            else "    "
+        )
+        kept[insertion:insertion] = _render_entry_block(command, entry_indent)
         return "".join(lines[: start + 1] + kept + lines[end:])
 
     hook_indices = [index for index, line in enumerate(lines) if line == "hooks:\n"]
@@ -146,15 +151,49 @@ def render(text: str, command: str) -> str:
 def _normalize_known_runtime_commands(text: str, command: str) -> str:
     python_bin = shlex.split(command)[0]
     canonical = f"{python_bin} {DEDUP_GUARD_PATH}"
-    for prefix in (
-        "python3",
-        "/usr/bin/python3",
-        "/usr/local/bin/python3",
-        "/opt/venv/bin/python3",
-    ):
-        text = text.replace(f"{prefix} {DEDUP_GUARD_PATH}", canonical)
-    return text
+    lines = text.splitlines(keepends=True)
+    rendered: list[str] = []
+    index = 0
 
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip()
+        if not stripped.startswith("command:"):
+            rendered.append(line)
+            index += 1
+            continue
+
+        indent = line[: len(line) - len(stripped)]
+        raw_parts = [stripped[len("command:"):].strip()]
+        end = index + 1
+        while end < len(lines):
+            continuation = lines[end]
+            continuation_stripped = continuation.lstrip()
+            continuation_indent = continuation[: len(continuation) - len(continuation_stripped)]
+            if not continuation_stripped.strip() or len(continuation_indent) <= len(indent):
+                break
+            raw_parts.append(continuation_stripped.strip())
+            end += 1
+
+        try:
+            parts = shlex.split(" ".join(raw_parts))
+        except ValueError:
+            rendered.extend(lines[index:end])
+            index = end
+            continue
+
+        if (
+            len(parts) == 2
+            and parts[1] == DEDUP_GUARD_PATH
+            and parts[0].endswith("python3")
+        ):
+            newline = "\n" if any(part.endswith("\n") for part in lines[index:end]) else ""
+            rendered.append(f"{indent}command: {canonical}{newline}")
+        else:
+            rendered.extend(lines[index:end])
+        index = end
+
+    return "".join(rendered)
 
 def write_candidate(source: Path, destination: Path, command: str) -> None:
     if not source.is_file():

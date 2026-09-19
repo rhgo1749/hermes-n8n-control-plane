@@ -639,34 +639,94 @@ def test_hook_config_render_is_idempotent_and_fail_closed():
     assert "logging:\n" in rendered
 
 
+def test_hook_config_render_supports_indentless_pre_tool_call_sequence():
+    helper = _load("issue92_config_helper_indentless", CONFIG_HELPER)
+    original = (
+        "hooks:\n"
+        "  pre_tool_call:\n"
+        "  - matcher: kanban_create\n"
+        "    command: python3 /home/hermes/.hermes/scripts/kanban-dedup-guard.py\n"
+        "    timeout: 10\n"
+        "    fail_closed: true\n"
+        "  - matcher: kanban_block\n"
+        "    command: /ws/hermes-agent/venv/bin/python3 \n"
+        "      /home/hermes/.hermes/scripts/kanban-block-kind-guard.py\n"
+        "    timeout: 10\n"
+        "    fail_closed: true\n"
+        "logging:\n"
+        "  level: INFO\n"
+    )
+    command = (
+        "/ws/hermes-agent/venv/bin/python3 "
+        "/home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
+    )
+    rendered = helper._normalize_known_runtime_commands(
+        helper.render(original, command),
+        command,
+    )
+    data = yaml.safe_load(rendered)
+    entries = data["hooks"]["pre_tool_call"]
+    lifecycle = [
+        item for item in entries
+        if "kanban-block-kind-guard.py" in str(item.get("command", ""))
+    ]
+    assert len(lifecycle) == 3
+    assert {item["matcher"] for item in lifecycle} == {
+        "kanban_block", "kanban_create", "terminal"
+    }
+    assert all(item["fail_closed"] is True for item in lifecycle)
+    assert all(line.startswith("  - matcher:") for line in rendered.splitlines() if "matcher:" in line)
+    assert helper.render(rendered, command) == rendered
+
+
 def test_hook_config_write_candidate_normalizes_dedup_python():
     helper = _load("issue92_config_helper_dedup", CONFIG_HELPER)
     with tempfile.TemporaryDirectory(prefix="issue92-config-dedup-") as directory:
         root = Path(directory)
-        source = root / "source.yaml"
-        destination = root / "candidate.yaml"
-        source.write_text(
-            "hooks:\n"
-            "  pre_tool_call:\n"
-            "    - matcher: kanban_create\n"
-            "      command: python3 /home/hermes/.hermes/scripts/kanban-dedup-guard.py\n",
-            encoding="utf-8",
-        )
         command = (
             "/ws/hermes-agent/venv/bin/python3 "
             "/home/hermes/.hermes/scripts/kanban-block-kind-guard.py"
         )
-        helper.write_candidate(source, destination, command)
-        rendered = destination.read_text(encoding="utf-8")
-        assert (
-            "command: /ws/hermes-agent/venv/bin/python3 "
+        canonical = (
+            "/ws/hermes-agent/venv/bin/python3 "
             "/home/hermes/.hermes/scripts/kanban-dedup-guard.py"
-        ) in rendered
-        assert (
-            "command: python3 /home/hermes/.hermes/scripts/kanban-dedup-guard.py"
-            not in rendered
         )
 
+        cases = {
+            "legacy-single": (
+                "      command: python3 "
+                "/home/hermes/.hermes/scripts/kanban-dedup-guard.py\n"
+            ),
+            "canonical-single": f"      command: {canonical}\n",
+            "double-single": (
+                "      command: /ws/hermes-agent/venv/bin//ws/hermes-agent/venv/bin/python3 "
+                "/home/hermes/.hermes/scripts/kanban-dedup-guard.py\n"
+            ),
+            "double-folded": (
+                "      command: /ws/hermes-agent/venv/bin//ws/hermes-agent/venv/bin/python3 \n"
+                "        /home/hermes/.hermes/scripts/kanban-dedup-guard.py\n"
+            ),
+        }
+
+        for name, command_line in cases.items():
+            source = root / f"{name}.yaml"
+            destination = root / f"{name}-out.yaml"
+            source.write_text(
+                "hooks:\n"
+                "  pre_tool_call:\n"
+                "    - matcher: kanban_create\n"
+                f"{command_line}"
+                "      timeout: 10\n",
+                encoding="utf-8",
+            )
+            helper.write_candidate(source, destination, command)
+            rendered = destination.read_text(encoding="utf-8")
+            assert f"command: {canonical}" in rendered, (name, rendered)
+            assert "/ws/hermes-agent/venv/bin//ws/hermes-agent/venv/bin/python3" not in rendered
+
+            second = root / f"{name}-second.yaml"
+            helper.write_candidate(destination, second, command)
+            assert second.read_text(encoding="utf-8") == rendered, name
 
 def test_deployer_dry_run_validates_without_changing_live_config():
     with tempfile.TemporaryDirectory(prefix="issue92-hermes-home-") as directory:
